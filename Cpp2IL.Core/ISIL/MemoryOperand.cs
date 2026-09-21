@@ -13,7 +13,10 @@ public struct MemoryOperand(IOperand? baseRegister = null, IOperand? indexRegist
     public long Addend = addend;
     public int Scale = scale;
 
-    // Zero means the lifter did not retain the native access width.
+    // Native store width in bytes, retained by ARM64 STR/STUR/STP lifting.
+    // Zero means unknown (including unhandled SIMD/other lifters), never pointer-sized by default.
+    // SSA/coalescing copy this struct when replacing Base/Index, preserving the width;
+    // default struct equality also distinguishes accesses of different widths.
     public int AccessSize = accessSize;
 
     public bool IsConstant => Base == null && Index == null && Scale == 0;

@@ -306,7 +306,7 @@ public static class IlGenerator
                 if (instruction.Operands[0] is MemoryOperand
                     { Index: null, Addend: 0, Scale: 0, Base: LocalVariable
                         { Type: ByRefTypeAnalysisContext { ElementType: { IsValueType: false } referent } } address } store
-                    && referent is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext)
+                    && referent is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext or GenericParameterTypeAnalysisContext)
                     && store.AccessSize == context.AppContext.Binary.PointerSizeBytes)
                 {
                     LoadLocal(address, method, locals);

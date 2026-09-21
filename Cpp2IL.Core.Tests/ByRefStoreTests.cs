@@ -43,6 +43,7 @@ public class ByRefStoreTests
     [TestCase("int", 4, 0, false)]
     [TestCase("struct", 8, 0, false)]
     [TestCase("pointer", 8, 0, false)]
+    [TestCase("generic", 8, 0, false)]
     [TestCase("unmanaged", 8, 0, false)]
     [TestCase("ordinary", 8, 0, false)]
     public void OnlyExactReferenceByrefStoreDereferencesDestination(string kind, int width, int offset, bool supported)
@@ -53,6 +54,8 @@ public class ByRefStoreTests
             "int" => app.SystemTypes.SystemInt32Type,
             "struct" => app.AssembliesByName["mscorlib"].GetTypeByFullName("System.DateTime")!,
             "pointer" => new PointerTypeAnalysisContext(app.SystemTypes.SystemInt32Type),
+            "generic" => new GenericParameterTypeAnalysisContext("T", 0,
+                LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_VAR, 0, app.SystemTypes.SystemObjectType),
             _ => app.SystemTypes.SystemObjectType
         };
         TypeAnalysisContext parameterType = kind switch
