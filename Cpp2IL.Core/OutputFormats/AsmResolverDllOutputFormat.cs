@@ -68,6 +68,7 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
         {
             var dllPath = Path.Combine(outputRoot, name);
             fileBuilder.CreateFile(image).Write(dllPath);
+            OnAssemblyWritten(context, dllPath);
         }
 
         Logger.VerboseNewline($"{(DateTime.Now - start).TotalMilliseconds:F1}ms", "DllOutput");
@@ -78,6 +79,8 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
             Logger.InfoNewline($"{percent}% of methods successfully decompiled ({SuccessfulMethodCount} / {TotalMethodCount})", "DllOutput");
         }
     }
+
+    protected virtual void OnAssemblyWritten(ApplicationAnalysisContext context, string dllPath) { }
 
     public virtual List<AssemblyDefinition> BuildAssemblies(ApplicationAnalysisContext context)
     {
