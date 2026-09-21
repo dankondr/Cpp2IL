@@ -74,7 +74,9 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
 
     /// <summary>
     /// Exception type name thrown by the runtime helper at each address, or null where the address turned
-    /// out not to be a throw helper. Populated on demand by <see cref="Analysis.ThrowHelperRecovery"/>.
+    /// out not to be a throw helper. Only completed full-budget root queries are cached;
+    /// recursive or in-progress results must not be published here.
+    /// Populated on demand by <see cref="Analysis.ThrowHelperRecovery"/>.
     /// </summary>
     public readonly ConcurrentDictionary<ulong, string?> ThrowHelperNamesByAddress = new();
     internal readonly ConcurrentDictionary<ulong, bool> ProvenNonReturningHelpers = new();

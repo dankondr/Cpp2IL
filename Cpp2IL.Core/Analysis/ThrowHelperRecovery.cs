@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Model.Contexts;
@@ -18,7 +19,7 @@ public static class ThrowHelperRecovery
 
     public static TypeAnalysisContext? GetThrownException(ApplicationAnalysisContext appContext, ulong address)
     {
-        var name = ResolveName(appContext, address, 0);
+        var name = ResolveName(appContext, address);
 
         if (name == null)
             return null;
@@ -66,34 +67,37 @@ public static class ThrowHelperRecovery
         return callTargets.Any(target => ReachesCall(appContext, target, wanted, depth + 1, visited));
     }
 
-    private static string? ResolveName(ApplicationAnalysisContext appContext, ulong address, int depth)
-    {
-        if (appContext.ThrowHelperNamesByAddress.TryGetValue(address, out var cached))
-            return cached;
-
-        if (address == 0 || depth >= MaxDepth)
-            return null;
-
-        // Insert before recursing so a cycle terminates
-        appContext.ThrowHelperNamesByAddress[address] = null;
-
-        var (dataReferences, callTargets) = appContext.InstructionSet.InspectPotentialThrowHelper(appContext, address);
-
-        var name = FindExceptionName(appContext, dataReferences);
-
-        if (name == null)
+    private static string? ResolveName(ApplicationAnalysisContext appContext, ulong address)
+        => ResolveName(address, appContext.ThrowHelperNamesByAddress, target =>
         {
-            foreach (var target in callTargets)
+            var (dataReferences, callTargets) = appContext.InstructionSet.InspectPotentialThrowHelper(appContext, target);
+            return (FindExceptionName(appContext, dataReferences), callTargets);
+        });
+
+    internal static string? ResolveName(ulong address, ConcurrentDictionary<ulong, string?> cache,
+        Func<ulong, (string? Name, IReadOnlyList<ulong> Calls)> inspect)
+    {
+        // Cache only completed root queries with the full search budget. A recursive
+        // result depends on both depth and path; publishing it under its address alone
+        // lets a different root (or worker) observe an incomplete/incorrect answer.
+        return cache.GetOrAdd(address, root => Search(root, 0, []));
+
+        string? Search(ulong current, int depth, HashSet<ulong> path)
+        {
+            if (current == 0 || depth >= MaxDepth || !path.Add(current))
+                return null;
+            try
             {
-                name = ResolveName(appContext, target, depth + 1);
-
+                var (name, callTargets) = inspect(current);
                 if (name != null)
-                    break;
+                    return name;
+                foreach (var target in callTargets)
+                    if (Search(target, depth + 1, path) is { } resolved)
+                        return resolved;
+                return null;
             }
+            finally { path.Remove(current); }
         }
-
-        appContext.ThrowHelperNamesByAddress[address] = name;
-        return name;
     }
 
     private static string? FindExceptionName(ApplicationAnalysisContext appContext, IReadOnlyList<ulong> dataReferences)
