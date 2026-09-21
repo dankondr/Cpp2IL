@@ -56,6 +56,8 @@ public abstract class BaseKeyFunctionAddresses
 
     public IEnumerable<KeyValuePair<string, ulong>> Pairs => resolvedAddressMap;
 
+    public HashSet<ulong> WriteBarrierAliases { get; } = [];
+
     protected ApplicationAnalysisContext _appContext = null!; //Always initialized before used
 
     protected LibCpp2IlReflectionCache ReflectionCache =>
@@ -66,7 +68,7 @@ public abstract class BaseKeyFunctionAddresses
 
     public bool IsKeyFunctionAddress(ulong address)
     {
-        return address != 0 && resolvedAddressSet.Contains(address);
+        return address != 0 && (resolvedAddressSet.Contains(address) || WriteBarrierAliases.Contains(address));
     }
 
     private void FindExport(string name, out ulong ptr)

@@ -110,19 +110,22 @@ public class IlGeneratorTests
         TestGameLoader.LoadSimple2019Game();
     }
 
-    [TestCase(false)]
-    [TestCase(true)]
-    public void InterfaceCallPreservesRuntimeDispatch(bool isStatic)
+    [TestCase(false, true, false)]
+    [TestCase(true, true, false)]
+    [TestCase(false, false, true)]
+    [TestCase(false, false, false)] // direct base/virtual calls must remain direct
+    public void InterfaceCallPreservesRuntimeDispatch(bool isStatic, bool isInterface, bool virtualDispatch)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var owner = app.SystemTypes.SystemObjectType;
         var iface = new InjectedTypeAnalysisContext(owner.DeclaringAssembly, "Tests", "IDispatch", null,
-            System.Reflection.TypeAttributes.Public | System.Reflection.TypeAttributes.Interface | System.Reflection.TypeAttributes.Abstract);
+            System.Reflection.TypeAttributes.Public | (isInterface ? System.Reflection.TypeAttributes.Interface : System.Reflection.TypeAttributes.Class) | System.Reflection.TypeAttributes.Abstract);
         var target = iface.InjectMethodContext("Invoke", app.SystemTypes.SystemVoidType,
             ReflectionMethodAttributes.Public | (isStatic ? ReflectionMethodAttributes.Static : ReflectionMethodAttributes.Abstract | ReflectionMethodAttributes.Virtual));
         var caller = new InjectedMethodAnalysisContext(owner, "Caller", app.SystemTypes.SystemVoidType,
             ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
         caller.ControlFlowGraph = new ISILControlFlowGraph([isStatic ? new(0, OpCode.CallVoid, target) : new(0, OpCode.CallVoid, target, new Immediate(0)), new(1, OpCode.Return)]);
+        caller.ControlFlowGraph.Instructions[0].IsVirtualDispatch = virtualDispatch;
         caller.Locals = [];
         caller.ParameterLocals = [];
         caller.AnalysisWarnings = [];
@@ -137,7 +140,7 @@ public class IlGeneratorTests
             MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
         type.Methods.Add(method);
         IlGenerator.GenerateIl(caller, method);
-        Assert.That(method.CilMethodBody!.Instructions.Any(i => i.OpCode == (isStatic ? CilOpCodes.Call : CilOpCodes.Callvirt) && i.Operand == targetDefinition), Is.True);
+        Assert.That(method.CilMethodBody!.Instructions.Any(i => i.OpCode == (!isStatic && (isInterface || virtualDispatch) ? CilOpCodes.Callvirt : CilOpCodes.Call) && i.Operand == targetDefinition), Is.True);
     }
 
     [Test]
