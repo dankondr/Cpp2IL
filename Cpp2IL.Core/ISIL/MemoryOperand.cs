@@ -6,12 +6,15 @@ namespace Cpp2IL.Core.ISIL;
 /// <summary>
 /// Memory operand in the format of [base+addend+index*scale]
 /// </summary>
-public struct MemoryOperand(IOperand? baseRegister = null, IOperand? indexRegister = null, long addend = 0, int scale = 0) : IOperand
+public struct MemoryOperand(IOperand? baseRegister = null, IOperand? indexRegister = null, long addend = 0, int scale = 0, int accessSize = 0) : IOperand
 {
     public IOperand? Base = baseRegister;
     public IOperand? Index = indexRegister;
     public long Addend = addend;
     public int Scale = scale;
+
+    // Zero means the lifter did not retain the native access width.
+    public int AccessSize = accessSize;
 
     public bool IsConstant => Base == null && Index == null && Scale == 0;
 

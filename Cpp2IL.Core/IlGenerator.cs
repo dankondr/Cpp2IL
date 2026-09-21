@@ -303,6 +303,18 @@ public static class IlGenerator
                 break;
 
             case OpCode.Move:
+                if (instruction.Operands[0] is MemoryOperand
+                    { Index: null, Addend: 0, Scale: 0, Base: LocalVariable
+                        { Type: ByRefTypeAnalysisContext { ElementType: { IsValueType: false } referent } } address } store
+                    && referent is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext)
+                    && store.AccessSize == context.AppContext.Binary.PointerSizeBytes)
+                {
+                    LoadLocal(address, method, locals);
+                    LoadOperand(instruction.Operands[1], method, locals, writeLine, referent);
+                    instructions.Add(CilOpCodes.Stind_Ref);
+                    break;
+                }
+
                 if (instruction.Operands[0] is FieldReference field) // stfld takes instance before value so LoadOperand StoreToOperand doesn't work
                 {
                     if (!field.Field.IsStatic)
@@ -932,6 +944,13 @@ public static class IlGenerator
                 break;
 
             case MemoryOperand memory:
+                if (memory.Base is LocalVariable { Type: ByRefTypeAnalysisContext })
+                {
+                    instructions.Add(CilOpCodes.Pop);
+                    instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Unsupported managed-pointer store ({memory.AccessSize} bytes): {memory}"));
+                    instructions.Add(CilOpCodes.Call, writeLine);
+                    break;
+                }
                 if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
                     && memory.Base is LocalVariable local2)
                 {

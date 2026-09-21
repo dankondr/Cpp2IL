@@ -265,26 +265,26 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         }
 
         // the memory operand for the current instruction's access, offset by extraOffset (for the second reg of a pair)
-        IOperand MemOperand(long extraOffset = 0)
+        IOperand MemOperand(long extraOffset = 0, int accessSize = 0)
         {
             var baseReg = instruction.MemBase;
             // writeback modes apply the offset to the base register itself, the access is at [base]
             var offset = (instruction.MemIndexMode == Arm64MemoryIndexMode.Offset ? instruction.MemOffset : 0) + extraOffset;
 
             if (baseReg == Arm64Register.INVALID)
-                return new MemoryOperand(addend: offset);
+                return new MemoryOperand(addend: offset, accessSize: accessSize);
 
             if (IsReg31(baseReg))
                 return new StackOffset((int)offset);
 
             if (instruction.MemAddendReg != Arm64Register.INVALID)
-                return new MemoryOperand(Reg(baseReg), Reg(instruction.MemAddendReg), offset, 1 << instruction.MemExtendOrShiftAmount);
+                return new MemoryOperand(Reg(baseReg), Reg(instruction.MemAddendReg), offset, 1 << instruction.MemExtendOrShiftAmount, accessSize);
 
             // a load through a register holding an ADRP page address is really an absolute load
             if (adrpOffsets!.TryGetValue(NormalizeRegister(baseReg), out var page))
-                return new MemoryOperand(addend: (long)page + offset);
+                return new MemoryOperand(addend: (long)page + offset, accessSize: accessSize);
 
-            return new MemoryOperand(Reg(baseReg), addend: offset);
+            return new MemoryOperand(Reg(baseReg), addend: offset, accessSize: accessSize);
         }
 
         var flagN = new Register(null, "N");
@@ -487,10 +487,23 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.STUR:
             case Arm64Mnemonic.STURB:
             case Arm64Mnemonic.STURH:
+            {
+                var storeSize = instruction.Mnemonic switch
+                {
+                    Arm64Mnemonic.STRB or Arm64Mnemonic.STURB => 1,
+                    Arm64Mnemonic.STRH or Arm64Mnemonic.STURH => 2,
+                    _ => instruction.Op0Reg switch
+                    {
+                        >= Arm64Register.X0 and <= Arm64Register.X31 => 8,
+                        >= Arm64Register.W0 and <= Arm64Register.W31 => 4,
+                        _ => 0 // SIMD stores are not managed-reference writes.
+                    }
+                };
                 EmitWriteback(beforeAccess: true);
-                Add(address, OpCode.Move, MemOperand(), ConvertOperand(instruction, 0));
+                Add(address, OpCode.Move, MemOperand(accessSize: storeSize), ConvertOperand(instruction, 0));
                 EmitWriteback(beforeAccess: false);
                 break;
+            }
             case Arm64Mnemonic.LDP:
             case Arm64Mnemonic.LDPSW:
             case Arm64Mnemonic.STP:
@@ -508,8 +521,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
                     if (instruction.Mnemonic == Arm64Mnemonic.STP)
                     {
-                        Add(address, OpCode.Move, MemOperand(), ConvertOperand(instruction, 0));
-                        Add(address, OpCode.Move, MemOperand(pairSize), ConvertOperand(instruction, 1));
+                        var storeSize = instruction.Op0Reg is >= Arm64Register.X0 and <= Arm64Register.X31
+                            or >= Arm64Register.W0 and <= Arm64Register.W31 ? pairSize : 0;
+                        Add(address, OpCode.Move, MemOperand(accessSize: storeSize), ConvertOperand(instruction, 0));
+                        Add(address, OpCode.Move, MemOperand(pairSize, storeSize), ConvertOperand(instruction, 1));
                     }
                     else
                     {
