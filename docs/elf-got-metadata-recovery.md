@@ -108,3 +108,30 @@ The synthetic arithmetic harness explicitly computed MaxStack; actual generated
 Start still declares `.maxstack 0`. That pre-existing header problem is a separate
 runtime blocker despite its zero diagnostics. The unchanged runtime gate remains
 blocked, with 1,842 reachable methods now exposed; no runtime oracle was run.
+# Per-method MaxStack follow-up
+
+The interface snapshot above preserved the historical generator's `MaxStack=0`.
+Generation now computes the bound with AsmResolver after all branch fixups.
+Successful bodies receive the computed value; a `StackImbalanceException` leaves
+the original invalid body and zero header in place and adds an explicit
+`Invalid reconstructed IL stack` diagnostic. No guessed bound or stub is used.
+This is stack-height analysis, not a type verifier or semantic oracle.
+
+The five synthetic conversion/shift tests now serialize and execute generated IL
+without a test-only `ComputeMaxStackOnBuild` override. They fail before this fix
+and pass afterwards. A negative test preserves a non-void return with an empty
+stack and checks its diagnostic. Core: 90/90; LibCpp2IL runner: 5/5 (same legacy
+fixture caveat). Full recovery completed for 70,310 methods in 52.75 seconds.
+
+Across the same nine assemblies (17,026 methods), structural failures remain
+217, methods with issues remain 7,844, and total issue strings rise from 63,128
+to 63,345: exactly 217 newly explicit stack failures. Unmanaged loads 38,345,
+method-not-found 18,232, indirect calls 1,857, and unimplemented instructions
+1,822 are unchanged. Bootstrap.Awake and Start remain free of diagnostics and
+structural failures; serialized Start now has `.maxstack 2` and preserves
+`callvirt IRemoteConfigFetcher.SubscribeOnInitFinished`. The unchanged runtime
+gate still blocks all 1,842 reachable methods. Input hashes remain unchanged.
+
+Immutable local artifact sets: `cpp2il-interface-patch-20260921` and
+`cpp2il-maxstack-patch-20260921` under the dataset's `recovery/1.11.1` directory.
+Game inputs/outputs are not distributed in this source repository.

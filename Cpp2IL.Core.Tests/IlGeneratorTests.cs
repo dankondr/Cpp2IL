@@ -14,6 +14,30 @@ namespace Cpp2IL.Core.Tests;
 
 public class IlGeneratorTests
 {
+    [Test]
+    public void InvalidStackRemainsExplicitlyDiagnosedAndBodyIsPreserved()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Invalid",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([new(0, OpCode.Return)]);
+        caller.Locals = [];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("InvalidStack.dll");
+        var type = new TypeDefinition("Tests", "InvalidStack", TypeAttributes.Public | TypeAttributes.Class);
+        module.TopLevelTypes.Add(type);
+        // A non-void signature with an empty return stack must not acquire a guessed bound.
+        var method = new MethodDefinition("Invalid", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32));
+        type.Methods.Add(method);
+        IlGenerator.GenerateIl(caller, method);
+        Assert.That(method.CilMethodBody!.Instructions[0].OpCode, Is.EqualTo(CilOpCodes.Ret));
+        Assert.That(method.CilMethodBody.MaxStack, Is.EqualTo(0));
+        Assert.That(caller.AnalysisWarnings.Any(w => w.Contains("Invalid reconstructed IL stack")), Is.True);
+        Assert.That(method.CilMethodBody.Instructions.Any(i => i.Operand is string s && s.Contains("Invalid reconstructed IL stack")), Is.True);
+    }
+
     [TestCase(0L, 0L)]
     [TestCase(0x7fffffffL, 34359738352L)]
     [TestCase(0x80000000L, -34359738368L)]
@@ -44,7 +68,7 @@ public class IlGeneratorTests
         // fixture game's entire mscorlib. Exercise the actual emitted conversion and shift IL.
         foreach (var local in method.CilMethodBody!.LocalVariables)
             local.VariableType = module.CorLibTypeFactory.Int64;
-        method.CilMethodBody.ComputeMaxStackOnBuild = true;
+        Assert.That(method.CilMethodBody.MaxStack, Is.GreaterThan(0));
 
         var assembly = new AssemblyDefinition("ExtensionTest", new Version(1, 0));
         assembly.Modules.Add(module);

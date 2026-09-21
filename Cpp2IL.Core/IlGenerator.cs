@@ -61,7 +61,8 @@ public static class IlGenerator
         var body = new CilMethodBody()
         {
             InitializeLocals = true, // Without this ILSpy does: CompilerServices.Unsafe.SkipInit(out object obj);
-            ComputeMaxStackOnBuild = false // There's stack imbalance somewhere, but this works for now
+            // Compute per method below so one invalid reconstruction cannot abort the assembly.
+            ComputeMaxStackOnBuild = false
         };
 
         definition.CilMethodBody = body;
@@ -219,6 +220,20 @@ public static class IlGenerator
         foreach (var warning in context.AnalysisWarnings)
         {
             instructions.Add(CilOpCodes.Ldstr, Diagnostic("Warning: " + warning));
+            instructions.Add(CilOpCodes.Call, writeLine);
+        }
+
+        try
+        {
+            body.MaxStack = body.ComputeMaxStack();
+        }
+        catch (StackImbalanceException exception)
+        {
+            // Preserve the invalid body as evidence, but never label failed stack analysis
+            // as recovered or hide it behind a guessed stack bound.
+            var warning = "Invalid reconstructed IL stack: " + exception.Message;
+            context.AddWarning(warning);
+            instructions.Add(CilOpCodes.Ldstr, Diagnostic(warning));
             instructions.Add(CilOpCodes.Call, writeLine);
         }
     }
