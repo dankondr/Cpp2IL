@@ -98,6 +98,9 @@ public static class IlGenerator
             if (operand is AddressOf { Target: LocalVariable addressed })
                 local = addressed;
 
+            if (operand is AddressOf { Target: FieldReference addressedField })
+                local = addressedField.Local;
+
             if (local != null && !context.Locals.Contains(local))
                 context.Locals.Add(local);
         }
@@ -721,6 +724,12 @@ public static class IlGenerator
                 break;
             case AddressOf { Target: LocalVariable addressed }:
                 instructions.Add(CilOpCodes.Ldloca, locals[addressed]);
+                break;
+            case AddressOf { Target: FieldReference addressedField }:
+                if (!addressedField.Field.IsStatic)
+                    LoadLocal(addressedField.Local, method, locals);
+                instructions.Add(addressedField.Field.IsStatic ? CilOpCodes.Ldsflda : CilOpCodes.Ldflda,
+                    addressedField.Field.ToFieldDescriptor());
                 break;
             case AddressOf { Target: ArrayAccess elementAddress }:
                 LoadLocal(elementAddress.Array, method, locals);
