@@ -9,6 +9,7 @@ using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils.AsmResolver;
+using LibCpp2IL.BinaryStructures;
 
 namespace Cpp2IL.Core;
 
@@ -431,6 +432,19 @@ public static class IlGenerator
                     break;
                 }
 
+                if (Analysis.StringConstructorRecovery.Resolve(instruction, targetMethod) is { } stringConstructor)
+                {
+                    var firstArgument = instruction.OpCode == OpCode.Call ? 3 : 2;
+                    for (var i = 0; i < stringConstructor.Parameters.Count; i++)
+                        LoadOperand(instruction.Operands[firstArgument + i], method, locals, writeLine, stringConstructor.Parameters[i].ParameterType);
+                    instructions.Add(CilOpCodes.Newobj, stringConstructor.ToMethodDescriptor());
+                    if (instruction.OpCode == OpCode.Call)
+                        StoreToOperand(instruction.Operands[1], method, locals, writeLine);
+                    else
+                        instructions.Add(CilOpCodes.Pop);
+                    break;
+                }
+
                 var importedMethod = targetMethod.ToMethodDescriptor();
 
                 var thisParamIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
@@ -540,10 +554,10 @@ public static class IlGenerator
                 // operands are coerced to the (float) result type. A no-op when they already match.
                 var floatConversion = FloatArithmeticConversion(instruction);
 
-                LoadOperand(instruction.Operands[1], method, locals, writeLine);
+                LoadOperand(instruction.Operands[1], method, locals, writeLine, NullComparisonType(instruction, 1));
                 if (floatConversion is { } conv1)
                     instructions.Add(conv1);
-                LoadOperand(instruction.Operands[2], method, locals, writeLine);
+                LoadOperand(instruction.Operands[2], method, locals, writeLine, NullComparisonType(instruction, 2));
                 if (floatConversion is { } conv2)
                     instructions.Add(conv2);
 
@@ -870,6 +884,19 @@ public static class IlGenerator
         operand is LocalVariable { Type: { } type } && type == context.AppContext.SystemTypes.SystemBooleanType;
 
     private static bool IsZeroConstant(IOperand operand) => operand is Immediate { Value: 0 };
+
+    private static TypeAnalysisContext? NullComparisonType(Instruction instruction, int operandIndex)
+    {
+        if (instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual)
+            || !IsZeroConstant(instruction.Operands[operandIndex])) return null;
+        var otherType = DestinationType(instruction.Operands[3 - operandIndex]);
+        // Runtime handles, unmanaged/byref pointers and unconstrained generic parameters
+        // are not managed references, even when their IsValueType property is false.
+        return otherType is { IsValueType: false } && otherType.Type is
+            Il2CppTypeEnum.IL2CPP_TYPE_CLASS or Il2CppTypeEnum.IL2CPP_TYPE_OBJECT or
+            Il2CppTypeEnum.IL2CPP_TYPE_STRING or Il2CppTypeEnum.IL2CPP_TYPE_SZARRAY or
+            Il2CppTypeEnum.IL2CPP_TYPE_ARRAY or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST ? otherType : null;
+    }
     
     private static TypeAnalysisContext? DestinationType(IOperand destination) =>
         destination switch
