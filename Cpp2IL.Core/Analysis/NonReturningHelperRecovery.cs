@@ -15,25 +15,27 @@ internal static class NonReturningHelperRecovery
     internal static HashSet<Block> Find(MethodAnalysisContext method)
     {
         var app = method.AppContext;
-        if (app.InstructionSet is not NewArmV8InstructionSet || app.Binary is not ElfFile elf)
-            return [];
+        return Select(method.ControlFlowGraph!, target => IsProven(app, target));
+    }
+
+    internal static bool IsProven(ApplicationAnalysisContext app, ulong target)
+    {
+        if (app.InstructionSet is not NewArmV8InstructionSet || app.Binary is not ElfFile elf
+            || app.MethodsByAddress.ContainsKey(target))
+            return false;
         var export = app.Binary.GetVirtualAddressOfExportedFunctionByName("il2cpp_raise_exception");
         if (export == 0)
-            return [];
+            return false;
         uint? Read(ulong address)
         {
             var offset = app.Binary.MapVirtualAddressToRaw(address, false);
-            if (offset < 0 || offset > app.Binary.RawLength - 4)
-                return null;
-            return BinaryPrimitives.ReadUInt32LittleEndian(app.Binary.GetRawBinaryContent().Slice((int)offset, 4));
+            return offset < 0 || offset > app.Binary.RawLength - 4 ? null
+                : BinaryPrimitives.ReadUInt32LittleEndian(app.Binary.GetRawBinaryContent().Slice((int)offset, 4));
         }
         var raise = MatchRaiseExport(export, elf.GetExportedFunctionSize("il2cpp_raise_exception"), Read);
-        if (raise == 0)
-            return [];
-        return Select(method.ControlFlowGraph!, target =>
-            !app.MethodsByAddress.ContainsKey(target)
+        return raise != 0
             && app.ProvenNonReturningHelpers.GetOrAdd(target, address => ProvesNoReturn(address, raise, Read))
-            && ThrowHelperRecovery.GetThrownException(app, target) != null);
+            && ThrowHelperRecovery.GetThrownException(app, target) != null;
     }
 
     // The exported API is declared DO_API_NO_RETURN. Match its whole straight-line
