@@ -11,6 +11,6 @@ Castle Busters 1.11.1 exact-input audit (17,026 selected methods): ILVerify-vali
 
 LoadingUI.StartDots has no diagnostics, declared/computed MaxStack 2/2, and passes ILVerify. Exact A64 StartDots and KillDots execution compared against emitted IL passes 72 bounded cases: null/destroyed/live text, null/inactive/active prior tween, repeated calls, callback-registration boundary mutation, dotMax and sequence reloads. Only warm initialized state, successful allocation and intercepted external boundary contracts are covered. Callback bodies, cold initialization, real Unity/DOTween scheduling, collector semantics and full boot are not verified.
 
-Remaining closure blockers include KillDots' reference-versus-integer-zero comparison (ILVerify StackUnexpected IL000b) and the callback's private String.CreateString call (MethodAccess IL0027). CLR acceptance of a tested helper does not override ILVerify. No runtime transplant or asset mutation is authorized by these results.
+Remaining closure blockers include KillDots' reference-versus-integer-zero comparison (ILVerify StackUnexpected IL000b) and the callback's private String.CreateString call (MethodAccess IL001b, decimal offset 27). CLR acceptance of a tested helper does not override ILVerify. No runtime transplant or asset mutation is authorized by these results.
 
 Rejected broad Boolean propagation and early CFG-pruning trials are retained in the immutable dataset report. The latter changed downstream SSA/cache behavior; final SP-only analysis avoids those changes.
