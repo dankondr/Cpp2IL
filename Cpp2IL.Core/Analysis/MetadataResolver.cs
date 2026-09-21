@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -8,6 +9,7 @@ using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
 using LibCpp2IL;
+using LibCpp2IL.Elf;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -15,10 +17,40 @@ public static class MetadataResolver
 {
     public static void ResolveAll(MethodAnalysisContext method)
     {
+        if (method.AppContext.Binary is ElfFile elf)
+            ResolveGotLoads(method.ControlFlowGraph!, address =>
+                elf.ReadReadOnlyGotPointer(address) is { } pointer
+                && method.AppContext.LibCpp2IlContext.GetAnyGlobalByAddress(pointer) != null ? pointer : null);
+
         ResolveStringLiteralAccessors(method);
         ResolveCalls(method);
         ResolveGetter(method);
         ResolveMetadataUsages(method);
+    }
+
+    // In SSA, a GOT load defines a constant *address of* a metadata slot. The second load
+    // dereferences that slot. Preserve both levels; treating the first load as its value
+    // would confuse MethodInfo*/Il2CppClass* with their addresses.
+    public static void ResolveGotLoads(ISILControlFlowGraph graph, Func<ulong, ulong?> readGotPointer)
+    {
+        var slots = new Dictionary<LocalVariable, ulong>();
+        foreach (var instruction in graph.Instructions)
+            if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable destination, MemoryOperand { IsConstant: true } source] }
+                && readGotPointer((ulong)source.Addend) is { } slot)
+                slots[destination] = slot;
+
+        foreach (var instruction in graph.Instructions)
+        {
+            if (instruction is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable address } memory] }
+                || !slots.TryGetValue(address, out var slot))
+                continue;
+
+            memory.Base = null;
+            memory.Addend = (long)slot;
+            instruction.SetOperand(1, memory);
+        }
+        // Leave the original address-producing load alone. Metadata initialization may still
+        // consume it; normal dead-code elimination removes it once all its uses are resolved.
     }
 
     private static void ResolveStringLiteralAccessors(MethodAnalysisContext method)

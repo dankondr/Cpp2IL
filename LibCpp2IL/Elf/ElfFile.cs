@@ -24,6 +24,22 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
 
     private long _globalOffset;
 
+    /// <summary>Reads a relocated, pointer-aligned GOT slot protected by GNU RELRO.</summary>
+    public ulong? ReadReadOnlyGotPointer(ulong address)
+    {
+        var width = (ulong)PointerSizeBytes;
+        if (address % width != 0
+            || !_elfSectionHeaderEntries.Any(s => s.Name == ".got" && s.Size >= width
+                && address >= s.VirtualAddress && address - s.VirtualAddress <= s.Size - width)
+            || !_elfProgramHeaderEntries.Any(p => (uint)p.Type == 0x6474e552 /* PT_GNU_RELRO */
+                && p.VirtualSize >= width && address >= p.VirtualAddress
+                && address - p.VirtualAddress <= p.VirtualSize - width)
+            || !TryMapVirtualAddressToRaw(address, out var raw) || raw < 0 || raw > RawLength - (long)width)
+            return null;
+
+        return ReadPointerAtVirtualAddress(address);
+    }
+
     public ElfFile(MemoryStream input) : base(input)
     {
         _raw = input.GetBuffer();
