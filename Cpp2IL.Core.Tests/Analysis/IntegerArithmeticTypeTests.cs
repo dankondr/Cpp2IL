@@ -11,6 +11,43 @@ public class IntegerArithmeticTypeTests
 {
     [SetUp] public void Setup() { Cpp2IlApi.ResetInternalState(); TestGameLoader.LoadSimple2019Game(); }
 
+    [Test]
+    public void BooleanNotResultRetainsBooleanType()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture", app.SystemTypes.SystemVoidType, MethodAttributes.Static, []);
+        var input = new LocalVariable("input", new Register(null, "input")) { Type = app.SystemTypes.SystemBooleanType };
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var taken = new Instruction(3, OpCode.Return);
+        method.ControlFlowGraph = new ISILControlFlowGraph([new(0, OpCode.Not, result, input), new(1, OpCode.ConditionalJump, taken, result), new(2, OpCode.Return), taken]);
+        method.Locals = [input, result];
+        method.ParameterLocals = [];
+        LocalVariables.ResolveTypesAndFields(method);
+        Assert.That(result.Type, Is.SameAs(app.SystemTypes.SystemBooleanType));
+    }
+
+    [TestCase(0)] // An object is not a boolean flag.
+    [TestCase(1)] // An unknown input stays unknown.
+    [TestCase(2)] // Numeric bitwise Not preserves the existing numeric contract.
+    [TestCase(3)] // Boolean negation is not numeric Negate.
+    [TestCase(4)] // Do not seed a result that can propagate backwards through a copy/phi.
+    public void BooleanNotInferenceDoesNotGuessOtherOperands(int kind)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture", app.SystemTypes.SystemVoidType, MethodAttributes.Static, []);
+        var input = new LocalVariable("input", new Register(null, "input")) { Type = kind switch { 0 => app.SystemTypes.SystemObjectType, 2 => app.SystemTypes.SystemInt32Type, 3 or 4 => app.SystemTypes.SystemBooleanType, _ => null } };
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var instructions = new List<Instruction> { new(0, kind == 3 ? OpCode.Negate : OpCode.Not, result, input) };
+        if (kind == 4) instructions.Add(new(1, OpCode.Move, new LocalVariable("copy", new Register(null, "copy")), result));
+        instructions.Add(new(2, OpCode.Return));
+        method.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        method.Locals = [input, result];
+        method.ParameterLocals = [];
+        LocalVariables.ResolveTypesAndFields(method);
+        if (kind == 2) Assert.That(result.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+        else Assert.That(result.Type, Is.Null);
+    }
+
     [TestCase(OpCode.Add)]
     [TestCase(OpCode.Subtract)]
     [TestCase(OpCode.Multiply)]
