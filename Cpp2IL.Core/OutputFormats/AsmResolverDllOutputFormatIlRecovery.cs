@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -18,6 +19,10 @@ namespace Cpp2IL.Core.OutputFormats;
 
 public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 {
+    private readonly ConcurrentDictionary<string, RecoveryNativeInfo> _recoveryEvidence = new();
+
+    protected override void OnAssemblyWritten(ApplicationAnalysisContext context, string dllPath)
+        => RecoveryManifest.Write(dllPath, _recoveryEvidence);
     public override string OutputFormatId => "dll_il_recovery";
 
     public override string OutputFormatName => "DLL files with IL Recovery";
@@ -37,6 +42,19 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 
     protected override void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
     {
+        var status = "lifted-unverified";
+        try { FillRecoveryBody(methodDefinition, methodContext, ref status); }
+        finally
+        {
+            _recoveryEvidence[methodDefinition.DeclaringModule!.Name + ":" + methodDefinition.FullName] = new RecoveryNativeInfo(
+                methodContext.Definition == null ? null : "0x" + methodContext.UnderlyingPointer.ToString("x"),
+                methodContext.RawBytes.Length == 0 ? null : RecoveryManifest.Hash(methodContext.RawBytes.ToArray()), status);
+            methodContext.ReleaseAnalysisData();
+        }
+    }
+
+    private void FillRecoveryBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext, ref string status)
+    {
         var module = methodDefinition.DeclaringModule!;
         var moduleName = module.Name!.ToString();
         var shouldSkip = moduleName.StartsWith("UnityEngine.") || moduleName.StartsWith("Unity.") ||
@@ -44,13 +62,17 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
                          moduleName.StartsWith("mscorlib");
 
         if (!methodDefinition.IsManagedMethodWithBody())
+        {
+            status = "external-or-abstract";
             return;
+        }
 
         methodDefinition.CilMethodBody = new();
         var instructions = methodDefinition.CilMethodBody.Instructions;
 
         if (shouldSkip)
         {
+            status = "intentional-stub";
             FillMethodBodyWithStub(methodDefinition);
             return;
         }
@@ -62,7 +84,10 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             methodContext.Analyze();
 
             if (methodContext.ConvertedIsil.Count == 0)
+            {
+                status = "unresolved";
                 FillMethodBodyWithStub(methodDefinition);
+            }
             else
                 IlGenerator.GenerateIl(methodContext, methodDefinition);
 
@@ -72,6 +97,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         }
         catch (Exception e)
         {
+            status = "analysis-failed";
             // Known analysis limitations (DecompilerException) get a one-line warning; anything
             // else is an unexpected bug and keeps its (collapsed) stack trace.
             var detail = e is DecompilerException ? e.Message : e.ToCollapsedString();
@@ -97,7 +123,6 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             instructions.Add(CilOpCodes.Throw);
         }
 
-        methodContext.ReleaseAnalysisData();
     }
 
     public static void WriteControlFlowGraph(MethodAnalysisContext method, string outputPath)
