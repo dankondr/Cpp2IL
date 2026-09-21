@@ -43,6 +43,32 @@ public class ReferenceCasFieldTests
 {
     [SetUp] public void Setup() { Cpp2IlApi.ResetInternalState(); TestGameLoader.LoadSimple2019Game(); }
 
+    [TestCase("nullable", true)]
+    [TestCase("nullable-prefix", true)]
+    [TestCase("nonnull", true)]
+    [TestCase("extra-entry", false)]
+    [TestCase("inverted-null", false)]
+    [TestCase("wrong-type", false)]
+    [TestCase("side-effect", false)]
+    [TestCase("wrong-throw", false)]
+    public void ReferenceCastRequiresExactNativeTypeGuard(string mutation, bool expected)
+    {
+        var app=Cpp2IlApi.CurrentAppContext!;var type=app.SystemTypes.SystemStringType;
+        var value=new LocalVariable("value",new Register(null,"value"),app.SystemTypes.SystemObjectType);
+        var nullCondition=new LocalVariable("null",new Register(null,"null"));var classCondition=new LocalVariable("class",new Register(null,"class"));
+        var use=new Block();var nullGuard=new Block();var classGuard=new Block();var failure=new Block();
+        nullGuard.Instructions=[new(0,mutation=="inverted-null"?OpCode.CheckNotEqual:OpCode.CheckEqual,nullCondition,value,new Immediate(0)),new(1,OpCode.ConditionalJump,mutation=="nonnull"?new Block():use,nullCondition)];
+        if(mutation=="nullable-prefix")nullGuard.Instructions.Insert(0,new(-1,OpCode.Call,new Immediate(0x3000),value));
+        classGuard.Instructions=[new(2,OpCode.CheckNotEqual,classCondition,new MemoryOperand(value),mutation=="wrong-type"?app.SystemTypes.SystemObjectType:type),new(3,OpCode.ConditionalJump,failure,classCondition)];
+        if(mutation=="side-effect")classGuard.Instructions.Insert(1,new(4,OpCode.CallVoid,new Immediate(0x3000)));
+        failure.Instructions=[new(5,OpCode.Throw,app.AssembliesByName["mscorlib"].GetTypeByFullName(mutation=="wrong-throw"?"System.NullReferenceException":"System.InvalidCastException")!)];
+        classGuard.Predecessors=[nullGuard];classGuard.Successors=[use,failure];use.Predecessors=[classGuard];failure.Predecessors=[classGuard];
+        if(mutation!="nonnull"){nullGuard.Successors=[use,classGuard];use.Predecessors.Insert(0,nullGuard);}
+        else nullGuard.Successors=[classGuard];
+        if(mutation=="extra-entry")use.Predecessors.Add(new Block());
+        Assert.That(ReferenceCastRecovery.HasExactTypeGuard(use,value,type),Is.EqualTo(expected));
+    }
+
     [TestCase(false)]
     [TestCase(true)]
     public void EmittedFieldAddressIsARealManagedReference(bool isStatic)

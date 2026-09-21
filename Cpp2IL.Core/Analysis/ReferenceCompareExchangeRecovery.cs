@@ -59,6 +59,27 @@ public static class ReferenceCompareExchangeRecovery
             call.SetOperands(generic.MakeGenericInstanceMethod(referent), result,
                 new AddressOf(new FieldReference(field, receiver, (int)offset.Value)), value, comparand);
             result.Type = referent;
+
+            var callBlock = method.ControlFlowGraph.Blocks.Single(block => block.Instructions.Contains(call));
+            if (value is LocalVariable checkedValue
+                && callBlock.Instructions.TakeWhile(i => i != call).All(i => i.OpCode == OpCode.Nop)
+                && ReferenceCastRecovery.HasExactTypeGuard(callBlock, checkedValue, referent))
+                call.SetOperand(3, new ReferenceCast(checkedValue, referent));
+
+            if (comparand is LocalVariable previous)
+            {
+                var writes = method.ControlFlowGraph.Instructions
+                    .Where(instruction => ReferenceEquals(instruction.Destination, previous)).ToArray();
+                bool IsFieldLoad(Instruction instruction) => instruction is
+                    { OpCode: OpCode.Move, Operands: [_, FieldReference source] }
+                    && ReferenceEquals(source.Field, field)
+                    && ReferenceEquals(source.Local, receiver);
+
+                if (writes.Any(IsFieldLoad) && writes.All(instruction => IsFieldLoad(instruction)
+                    || instruction is { OpCode: OpCode.Move, Operands: [_, var priorResult] }
+                    && ReferenceEquals(priorResult, result)))
+                    call.SetOperand(4, new ReferenceCast(previous, referent));
+            }
         }
     }
 

@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Linq;
+using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
@@ -18,57 +19,84 @@ public static class DelegateInvokeRecovery
 
         foreach (var instruction in instructions)
         {
-            if (instruction.OpCode != OpCode.IndirectCall)
+            if (instruction.OpCode is not (OpCode.IndirectCall or OpCode.IndirectJump))
                 continue;
 
-            if (GetInvokeImplLoad(instruction, instructions) is not { } memory)
-                continue;
-
-            if (memory.Addend != invokeImplOffset || memory.Index != null || memory.Scale != 0)
-                continue;
-
-            if (memory.Base is not LocalVariable delegateLocal || delegateLocal.Type is not { IsDelegate: true } delegateType)
+            if (GetDelegate(instruction, instructions, invokeImplOffset) is not { } delegateLocal
+                || delegateLocal.Type is not { IsDelegate: true } delegateType)
                 continue;
 
             if (delegateType.Methods.FirstOrDefault(m => m.Name == "Invoke") is not { } invoke)
                 continue;
 
-            RewriteAsInvoke(instruction, delegateLocal, invoke);
+            // Raw tail-call argument recovery is only proven for parameterless delegates.
+            if (instruction.OpCode == OpCode.IndirectJump && invoke.Parameters.Count != 0)
+                continue;
+
+            var block = method.ControlFlowGraph.Blocks.Single(block => block.Instructions.Contains(instruction));
+            RewriteAsInvoke(method, instruction, block, delegateLocal, invoke);
         }
     }
 
     // The address being called, whether it is still a separate load or has been inlined
-    private static MemoryOperand? GetInvokeImplLoad(Instruction call, List<Instruction> instructions)
+    private static LocalVariable? GetDelegate(Instruction call, List<Instruction> instructions, int invokeImplOffset)
     {
         if (call.Operands.Count == 0)
             return null;
 
-        if (call.Operands[0] is MemoryOperand folded)
-            return folded;
+        var target = call.Operands[0];
+        if (target is LocalVariable targetLocal)
+            target = instructions.FirstOrDefault(i => ReferenceEquals(i.Destination, targetLocal)) is
+                { OpCode: OpCode.Move, Operands: [_, var loaded] } ? loaded : target;
 
-        if (call.Operands[0] is not LocalVariable target)
-            return null;
-
-        var definition = instructions.FirstOrDefault(i => ReferenceEquals(i.Destination, target));
-
-        return definition is { OpCode: OpCode.Move, Operands: [_, MemoryOperand loaded] } ? loaded : null;
+        return target switch
+        {
+            MemoryOperand { Addend: var offset, Index: null, Scale: 0, Base: LocalVariable value }
+                when offset == invokeImplOffset => value,
+            FieldReference { Field.Name: "invoke_impl", Field.DeclaringType.FullName: "System.Delegate", Local: var value }
+                when call.OpCode == OpCode.IndirectJump
+                => value,
+            _ => null
+        };
     }
 
-    private static void RewriteAsInvoke(Instruction call, LocalVariable delegateLocal, MethodAnalysisContext invoke)
+    private static void RewriteAsInvoke(MethodAnalysisContext method, Instruction call, Block block,
+        LocalVariable delegateLocal, MethodAnalysisContext invoke)
     {
+        var isTailCall = call.OpCode == OpCode.IndirectJump;
+        if (isTailCall && (method.IsVoid != invoke.IsVoid
+            || !method.IsVoid && method.ReturnType.FullName != invoke.ReturnType.FullName))
+            return;
+
         if (invoke.AppContext.InstructionSet.CallingConventionResolver is not { } callingConventions
             || !callingConventions.HasRawArgumentLayout(call, invoke.AppContext))
             return;
 
-        if (invoke.IsVoid)
-            call.RemoveOperandAt(1);
+        if (isTailCall)
+        {
+            var operands = new List<IOperand> { invoke };
+            if (!invoke.IsVoid)
+                operands.Add(new LocalVariable("delegateTailCallResult", callingConventions.ReturnRegister(invoke), invoke.ReturnType));
+            operands.AddRange(call.Operands.Skip(2));
+            call.SetOperands(operands);
+            call.OpCode = invoke.IsVoid ? OpCode.CallVoid : OpCode.Call;
+            callingConventions.RemapRawArguments(call, invoke);
 
-        call.OpCode = invoke.IsVoid ? OpCode.CallVoid : OpCode.Call;
-        call.SetOperand(0, invoke);
+            // The native receiver register holds invoke_impl_this rather than the managed delegate.
+            call.SetOperand(invoke.IsVoid ? 1 : 2, delegateLocal);
 
-        // the receiver register holds invoke_impl_this rather than the delegate itself
-        call.SetOperand(invoke.IsVoid ? 1 : 2, delegateLocal);
-
-        callingConventions.RemapRawArguments(call, invoke);
+            block.AddInstruction(new Instruction(-1, OpCode.Return,
+                invoke.IsVoid ? [] : [call.Operands[1]]));
+            block.CalculateBlockType();
+        }
+        else
+        {
+            if (invoke.IsVoid)
+                call.RemoveOperandAt(1);
+            call.SetOperand(0, invoke);
+            call.OpCode = invoke.IsVoid ? OpCode.CallVoid : OpCode.Call;
+            call.SetOperand(invoke.IsVoid ? 1 : 2, delegateLocal);
+            callingConventions.RemapRawArguments(call, invoke);
+        }
     }
 }
