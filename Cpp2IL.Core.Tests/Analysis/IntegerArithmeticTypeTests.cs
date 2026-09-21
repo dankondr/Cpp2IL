@@ -48,6 +48,34 @@ public class IntegerArithmeticTypeTests
         else Assert.That(result.Type, Is.Null);
     }
 
+    [TestCase(0)] // Two logical inversions ending at a branch.
+    [TestCase(1)] // Copy escape must not seed types backwards.
+    [TestCase(2)] // Arithmetic escape is not a guard.
+    [TestCase(3)] // A cycle is not proof of a control-flow-only result.
+    [TestCase(4)] // Known incompatible downstream type must remain untouched.
+    [TestCase(5)] // An unused chain does not prove a control-flow flag.
+    public void BooleanNotChainRequiresGuardOnlyUses(int kind)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture", app.SystemTypes.SystemVoidType, MethodAttributes.Static, []);
+        var input = new LocalVariable("input", new Register(null, "input")) { Type = app.SystemTypes.SystemBooleanType };
+        var first = new LocalVariable("first", new Register(null, "first"));
+        var second = new LocalVariable("second", new Register(null, "second")) { Type = kind == 4 ? app.SystemTypes.SystemObjectType : null };
+        var escaped = new LocalVariable("escaped", new Register(null, "escaped"));
+        var taken = new Instruction(8, OpCode.Return);
+        var instructions = new List<Instruction> { new(0, OpCode.Not, first, input), new(1, OpCode.Not, second, first) };
+        if (kind == 1) instructions.Add(new(2, OpCode.Move, escaped, second));
+        if (kind == 2) instructions.Add(new(2, OpCode.Add, escaped, second, new Immediate(1)));
+        if (kind == 3) instructions.Add(new(2, OpCode.Not, first, second));
+        if (kind != 5) instructions.Add(new(3, OpCode.ConditionalJump, taken, second));
+        instructions.Add(new(4, OpCode.Return)); instructions.Add(taken);
+        method.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        method.Locals = [input, first, second, escaped]; method.ParameterLocals = [];
+        LocalVariables.ResolveTypesAndFields(method);
+        if (kind == 0) Assert.Multiple(() => { Assert.That(first.Type, Is.SameAs(app.SystemTypes.SystemBooleanType)); Assert.That(second.Type, Is.SameAs(app.SystemTypes.SystemBooleanType)); });
+        else Assert.That(first.Type, Is.Null);
+    }
+
     [TestCase(OpCode.Add)]
     [TestCase(OpCode.Subtract)]
     [TestCase(OpCode.Multiply)]

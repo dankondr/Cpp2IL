@@ -452,19 +452,42 @@ public static class LocalVariables
     }
 
     private static bool IsGuardOnlyResult(LocalVariable local, Instruction producer, MethodAnalysisContext method)
+        => IsGuardOnlyResult(local, producer, method, new HashSet<LocalVariable>());
+
+    private static bool IsGuardOnlyResult(LocalVariable local, Instruction producer, MethodAnalysisContext method, HashSet<LocalVariable> active)
     {
         // Mixed native pointer/zero phis can flow types backwards into a receiver.
-        // Until those conversions are explicit, infer only direct control-flow flags.
+        // Permit only direct branches and logical-Not chains ending in branches:
+        // no copy/phi/arithmetic escapes, incompatible known types, or cycles.
+        if (!active.Add(local))
+            return false;
+        var reachesGuard = false;
         foreach (var user in method.ControlFlowGraph!.Instructions)
         {
             if (ReferenceEquals(user, producer))
                 continue;
             foreach (var operand in user.Operands)
-                if (ContainsLocal(operand, local)
-                    && (user.OpCode != OpCode.ConditionalJump || !ReferenceEquals(operand, local)))
-                    return false;
+            {
+                if (!ContainsLocal(operand, local))
+                    continue;
+                if (user.OpCode == OpCode.ConditionalJump && ReferenceEquals(operand, local))
+                {
+                    reachesGuard = true;
+                    continue;
+                }
+                if (user.OpCode == OpCode.Not && user.Operands is [LocalVariable next, var input]
+                    && ReferenceEquals(input, local) && ReferenceEquals(operand, input)
+                    && (next.Type == null || next.Type.FullName == "System.Boolean")
+                    && IsGuardOnlyResult(next, user, method, active))
+                {
+                    reachesGuard = true;
+                    continue;
+                }
+                return false;
+            }
         }
-        return true;
+        active.Remove(local);
+        return reachesGuard;
     }
 
     // A local assigned a float/double literal (a lifted rodata constant load) is that float type
