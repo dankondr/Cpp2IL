@@ -434,6 +434,13 @@ public static class LocalVariables
                 case OpCode.Divide or OpCode.Modulo:
                     changed |= PropagateArithmetic(instruction, method) || PropagateIntegerResult(instruction, method);
                     break;
+                case OpCode.Not when instruction.Operands is [LocalVariable destination, LocalVariable { Type.FullName: "System.Boolean" }]
+                    && IsGuardOnlyResult(destination, instruction, method):
+                    // IlGenerator emits boolean Not as ceq 0, not bitwise complement.
+                    // Keep its result typed even when the lifter introduced Not before
+                    // comparison-result seeding (rather than the late flag simplifier).
+                    changed |= SetTypeIfUnknown(destination, method.AppContext.SystemTypes.SystemBooleanType);
+                    break;
                 case OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
                     or OpCode.ShiftLeft or OpCode.ShiftRight:
                     changed |= PropagateIntegerResult(instruction, method);
@@ -442,6 +449,22 @@ public static class LocalVariables
         }
 
         return changed;
+    }
+
+    private static bool IsGuardOnlyResult(LocalVariable local, Instruction producer, MethodAnalysisContext method)
+    {
+        // Mixed native pointer/zero phis can flow types backwards into a receiver.
+        // Until those conversions are explicit, infer only direct control-flow flags.
+        foreach (var user in method.ControlFlowGraph!.Instructions)
+        {
+            if (ReferenceEquals(user, producer))
+                continue;
+            foreach (var operand in user.Operands)
+                if (ContainsLocal(operand, local)
+                    && (user.OpCode != OpCode.ConditionalJump || !ReferenceEquals(operand, local)))
+                    return false;
+        }
+        return true;
     }
 
     // A local assigned a float/double literal (a lifted rodata constant load) is that float type

@@ -77,6 +77,7 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
     /// out not to be a throw helper. Populated on demand by <see cref="Analysis.ThrowHelperRecovery"/>.
     /// </summary>
     public readonly ConcurrentDictionary<ulong, string?> ThrowHelperNamesByAddress = new();
+    internal readonly ConcurrentDictionary<ulong, bool> ProvenNonReturningHelpers = new();
 
     /// <summary>
     /// Dict of address to "is this method analogue to il2cpp::vm::Exception::Raise"

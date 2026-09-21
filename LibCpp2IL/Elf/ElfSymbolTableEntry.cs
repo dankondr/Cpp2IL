@@ -13,4 +13,5 @@ public class ElfSymbolTableEntry
     public string Name = null!;
     public ElfSymbolEntryType Type;
     public ulong VirtualAddress;
+    public ulong Size;
 }

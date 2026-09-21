@@ -222,6 +222,14 @@ public static class IlGenerator
             instructions.Add(CilOpCodes.Ldstr, Diagnostic("Warning: " + warning));
             instructions.Add(CilOpCodes.Call, writeLine);
         }
+        if (context.AnalysisWarnings.Count != 0)
+        {
+            // Even unreachable CIL must not fall off the physical end of a body:
+            // the CLR rejects such a trailer before executing the valid entry path.
+            // If malformed recovered control flow reaches diagnostics, fail closed.
+            instructions.Add(CilOpCodes.Ldnull);
+            instructions.Add(CilOpCodes.Throw);
+        }
 
         try
         {
@@ -235,6 +243,8 @@ public static class IlGenerator
             context.AddWarning(warning);
             instructions.Add(CilOpCodes.Ldstr, Diagnostic(warning));
             instructions.Add(CilOpCodes.Call, writeLine);
+            instructions.Add(CilOpCodes.Ldnull);
+            instructions.Add(CilOpCodes.Throw);
         }
     }
 
@@ -352,6 +362,7 @@ public static class IlGenerator
                 // If we can't, just fall back to an Ldnull.
                 if (FindConstructorCall(context, instruction) is { Operands: [MethodAnalysisContext constructor, _, ..] } constructorCall)
                 {
+                    constructor = Analysis.AllocationConstructorRecovery.Resolve(instruction, constructor) ?? constructor;
                     // Operands run [ctor, newObject, arguments..., methodInfo], so take only as many as
                     // the constructor declares (i.e. drop methodInfo)
                     var constructorArgs = constructorCall.Operands.Skip(ConstructorReceiverIndex(constructorCall) + 1).Take(constructor.Parameters.Count).ToList();
