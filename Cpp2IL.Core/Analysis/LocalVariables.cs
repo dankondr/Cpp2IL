@@ -418,6 +418,10 @@ public static class LocalVariables
         {
             switch (instruction.OpCode)
             {
+                case OpCode.SignExtend32:
+                    if (instruction.Destination is LocalVariable extended)
+                        changed |= SetTypeIfUnknown(extended, method.AppContext.SystemTypes.SystemInt64Type);
+                    break;
                 case OpCode.Move:
                     changed |= PropagateMove(instruction, method.AppContext.Binary.PointerSizeBytes);
                     break;

@@ -61,7 +61,8 @@ public static class IlGenerator
         var body = new CilMethodBody()
         {
             InitializeLocals = true, // Without this ILSpy does: CompilerServices.Unsafe.SkipInit(out object obj);
-            ComputeMaxStackOnBuild = false // There's stack imbalance somewhere, but this works for now
+            // Compute per method below so one invalid reconstruction cannot abort the assembly.
+            ComputeMaxStackOnBuild = false
         };
 
         definition.CilMethodBody = body;
@@ -221,6 +222,20 @@ public static class IlGenerator
             instructions.Add(CilOpCodes.Ldstr, Diagnostic("Warning: " + warning));
             instructions.Add(CilOpCodes.Call, writeLine);
         }
+
+        try
+        {
+            body.MaxStack = body.ComputeMaxStack();
+        }
+        catch (StackImbalanceException exception)
+        {
+            // Preserve the invalid body as evidence, but never label failed stack analysis
+            // as recovered or hide it behind a guessed stack bound.
+            var warning = "Invalid reconstructed IL stack: " + exception.Message;
+            context.AddWarning(warning);
+            instructions.Add(CilOpCodes.Ldstr, Diagnostic(warning));
+            instructions.Add(CilOpCodes.Call, writeLine);
+        }
     }
 
     // Limit so we don't run into the 16mb limit (see AsmResolver issue #775)
@@ -310,6 +325,13 @@ public static class IlGenerator
                 }
 
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, DestinationType(instruction.Operands[0]));
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+
+            case OpCode.SignExtend32:
+                LoadOperand(instruction.Operands[1], method, locals, writeLine);
+                instructions.Add(CilOpCodes.Conv_I4);
+                instructions.Add(CilOpCodes.Conv_I8);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
@@ -430,7 +452,7 @@ public static class IlGenerator
                         PushDefaultOf(parameterType, instructions);
                 }
 
-                instructions.Add(CilOpCodes.Call, importedMethod);
+                instructions.Add(!targetMethod.IsStatic && targetMethod.DeclaringType?.IsInterface == true ? CilOpCodes.Callvirt : CilOpCodes.Call, importedMethod);
 
                 // the lifter's guess at whether the callee returns anything can disagree with the
                 // signature we later resolved, so go by the signature and balance the stack

@@ -105,6 +105,7 @@ public class Instruction : IOperand
             case OpCode.Xor:
             case OpCode.Not:
             case OpCode.Negate:
+            case OpCode.SignExtend32:
             case OpCode.CheckEqual:
             case OpCode.CheckGreater:
             case OpCode.CheckLess:
@@ -151,7 +152,7 @@ public class Instruction : IOperand
         {
             OpCode.Move or OpCode.ConditionalJump
                 or OpCode.ShiftStack or OpCode.Not or OpCode.Negate
-                or OpCode.Newobj
+                or OpCode.Newobj or OpCode.SignExtend32
                 => [_operands[1]],
 
             OpCode.Box => [_operands[2]],
