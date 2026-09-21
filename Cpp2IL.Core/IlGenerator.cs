@@ -101,6 +101,9 @@ public static class IlGenerator
             if (operand is AddressOf { Target: FieldReference addressedField })
                 local = addressedField.Local;
 
+            if (operand is ReferenceCast referenceCast)
+                local = referenceCast.Value;
+
             if (local != null && !context.Locals.Contains(local))
                 context.Locals.Add(local);
         }
@@ -729,6 +732,10 @@ public static class IlGenerator
             case LocalVariable local:
                 LoadLocal(local, method, locals);
                 break;
+            case ReferenceCast referenceCast:
+                LoadLocal(referenceCast.Value, method, locals);
+                instructions.Add(CilOpCodes.Castclass, referenceCast.Type.ToTypeSignature().ToTypeDefOrRef());
+                break;
             case ArrayLength arrayLength:
                 LoadLocal(arrayLength.Array, method, locals);
                 instructions.Add(CilOpCodes.Ldlen);
@@ -902,7 +909,7 @@ public static class IlGenerator
     }
 
     private static bool IsBoolean(IOperand operand, MethodAnalysisContext context) =>
-        operand is LocalVariable { Type: { } type } && type == context.AppContext.SystemTypes.SystemBooleanType;
+        DestinationType(operand) == context.AppContext.SystemTypes.SystemBooleanType;
 
     private static bool IsZeroConstant(IOperand operand) => operand is Immediate { Value: 0 };
 

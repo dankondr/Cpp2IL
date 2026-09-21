@@ -555,6 +555,7 @@ public static class LocalVariables
         LocalVariable value => ReferenceEquals(value, local),
         MemoryOperand memory => ContainsLocal(memory.Base, local) || ContainsLocal(memory.Index, local),
         AddressOf address => ContainsLocal(address.Target, local),
+        ReferenceCast referenceCast => ReferenceEquals(referenceCast.Value, local),
         FieldReference field => ReferenceEquals(field.Local, local),
         ArrayAccess array => ReferenceEquals(array.Array, local) || ContainsLocal(array.Index, local),
         ArrayLength length => ReferenceEquals(length.Array, local),
