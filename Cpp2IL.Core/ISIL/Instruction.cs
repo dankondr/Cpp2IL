@@ -31,6 +31,10 @@ public class Instruction : IOperand
     // Exists to clear the return register after a CallVoid, basically.
     public Register? ImplicitDefinition;
 
+    // The target was read from a runtime vtable; a direct call to a virtual
+    // method (for example base.M()) must not acquire this flag.
+    public bool IsVirtualDispatch;
+
     public bool IsFallThrough =>
         OpCode switch
         {
@@ -241,7 +245,7 @@ public class Instruction : IOperand
         if (other is null)
             return false;
 
-        if (OpCode != other.OpCode)
+        if (OpCode != other.OpCode || IsVirtualDispatch != other.IsVirtualDispatch)
             return false;
 
         if (Index != other.Index)

@@ -8,6 +8,54 @@ namespace Cpp2IL.Core.Il2CppApiFunctions;
 
 public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
 {
+    protected override ulong GetWriteBarrier()
+    {
+        var binary = _appContext.Binary;
+        var export = binary.GetVirtualAddressOfExportedFunctionByName("il2cpp_gc_wbarrier_set_field");
+        WriteBarrierAliases.Clear();
+        if (export == 0)
+            return 0;
+        uint Read(ulong address) => System.BitConverter.ToUInt32(binary.GetRawBinaryContent().Slice((int)binary.MapVirtualAddressToRaw(address), 4).ToArray(), 0);
+        var core = MatchWriteBarrierExport(export, Read);
+        if (core == 0)
+            return 0;
+        WriteBarrierAliases.Add(core);
+        // Only pure B veneers preserve the barrier-only ABI. In particular, never
+        // include the exported setter or its STR wrapper: those perform the store.
+        var branches = DisassembleTextSection().Where(i => i.Mnemonic == Arm64Mnemonic.B
+            && i.MnemonicConditionCode is Arm64ConditionCode.NONE or Arm64ConditionCode.AL).ToArray();
+        bool changed;
+        do
+        {
+            changed = false;
+            foreach (var branch in branches)
+                if (WriteBarrierAliases.Contains(branch.BranchTarget))
+                    changed |= WriteBarrierAliases.Add(branch.Address);
+        } while (changed);
+        return core;
+    }
+
+    // Export ABI: (object, slot, value). Match exact argument shuffle, then the
+    // setter's exact STR followed by B; the B target is barrier-only (slot in X0).
+    internal static ulong MatchWriteBarrierExport(ulong export, System.Func<ulong, uint> read)
+    {
+        if (read(export) != 0xaa0103e0 || read(export + 4) != 0xaa0203e1)
+            return 0;
+        var setter = Branch(export + 8);
+        if (setter == 0 || read(setter) != 0xf9000001)
+            return 0;
+        return Branch(setter + 4);
+
+        ulong Branch(ulong address)
+        {
+            var word = read(address);
+            if ((word & 0xfc000000) != 0x14000000)
+                return 0;
+            var delta = (long)((int)(word << 6) >> 4);
+            return unchecked((ulong)((long)address + delta));
+        }
+    }
+
     private List<Arm64Instruction>? _cachedDisassembledBytes;
 
     private List<Arm64Instruction> DisassembleTextSection()

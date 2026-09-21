@@ -164,7 +164,7 @@ public static class MetadataResolver
     /// </summary>
     public static bool ResolveFieldOffsets(MethodAnalysisContext method)
     {
-        var changed = false;
+        var changed = NormalizeObjectAddressAliases(method);
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
@@ -224,6 +224,42 @@ public static class MetadataResolver
             }
         }
 
+        return changed;
+    }
+
+    // SSA pre-indexed stores can leave subsequent accesses relative to a field address
+    // rather than the object. Preserve the address producer for any other consumers.
+    private static bool NormalizeObjectAddressAliases(MethodAnalysisContext method)
+    {
+        var instructions = method.ControlFlowGraph!.Instructions;
+        var definitions = instructions.Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!)
+            .Where(g => g.Count() == 1).ToDictionary(g => g.Key, g => g.Single());
+        var changed = false;
+        foreach (var instruction in instructions)
+        for (var i = 0; i < instruction.Operands.Count; i++)
+        {
+            if (instruction.Operands[i] is not MemoryOperand { Base: LocalVariable alias, Index: null, Scale: 0 } memory
+                || !definitions.TryGetValue(alias, out var definition)
+                || definition is not { OpCode: OpCode.Add, Operands: [_, LocalVariable root, Immediate displacement] }
+                || alias.Type != null || ReferenceEquals(root, alias) || root.Type?.Definition == null || root.Type.IsValueType)
+                continue;
+            long offset;
+            try { offset = checked(memory.Addend + displacement.Value); }
+            catch (System.OverflowException) { continue; }
+            // Do not obscure an interior value-type/array address that this field
+            // resolver cannot represent. Only fold to an exact named object field.
+            var hasField = false;
+            for (var owner = root.Type; owner != null && !hasField; owner = owner.BaseType)
+                hasField = owner.Fields.Any(f => !f.IsStatic && (f.Attributes & FieldAttributes.Literal) == 0
+                    && f.BackingData?.FieldOffset == offset);
+            if (!hasField)
+                continue;
+            memory.Base = root;
+            memory.Addend = offset;
+            instruction.SetOperand(i, memory);
+            changed = true;
+        }
         return changed;
     }
 
@@ -603,7 +639,7 @@ public static class MetadataResolver
 
         foreach (var instruction in method.ControlFlowGraph.Instructions)
         {
-            if (instruction.OpCode != OpCode.IndirectCall)
+            if (instruction.OpCode is not (OpCode.IndirectCall or OpCode.IndirectJump))
                 continue;
 
             if (SlotLoad(instruction.Operands[0]) is not { } target
@@ -618,10 +654,30 @@ public static class MetadataResolver
             if (ResolveVTableSlot(method.AppContext, receiverType, slot) is not { } resolved)
                 continue;
 
+            var tail = instruction.OpCode == OpCode.IndirectJump;
+            var block = tail ? method.ControlFlowGraph.Blocks.FirstOrDefault(b => b.Instructions.LastOrDefault() == instruction) : null;
+            if (resolved.IsStatic || tail && (block == null || method.IsVoid != resolved.IsVoid
+                    || !method.IsVoid && method.ReturnType.FullName != resolved.ReturnType.FullName))
+                continue;
+
             var assembly = resolved.DeclaringType?.DeclaringAssembly ?? method.DeclaringType?.DeclaringAssembly;
 
-            instruction.OpCode = OpCode.Call; // same operand layout as IndirectCall, and we've resolved it now
-            instruction.SetOperand(0, resolved);
+            if (tail)
+            {
+                var operands = new List<IOperand> { resolved };
+                if (!resolved.IsVoid)
+                    operands.Add(new LocalVariable("virtualTailCallResult", resolved.AppContext.InstructionSet.CallingConventionResolver?.ReturnRegister(resolved) ?? new Register(null, "return"), resolved.ReturnType));
+                operands.AddRange(instruction.Operands.Skip(2));
+                instruction.SetOperands(operands);
+            }
+            else
+            {
+                if (resolved.IsVoid)
+                    instruction.RemoveOperandAt(1);
+                instruction.SetOperand(0, resolved);
+            }
+            instruction.OpCode = resolved.IsVoid ? OpCode.CallVoid : OpCode.Call;
+            instruction.IsVirtualDispatch = true;
             resolved.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, resolved);
 
             // the MethodInfo field is also the same method, name it, for cleanliness and so it can
@@ -632,6 +688,13 @@ public static class MetadataResolver
                     && ReferenceEquals(methodInfoLoad.Base, klassLocal)
                     && methodInfoLoad.Addend == target.Addend + pointerSize)
                     instruction.SetOperand(i, new RuntimeMethodInfoAnalysisContext(resolved, assembly));
+            }
+
+            if (tail)
+            {
+                block!.AddInstruction(new Instruction(-1, OpCode.Return,
+                    resolved.IsVoid ? [] : [instruction.Operands[1]]));
+                block.CalculateBlockType();
             }
 
             changed = true;
@@ -694,7 +757,9 @@ public static class MetadataResolver
     private static void HandleKeyFunction(ApplicationAnalysisContext appContext, Instruction instruction, ulong target, BaseKeyFunctionAddresses kFA)
     {
         var method = "";
-        if (target == kFA.il2cpp_codegen_initialize_method || target == kFA.il2cpp_codegen_initialize_runtime_metadata)
+        if (kFA.WriteBarrierAliases.Contains(target))
+            method = nameof(kFA.il2cpp_codegen_write_barrier);
+        else if (target == kFA.il2cpp_codegen_initialize_method || target == kFA.il2cpp_codegen_initialize_runtime_metadata)
         {
             if (appContext.MetadataVersion < 27)
             {
