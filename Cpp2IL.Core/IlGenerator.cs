@@ -222,6 +222,14 @@ public static class IlGenerator
             instructions.Add(CilOpCodes.Ldstr, Diagnostic("Warning: " + warning));
             instructions.Add(CilOpCodes.Call, writeLine);
         }
+        if (context.AnalysisWarnings.Count != 0)
+        {
+            // Even unreachable CIL must not fall off the physical end of a body:
+            // the CLR rejects such a trailer before executing the valid entry path.
+            // If malformed recovered control flow reaches diagnostics, fail closed.
+            instructions.Add(CilOpCodes.Ldnull);
+            instructions.Add(CilOpCodes.Throw);
+        }
 
         try
         {
@@ -235,6 +243,8 @@ public static class IlGenerator
             context.AddWarning(warning);
             instructions.Add(CilOpCodes.Ldstr, Diagnostic(warning));
             instructions.Add(CilOpCodes.Call, writeLine);
+            instructions.Add(CilOpCodes.Ldnull);
+            instructions.Add(CilOpCodes.Throw);
         }
     }
 

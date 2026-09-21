@@ -14,6 +14,26 @@ namespace Cpp2IL.Core.Tests;
 
 public class IlGeneratorTests
 {
+    [Test]
+    public void UnreachableAnalysisWarningDoesNotMakeSerializedBodyUnrunnable()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run", app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([new(0, OpCode.Return)]);
+        context.Locals = []; context.ParameterLocals = []; context.AnalysisWarnings = ["fixture warning"];
+        var module = new ModuleDefinition("WarningTrailer.dll", new AssemblyReference("System.Private.CoreLib", typeof(object).Assembly.GetName().Version!));
+        var type = new TypeDefinition("Tests", "WarningTrailer", TypeAttributes.Public, module.CorLibTypeFactory.Object.Type); module.TopLevelTypes.Add(type);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static, MethodSignature.CreateStatic(module.CorLibTypeFactory.Void)); type.Methods.Add(method);
+        IlGenerator.GenerateIl(context, method);
+        Assert.That(method.CilMethodBody!.Instructions[0].OpCode, Is.EqualTo(CilOpCodes.Ret));
+        Assert.That(method.CilMethodBody.Instructions[^1].OpCode, Is.EqualTo(CilOpCodes.Throw));
+        Assert.That(context.AnalysisWarnings, Does.Contain("fixture warning"));
+        var assembly = new AssemblyDefinition("WarningTrailer", new Version(1, 0)); assembly.Modules.Add(module);
+        using var stream = new System.IO.MemoryStream(); module.Write(stream);
+        var callable = System.Reflection.Assembly.Load(stream.ToArray()).GetType("Tests.WarningTrailer")!.GetMethod("Run")!;
+        Assert.DoesNotThrow(() => callable.Invoke(null, null));
+    }
+
     [TestCase(0xffffffffL, -1, false, false)]
     [TestCase(0x80000000L, int.MinValue, false, false)]
     [TestCase(0x100000000L, 0, false, false)]
@@ -61,6 +81,7 @@ public class IlGeneratorTests
         Assert.That(method.CilMethodBody.MaxStack, Is.EqualTo(0));
         Assert.That(caller.AnalysisWarnings.Any(w => w.Contains("Invalid reconstructed IL stack")), Is.True);
         Assert.That(method.CilMethodBody.Instructions.Any(i => i.Operand is string s && s.Contains("Invalid reconstructed IL stack")), Is.True);
+        Assert.That(method.CilMethodBody.Instructions[^1].OpCode, Is.EqualTo(CilOpCodes.Throw));
     }
 
     [TestCase(0L, 0L)]
