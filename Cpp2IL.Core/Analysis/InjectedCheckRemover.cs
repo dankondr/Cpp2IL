@@ -61,7 +61,7 @@ public static class InjectedCheckRemover
         };
 
     internal static bool HasEquivalentImplicitFailure(MethodAnalysisContext method, Block throwBlock, string thrownType,
-        IReadOnlySet<Block> recoveredHelpers)
+        ISet<Block> recoveredHelpers)
     {
         if (throwBlock.Instructions.LastOrDefault() is not { IsCall: true }
             || throwBlock.Instructions.Take(throwBlock.Instructions.Count - 1)
