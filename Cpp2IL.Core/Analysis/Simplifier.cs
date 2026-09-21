@@ -95,6 +95,12 @@ public static class Simplifier
                     // If it's move and it moves something to local, replace and remove it
                     if (instruction.OpCode == OpCode.Move && instruction.Operands[0] is LocalVariable local)
                     {
+                        // A group of field loads from one receiver before a value-returning call is a
+                        // native snapshot. Forwarding the loads would turn it into post-call reloads.
+                        if (instruction.Operands[1] is FieldReference field
+                            && MustPreserveFieldSnapshot(block, i + 1, local, field.Local))
+                            continue;
+
                         if (IsLocalUsedAfterInstruction(block, i + 1, local, out var usedByMemory))
                         {
                             // This can't be inlined into memory operand
@@ -130,6 +136,48 @@ public static class Simplifier
             }
 
             return changed;
+        }
+
+        private bool MustPreserveFieldSnapshot(Block block, int startIndex, LocalVariable value,
+            LocalVariable? receiver)
+        {
+            if (receiver == null)
+                return false;
+
+            for (var callIndex = startIndex; callIndex < block.Instructions.Count; callIndex++)
+            {
+                var instruction = block.Instructions[callIndex];
+                if (instruction.Destination == value)
+                    return false;
+
+                if (instruction.OpCode != OpCode.Call)
+                    continue;
+
+                if (!IsLocalUsedAfterInstruction(block, callIndex + 1, value, out _))
+                    return false;
+
+                for (var i = 0; i < callIndex; i++)
+                {
+                    var candidateInstruction = block.Instructions[i];
+                    if (candidateInstruction.OpCode != OpCode.Move
+                        || candidateInstruction.Destination is not LocalVariable candidate
+                        || candidate == value
+                        || candidateInstruction.Operands[1] is not FieldReference field
+                        || field.Local != receiver)
+                        continue;
+
+                    var reassigned = false;
+                    for (var j = i + 1; j < callIndex; j++)
+                        reassigned |= block.Instructions[j].Destination == candidate;
+
+                    if (!reassigned && IsLocalUsedAfterInstruction(block, callIndex + 1, candidate, out _))
+                        return true;
+                }
+
+                return false;
+            }
+
+            return false;
         }
 
         private void InlineLocals()
