@@ -19,6 +19,7 @@ public class StackAnalyzer
     private Dictionary<Block, StackState> _inComingState = [];
     private Dictionary<Block, StackState> _outGoingState = [];
     private Dictionary<Instruction, StackState> _instructionState = [];
+    private HashSet<Block> _nonReturningBlocks = [];
 
     /// <summary>
     /// Max allowed count of blocks to visit (-1 for no limit).
@@ -26,8 +27,12 @@ public class StackAnalyzer
     public static int MaxBlockVisitCount = 500000; //High enough to not be legitimately hit, but still give up if something loops infinitely.
 
     public static void Analyze(MethodAnalysisContext method)
+        => Analyze(method, NonReturningHelperRecovery.Find(method));
+
+    internal static void Analyze(MethodAnalysisContext method, HashSet<Block> nonReturningBlocks)
     {
         var analyzer = new StackAnalyzer();
+        analyzer._nonReturningBlocks = nonReturningBlocks;
 
         var graph = method.ControlFlowGraph!;
         graph.RemoveUnreachableBlocks(); // Without this indirect jumps (in try catch i think) cause some weird stuff
@@ -183,6 +188,8 @@ public class StackAnalyzer
                 throw new DecompilerException($"Stack state not settling! ({visitedBlockCount} blocks already visited)");
 
             // Visit successors
+            if (_nonReturningBlocks.Contains(block))
+                continue;
             foreach (var successor in block.Successors)
             {
                 // Already visited

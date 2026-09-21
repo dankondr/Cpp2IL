@@ -298,7 +298,7 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
 
                 var virtualAddress = symbol.Value;
 
-                var entry = new ElfSymbolTableEntry { Name = name, Type = usefulType, VirtualAddress = virtualAddress };
+                var entry = new ElfSymbolTableEntry { Name = name, Type = usefulType, VirtualAddress = virtualAddress, Size = symbol.Size };
                 _symbolTable.Add(entry);
 
                 if (symbol.Shndx != 0)
@@ -595,6 +595,9 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
     }
 
     public override bool IsExportedFunction(ulong addr) => _exportAddressTable.ContainsKey(addr);
+
+    public ulong GetExportedFunctionSize(string name)
+        => _exportNameTable.TryGetValue(name, out var symbol) && symbol.Type == ElfSymbolTableEntry.ElfSymbolEntryType.Function ? symbol.Size : 0;
 
     public override bool TryGetExportedFunctionName(ulong addr, [NotNullWhen(true)] out string? name)
     {
