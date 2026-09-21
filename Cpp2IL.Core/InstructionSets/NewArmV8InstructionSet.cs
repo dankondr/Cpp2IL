@@ -137,9 +137,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     }
 
     public override List<Instruction> GetIsilFromMethod(MethodAnalysisContext context)
-    {
-        var insns = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext, context.UnderlyingPointer);
+        => ConvertInstructions(NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext, context.UnderlyingPointer), context);
 
+    internal List<Instruction> ConvertInstructions(IEnumerable<Arm64Instruction> insns, MethodAnalysisContext context)
+    {
         if (adrpOffsets == null) // initializers for ThreadStatic fields only run on the first thread
             adrpOffsets = new();
         else
@@ -544,6 +545,19 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
                     var src1 = ConvertOperand(instruction, 1);
                     var src2 = ConvertOperand(instruction, 2);
+                    if (instruction.FinalOpExtendType == Arm64ExtendType.SXTW
+                        && instruction.Op0Reg is >= Arm64Register.X0 and <= Arm64Register.X30)
+                    {
+                        var extended = new Register(null, "TEMP_EXTEND");
+                        Add(address, OpCode.SignExtend32, extended, src2);
+                        src2 = extended;
+                        if (instruction.Op3Imm != 0)
+                        {
+                            var shifted = new Register(null, "TEMP_SHIFT");
+                            Add(address, OpCode.ShiftLeft, shifted, src2, Imm(instruction.Op3Imm));
+                            src2 = shifted;
+                        }
+                    }
                     // a discarded result means this is only about the flags
                     var dest = IsReg31(instruction.Op0Reg) ? new Register(null, "TEMP") : ConvertOperand(instruction, 0);
 

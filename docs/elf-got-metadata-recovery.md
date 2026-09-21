@@ -73,3 +73,38 @@ This deliberately does not handle missing section headers, writable GOTs, copied
 or merged slot-address locals, arbitrary pointer chains, or interface dispatch.
 It does not fix existing structural/type-invalid IL and has no runtime oracle;
 fewer diagnostics and recovered references do not certify behavioral equivalence.
+
+## Follow-up: ARM64 interface dispatch
+
+The remaining six `Bootstrap.Start` diagnostics came from its interface lookup:
+class interface count (`+0x12e`), interface-offset table (`+0xb0`), entry interface,
+slow helper, and final indirect call. Three existing gaps prevented recovery:
+the ARM64 lifter discarded `SXTW #4` on an extended-register add; the matcher
+expected `klass+(scaledIndex+0x138)` instead of ARM64's
+`(klass+scaledIndex)+0x138`; and interface calls needed `callvirt` to preserve
+runtime dispatch (static interface calls still use `call`).
+
+The fix explicitly lowers signed low-32-bit extension to 64 bits before shifting,
+accepts the ARM64 addition order with the existing exact layout/slot checks, and
+emits the proper interface call opcode. Existing region escape/side-effect checks
+still control lookup removal. No game-specific addresses or names are in the fix.
+
+On the same inputs, compared with the GOT-only result:
+
+| Metric | GOT only | + interface recovery |
+|---|---:|---:|
+| Methods with issues | 7,889 | 7,844 |
+| Total issue strings | 64,250 | 63,128 |
+| Unmanaged loads | 38,970 | 38,345 |
+| Method not found | 18,340 | 18,232 |
+| Indirect calls | 2,202 | 1,857 |
+| Structural IL errors | 261 | 217 |
+| Bootstrap.Start issues | 6 | 0 |
+
+Core suite: 89 passed, including a native-opcode red-before/green-after test,
+five executed synthetic IL signed-boundary cases, four exact scale/slot/layout
+checks, and instance/static interface opcode checks. LibCpp2IL runner: 5 passed.
+The synthetic arithmetic harness explicitly computed MaxStack; actual generated
+Start still declares `.maxstack 0`. That pre-existing header problem is a separate
+runtime blocker despite its zero diagnostics. The unchanged runtime gate remains
+blocked, with 1,842 reachable methods now exposed; no runtime oracle was run.

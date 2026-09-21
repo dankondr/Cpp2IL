@@ -14,11 +14,81 @@ namespace Cpp2IL.Core.Tests;
 
 public class IlGeneratorTests
 {
+    [TestCase(0L, 0L)]
+    [TestCase(0x7fffffffL, 34359738352L)]
+    [TestCase(0x80000000L, -34359738368L)]
+    [TestCase(0xffffffffL, -16L)]
+    [TestCase(0x100000001L, 16L)]
+    public void SignedWordExtensionExecutesWithCorrectLowWordAndScale(long input, long expected)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Extend",
+            app.SystemTypes.SystemInt64Type, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        var wide = new LocalVariable("wide", new Register(null, "wide"));
+        var scaled = new LocalVariable("scaled", new Register(null, "scaled"));
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.SignExtend32, wide, new Immediate(input)),
+            new(1, OpCode.ShiftLeft, scaled, wide, new Immediate(4)),
+            new(2, OpCode.Return, scaled)]);
+        caller.Locals = [wide, scaled];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("ExtensionTest.dll", new AssemblyReference("System.Private.CoreLib", typeof(object).Assembly.GetName().Version!));
+        var type = new TypeDefinition("Tests", "Extension", TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);
+        var method = new MethodDefinition("Extend", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int64));
+        type.Methods.Add(method);
+        IlGenerator.GenerateIl(caller, method);
+        // This standalone harness supplies the primitive signatures without generating the
+        // fixture game's entire mscorlib. Exercise the actual emitted conversion and shift IL.
+        foreach (var local in method.CilMethodBody!.LocalVariables)
+            local.VariableType = module.CorLibTypeFactory.Int64;
+        method.CilMethodBody.ComputeMaxStackOnBuild = true;
+
+        var assembly = new AssemblyDefinition("ExtensionTest", new Version(1, 0));
+        assembly.Modules.Add(module);
+        using var stream = new System.IO.MemoryStream();
+        module.Write(stream);
+        var loaded = System.Reflection.Assembly.Load(stream.ToArray());
+        Assert.That(loaded.GetType("Tests.Extension")!.GetMethod("Extend")!.Invoke(null, null), Is.EqualTo(expected));
+    }
+
     [SetUp]
     public void Setup()
     {
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void InterfaceCallPreservesRuntimeDispatch(bool isStatic)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = app.SystemTypes.SystemObjectType;
+        var iface = new InjectedTypeAnalysisContext(owner.DeclaringAssembly, "Tests", "IDispatch", null,
+            System.Reflection.TypeAttributes.Public | System.Reflection.TypeAttributes.Interface | System.Reflection.TypeAttributes.Abstract);
+        var target = iface.InjectMethodContext("Invoke", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | (isStatic ? ReflectionMethodAttributes.Static : ReflectionMethodAttributes.Abstract | ReflectionMethodAttributes.Virtual));
+        var caller = new InjectedMethodAnalysisContext(owner, "Caller", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([isStatic ? new(0, OpCode.CallVoid, target) : new(0, OpCode.CallVoid, target, new Immediate(0)), new(1, OpCode.Return)]);
+        caller.Locals = [];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("DispatchTest.dll");
+        var type = new TypeDefinition("Tests", "IDispatch", TypeAttributes.Public | TypeAttributes.Interface | TypeAttributes.Abstract);
+        module.TopLevelTypes.Add(type);
+        var targetDefinition = new MethodDefinition("Invoke", MethodAttributes.Public | (isStatic ? MethodAttributes.Static : MethodAttributes.Abstract | MethodAttributes.Virtual),
+            isStatic ? MethodSignature.CreateStatic(module.CorLibTypeFactory.Void) : MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        type.Methods.Add(targetDefinition);
+        target.PutExtraData("AsmResolverMethod", targetDefinition);
+        var method = new MethodDefinition("Caller", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        type.Methods.Add(method);
+        IlGenerator.GenerateIl(caller, method);
+        Assert.That(method.CilMethodBody!.Instructions.Any(i => i.OpCode == (isStatic ? CilOpCodes.Call : CilOpCodes.Callvirt) && i.Operand == targetDefinition), Is.True);
     }
 
     [Test]

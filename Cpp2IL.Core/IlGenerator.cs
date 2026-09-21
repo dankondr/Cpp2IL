@@ -313,6 +313,13 @@ public static class IlGenerator
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
+            case OpCode.SignExtend32:
+                LoadOperand(instruction.Operands[1], method, locals, writeLine);
+                instructions.Add(CilOpCodes.Conv_I4);
+                instructions.Add(CilOpCodes.Conv_I8);
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+
             case OpCode.NewArr:
                 if (instruction.Operands is [_, SzArrayTypeAnalysisContext { ElementType: { } newArrayElement }, { } length])
                 {
@@ -430,7 +437,7 @@ public static class IlGenerator
                         PushDefaultOf(parameterType, instructions);
                 }
 
-                instructions.Add(CilOpCodes.Call, importedMethod);
+                instructions.Add(!targetMethod.IsStatic && targetMethod.DeclaringType?.IsInterface == true ? CilOpCodes.Callvirt : CilOpCodes.Call, importedMethod);
 
                 // the lifter's guess at whether the callee returns anything can disagree with the
                 // signature we later resolved, so go by the signature and balance the stack

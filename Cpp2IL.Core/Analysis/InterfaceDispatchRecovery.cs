@@ -119,8 +119,14 @@ public static class InterfaceDispatchRecovery
         return new Match(resolved, phi, merge, slowCall, klassLocal);
     }
 
-    private static LocalVariable? MatchVTableEntryChain(Dictionary<LocalVariable, Instruction> definitions, Instruction? vtableEntry, int slot)
+    internal static LocalVariable? MatchVTableEntryChain(Dictionary<LocalVariable, Instruction> definitions, Instruction? vtableEntry, int slot)
     {
+        // ARM64 emits (klass + (SXTW(entryOffset + slot) << 4)) + vtableOffset.
+        // The existing x86 shape associates the same final additions the other way around.
+        var trailingOffset = vtableEntry is { OpCode: OpCode.Add, Operands: [_, LocalVariable, Immediate { Value: VTableOffset }] };
+        if (trailingOffset)
+            vtableEntry = ChaseCopies(definitions, (LocalVariable)vtableEntry!.Operands[1]);
+
         if (vtableEntry is not { OpCode: OpCode.Add, Operands: [_, LocalVariable addLeft, LocalVariable addRight] })
             return null;
 
@@ -131,13 +137,20 @@ public static class InterfaceDispatchRecovery
         if (Definition(definitions, klassCandidate) is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable }] })
             return null;
 
-        if (ChaseCopies(definitions, sum) is not { OpCode: OpCode.Add, Operands: [_, LocalVariable shifted, Immediate { Value: VTableOffset }] })
-            return null;
+        var shifted = sum;
+        if (!trailingOffset)
+        {
+            if (ChaseCopies(definitions, sum) is not { OpCode: OpCode.Add, Operands: [_, LocalVariable innerShift, Immediate { Value: VTableOffset }] })
+                return null;
+            shifted = innerShift;
+        }
 
         if (ChaseCopies(definitions, shifted) is not { OpCode: OpCode.ShiftLeft, Operands: [_, LocalVariable index, Immediate { Value: InvokeDataShift }] })
             return null;
 
         var entryOffset = ChaseCopies(definitions, index);
+        if (entryOffset is { OpCode: OpCode.SignExtend32, Operands: [_, LocalVariable unextended] })
+            entryOffset = ChaseCopies(definitions, unextended);
 
         if (entryOffset is { OpCode: OpCode.Add, Operands: [_, LocalVariable beforeSlot, Immediate slotAddend] })
         {
@@ -359,7 +372,7 @@ public static class InterfaceDispatchRecovery
                     OpCode.Nop or OpCode.Jump or OpCode.ConditionalJump or OpCode.Phi => true,
                     OpCode.Move or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
                         or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And or OpCode.Or or OpCode.Xor
-                        or OpCode.Not or OpCode.Negate
+                        or OpCode.Not or OpCode.Negate or OpCode.SignExtend32
                         or (>= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual)
                         => instruction.Destination is LocalVariable,
                     _ => false,

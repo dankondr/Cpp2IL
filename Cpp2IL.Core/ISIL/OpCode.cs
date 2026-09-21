@@ -125,5 +125,8 @@ public enum OpCode
     /// <summary>
     /// Throws a new instance of the exception type described by op 1.
     /// </summary>
-    Throw
+    Throw,
+
+    /// <summary>Sign-extends the low 32 bits of op 2 to 64 bits in op 1.</summary>
+    SignExtend32
 }
