@@ -10,6 +10,7 @@ using Cpp2IL.Core.Api;
 using Cpp2IL.Core.Exceptions;
 using Cpp2IL.Core.Il2CppApiFunctions;
 using Cpp2IL.Core.Logging;
+using Cpp2IL.Core.OutputFormats;
 using Cpp2IL.Core.Utils;
 using LibCpp2IL;
 using LibCpp2IL.BinaryStructures;
@@ -46,6 +47,10 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
     /// The LibCpp2IlContext instance which this ApplicationAnalysisContext belongs to, containing the binary and metadata files that this application was loaded from.
     /// </summary>
     public LibCpp2IlContext LibCpp2IlContext;
+
+    // Snapshot the loaded binary/metadata before any processing layer can mutate
+    // them. Output locations and emitted bytes are deliberately not identity inputs.
+    internal string RecoveryInputIdentity { get; }
 
     /// <summary>
     /// The instruction set helper class associated with the instruction set that this application was compiled with.
@@ -113,6 +118,8 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
     public ApplicationAnalysisContext(LibCpp2IlContext context)
     {
         LibCpp2IlContext = context;
+        RecoveryInputIdentity = RecoveryModuleIdentity.CaptureInputs(Binary.GetRawBinaryContent().ToArray(),
+            Metadata.ReadByteArrayAtRawAddress(0, checked((int)Metadata.Length)));
 
         try
         {

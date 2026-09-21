@@ -29,6 +29,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 
     public override List<AssemblyDefinition> BuildAssemblies(ApplicationAnalysisContext context)
     {
+        var buildIdentity = RecoveryModuleIdentity.ForBuild(context, this);
         //We're going to need key function addresses, so grab them. This way the logging is more consistent
         Logger.InfoNewline("Finding key function addresses...");
         var start = DateTime.Now;
@@ -37,7 +38,11 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 
         IlGenerator.InjectHelpersType(context);
 
-        return base.BuildAssemblies(context);
+        var assemblies = base.BuildAssemblies(context);
+        foreach (var assembly in assemblies)
+            foreach (var module in assembly.Modules)
+                RecoveryModuleIdentity.Assign(module, buildIdentity);
+        return assemblies;
     }
 
     protected override void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
