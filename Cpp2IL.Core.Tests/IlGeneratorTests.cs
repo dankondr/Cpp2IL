@@ -14,6 +14,45 @@ namespace Cpp2IL.Core.Tests;
 
 public class IlGeneratorTests
 {
+    [TestCase(0, false, OpCode.CheckEqual, true)]
+    [TestCase(0, true, OpCode.CheckNotEqual, true)]
+    [TestCase(0, true, OpCode.CheckEqual, true)]
+    [TestCase(0, false, OpCode.CheckNotEqual, true)]
+    [TestCase(6, false, OpCode.CheckEqual, true)]
+    [TestCase(7, false, OpCode.CheckEqual, true)]
+    [TestCase(8, false, OpCode.CheckEqual, true)]
+    [TestCase(9, false, OpCode.CheckEqual, false)]
+    [TestCase(10, false, OpCode.CheckEqual, false)]
+    [TestCase(1, false, OpCode.CheckEqual, false)]
+    [TestCase(2, false, OpCode.CheckEqual, false)]
+    [TestCase(3, false, OpCode.CheckEqual, false)]
+    [TestCase(4, false, OpCode.CheckEqual, false)]
+    [TestCase(5, false, OpCode.CheckEqual, false)]
+    [TestCase(0, false, OpCode.Add, false)]
+    public void OnlyReferenceEqualityWithLiteralZeroEmitsNull(int kind, bool reverse, OpCode opcode, bool expectsNull)
+    {
+        var app=Cpp2IlApi.CurrentAppContext!;
+        var operandType=kind switch {1=>app.SystemTypes.SystemInt32Type,2=>app.SystemTypes.SystemBooleanType,3=>new PointerTypeAnalysisContext(app.SystemTypes.SystemInt32Type),_=>app.SystemTypes.SystemObjectType};
+        var list=app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        if(kind==6)operandType=app.SystemTypes.SystemStringType;
+        if(kind==7)operandType=new SzArrayTypeAnalysisContext(app.SystemTypes.SystemObjectType);
+        if(kind==8)operandType=new GenericInstanceTypeAnalysisContext(list,[app.SystemTypes.SystemObjectType]);
+        if(kind==9)operandType=new ByRefTypeAnalysisContext(app.SystemTypes.SystemObjectType);
+        if(kind==10)operandType=list.GenericParameters[0];
+        var input=new LocalVariable("input",new Register(null,"input")){Type=operandType};
+        var result=new LocalVariable("result",new Register(null,"result")){Type=app.SystemTypes.SystemBooleanType};
+        IOperand right=kind==5?new LocalVariable("numeric",new Register(null,"numeric")){Type=app.SystemTypes.SystemInt32Type}:new Immediate(kind==4?1:0);
+        var context=new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType,"Run",app.SystemTypes.SystemVoidType,ReflectionMethodAttributes.Static,[]);
+        context.ControlFlowGraph=new ISILControlFlowGraph([new(0,opcode,result,reverse?right:input,reverse?input:right),new(1,OpCode.Return)]);
+        context.Locals=kind==5?[input,result,(LocalVariable)right]:[input,result];context.ParameterLocals=[];context.AnalysisWarnings=[];
+        var module=new ModuleDefinition("NullComparison.dll");var type=new TypeDefinition("Tests","Comparison",TypeAttributes.Public,module.CorLibTypeFactory.Object.Type);module.TopLevelTypes.Add(type);
+        foreach(var primitive in new[]{app.SystemTypes.SystemObjectType,app.SystemTypes.SystemInt32Type,app.SystemTypes.SystemBooleanType,app.SystemTypes.SystemStringType,list})
+            primitive.PutExtraData("AsmResolverType",new TypeDefinition("System",primitive.Name,TypeAttributes.Public));
+        var method=new MethodDefinition("Run",MethodAttributes.Public|MethodAttributes.Static,MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));type.Methods.Add(method);
+        IlGenerator.GenerateIl(context,method);
+        Assert.That(method.CilMethodBody!.Instructions.Any(i=>i.OpCode==CilOpCodes.Ldnull),Is.EqualTo(expectsNull));
+    }
+
     [Test]
     public void UnreachableAnalysisWarningDoesNotMakeSerializedBodyUnrunnable()
     {
