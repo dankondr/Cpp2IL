@@ -10,6 +10,65 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class SimplifierTests
 {
+    [SetUp]
+    public void Setup()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+    }
+
+    [Test]
+    public void PreservesFieldSnapshotGroupAcrossValueReturningCall()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new LocalVariable("owner", new Register(null, "owner"));
+        var snapshot = new LocalVariable("snapshot", new Register(null, "snapshot"));
+        var companion = new LocalVariable("companion", new Register(null, "companion"));
+        var callResult = new LocalVariable("callResult", new Register(null, "callResult"));
+        var field = new InjectedFieldAnalysisContext("value", app.SystemTypes.SystemInt32Type,
+            System.Reflection.FieldAttributes.Public, app.SystemTypes.SystemObjectType);
+        var companionField = new InjectedFieldAnalysisContext("other", app.SystemTypes.SystemInt32Type,
+            System.Reflection.FieldAttributes.Public, app.SystemTypes.SystemObjectType);
+        var load = new Instruction(0, OpCode.Move, snapshot, new FieldReference(field, owner, 16));
+        var companionLoad = new Instruction(1, OpCode.Move, companion, new FieldReference(companionField, owner, 20));
+        var observe = new Instruction(3, OpCode.CallVoid, Str("Observe"), snapshot, companion);
+        var graph = new ISILControlFlowGraph([
+            load,
+            companionLoad,
+            new Instruction(2, OpCode.Call, Str("Read"), callResult, owner),
+            observe,
+            new Instruction(4, OpCode.Return)
+        ]);
+
+        Simplifier.Simplify(CreateMethod(graph, owner, snapshot, companion, callResult));
+
+        Assert.That(load.OpCode, Is.EqualTo(OpCode.Move));
+        Assert.That(companionLoad.OpCode, Is.EqualTo(OpCode.Move));
+        Assert.That(observe.Operands[1], Is.SameAs(snapshot));
+        Assert.That(observe.Operands[2], Is.SameAs(companion));
+    }
+
+    [Test]
+    public void StillForwardsFieldLoadIntoItsImmediateUse()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new LocalVariable("owner", new Register(null, "owner"));
+        var value = new LocalVariable("value", new Register(null, "value"));
+        var sum = new LocalVariable("sum", new Register(null, "sum"));
+        var field = new InjectedFieldAnalysisContext("value", app.SystemTypes.SystemInt32Type,
+            System.Reflection.FieldAttributes.Public, app.SystemTypes.SystemObjectType);
+        var add = new Instruction(1, OpCode.Add, sum, value, Imm(1));
+        var graph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, value, new FieldReference(field, owner, 16)),
+            add,
+            new Instruction(2, OpCode.Return, sum)
+        ]);
+
+        Simplifier.Simplify(CreateMethod(graph, owner, value, sum));
+
+        Assert.That(add.Operands[1], Is.InstanceOf<FieldReference>());
+    }
+
     private static MethodAnalysisContext CreateMethod(ISILControlFlowGraph graph, params LocalVariable[] locals)
     {
         var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));
