@@ -10,6 +10,7 @@ using Cpp2IL.Core.Api;
 using Cpp2IL.Core.Exceptions;
 using Cpp2IL.Core.Il2CppApiFunctions;
 using Cpp2IL.Core.Logging;
+using Cpp2IL.Core.OutputFormats;
 using Cpp2IL.Core.Utils;
 using LibCpp2IL;
 using LibCpp2IL.BinaryStructures;
@@ -47,6 +48,10 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
     /// </summary>
     public LibCpp2IlContext LibCpp2IlContext;
 
+    // Snapshot the loaded binary/metadata before any processing layer can mutate
+    // them. Output locations and emitted bytes are deliberately not identity inputs.
+    internal string RecoveryInputIdentity { get; }
+
     /// <summary>
     /// The instruction set helper class associated with the instruction set that this application was compiled with.
     /// </summary>
@@ -74,7 +79,9 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
 
     /// <summary>
     /// Exception type name thrown by the runtime helper at each address, or null where the address turned
-    /// out not to be a throw helper. Populated on demand by <see cref="Analysis.ThrowHelperRecovery"/>.
+    /// out not to be a throw helper. Only completed full-budget root queries are cached;
+    /// recursive or in-progress results must not be published here.
+    /// Populated on demand by <see cref="Analysis.ThrowHelperRecovery"/>.
     /// </summary>
     public readonly ConcurrentDictionary<ulong, string?> ThrowHelperNamesByAddress = new();
     internal readonly ConcurrentDictionary<ulong, bool> ProvenNonReturningHelpers = new();
@@ -111,6 +118,8 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
     public ApplicationAnalysisContext(LibCpp2IlContext context)
     {
         LibCpp2IlContext = context;
+        RecoveryInputIdentity = RecoveryModuleIdentity.CaptureInputs(Binary.GetRawBinaryContent().ToArray(),
+            Metadata.ReadByteArrayAtRawAddress(0, checked((int)Metadata.Length)));
 
         try
         {
