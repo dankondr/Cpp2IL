@@ -14,6 +14,31 @@ namespace Cpp2IL.Core.Tests;
 
 public class IlGeneratorTests
 {
+    [TestCase(0xffffffffL, -1, false, false)]
+    [TestCase(0x80000000L, int.MinValue, false, false)]
+    [TestCase(0x100000000L, 0, false, false)]
+    [TestCase(0xffffffffL, 0, true, false)]
+    [TestCase(0xffffffffL, -1, false, true)]
+    [TestCase(-1L, -1, false, true)]
+    public void Int32CallArgumentUsesTheLowWordNotInt64(long nativeValue,int expected,bool wide,bool unsigned)
+    {
+        var app=Cpp2IlApi.CurrentAppContext!;
+        var target=new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType,"Take",app.SystemTypes.SystemInt32Type,ReflectionMethodAttributes.Public|ReflectionMethodAttributes.Static,[wide?app.SystemTypes.SystemInt64Type:unsigned?app.SystemTypes.SystemUInt32Type:app.SystemTypes.SystemInt32Type]);
+        var caller=new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType,"Caller",app.SystemTypes.SystemVoidType,ReflectionMethodAttributes.Public|ReflectionMethodAttributes.Static,[]);
+        caller.ControlFlowGraph=new ISILControlFlowGraph([new(0,OpCode.CallVoid,target,new Immediate(nativeValue)),new(1,OpCode.Return)]);
+        caller.Locals=[];caller.ParameterLocals=[];caller.AnalysisWarnings=[];
+        var module=new ModuleDefinition("WidthFixture.dll");
+        var type=new TypeDefinition("Tests","Width",TypeAttributes.Public,module.CorLibTypeFactory.Object.Type);module.TopLevelTypes.Add(type);
+        var targetDefinition=new MethodDefinition("Take",MethodAttributes.Public|MethodAttributes.Static,MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32,[wide?module.CorLibTypeFactory.Int64:unsigned?module.CorLibTypeFactory.UInt32:module.CorLibTypeFactory.Int32]));type.Methods.Add(targetDefinition);
+        target.PutExtraData("AsmResolverMethod",targetDefinition);
+        var definition=new MethodDefinition("Caller",MethodAttributes.Public|MethodAttributes.Static,MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));type.Methods.Add(definition);
+        IlGenerator.GenerateIl(caller,definition);
+        var needsWide=wide||nativeValue>uint.MaxValue;
+        Assert.That(definition.CilMethodBody!.Instructions[0].OpCode,Is.EqualTo(needsWide?CilOpCodes.Ldc_I8:CilOpCodes.Ldc_I4));
+        if(needsWide)Assert.That(definition.CilMethodBody.Instructions[0].Operand,Is.EqualTo(nativeValue));
+        else Assert.That(definition.CilMethodBody.Instructions[0].Operand,Is.EqualTo(expected));
+    }
+
     [Test]
     public void InvalidStackRemainsExplicitlyDiagnosedAndBodyIsPreserved()
     {

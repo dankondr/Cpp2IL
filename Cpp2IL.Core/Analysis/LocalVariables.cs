@@ -461,17 +461,59 @@ public static class LocalVariables
         }
     }
 
-    // Arithmetic on a float operand is float arithmetic, so the result is that float type.
+    // Preserve numeric result types without guessing pointer arithmetic or mixed widths.
     private static bool PropagateArithmetic(Instruction instruction, MethodAnalysisContext method)
     {
         if (instruction.Operands is not [LocalVariable { Type: null } destination, var left, var right])
             return false;
 
-        if ((FloatOperandType(left, method) ?? FloatOperandType(right, method)) is not { } floatType)
+        if ((FloatOperandType(left, method) ?? FloatOperandType(right, method)) is { } floatType)
+            return SetTypeIfUnknown(destination, floatType);
+
+        var integerType = IntegerResultType(left, method) ?? IntegerResultType(right, method);
+        if (integerType == null)
             return false;
 
-        return SetTypeIfUnknown(destination, floatType);
+        // Native comparison lowering leaves an arithmetic temporary. Do not let this
+        // inference race pointer/metadata resolution elsewhere in the fixpoint.
+        var compared = false;
+        foreach (var user in method.ControlFlowGraph!.Instructions)
+        {
+            if (ReferenceEquals(user, instruction))
+                continue;
+            foreach (var operand in user.Operands)
+            {
+                if (!ContainsLocal(operand, destination))
+                    continue;
+                if (user.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual
+                        or OpCode.CheckGreater or OpCode.CheckLess
+                        or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual)
+                    || !ReferenceEquals(operand, destination)
+                    || ReferenceEquals(user.Destination, destination))
+                    return false;
+                compared = true;
+            }
+        }
+        if (!compared)
+            return false;
+
+        bool Compatible(IOperand operand) => operand is Immediate immediate
+            ? integerType.FullName == "System.Int64" || immediate.Value is >= int.MinValue and <= uint.MaxValue
+            : IntegerResultType(operand, method) == integerType;
+
+        return Compatible(left) && Compatible(right) && SetTypeIfUnknown(destination, integerType);
     }
+
+    private static bool ContainsLocal(IOperand? operand, LocalVariable local) => operand switch
+    {
+        LocalVariable value => ReferenceEquals(value, local),
+        MemoryOperand memory => ContainsLocal(memory.Base, local) || ContainsLocal(memory.Index, local),
+        AddressOf address => ContainsLocal(address.Target, local),
+        FieldReference field => ReferenceEquals(field.Local, local),
+        ArrayAccess array => ReferenceEquals(array.Array, local) || ContainsLocal(array.Index, local),
+        ArrayLength length => ReferenceEquals(length.Array, local),
+        _ => false,
+    };
 
     // An integer operand makes the result an integer. Excludes bool operands so flag logic stays boolean.
     private static bool PropagateIntegerResult(Instruction instruction, MethodAnalysisContext method)

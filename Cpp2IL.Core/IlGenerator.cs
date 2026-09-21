@@ -665,6 +665,12 @@ public static class IlGenerator
 
         switch (operand)
         {
+            // A native W-register literal may be represented as unsigned 32-bit in ISIL.
+            // The known managed I4 contract supplies the width; do not truncate arbitrary I8s.
+            case Immediate { Value: >= int.MinValue and <= uint.MaxValue } immediate
+                when expectedType?.FullName is "System.Int32" or "System.UInt32":
+                instructions.Add(CilOpCodes.Ldc_I4, unchecked((int)immediate.Value));
+                break;
             case Immediate { Value: >= int.MinValue and <= int.MaxValue } immediate:
                 instructions.Add(CilOpCodes.Ldc_I4, (int)immediate.Value);
                 break;
