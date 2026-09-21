@@ -352,6 +352,7 @@ public static class IlGenerator
                 // If we can't, just fall back to an Ldnull.
                 if (FindConstructorCall(context, instruction) is { Operands: [MethodAnalysisContext constructor, _, ..] } constructorCall)
                 {
+                    constructor = Analysis.AllocationConstructorRecovery.Resolve(instruction, constructor) ?? constructor;
                     // Operands run [ctor, newObject, arguments..., methodInfo], so take only as many as
                     // the constructor declares (i.e. drop methodInfo)
                     var constructorArgs = constructorCall.Operands.Skip(ConstructorReceiverIndex(constructorCall) + 1).Take(constructor.Parameters.Count).ToList();
