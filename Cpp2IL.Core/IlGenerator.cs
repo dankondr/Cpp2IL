@@ -1239,7 +1239,9 @@ public static class IlGenerator
                 break;
             case RuntimeMethodInfoAnalysisContext runtimeMethod:
                 // A delegate constructor takes its target as a native pointer, which is exactly ldftn.
-                if (expectedType?.FullName == "System.IntPtr")
+                // ldftn cannot name a .ctor though; the unresolved placeholder below stays
+                // verifier-legal (a native-int zero) instead of fabricating a function pointer.
+                if (expectedType?.FullName == "System.IntPtr" && runtimeMethod.RepresentedMethod.Name is not ".ctor")
                 {
                     instructions.Add(CilOpCodes.Ldftn, runtimeMethod.RepresentedMethod.ToMethodDescriptor());
                     break;
@@ -1409,7 +1411,7 @@ public static class IlGenerator
     private static TypeAnalysisContext EmittedLocalType(LocalVariable local, MethodAnalysisContext context)
     {
         if (local.Type != null && local.Type != context.AppContext.SystemTypes.SystemVoidType)
-            return local.Type;
+            return IsNativeHandleType(local.Type) ? context.AppContext.SystemTypes.SystemIntPtrType : local.Type;
         // `this` loads use ldarg.0, whose stack type is the declaring type (a managed
         // pointer to it for value-type methods), even when ISIL leaves the local untyped.
         if (context.DeclaringType is { } declaringType
@@ -1485,14 +1487,19 @@ public static class IlGenerator
             : null;
     }
     
-    private static TypeAnalysisContext? DestinationType(IOperand destination) =>
-        destination switch
+    private static TypeAnalysisContext? DestinationType(IOperand destination)
+    {
+        var type = destination switch
         {
             LocalVariable local => local.Type,
             FieldReference field => field.Field.FieldType,
             ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } => array.ElementType,
             _ => null
         };
+        // Handle contexts are emitted as System.IntPtr, so that is the real contract
+        // the stack value has to satisfy.
+        return type != null && IsNativeHandleType(type) ? type.AppContext.SystemTypes.SystemIntPtrType : type;
+    }
 
     // The stack type an operand produces once emitted, before any coercion. Literal
     // immediates adapt to whatever the consumer asks for, so they report no type.
