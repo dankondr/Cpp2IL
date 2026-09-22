@@ -408,7 +408,9 @@ public static class IlGenerator
                         LoadOperandIntoSlot(field.Local, FieldBaseContract(field.Field), context, method, locals, writeLine);
 
                     LoadOperandIntoSlot(instruction.Operands[1], field.Field.FieldType, context, method, locals, writeLine);
-                    instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
+                    instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
+                        field.Field.IsStatic ? field.Field.ToFieldDescriptor()
+                            : FieldDescriptorFor(field.Field, EmittedOperandType(field.Local, context)));
                     break;
                 }
 
@@ -420,7 +422,10 @@ public static class IlGenerator
                     LoadOperandIntoSlot(target.Index, context.AppContext.SystemTypes.SystemInt32Type, context, method, locals, writeLine);
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, stored, context);
                     CoerceOrDefault(EmittedOperandType(instruction.Operands[1], context, stored), stored, method);
-                    instructions.Add(CilOpCodes.Stelem, stored.ToTypeSignature().ToTypeDefOrRef());
+                    if (StelemOpCode(stored) is { } stelemOp)
+                        instructions.Add(stelemOp);
+                    else
+                        instructions.Add(CilOpCodes.Stelem, stored.ToTypeSignature().ToTypeDefOrRef());
                     break;
                 }
 
@@ -2049,7 +2054,9 @@ public static class IlGenerator
                     LoadOperandIntoSlot(addressedField.Local, FieldBaseContract(addressedField.Field),
                         callingContext, method, locals, writeLine);
                 instructions.Add(addressedField.Field.IsStatic ? CilOpCodes.Ldsflda : CilOpCodes.Ldflda,
-                    addressedField.Field.ToFieldDescriptor());
+                    addressedField.Field.IsStatic ? addressedField.Field.ToFieldDescriptor()
+                        : FieldDescriptorFor(addressedField.Field,
+                            EmittedOperandType(addressedField.Local, callingContext)));
                 break;
             case AddressOf { Target: ArrayAccess elementAddress }:
                 LoadArrayBase(elementAddress.Array, method, locals, callingContext);
@@ -2079,7 +2086,8 @@ public static class IlGenerator
 
                 LoadOperandIntoSlot(field.Local, FieldBaseContract(field.Field), callingContext,
                     method, locals, writeLine);
-                instructions.Add(CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
+                instructions.Add(CilOpCodes.Ldfld,
+                    FieldDescriptorFor(field.Field, EmittedOperandType(field.Local, callingContext)));
                 break;
             case MemoryOperand memory:
                 if (TryGetDeterministicMemoryReferent(memory, expectedType, out var referent))
@@ -2383,8 +2391,13 @@ public static class IlGenerator
         // `this` loads use ldarg.0, whose stack type is the declaring type (a managed
         // pointer to it for value-type methods) - even when the lifter tagged the
         // local with the bare struct type, the address is what lands on the stack.
+        // On a generic type `this` verifies as the self-instantiation def<!0..!n>,
+        // which is what the local analysis stored - prefer it over the bare def.
         if (local.IsThis && context.DeclaringType is { } thisDeclaring)
-            return thisDeclaring.IsValueType ? new ByRefTypeAnalysisContext(thisDeclaring) : thisDeclaring;
+        {
+            var thisType = local.Type as GenericInstanceTypeAnalysisContext ?? thisDeclaring;
+            return thisType.IsValueType ? new ByRefTypeAnalysisContext(thisType) : thisType;
+        }
         if (local.Type != null && local.Type != context.AppContext.SystemTypes.SystemVoidType)
             return IsNativeHandleType(local.Type) ? context.AppContext.SystemTypes.SystemIntPtrType : local.Type;
         if (context.DeclaringType is { } declaringType
@@ -3087,8 +3100,11 @@ public static class IlGenerator
         if (match == null)
             return false;
 
+        var thisReceiver = context.ParameterLocals.FirstOrDefault() is { } thisLocal
+            ? EmittedLocalType(thisLocal, context)
+            : context.DeclaringType;
         method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldarg_0);
-        method.CilMethodBody.Instructions.Add(CilOpCodes.Ldfld, match.ToFieldDescriptor());
+        method.CilMethodBody.Instructions.Add(CilOpCodes.Ldfld, FieldDescriptorFor(match, thisReceiver));
         CoerceOrDefault(match.FieldType, contract, method);
         return true;
     }
@@ -3583,7 +3599,8 @@ public static class IlGenerator
                     && IntegralStackWidth(destinationType) != 0)
             && EmitManagedAddress(address, method, context, locals, writeLine))
         {
-            instructions.Add(CilOpCodes.Ldfld, addressField.ToFieldDescriptor());
+            instructions.Add(CilOpCodes.Ldfld,
+                FieldDescriptorFor(addressField, EmittedOperandType(address, context)));
             CoerceOrDefault(addressField.FieldType, destinationType, method);
             StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
             return true;
@@ -3595,7 +3612,8 @@ public static class IlGenerator
             && EmitManagedAddress(packed, method, context, locals, writeLine))
         {
             var fieldType = packedField.FieldType;
-            instructions.Add(CilOpCodes.Ldfld, packedField.ToFieldDescriptor());
+            instructions.Add(CilOpCodes.Ldfld,
+                FieldDescriptorFor(packedField, EmittedOperandType(packed, context)));
             if (otherOperand != null)
             {
                 // The op applies to the low-word field only; that is exact for the
@@ -3741,6 +3759,34 @@ public static class IlGenerator
             ? new ByRefTypeAnalysisContext(valueOwner)
             : field.DeclaringType;
 
+    private static TypeAnalysisContext? GenericDefinition(TypeAnalysisContext? type)
+        => type is GenericInstanceTypeAnalysisContext instance ? instance.GenericType : type;
+
+    // A field reference declared on a generic definition must be emitted on the
+    // receiver's own instantiation: `ldfld !0 C`1::f` expects a `ref C`1` (the
+    // unbound definition), which no stack value can be, while `C`1<!0>::f` is the
+    // member the verifier actually accepts.
+    private static IFieldDescriptor FieldDescriptorFor(FieldAnalysisContext field,
+        TypeAnalysisContext? receiverType)
+    {
+        if (field is ConcreteGenericFieldAnalysisContext)
+            return field.ToFieldDescriptor();
+        var receiverInstance = receiverType switch
+        {
+            GenericInstanceTypeAnalysisContext instance => instance,
+            ByRefTypeAnalysisContext { ElementType: GenericInstanceTypeAnalysisContext instance } => instance,
+            _ => null,
+        };
+        if (receiverInstance == null || GenericDefinition(field.DeclaringType) is not { } declaringDefinition
+            || !ThisConstructorCallPlan.SameTypeIdentity(declaringDefinition, receiverInstance.GenericType))
+            return field.ToFieldDescriptor();
+        if (field.GetExtraData<FieldDefinition>("AsmResolverField") is not { } definition)
+            return field.ToFieldDescriptor();
+        MemberAccessibility.EnsureAccessible(definition);
+        return new MemberReference(receiverInstance.ToTypeSignature().ToTypeDefOrRef(),
+            field.Name, new FieldSignature(field.ToTypeSignature()));
+    }
+
     private static bool FieldUsableFrom(FieldAnalysisContext field, MethodAnalysisContext context,
         bool writeAccess = false)
     {
@@ -3750,7 +3796,8 @@ public static class IlGenerator
         if (writeAccess && (attrs & FieldAttributes.InitOnly) != 0
             && !(context.Name is ".ctor" or ".cctor"
                 && field.DeclaringType != null && context.DeclaringType != null
-                && ThisConstructorCallPlan.SameTypeIdentity(field.DeclaringType, context.DeclaringType)))
+                && ThisConstructorCallPlan.SameTypeIdentity(GenericDefinition(field.DeclaringType),
+                    GenericDefinition(context.DeclaringType))))
             return false;
         var callerType = context.DeclaringType;
         var declaring = field.DeclaringType;
@@ -3774,6 +3821,27 @@ public static class IlGenerator
             FieldAttributes.FamANDAssem => sameAssembly && (sameType || callerType.IsAssignableTo(declaring)),
             FieldAttributes.FamORAssem => sameAssembly || sameType || callerType.IsAssignableTo(declaring),
             _ => false,
+        };
+    }
+
+    // Typed `stelem` requires the stack value to be exactly the element type, which
+    // narrow integrals can never produce (everything loads as i4); the dedicated
+    // element opcodes accept the i4 family directly.
+    private static CilOpCode? StelemOpCode(TypeAnalysisContext elementType)
+    {
+        var effective = elementType is { IsEnumType: true }
+            ? elementType.DefaultEnumUnderlyingType : elementType;
+        return effective?.FullName switch
+        {
+            "System.Boolean" or "System.Byte" or "System.SByte" => CilOpCodes.Stelem_I1,
+            "System.Char" or "System.Int16" or "System.UInt16" => CilOpCodes.Stelem_I2,
+            "System.Int32" or "System.UInt32" => CilOpCodes.Stelem_I4,
+            "System.Int64" or "System.UInt64" => CilOpCodes.Stelem_I8,
+            "System.IntPtr" or "System.UIntPtr" => CilOpCodes.Stelem_I,
+            "System.Single" => CilOpCodes.Stelem_R4,
+            "System.Double" => CilOpCodes.Stelem_R8,
+            _ when effective is { IsValueType: false } => CilOpCodes.Stelem_Ref,
+            _ => null,
         };
     }
 
@@ -3825,7 +3893,8 @@ public static class IlGenerator
                 if (!FieldUsableFrom(field.Field, context, writeAccess: true)
                     || !EmitManagedAddress(field.Local, method, context, locals, writeLine))
                     return false;
-                instructions.Add(CilOpCodes.Ldflda, field.Field.ToFieldDescriptor());
+                instructions.Add(CilOpCodes.Ldflda,
+                    FieldDescriptorFor(field.Field, EmittedOperandType(field.Local, context)));
                 return true;
             case ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } access:
                 LoadArrayBase(access.Array, method, locals, context);
@@ -3888,7 +3957,9 @@ public static class IlGenerator
                         $"Inaccessible field store: {field.Field.DeclaringType?.FullName}.{field.Field.Name}");
                     break;
                 }
-                var fieldDescriptor = field.Field.ToFieldDescriptor();
+                var fieldDescriptor = field.Field.IsStatic
+                    ? field.Field.ToFieldDescriptor()
+                    : FieldDescriptorFor(field.Field, EmittedOperandType(field.Local, context));
 
                 if (field.Field.IsStatic)
                 {
@@ -3919,7 +3990,10 @@ public static class IlGenerator
                 LoadOperandIntoSlot(arrayAccess.Index, context.AppContext.SystemTypes.SystemInt32Type,
                     context, method, locals, writeLine);
                 instructions.Add(CilOpCodes.Ldloc, elementScratch);
-                instructions.Add(CilOpCodes.Stelem, elementType.ToTypeSignature().ToTypeDefOrRef());
+                if (StelemOpCode(elementType) is { } storeElementOp)
+                    instructions.Add(storeElementOp);
+                else
+                    instructions.Add(CilOpCodes.Stelem, elementType.ToTypeSignature().ToTypeDefOrRef());
                 break;
 
             case MemoryOperand memory:
