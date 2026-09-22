@@ -972,4 +972,49 @@ public class IlGeneratorTests
             Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Call));
         });
     }
+
+    [Test]
+    public void ImmediateInStructArgumentSlotEmitsDefaultOfStruct()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "UnityEngine", "Vector3", app.SystemTypes.SystemValueTypeType, System.Reflection.TypeAttributes.Public);
+        var target = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Place",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [vector]);
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CallVoid, target, new Immediate(0)),
+            new(1, OpCode.Return)]);
+        caller.Locals = [];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("StructLit.dll");
+        var vectorDef = new TypeDefinition("UnityEngine", "Vector3",
+            TypeAttributes.Public | TypeAttributes.SequentialLayout, module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType"));
+        module.TopLevelTypes.Add(vectorDef);
+        vector.PutExtraData("AsmResolverType", vectorDef);
+        var owner = new TypeDefinition("Tests", "Place", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var targetDef = new MethodDefinition("Place", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [vectorDef.ToTypeSignature()]));
+        owner.Methods.Add(targetDef);
+        target.PutExtraData("AsmResolverMethod", targetDef);
+        var definition = new MethodDefinition("Caller", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldloca));
+            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Initobj));
+            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+            Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.Call));
+        });
+    }
 }
