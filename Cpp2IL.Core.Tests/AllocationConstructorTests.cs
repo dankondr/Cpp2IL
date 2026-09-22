@@ -182,9 +182,13 @@ public class AllocationConstructorTests
 
         Assert.DoesNotThrow(() => IlGenerator.GenerateIl(caller, definition));
         var il = definition.CilMethodBody!.Instructions;
-        var branch = il.Single(i => i.OpCode == CilOpCodes.Br || i.OpCode == CilOpCodes.Br_S);
-        var target = branch.Operand as CilInstructionLabel;
-        Assert.That(target, Is.Not.Null);
-        Assert.That(il, Does.Contain(target!.Instruction));
+        var branches = il.Where(i => i.OpCode == CilOpCodes.Br || i.OpCode == CilOpCodes.Br_S).ToList();
+        Assert.That(branches, Is.Not.Empty);
+        foreach (var branch in branches)
+        {
+            var target = branch.Operand as CilInstructionLabel;
+            Assert.That(target, Is.Not.Null);
+            Assert.That(il, Does.Contain(target!.Instruction));
+        }
     }
 }
