@@ -405,7 +405,7 @@ public static class IlGenerator
                         break;
                     }
                     if (!field.Field.IsStatic)
-                        LoadLocal(field.Local, method, locals);
+                        LoadOperandIntoSlot(field.Local, field.Field.DeclaringType, context, method, locals, writeLine);
 
                     LoadOperandIntoSlot(instruction.Operands[1], field.Field.FieldType, context, method, locals, writeLine);
                     instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
@@ -416,12 +416,10 @@ public static class IlGenerator
                 // This also lets ILSpy handle it as a proper array initializer
                 if (instruction.Operands[0] is ArrayAccess { Array.Type: SzArrayTypeAnalysisContext { ElementType: { } stored } } target)
                 {
-                    LoadLocal(target.Array, method, locals);
-                    LoadOperand(target.Index, method, locals, writeLine, null, context);
+                    LoadArrayBase(target.Array, method, locals, context);
+                    LoadOperandIntoSlot(target.Index, context.AppContext.SystemTypes.SystemInt32Type, context, method, locals, writeLine);
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, stored, context);
                     CoerceOrDefault(EmittedOperandType(instruction.Operands[1], context, stored), stored, method);
-                    if (IntegralStackWidth(DestinationType(target.Index)) == 8)
-                        instructions.Add(CilOpCodes.Conv_I4);
                     instructions.Add(CilOpCodes.Stelem, stored.ToTypeSignature().ToTypeDefOrRef());
                     break;
                 }
@@ -539,6 +537,13 @@ public static class IlGenerator
                     LoadOperandIntoSlot(boxedValue is AddressOf { Target: LocalVariable byRef } ? byRef : boxedValue,
                         boxedType, context, method, locals, writeLine);
                     instructions.Add(CilOpCodes.Box, boxedType.ToTypeSignature().ToTypeDefOrRef());
+                    // `box` leaves a boxed-T reference; a slot that wants a narrower
+                    // reference still needs the castclass the contract requires.
+                    if (StoreContract(instruction.Operands[0], context) is { IsValueType: false } boxContract
+                        and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+                            or GenericParameterTypeAnalysisContext)
+                        && !IsAssignableToLoose(boxedType, boxContract) && CanEmitTypeToken(boxContract))
+                        instructions.Add(CilOpCodes.Castclass, boxContract.ToTypeSignature().ToTypeDefOrRef());
                 }
                 else
                     EmitNullOrDefault(StoreContract(instruction.Operands[0], context), method, instructions);
@@ -682,22 +687,32 @@ public static class IlGenerator
                         }
                         else if (ctorReinitReceiver == null)
                         {
-                            LoadOperand(thisOperand, method, locals, writeLine, targetMethod.DeclaringType, context);
-                            // A struct's instance `this` is a managed pointer, not the value —
-                            // coerce toward `&T` (which no stack op can forge) so a ldloca
-                            // receiver is left alone instead of being unboxed. The method's own
-                            // `this` and constructor receivers must stay a bare ldarg.0 for the
-                            // verifier, so they skip coercion entirely.
-                            if (!isOwnThis && (targetMethod.Name is not ".ctor" || structCallee != null))
+                            var thisTarget = structCallee != null
+                                ? new ByRefTypeAnalysisContext(structCallee)
+                                : targetMethod.DeclaringType;
+                            var thisEmitted = EmittedOperandType(thisOperand, context);
+                            if (isOwnThis && !StackContractSatisfied(thisEmitted, thisTarget)
+                                && TryEmitThisFieldReceiver(context, thisTarget, method))
                             {
-                                var thisEmitted = EmittedOperandType(thisOperand, context);
-                                // An unmanaged pointer to the struct is already a legal receiver.
-                                if (thisEmitted is not PointerTypeAnalysisContext)
+                                // `this` cannot be the callee's receiver, but the compiler's
+                                // own escape applies: a state machine or display class reaches
+                                // its enclosing instance through <>4__this (or another field
+                                // typed for the contract), which is what the native code passed.
+                            }
+                            else
+                            {
+                                LoadOperand(thisOperand, method, locals, writeLine, targetMethod.DeclaringType, context);
+                                // A struct's instance `this` is a managed pointer, not the value —
+                                // coerce toward `&T` (which no stack op can forge) so a ldloca
+                                // receiver is left alone instead of being unboxed. The method's own
+                                // `this` must stay a bare ldarg.0 when it already satisfies the
+                                // callee - only a provable contract mismatch earns a coercion.
+                                if ((!isOwnThis && (targetMethod.Name is not ".ctor" || structCallee != null))
+                                    || (isOwnThis && !StackContractSatisfied(thisEmitted, thisTarget)))
                                 {
-                                    var thisTarget = structCallee != null
-                                        ? new ByRefTypeAnalysisContext(structCallee)
-                                        : targetMethod.DeclaringType;
-                                    CoerceOrDefault(thisEmitted, thisTarget, method);
+                                    // An unmanaged pointer to the struct is already a legal receiver.
+                                    if (thisEmitted is not PointerTypeAnalysisContext)
+                                        CoerceOrDefault(thisEmitted, thisTarget, method);
                                 }
                             }
                         }
@@ -757,6 +772,8 @@ public static class IlGenerator
                     instructions.Add(CilOpCodes.Newobj, importedMethod);
                     if (instruction.OpCode == OpCode.Call)
                         instructions.Add(CilOpCodes.Dup); // the constructed object is also the call result
+                    EmitStackCoerceOrDefault(targetMethod.DeclaringType,
+                        StoreContract(ctorReinitReceiver, context), method);
                     StoreToOperand(ctorReinitReceiver, method, locals, writeLine, context);
                     if (instruction.OpCode == OpCode.Call)
                     {
@@ -2007,7 +2024,7 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Castclass, referenceCast.Type.ToTypeSignature().ToTypeDefOrRef());
                 break;
             case ArrayLength arrayLength:
-                LoadLocal(arrayLength.Array, method, locals);
+                LoadArrayBase(arrayLength.Array, method, locals, callingContext);
                 instructions.Add(CilOpCodes.Ldlen);
                 instructions.Add(CilOpCodes.Conv_I4);
                 break;
@@ -2024,24 +2041,22 @@ public static class IlGenerator
                     break;
                 }
                 if (!addressedField.Field.IsStatic)
-                    LoadLocal(addressedField.Local, method, locals);
+                    LoadOperandIntoSlot(addressedField.Local, addressedField.Field.DeclaringType,
+                        callingContext, method, locals, writeLine);
                 instructions.Add(addressedField.Field.IsStatic ? CilOpCodes.Ldsflda : CilOpCodes.Ldflda,
                     addressedField.Field.ToFieldDescriptor());
                 break;
             case AddressOf { Target: ArrayAccess elementAddress }:
-                LoadLocal(elementAddress.Array, method, locals);
-                LoadOperand(elementAddress.Index, method, locals, writeLine, null, callingContext);
-                // ldelema takes an i4 or native-int index; a wider index must narrow.
-                if (IntegralStackWidth(DestinationType(elementAddress.Index)) == 8)
-                    instructions.Add(CilOpCodes.Conv_I4);
+                LoadArrayBase(elementAddress.Array, method, locals, callingContext);
+                LoadOperandIntoSlot(elementAddress.Index, callingContext.AppContext.SystemTypes.SystemInt32Type,
+                    callingContext, method, locals, writeLine);
                 instructions.Add(CilOpCodes.Ldelema,
                     ((SzArrayTypeAnalysisContext)elementAddress.Array.Type!).ElementType.ToTypeSignature().ToTypeDefOrRef());
                 break;
             case ArrayAccess arrayAccess:
-                LoadLocal(arrayAccess.Array, method, locals);
-                LoadOperand(arrayAccess.Index, method, locals, writeLine, null, callingContext);
-                if (IntegralStackWidth(DestinationType(arrayAccess.Index)) == 8)
-                    instructions.Add(CilOpCodes.Conv_I4);
+                LoadArrayBase(arrayAccess.Array, method, locals, callingContext);
+                LoadOperandIntoSlot(arrayAccess.Index, callingContext.AppContext.SystemTypes.SystemInt32Type,
+                    callingContext, method, locals, writeLine);
                 instructions.Add(CilOpCodes.Ldelem,
                     ((SzArrayTypeAnalysisContext)arrayAccess.Array.Type!).ElementType.ToTypeSignature().ToTypeDefOrRef());
                 break;
@@ -2223,6 +2238,8 @@ public static class IlGenerator
             instructions.Add(CilOpCodes.Ceq);
         }
 
+        EmitStackCoerceOrDefault(context.AppContext.SystemTypes.SystemInt32Type,
+            StoreContract(instruction.Operands[0], context), method);
         StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
         return true;
     }
@@ -2358,12 +2375,15 @@ public static class IlGenerator
             return IsNativeHandleType(parameter.ParameterType)
                 ? context.AppContext.SystemTypes.SystemIntPtrType
                 : parameter.ParameterType;
+        // `this` loads use ldarg.0, whose stack type is the declaring type (a managed
+        // pointer to it for value-type methods) - even when the lifter tagged the
+        // local with the bare struct type, the address is what lands on the stack.
+        if (local.IsThis && context.DeclaringType is { } thisDeclaring)
+            return thisDeclaring.IsValueType ? new ByRefTypeAnalysisContext(thisDeclaring) : thisDeclaring;
         if (local.Type != null && local.Type != context.AppContext.SystemTypes.SystemVoidType)
             return IsNativeHandleType(local.Type) ? context.AppContext.SystemTypes.SystemIntPtrType : local.Type;
-        // `this` loads use ldarg.0, whose stack type is the declaring type (a managed
-        // pointer to it for value-type methods), even when ISIL leaves the local untyped.
         if (context.DeclaringType is { } declaringType
-            && (local.IsThis || !context.IsStatic && ReferenceEquals(local, context.ParameterLocals.FirstOrDefault())))
+            && !context.IsStatic && ReferenceEquals(local, context.ParameterLocals.FirstOrDefault()))
             return declaringType.IsValueType ? new ByRefTypeAnalysisContext(declaringType) : declaringType;
         if (IsBooleanEmissionLocal(local, context))
             return context.AppContext.SystemTypes.SystemBooleanType;
@@ -2663,10 +2683,9 @@ public static class IlGenerator
             || !IsZeroConstant(instruction.Operands[operandIndex])) return null;
         var otherOperand = instruction.Operands[3 - operandIndex];
         // Untyped locals may be inferred as numeric by NumericLocalTypes; the emitted
-        // local type, not the raw analysis type, is the real stack contract.
-        var otherType = otherOperand is LocalVariable otherLocal
-            ? EmittedLocalType(otherLocal, context)
-            : DestinationType(otherOperand);
+        // stack type, not the raw analysis type, is the real stack contract. Memory
+        // dereferences report their referent here the same way locals report theirs.
+        var otherType = EmittedOperandType(otherOperand, context);
         // Untyped locals are emitted as System.Object. Match the actual CIL local contract so a
         // zero equality test is a reference-null comparison rather than invalid object-vs-I4 IL.
         if (otherType == null && otherOperand is LocalVariable)
@@ -2701,7 +2720,12 @@ public static class IlGenerator
     // emitted type even though the memory operand itself declares none.
     private static TypeAnalysisContext? StoreContract(IOperand destination, MethodAnalysisContext context)
     {
-        var declared = DestinationType(destination);
+        // `this` is the one local whose declared type is not what `stloc` sees:
+        // ldarg.0/stloc on a struct method's this moves a managed pointer, so the
+        // store contract is the emitted type, not the bare struct.
+        var declared = destination is LocalVariable { IsThis: true }
+            ? null
+            : DestinationType(destination);
         if (declared != null)
             return declared;
         return destination switch
@@ -2756,6 +2780,13 @@ public static class IlGenerator
             StaticFieldStorageTypeAnalysisContext or RgctxTableTypeAnalysisContext
                 or MethodRgctxTableTypeAnalysisContext
                 => context.AppContext.SystemTypes.SystemIntPtrType,
+            // A deterministic memory dereference pushes whatever LoadOperand emits:
+            // ldind.i for pointer referents, ldobj/ldind.ref for managed ones.
+            MemoryOperand memory => TryGetDeterministicMemoryReferent(memory, expectedType, out var referent)
+                ? referent is PointerTypeAnalysisContext or ByRefTypeAnalysisContext
+                    ? context.AppContext.SystemTypes.SystemIntPtrType
+                    : referent
+                : null,
             // A bare type operand (ldtoken): LoadOperand emits ldtoken + GetTypeFromHandle
             // for ordinary contracts, the bare handle for RuntimeTypeHandle, or a native
             // pointer for handle contracts — report what is actually pushed.
@@ -2892,7 +2923,9 @@ public static class IlGenerator
         }
 
         // A managed pointer read back as a value is an honest dereference: ldobj on
-        // an exact element match, ldind.ref for reference targets.
+        // an exact element match, ldind.ref for reference targets. Neither deref
+        // finishes the job by itself - the value on the stack is still the
+        // element type, so the element still has to satisfy the slot's contract.
         if (from is ByRefTypeAnalysisContext byRef && to is not ByRefTypeAnalysisContext
             && fromWidth == -1 && !convertByRef)
         {
@@ -2910,26 +2943,20 @@ public static class IlGenerator
                     return EmitStackCoerce(byRef.ElementType, to, method);
                 }
             }
-            else if (!byRef.ElementType.IsValueType)
+            else if (byRef.ElementType is { IsValueType: false }
+                and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext))
             {
+                // ldind.ref yields the element reference; a narrowing slot
+                // still needs the castclass the contract requires.
                 instructions.Add(CilOpCodes.Ldind_Ref);
-                // ldind.ref yields the element reference; a narrower reference slot
-                // still needs the same castclass a plain value would.
-                if (!IsAssignableToLoose(byRef.ElementType, to) && CanEmitTypeToken(to))
-                    instructions.Add(CilOpCodes.Castclass, to.ToTypeSignature().ToTypeDefOrRef());
-                return true;
+                return EmitStackCoerce(byRef.ElementType, to, method);
             }
-            // A value-type element reaches a reference slot only through ldobj+box,
-            // and only where the boxed type is genuinely assignable to the slot -
-            // an enum receiver for System.Enum::ToString is the common case. An
-            // unrelated value type stays unbridgeable so the caller's honest
-            // default replaces it instead of fabricating a conversion.
-            else if (IsAssignableToLoose(byRef.ElementType, to) && CanEmitTypeToken(byRef.ElementType))
+            else if (byRef.ElementType is { IsValueType: true } && CanEmitTypeToken(byRef.ElementType))
             {
-                var elementToken = byRef.ElementType.ToTypeSignature().ToTypeDefOrRef();
-                instructions.Add(CilOpCodes.Ldobj, elementToken);
-                instructions.Add(CilOpCodes.Box, elementToken);
-                return true;
+                // `&T` with a value element reaching a reference slot reads the
+                // value and lets the normal value->reference sequence box it.
+                instructions.Add(CilOpCodes.Ldobj, byRef.ElementType.ToTypeSignature().ToTypeDefOrRef());
+                return EmitStackCoerce(byRef.ElementType, to, method);
             }
 
             // The slot wants an integer; the address itself is the honest value there.
@@ -3066,6 +3093,33 @@ public static class IlGenerator
         return true;
     }
 
+    // The callee's receiver is provably not `this`, but the compiler keeps the
+    // instance the native code actually passed inside the declaring type itself:
+    // state machines and display classes reach their enclosing instance through
+    // `<>4__this`, and any other contract-typed field is the same kind of slot.
+    // Emits `ldarg.0; ldfld` (plus any residual coercion) and returns true;
+    // false when no usable field fits the contract.
+    private static bool TryEmitThisFieldReceiver(MethodAnalysisContext context, TypeAnalysisContext? contract,
+        MethodDefinition method)
+    {
+        if (context.IsStatic || context.DeclaringType is not { } declaringType || contract == null)
+            return false;
+
+        var usableFields = InstanceFields(declaringType)
+            .Where(field => !field.IsStatic && FieldUsableFrom(field, context))
+            .ToList();
+        var match = usableFields.FirstOrDefault(field =>
+                ThisConstructorCallPlan.SameTypeIdentity(field.FieldType, contract))
+            ?? usableFields.FirstOrDefault(field => StackAssignableTo(field.FieldType, contract));
+        if (match == null)
+            return false;
+
+        method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldarg_0);
+        method.CilMethodBody.Instructions.Add(CilOpCodes.Ldfld, match.ToFieldDescriptor());
+        CoerceOrDefault(match.FieldType, contract, method);
+        return true;
+    }
+
     private static CilLocalVariable? UniqueLocalOfType(Dictionary<LocalVariable, CilLocalVariable> locals,
         MethodAnalysisContext context, TypeAnalysisContext type)
     {
@@ -3143,13 +3197,16 @@ public static class IlGenerator
             if (convertByRef && toWidth != 0)
                 return true; // conv.i lands the native-int kind, then width rules apply
             if (from is ByRefTypeAnalysisContext byRef)
-                // A reference element reaches any reference slot through ldind.ref plus
-                // the narrowing cast a plain value would need; a value-type element
-                // needs ldobj+box, which honestly lands only where the boxed type is
-                // assignable. Anything else emits nothing and stays uncoercible.
+                // Mirror EmitStackCoerce: ldobj on an exact element match (or an
+                // integral element into a numeric slot), conv.i when the slot
+                // takes the raw address, ldind.ref + element coerce for a
+                // reference element, and ldobj + box for a value element into a
+                // reference slot.
                 return to.IsValueType
-                    ? byRef.ElementType.FullName == to.FullName
-                    : !byRef.ElementType.IsValueType || IsAssignableToLoose(byRef.ElementType, to);
+                    ? byRef.ElementType.FullName == to.FullName && CanEmitTypeToken(to)
+                        || toWidth != 0
+                    : byRef.ElementType is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+                        && (!byRef.ElementType.IsValueType || CanEmitTypeToken(byRef.ElementType));
             // An unmanaged pointer is a native int: numeric coercions apply but it
             // can never box, unbox or castclass into a managed slot.
             return toWidth != 0;
@@ -3784,13 +3841,25 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldflda, field.Field.ToFieldDescriptor());
                 return true;
             case ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } access:
-                LoadLocal(access.Array, method, locals);
-                LoadOperand(access.Index, method, locals, writeLine, null, context);
+                LoadArrayBase(access.Array, method, locals, context);
+                LoadOperandIntoSlot(access.Index, context.AppContext.SystemTypes.SystemInt32Type,
+                    context, method, locals, writeLine);
                 instructions.Add(CilOpCodes.Ldelema, array.ElementType.ToTypeSignature().ToTypeDefOrRef());
                 return true;
             default:
                 return false;
         }
+    }
+
+    // The array an element access was lifted through always declares SzArray, but the
+    // local it was coalesced into can carry a narrower or wrong type (register reuse
+    // packs scalars into array slots). ldelem/ldelema/ldlen/stelem all need the real
+    // array type on the stack, so coerce the base to the operand's own array type.
+    private static void LoadArrayBase(LocalVariable array, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, MethodAnalysisContext context)
+    {
+        LoadLocal(array, method, locals);
+        CoerceOrDefault(EmittedLocalType(array, context), array.Type, method);
     }
 
     private static void LoadLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
@@ -3859,10 +3928,9 @@ public static class IlGenerator
                 method.CilMethodBody!.LocalVariables.Add(elementScratch);
 
                 instructions.Add(CilOpCodes.Stloc, elementScratch);
-                LoadLocal(arrayAccess.Array, method, locals);
-                LoadOperand(arrayAccess.Index, method, locals, writeLine, null, context);
-                if (IntegralStackWidth(DestinationType(arrayAccess.Index)) == 8)
-                    instructions.Add(CilOpCodes.Conv_I4);
+                LoadArrayBase(arrayAccess.Array, method, locals, context);
+                LoadOperandIntoSlot(arrayAccess.Index, context.AppContext.SystemTypes.SystemInt32Type,
+                    context, method, locals, writeLine);
                 instructions.Add(CilOpCodes.Ldloc, elementScratch);
                 instructions.Add(CilOpCodes.Stelem, elementType.ToTypeSignature().ToTypeDefOrRef());
                 break;
