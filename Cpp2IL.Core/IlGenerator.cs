@@ -391,6 +391,7 @@ public static class IlGenerator
                 {
                     LoadLocal(address, method, locals);
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, referent, context);
+                    CoerceOrDefault(EmittedOperandType(instruction.Operands[1], context, referent), referent, method);
                     instructions.Add(CilOpCodes.Stind_Ref);
                     break;
                 }
@@ -407,7 +408,7 @@ public static class IlGenerator
                         LoadLocal(field.Local, method, locals);
 
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, field.Field.FieldType, context);
-                    EmitStackCoerce(EmittedOperandType(instruction.Operands[1], context, field.Field.FieldType), field.Field.FieldType, method);
+                    CoerceOrDefault(EmittedOperandType(instruction.Operands[1], context, field.Field.FieldType), field.Field.FieldType, method);
                     instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
                     break;
                 }
@@ -419,14 +420,14 @@ public static class IlGenerator
                     LoadLocal(target.Array, method, locals);
                     LoadOperand(target.Index, method, locals, writeLine, null, context);
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, stored, context);
-                    EmitStackCoerce(EmittedOperandType(instruction.Operands[1], context, stored), stored, method);
+                    CoerceOrDefault(EmittedOperandType(instruction.Operands[1], context, stored), stored, method);
                     instructions.Add(CilOpCodes.Stelem, stored.ToTypeSignature().ToTypeDefOrRef());
                     break;
                 }
 
                 var moveDestinationType = StoreContract(instruction.Operands[0], context);
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, moveDestinationType, context);
-                EmitStackCoerce(EmittedOperandType(instruction.Operands[1], context, moveDestinationType), moveDestinationType, method);
+                CoerceOrDefault(EmittedOperandType(instruction.Operands[1], context, moveDestinationType), moveDestinationType, method);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 break;
 
@@ -434,17 +435,21 @@ public static class IlGenerator
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, null, context);
                 instructions.Add(CilOpCodes.Conv_I4);
                 instructions.Add(CilOpCodes.Conv_I8);
-                EmitStackCoerce(context.AppContext.SystemTypes.SystemInt64Type,
+                CoerceOrDefault(context.AppContext.SystemTypes.SystemInt64Type,
                     StoreContract(instruction.Operands[0], context), method);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 break;
 
             case OpCode.NewArr:
+                var newArrayDestination = StoreContract(instruction.Operands[0], context);
                 if (instruction.Operands is [_, SzArrayTypeAnalysisContext { ElementType: { } newArrayElement }, { } length])
                 {
                     LoadOperand(length, method, locals, writeLine, null, context);
                     instructions.Add(CilOpCodes.Newarr, newArrayElement.ToTypeSignature().ToTypeDefOrRef());
+                    CoerceOrDefault(new SzArrayTypeAnalysisContext(newArrayElement), newArrayDestination, method);
                 }
+                else if (newArrayDestination is { IsValueType: true } && CanEmitTypeToken(newArrayDestination))
+                    EmitDefaultValueLocal(newArrayDestination, method, instructions);
                 else
                     instructions.Add(CilOpCodes.Ldnull);
 
@@ -454,12 +459,12 @@ public static class IlGenerator
             case OpCode.Newobj:
                 // Try and fuse our Newobj + the follow up constructor CallVoid into one IL newobj.
                 // If we can't, just fall back to an Ldnull.
+                var allocatedDestination = StoreContract(instruction.Operands[0], context);
                 if (constructorPairs.TryGetValue(instruction, out var constructorCall)
                     && constructorCall.Operands is [MethodAnalysisContext constructor, _, ..])
                 {
                     constructor = Analysis.AllocationConstructorRecovery.Resolve(instruction, constructor) ?? constructor;
-                    constructor = ThisConstructorCallPlan.RetargetToDestinationInstantiation(constructor,
-                            StoreContract(instruction.Operands[0], context))
+                    constructor = ThisConstructorCallPlan.RetargetToDestinationInstantiation(constructor, allocatedDestination)
                         ?? constructor;
                     // Operands run [ctor, newObject, arguments..., methodInfo], so take only as many as
                     // the constructor declares (i.e. drop methodInfo)
@@ -467,10 +472,11 @@ public static class IlGenerator
                     for (var i = 0; i < constructorArgs.Count; i++)
                     {
                         LoadOperand(constructorArgs[i], method, locals, writeLine, constructor.Parameters[i].ParameterType, context);
-                        EmitStackCoerce(EmittedOperandType(constructorArgs[i], context, constructor.Parameters[i].ParameterType), constructor.Parameters[i].ParameterType, method);
+                        CoerceOrDefault(EmittedOperandType(constructorArgs[i], context, constructor.Parameters[i].ParameterType), constructor.Parameters[i].ParameterType, method);
                     }
 
                     instructions.Add(CilOpCodes.Newobj, constructor.ToMethodDescriptor());
+                    CoerceOrDefault(constructor.DeclaringType, allocatedDestination, method);
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
 
                     constructorCall.OpCode = OpCode.Nop;
@@ -479,15 +485,18 @@ public static class IlGenerator
                 else if (instruction.Operands is [_, TypeAnalysisContext allocatedType] && allocatedType.Methods.FirstOrDefault(m => m is { Name: ".ctor", Parameters.Count: 0 }) is { } parameterlessCtor)
                 {
                     // Nothing to fuse with, so the allocation was self-contained. The type is still right, so construct it bare.
-                    parameterlessCtor = ThisConstructorCallPlan.RetargetToDestinationInstantiation(parameterlessCtor,
-                            StoreContract(instruction.Operands[0], context))
+                    parameterlessCtor = ThisConstructorCallPlan.RetargetToDestinationInstantiation(parameterlessCtor, allocatedDestination)
                         ?? parameterlessCtor;
                     instructions.Add(CilOpCodes.Newobj, parameterlessCtor.ToMethodDescriptor());
+                    CoerceOrDefault(parameterlessCtor.DeclaringType, allocatedDestination, method);
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 }
                 else
                 {
-                    instructions.Add(CilOpCodes.Ldnull);
+                    if (allocatedDestination is { IsValueType: true } && CanEmitTypeToken(allocatedDestination))
+                        EmitDefaultValueLocal(allocatedDestination, method, instructions);
+                    else
+                        instructions.Add(CilOpCodes.Ldnull);
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 }
                 break;
@@ -496,7 +505,9 @@ public static class IlGenerator
                 if (instruction.Operands is [_, TypeAnalysisContext boxedType, var boxedValue])
                 {
                     // il2cpp_value_box takes the value by address, but IL boxes it by value
-                    LoadOperand(boxedValue is AddressOf { Target: LocalVariable byRef } ? byRef : boxedValue, method, locals, writeLine, boxedType, context);
+                    var boxedOperand = boxedValue is AddressOf { Target: LocalVariable byRef } ? byRef : boxedValue;
+                    LoadOperand(boxedOperand, method, locals, writeLine, boxedType, context);
+                    CoerceOrDefault(EmittedOperandType(boxedOperand, context, boxedType), boxedType, method);
                     instructions.Add(CilOpCodes.Box, boxedType.ToTypeSignature().ToTypeDefOrRef());
                 }
                 else
@@ -510,7 +521,11 @@ public static class IlGenerator
                     && exceptionType.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0) is { } exceptionCtor)
                     instructions.Add(CilOpCodes.Newobj, exceptionCtor.ToMethodDescriptor());
                 else if (instruction.Operands is [LocalVariable or FieldReference])
-                    LoadOperand(instruction.Operands[0], method, locals, writeLine, null, context);
+                {
+                    LoadOperand(instruction.Operands[0], method, locals, writeLine, null, context); // an already-constructed exception
+                    CoerceOrDefault(EmittedOperandType(instruction.Operands[0], context),
+                        context.AppContext.SystemTypes.SystemExceptionType, method);
+                }
                 else
                     instructions.Add(CilOpCodes.Ldnull);
 
@@ -541,11 +556,16 @@ public static class IlGenerator
                     for (var i = 0; i < stringConstructor.Parameters.Count; i++)
                     {
                         LoadOperand(instruction.Operands[firstArgument + i], method, locals, writeLine, stringConstructor.Parameters[i].ParameterType, context);
-                        EmitStackCoerce(EmittedOperandType(instruction.Operands[firstArgument + i], context, stringConstructor.Parameters[i].ParameterType), stringConstructor.Parameters[i].ParameterType, method);
+                        CoerceOrDefault(EmittedOperandType(instruction.Operands[firstArgument + i], context, stringConstructor.Parameters[i].ParameterType), stringConstructor.Parameters[i].ParameterType, method);
                     }
                     instructions.Add(CilOpCodes.Newobj, stringConstructor.ToMethodDescriptor());
                     if (instruction.OpCode == OpCode.Call)
+                    {
+                        CoerceOrDefault(stringConstructor.DeclaringType,
+                            StoreContract(instruction.Operands[1], context),
+                            method);
                         StoreToOperand(instruction.Operands[1], method, locals, writeLine, context);
+                    }
                     else
                         instructions.Add(CilOpCodes.Pop);
                     break;
@@ -581,6 +601,11 @@ public static class IlGenerator
 
                 if (!targetMethod.IsStatic) // Load 'this' param
                 {
+                    // A struct's instance `this` is a managed pointer to that struct.
+                    var structCallee = targetMethod.Name is not ".ctor"
+                        && targetMethod.DeclaringType is { IsValueType: true } structDeclaring
+                            ? structDeclaring
+                            : null;
                     if ((instruction.Operands.Count - 1) >= thisParamIndex)
                     {
                         var thisOperand = instruction.Operands[thisParamIndex];
@@ -594,13 +619,21 @@ public static class IlGenerator
                             && locals.TryGetValue(receiverLocal, out var foundReceiver)
                                 ? foundReceiver
                                 : null;
-                        var structReceiver = targetMethod.Name is not ".ctor" && !isOwnThis
-                            && targetMethod.DeclaringType is { IsValueType: true } structDeclaring
-                            && receiverCilLocal != null
+                        if (!isOwnThis && structCallee != null && receiverCilLocal != null
                             && thisOperand is LocalVariable typedReceiverLocal
-                            && ThisConstructorCallPlan.SameTypeIdentity(EmittedLocalType(typedReceiverLocal, context), structDeclaring);
-                        if (structReceiver)
+                            && ThisConstructorCallPlan.SameTypeIdentity(EmittedLocalType(typedReceiverLocal, context), structCallee))
                             instructions.Add(CilOpCodes.Ldloca, receiverCilLocal);
+                        else if (!isOwnThis && structCallee != null
+                            && !ReceiverEmitsStructAddress(thisOperand, context, structCallee))
+                        {
+                            // Catch/finally register reuse can leave a lost or mistyped
+                            // operand in the receiver slot (an exception object, the loop
+                            // boolean, a dropped constant); none of them can form `&T`.
+                            // The unique local of the struct type is the slot the native
+                            // code used; a fresh default local is the honest fallback.
+                            if (!EmitFallbackStructReceiver(structCallee, context, method, locals))
+                                LoadOperand(thisOperand, method, locals, writeLine, targetMethod.DeclaringType, context);
+                        }
                         else
                         {
                             LoadOperand(thisOperand, method, locals, writeLine, targetMethod.DeclaringType, context);
@@ -612,10 +645,14 @@ public static class IlGenerator
                             if (targetMethod.Name is not ".ctor" && !isOwnThis)
                             {
                                 var thisEmitted = EmittedOperandType(thisOperand, context);
-                                var thisTarget = targetMethod.DeclaringType is { IsValueType: true } declaringStruct
-                                    ? new ByRefTypeAnalysisContext(declaringStruct)
-                                    : targetMethod.DeclaringType;
-                                EmitStackCoerce(thisEmitted, thisTarget, method);
+                                // An unmanaged pointer to the struct is already a legal receiver.
+                                if (thisEmitted is not PointerTypeAnalysisContext)
+                                {
+                                    var thisTarget = structCallee != null
+                                        ? new ByRefTypeAnalysisContext(structCallee)
+                                        : targetMethod.DeclaringType;
+                                    CoerceOrDefault(thisEmitted, thisTarget, method);
+                                }
                             }
                         }
                     }
@@ -623,7 +660,8 @@ public static class IlGenerator
                     {
                         instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Non static method called without 'this' param ({instruction})"));
                         instructions.Add(CilOpCodes.Call, writeLine);
-                        instructions.Add(CilOpCodes.Ldnull);
+                        if (structCallee == null || !EmitFallbackStructReceiver(structCallee, context, method, locals))
+                            instructions.Add(CilOpCodes.Ldnull);
                     }
                 }
 
@@ -664,7 +702,7 @@ public static class IlGenerator
                         else
                         {
                             LoadOperand(argumentOperand, method, locals, writeLine, parameterType, context);
-                            EmitStackCoerce(EmittedOperandType(argumentOperand, context, parameterType), parameterType, method);
+                            CoerceOrDefault(EmittedOperandType(argumentOperand, context, parameterType), parameterType, method);
                         }
                     }
                     else
@@ -682,7 +720,7 @@ public static class IlGenerator
                 {
                     if (instruction.OpCode == OpCode.Call)
                     {
-                        EmitStackCoerce(targetMethod.ReturnType,
+                        CoerceOrDefault(targetMethod.ReturnType,
                             StoreContract(instruction.Operands[1], context),
                             method);
                         StoreToOperand(instruction.Operands[1], method, locals, writeLine, context);
@@ -715,8 +753,10 @@ public static class IlGenerator
                     if (instruction.Operands.Count == 1)
                     {
                         LoadOperand(instruction.Operands[0], method, locals, writeLine, context.ReturnType, context);
-                        EmitStackCoerce(EmittedOperandType(instruction.Operands[0], context, context.ReturnType), context.ReturnType, method);
+                        CoerceOrDefault(EmittedOperandType(instruction.Operands[0], context, context.ReturnType), context.ReturnType, method);
                     }
+                    else if (context.ReturnType is { IsValueType: true } returnValueType && CanEmitTypeToken(returnValueType))
+                        EmitDefaultValueLocal(returnValueType, method, instructions);
                     else
                         instructions.Add(CilOpCodes.Ldnull); // ret still pops a value even if we lost track of it
                 }
@@ -815,7 +855,7 @@ public static class IlGenerator
                         instructions.Add(CilOpCodes.Ldfld, resolvedField.ToFieldDescriptor());
                         fieldResult = resolvedField.FieldType;
                     }
-                    EmitStackCoerce(fieldResult, fieldContract, method);
+                    CoerceOrDefault(fieldResult, fieldContract, method);
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                     break;
                 }
@@ -843,7 +883,7 @@ public static class IlGenerator
                     EmitStackCoerce(EmittedOperandType(instruction.Operands[1], context, floatTarget),
                         floatTarget, method);
                 else
-                    EmitStackCoerce(EmittedOperandType(instruction.Operands[1], context, operandType), operandType, method,
+                    CoerceOrDefault(EmittedOperandType(instruction.Operands[1], context, operandType), operandType, method,
                         instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual
                             or OpCode.Add or OpCode.Subtract);
                 // shl/shr take an i32/n-int shift amount, not the value type.
@@ -856,7 +896,7 @@ public static class IlGenerator
                     EmitStackCoerce(EmittedOperandType(instruction.Operands[2], context, floatTarget),
                         floatTarget, method);
                 else
-                    EmitStackCoerce(EmittedOperandType(instruction.Operands[2], context, operand2Type), operand2Type, method,
+                    CoerceOrDefault(EmittedOperandType(instruction.Operands[2], context, operand2Type), operand2Type, method,
                         instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual
                             or OpCode.Add or OpCode.Subtract);
 
@@ -924,7 +964,7 @@ public static class IlGenerator
                 var resultType = instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual
                     ? context.AppContext.SystemTypes.SystemInt32Type
                     : operandType ?? EmittedOperandType(instruction.Operands[1], context);
-                EmitStackCoerce(resultType,
+                CoerceOrDefault(resultType,
                     StoreContract(instruction.Operands[0], context),
                     method);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
@@ -978,7 +1018,7 @@ public static class IlGenerator
                 else
                     instructions.Add(CilOpCodes.Not);
 
-                EmitStackCoerce(unaryResultType, StoreContract(instruction.Operands[0], context), method);
+                CoerceOrDefault(unaryResultType, StoreContract(instruction.Operands[0], context), method);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 break;
             }
@@ -2212,9 +2252,10 @@ public static class IlGenerator
         || type is { IsEnumType: true, DefaultEnumUnderlyingType: { } underlying } && IsUnsignedType(underlying);
 
     // Emits the conversion needed to make a value of `from` acceptable where `to` is
-    // required: primitive width change, box, unbox or reference cast. No-ops whenever
-    // the stack contract already matches or no legal conversion exists.
-    private static void EmitStackCoerce(TypeAnalysisContext? from, TypeAnalysisContext? to, MethodDefinition method,
+    // required: primitive width change, box, unbox or reference cast. Returns false
+    // when no legal conversion exists and the value still does not satisfy `to`;
+    // callers then drop the unrepresentable value and fill the slot honestly.
+    private static bool EmitStackCoerce(TypeAnalysisContext? from, TypeAnalysisContext? to, MethodDefinition method,
         bool convertByRef = false)
     {
         // Handle contexts have no managed stack type of their own; everything below
@@ -2225,21 +2266,22 @@ public static class IlGenerator
             to = to.AppContext.SystemTypes.SystemIntPtrType;
 
         if (from == null || to == null || from.FullName == to.FullName)
-            return;
+            return true;
 
         // No stack op synthesizes a generic-parameter or byref value from another kind.
         if (to is GenericParameterTypeAnalysisContext or ByRefTypeAnalysisContext)
-            return;
+            return false;
 
         var instructions = method.CilMethodBody!.Instructions;
 
         // A generic-parameter value into a reference slot boxes like any value
-        // type; box !T is the standard generic-store sequence.
+        // type; box !T is the standard generic-store sequence. A value-type slot
+        // cannot take !T by any stack op, so that pairing stays unbridgeable.
         if (from is GenericParameterTypeAnalysisContext)
         {
             if (!to.IsValueType && CanEmitTypeToken(from))
                 instructions.Add(CilOpCodes.Box, from.ToTypeSignature().ToTypeDefOrRef());
-            return;
+            return !to.IsValueType;
         }
         var fromWidth = IntegralStackWidth(from);
         var toWidth = IntegralStackWidth(to);
@@ -2261,30 +2303,49 @@ public static class IlGenerator
             if (to.IsValueType)
             {
                 if (byRef.ElementType.FullName == to.FullName && CanEmitTypeToken(to))
+                {
                     instructions.Add(CilOpCodes.Ldobj, to.ToTypeSignature().ToTypeDefOrRef());
-                else if (IntegralStackWidth(byRef.ElementType) > 0 && toWidth != 0
+                    return true;
+                }
+                if (IntegralStackWidth(byRef.ElementType) > 0 && toWidth != 0
                     && CanEmitTypeToken(byRef.ElementType))
                 {
                     instructions.Add(CilOpCodes.Ldobj, byRef.ElementType.ToTypeSignature().ToTypeDefOrRef());
-                    EmitStackCoerce(byRef.ElementType, to, method);
+                    return EmitStackCoerce(byRef.ElementType, to, method);
                 }
             }
             else if (!byRef.ElementType.IsValueType)
+            {
                 instructions.Add(CilOpCodes.Ldind_Ref);
-            return;
+                return true;
+            }
+
+            // The slot wants an integer; the address itself is the honest value there.
+            // `&` only converts through conv.i, so narrower slots truncate the
+            // resulting native int with a second legal conversion.
+            if (toWidth != 0)
+            {
+                instructions.Add(CilOpCodes.Conv_I);
+                if (toWidth == 8)
+                    instructions.Add(CilOpCodes.Conv_I8);
+                else if (toWidth > 0)
+                    instructions.Add(CilOpCodes.Conv_I4);
+                return true;
+            }
+            return false;
         }
 
         if (fromWidth != 0 && toWidth != 0)
         {
             if (fromWidth == toWidth)
-                return;
+                return true;
             if (toWidth < 0)
                 instructions.Add(IsUnsignedType(from) ? CilOpCodes.Conv_U : CilOpCodes.Conv_I);
             else if (toWidth == 8)
                 instructions.Add(IsUnsignedType(from) ? CilOpCodes.Conv_U8 : CilOpCodes.Conv_I8);
             else
                 instructions.Add(IsUnsignedType(from) ? CilOpCodes.Conv_U4 : CilOpCodes.Conv_I4);
-            return;
+            return true;
         }
 
         var fromIsFloat = from.FullName is "System.Single" or "System.Double";
@@ -2293,36 +2354,119 @@ public static class IlGenerator
         if (fromIsFloat && toWidth != 0)
         {
             instructions.Add(toWidth == 8 ? CilOpCodes.Conv_I8 : CilOpCodes.Conv_I4);
-            return;
+            return true;
         }
 
         if (toIsFloat)
         {
             if (fromIsFloat || fromWidth != 0)
+            {
                 instructions.Add(to.FullName == "System.Single" ? CilOpCodes.Conv_R4 : CilOpCodes.Conv_R8);
-            return;
+                return true;
+            }
+            return false;
         }
 
         if (from.IsValueType && !to.IsValueType)
         {
-            if (CanEmitTypeToken(from))
-                instructions.Add(CilOpCodes.Box, from.ToTypeSignature().ToTypeDefOrRef());
+            // Without a box token the value is left as-is: reduced fixtures retype
+            // the slot to the real primitive, and dropping real data for a guessed
+            // null is no better for the verifier.
+            if (!CanEmitTypeToken(from))
+                return true;
+            instructions.Add(CilOpCodes.Box, from.ToTypeSignature().ToTypeDefOrRef());
             // box yields a `from` reference; an interface/other-ref destination still
             // needs the narrowing cast the verifier requires.
-            if (!IsAssignableToLoose(from, to) && CanEmitTypeToken(to))
-                instructions.Add(CilOpCodes.Castclass, to.ToTypeSignature().ToTypeDefOrRef());
-            return;
+            if (IsAssignableToLoose(from, to) || !CanEmitTypeToken(to))
+                return true;
+            instructions.Add(CilOpCodes.Castclass, to.ToTypeSignature().ToTypeDefOrRef());
+            return true;
         }
 
         if (!from.IsValueType && to.IsValueType)
         {
-            if (CanEmitTypeToken(to))
-                instructions.Add(CilOpCodes.Unbox_Any, to.ToTypeSignature().ToTypeDefOrRef());
-            return;
+            if (!CanEmitTypeToken(to))
+                return true;
+            instructions.Add(CilOpCodes.Unbox_Any, to.ToTypeSignature().ToTypeDefOrRef());
+            return true;
         }
 
-        if (!from.IsValueType && !to.IsValueType && !IsAssignableToLoose(from, to) && CanEmitTypeToken(to))
+        if (!from.IsValueType && !to.IsValueType)
+        {
+            // When the cast token cannot be emitted the value is left as-is: it may
+            // still be runtime-compatible, and the verifier's complaint is no worse
+            // than dropping real data for a guessed default.
+            if (IsAssignableToLoose(from, to) || !CanEmitTypeToken(to))
+                return true;
             instructions.Add(CilOpCodes.Castclass, to.ToTypeSignature().ToTypeDefOrRef());
+            return true;
+        }
+
+        // Different value types (or a pointer kind with no legal conversion): no
+        // stack operation turns the emitted value into what the slot requires.
+        return false;
+    }
+
+    // Coerces the emitted value into the slot's contract, or - when no stack
+    // operation can bridge the types - drops it and fills the slot with the same
+    // honest default PushDefaultOf uses for operands that were lost upstream.
+    private static void CoerceOrDefault(TypeAnalysisContext? from, TypeAnalysisContext? to, MethodDefinition method,
+        bool convertByRef = false)
+    {
+        if (to == null || EmitStackCoerce(from, to, method, convertByRef))
+            return;
+        var instructions = method.CilMethodBody!.Instructions;
+        instructions.Add(CilOpCodes.Pop);
+        PushDefaultOf(to, method, instructions);
+    }
+
+    // True when the operand's emitted stack type is already a pointer to the struct a
+    // callee needs as `this`: `&T`/`T*` from an address-taken or pointer-typed operand.
+    private static bool ReceiverEmitsStructAddress(IOperand operand, MethodAnalysisContext context,
+        TypeAnalysisContext structType) => EmittedOperandType(operand, context, structType) switch
+        {
+            ByRefTypeAnalysisContext byRef => ThisConstructorCallPlan.SameTypeIdentity(byRef.ElementType, structType),
+            PointerTypeAnalysisContext pointer => ThisConstructorCallPlan.SameTypeIdentity(pointer.ElementType, structType),
+            _ => false,
+        };
+
+    // A `this` slot for a struct method needs `&T`, which no stack operation can forge
+    // from a lost or mistyped operand. When exactly one local of that struct type
+    // exists its address is the honest receiver (the foreach enumerator); otherwise a
+    // fresh default local is the only honest managed pointer to offer, same as
+    // PushDefaultOf for ref/out parameters.
+    private static bool EmitFallbackStructReceiver(TypeAnalysisContext structType, MethodAnalysisContext context,
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
+    {
+        var matched = UniqueLocalOfType(locals, context, structType);
+        if (matched != null)
+        {
+            method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldloca, matched);
+            return true;
+        }
+
+        if (!CanEmitTypeToken(structType))
+            return false;
+
+        var defaultReceiver = new CilLocalVariable(structType.ToTypeSignature());
+        method.CilMethodBody!.LocalVariables.Add(defaultReceiver);
+        method.CilMethodBody.Instructions.Add(CilOpCodes.Ldloca, defaultReceiver);
+        return true;
+    }
+
+    private static CilLocalVariable? UniqueLocalOfType(Dictionary<LocalVariable, CilLocalVariable> locals,
+        MethodAnalysisContext context, TypeAnalysisContext type)
+    {
+        CilLocalVariable? match = null;
+        foreach (var pair in locals)
+        {
+            if (!ThisConstructorCallPlan.SameTypeIdentity(EmittedLocalType(pair.Key, context), type))
+                continue;
+            if (match != null)
+                return null;
+            match = pair.Value;
+        }
+        return match;
     }
 
     // IsAssignableTo compares context objects by reference, but the emitter sees distinct
@@ -2493,7 +2637,7 @@ public static class IlGenerator
             && IntegralStackWidth(EmittedOperandType(instruction.Operands[1], context)) <= 0)
         {
             instructions.Add(CilOpCodes.Ldc_I4_0);
-            EmitStackCoerce(context.AppContext.SystemTypes.SystemInt32Type, destinationType, method);
+            CoerceOrDefault(context.AppContext.SystemTypes.SystemInt32Type, destinationType, method);
             StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
             return true;
         }
@@ -2510,7 +2654,7 @@ public static class IlGenerator
             && EmitManagedAddress(address, method, context, locals, writeLine))
         {
             instructions.Add(CilOpCodes.Ldfld, addressField.ToFieldDescriptor());
-            EmitStackCoerce(addressField.FieldType, destinationType, method);
+            CoerceOrDefault(addressField.FieldType, destinationType, method);
             StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
             return true;
         }
@@ -2526,7 +2670,7 @@ public static class IlGenerator
                 // The op applies to the low-word field only; that is exact for the
                 // masked range (and for wraps/shifts the field itself is the answer).
                 LoadOperand(otherOperand, method, locals, writeLine, fieldType, context);
-                EmitStackCoerce(EmittedOperandType(otherOperand, context, fieldType), fieldType, method);
+                CoerceOrDefault(EmittedOperandType(otherOperand, context, fieldType), fieldType, method);
                 instructions.Add(instruction.OpCode switch
                 {
                     OpCode.And => new CilInstruction(CilOpCodes.And),
@@ -2540,7 +2684,7 @@ public static class IlGenerator
                     _ => new CilInstruction(CilOpCodes.Nop),
                 });
             }
-            EmitStackCoerce(fieldType, destinationType, method);
+            CoerceOrDefault(fieldType, destinationType, method);
             StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
             return true;
         }
@@ -2673,7 +2817,14 @@ public static class IlGenerator
         var declaring = field.DeclaringType;
         if (declaring == null || callerType == null)
             return true;
-        var sameAssembly = ReferenceEquals(callerType.DeclaringAssembly, declaring.DeclaringAssembly);
+        // A field on the generic definition is still the same member when reached
+        // through an instantiation, so identity compares the definitions.
+        if (declaring is GenericInstanceTypeAnalysisContext declaringInstance)
+            declaring = declaringInstance.GenericType;
+        if (callerType is GenericInstanceTypeAnalysisContext callerInstance)
+            callerType = callerInstance.GenericType;
+        var sameAssembly = ReferenceEquals(callerType.DeclaringAssembly, declaring.DeclaringAssembly)
+            || callerType.DeclaringAssembly?.Name == declaring.DeclaringAssembly?.Name;
         var sameType = ThisConstructorCallPlan.SameTypeIdentity(declaring, callerType);
         return (attrs & FieldAttributes.FieldAccessMask) switch
         {

@@ -1271,4 +1271,150 @@ public class IlGeneratorTests
         Assert.That(calls.Any(c => c.Operand?.ToString()?.Contains("AddWithResize") == true), Is.True,
             () => string.Join("\n", method.CilMethodBody.Instructions.Select(i => i.ToString())));
     }
+
+    [Test]
+    public void MistypedStructReceiverLoadsMatchingEnumeratorAddress()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var enumerator = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "Tests", "Enumerator", app.SystemTypes.SystemValueTypeType, System.Reflection.TypeAttributes.Public);
+        var dispose = enumerator.InjectMethodContext("Dispose", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public);
+        var enumeratorLocal = new LocalVariable("enumerator", new Register(null, "enumerator")) { Type = enumerator };
+        var lostReceiver = new LocalVariable("lostReceiver", new Register(null, "lostReceiver"))
+            { Type = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.NullReferenceException")! };
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CallVoid, dispose, lostReceiver),
+            new(1, OpCode.Return)]);
+        caller.Locals = [enumeratorLocal, lostReceiver];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("StructReceiver.dll");
+        var enumeratorDefinition = new TypeDefinition("Tests", "Enumerator",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType"));
+        module.TopLevelTypes.Add(enumeratorDefinition);
+        enumerator.PutExtraData("AsmResolverType", enumeratorDefinition);
+        var disposeDefinition = new MethodDefinition("Dispose", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        enumeratorDefinition.Methods.Add(disposeDefinition);
+        dispose.PutExtraData("AsmResolverMethod", disposeDefinition);
+        lostReceiver.Type!.PutExtraData("AsmResolverType", new TypeDefinition("System", "NullReferenceException",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type));
+        var owner = new TypeDefinition("Tests", "Host", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(method);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        var ldloca = il.Where(i => i.OpCode == CilOpCodes.Ldloca).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(ldloca, Has.Count.EqualTo(1));
+            Assert.That(ldloca[0].Operand, Is.SameAs(method.CilMethodBody.LocalVariables[0]));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldloc), Is.False);
+        });
+    }
+
+    [Test]
+    public void MistypedStructReceiverWithoutMatchingLocalGetsFreshDefaultSlot()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var enumerator = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "Tests", "Enumerator", app.SystemTypes.SystemValueTypeType, System.Reflection.TypeAttributes.Public);
+        var moveNext = enumerator.InjectMethodContext("MoveNext", app.SystemTypes.SystemBooleanType,
+            ReflectionMethodAttributes.Public);
+        var lostReceiver = new LocalVariable("lostReceiver", new Register(null, "lostReceiver"))
+            { Type = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.NullReferenceException")! };
+        var result = new LocalVariable("result", new Register(null, "result"))
+            { Type = app.SystemTypes.SystemBooleanType };
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Call, moveNext, result, lostReceiver),
+            new(1, OpCode.Return)]);
+        caller.Locals = [lostReceiver, result];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("StructReceiverDefault.dll");
+        var enumeratorDefinition = new TypeDefinition("Tests", "Enumerator",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType"));
+        module.TopLevelTypes.Add(enumeratorDefinition);
+        enumerator.PutExtraData("AsmResolverType", enumeratorDefinition);
+        var moveNextDefinition = new MethodDefinition("MoveNext", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Boolean));
+        enumeratorDefinition.Methods.Add(moveNextDefinition);
+        moveNext.PutExtraData("AsmResolverMethod", moveNextDefinition);
+        lostReceiver.Type!.PutExtraData("AsmResolverType", new TypeDefinition("System", "NullReferenceException",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type));
+        var owner = new TypeDefinition("Tests", "Host", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(method);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        var ldloca = il.Where(i => i.OpCode == CilOpCodes.Ldloca).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(method.CilMethodBody.LocalVariables, Has.Count.EqualTo(3));
+            Assert.That(ldloca, Has.Count.EqualTo(1));
+            Assert.That(ldloca[0].Operand, Is.SameAs(method.CilMethodBody.LocalVariables[2]));
+            Assert.That(method.CilMethodBody.LocalVariables[2].VariableType.FullName, Is.EqualTo("Tests.Enumerator"));
+        });
+    }
+
+    [Test]
+    public void MoveFromUnbridgeableTypeToStructSlotEmitsDefaultValue()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "UnityEngine", "Vector3", app.SystemTypes.SystemValueTypeType, System.Reflection.TypeAttributes.Public);
+        var destination = new LocalVariable("destination", new Register(null, "destination")) { Type = vector };
+        var source = new LocalVariable("source", new Register(null, "source"))
+            { Type = app.SystemTypes.SystemInt32Type };
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, destination, source),
+            new(1, OpCode.Return)]);
+        caller.Locals = [destination, source];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("UnbridgeableMove.dll");
+        var vectorDefinition = new TypeDefinition("UnityEngine", "Vector3",
+            TypeAttributes.Public | TypeAttributes.SequentialLayout,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType"));
+        module.TopLevelTypes.Add(vectorDefinition);
+        vector.PutExtraData("AsmResolverType", vectorDefinition);
+        app.SystemTypes.SystemInt32Type.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Int32", TypeAttributes.Public));
+        var owner = new TypeDefinition("Tests", "Host", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(method);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(method.CilMethodBody.LocalVariables, Has.Count.EqualTo(3));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Pop), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Initobj), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stloc), Is.True);
+        });
+    }
 }
