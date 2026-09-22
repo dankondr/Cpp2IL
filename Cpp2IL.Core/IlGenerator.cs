@@ -600,9 +600,18 @@ public static class IlGenerator
                     }
                 }
 
-                var importedMethod = targetMethod.ToMethodDescriptor();
-
                 var thisParamIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
+
+                // Shared generics erase T to object at the call site, so the resolved callee
+                // can sit on List<object> while the receiver operand emits as List<T>; when
+                // both share the generic definition, the honest callee is the receiver's
+                // instantiation (which is what the native code actually invoked).
+                if (!targetMethod.IsStatic && instruction.Operands.Count - 1 >= thisParamIndex)
+                    targetMethod = ThisConstructorCallPlan.RetargetToDestinationInstantiation(targetMethod,
+                            EmittedOperandType(instruction.Operands[thisParamIndex], context))
+                        ?? targetMethod;
+
+                var importedMethod = targetMethod.ToMethodDescriptor();
 
                 // A `call` to a reference-type .ctor on anything but `this` inside a .ctor
                 // is IL2CPP's re-init of an allocated object; emit newobj and store the fresh
@@ -1352,11 +1361,21 @@ public static class IlGenerator
         internal static MethodAnalysisContext? RetargetToDestinationInstantiation(MethodAnalysisContext constructor,
             TypeAnalysisContext? destinationType)
         {
-            if (destinationType is not GenericInstanceTypeAnalysisContext destination
-                || constructor.DeclaringType is not GenericInstanceTypeAnalysisContext source
-                || !SameTypeIdentity(source.GenericType, destination.GenericType)
-                || source.GenericArguments.Count != destination.GenericArguments.Count
-                || source.GenericArguments.Zip(destination.GenericArguments, SameTypeIdentity).All(match => match))
+            if (destinationType is ByRefTypeAnalysisContext byRefDestination)
+                destinationType = byRefDestination.ElementType;
+            if (destinationType is not GenericInstanceTypeAnalysisContext destination)
+                return null;
+
+            // The callee may sit on another instantiation of the same generic definition
+            // (shared generics erase T to object) or on the definition itself; both can be
+            // re-anchored to the destination's concrete arguments.
+            var source = constructor.DeclaringType as GenericInstanceTypeAnalysisContext;
+            var sourceDefinition = source?.GenericType ?? constructor.DeclaringType;
+            if (sourceDefinition == null
+                || !SameTypeIdentity(sourceDefinition, destination.GenericType)
+                || (source != null
+                    && (source.GenericArguments.Count != destination.GenericArguments.Count
+                        || source.GenericArguments.Zip(destination.GenericArguments, SameTypeIdentity).All(match => match))))
                 return null;
 
             var baseConstructor = constructor is ConcreteGenericMethodAnalysisContext concrete
