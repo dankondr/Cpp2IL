@@ -407,8 +407,7 @@ public static class IlGenerator
                     break;
                 }
 
-                var moveDestinationType = DestinationType(instruction.Operands[0])
-                    ?? (instruction.Operands[0] is LocalVariable local ? EmittedLocalType(local, context) : null);
+                var moveDestinationType = StoreContract(instruction.Operands[0], context);
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, moveDestinationType);
                 EmitStackCoerce(EmittedOperandType(instruction.Operands[1], context, moveDestinationType), moveDestinationType, method);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
@@ -418,6 +417,8 @@ public static class IlGenerator
                 LoadOperand(instruction.Operands[1], method, locals, writeLine);
                 instructions.Add(CilOpCodes.Conv_I4);
                 instructions.Add(CilOpCodes.Conv_I8);
+                EmitStackCoerce(context.AppContext.SystemTypes.SystemInt64Type,
+                    StoreContract(instruction.Operands[0], context), method);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
@@ -441,8 +442,7 @@ public static class IlGenerator
                 {
                     constructor = Analysis.AllocationConstructorRecovery.Resolve(instruction, constructor) ?? constructor;
                     constructor = ThisConstructorCallPlan.RetargetToDestinationInstantiation(constructor,
-                            DestinationType(instruction.Operands[0])
-                            ?? (instruction.Operands[0] is LocalVariable allocatedLocal ? EmittedLocalType(allocatedLocal, context) : null))
+                            StoreContract(instruction.Operands[0], context))
                         ?? constructor;
                     // Operands run [ctor, newObject, arguments..., methodInfo], so take only as many as
                     // the constructor declares (i.e. drop methodInfo)
@@ -463,8 +463,7 @@ public static class IlGenerator
                 {
                     // Nothing to fuse with, so the allocation was self-contained. The type is still right, so construct it bare.
                     parameterlessCtor = ThisConstructorCallPlan.RetargetToDestinationInstantiation(parameterlessCtor,
-                            DestinationType(instruction.Operands[0])
-                            ?? (instruction.Operands[0] is LocalVariable allocatedLocal ? EmittedLocalType(allocatedLocal, context) : null))
+                            StoreContract(instruction.Operands[0], context))
                         ?? parameterlessCtor;
                     instructions.Add(CilOpCodes.Newobj, parameterlessCtor.ToMethodDescriptor());
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine);
@@ -650,8 +649,7 @@ public static class IlGenerator
                     if (instruction.OpCode == OpCode.Call)
                     {
                         EmitStackCoerce(targetMethod.ReturnType,
-                            DestinationType(instruction.Operands[1])
-                            ?? (instruction.Operands[1] is LocalVariable callResult ? EmittedLocalType(callResult, context) : null),
+                            StoreContract(instruction.Operands[1], context),
                             method);
                         StoreToOperand(instruction.Operands[1], method, locals, writeLine);
                     }
@@ -837,8 +835,7 @@ public static class IlGenerator
                     ? context.AppContext.SystemTypes.SystemInt32Type
                     : operandType ?? EmittedOperandType(instruction.Operands[1], context);
                 EmitStackCoerce(resultType,
-                    DestinationType(instruction.Operands[0])
-                    ?? (instruction.Operands[0] is LocalVariable resultLocal ? EmittedLocalType(resultLocal, context) : null),
+                    StoreContract(instruction.Operands[0], context),
                     method);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
@@ -861,6 +858,10 @@ public static class IlGenerator
                 else
                     instructions.Add(CilOpCodes.Not);
 
+                var unaryResultType = instruction.OpCode == OpCode.Not && IsBoolean(instruction.Operands[1], context)
+                    ? context.AppContext.SystemTypes.SystemInt32Type
+                    : EmittedOperandType(instruction.Operands[1], context);
+                EmitStackCoerce(unaryResultType, StoreContract(instruction.Operands[0], context), method);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
@@ -1854,6 +1855,23 @@ public static class IlGenerator
         // Handle contexts are emitted as System.IntPtr, so that is the real contract
         // the stack value has to satisfy.
         return type != null && IsNativeHandleType(type) ? type.AppContext.SystemTypes.SystemIntPtrType : type;
+    }
+
+    // The contract StoreToOperand actually enforces: a bare [baseLocal] memory store
+    // degrades to `stloc` of that local, so its slot contract is the base local's
+    // emitted type even though the memory operand itself declares none.
+    private static TypeAnalysisContext? StoreContract(IOperand destination, MethodAnalysisContext context)
+    {
+        var declared = DestinationType(destination);
+        if (declared != null)
+            return declared;
+        return destination switch
+        {
+            LocalVariable local => EmittedLocalType(local, context),
+            MemoryOperand { Index: null, Addend: 0, Scale: 0, Base: LocalVariable { Type: not ByRefTypeAnalysisContext } baseLocal }
+                => EmittedLocalType(baseLocal, context),
+            _ => null
+        };
     }
 
     // The stack type an operand produces once emitted, before any coercion. `expectedType`
