@@ -297,4 +297,42 @@ public class IlGeneratorTests
         Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldloc), Is.EqualTo(2),
             "expected exactly two Ldloc instructions for the two parameters of the target method");
     }
+
+    [Test]
+    public void RecoveredPrivateFieldAccessRelaxesOnlyReferencedMember()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "PrivateOwner",
+            app.SystemTypes.SystemObjectType, System.Reflection.TypeAttributes.NotPublic | System.Reflection.TypeAttributes.Class);
+        var field = owner.InjectFieldContext("secret", app.SystemTypes.SystemInt32Type,
+            System.Reflection.FieldAttributes.Private | System.Reflection.FieldAttributes.Static);
+        var result = new LocalVariable("result", new Register(null, "result")) { Type = app.SystemTypes.SystemInt32Type };
+        var methodContext = owner.InjectMethodContext("Read", app.SystemTypes.SystemInt32Type,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static);
+        methodContext.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, result, new FieldReference(field, result, 0)),
+            new(1, OpCode.Return, result)]);
+        methodContext.Locals = [result];
+        methodContext.ParameterLocals = [];
+        methodContext.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("PrivateFieldAccess.dll");
+        app.SystemTypes.SystemInt32Type.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Int32", TypeAttributes.Public));
+        var ownerDefinition = new TypeDefinition("Tests", "PrivateOwner", TypeAttributes.NotPublic | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(ownerDefinition);
+        var fieldDefinition = new FieldDefinition("secret", FieldAttributes.Private | FieldAttributes.Static,
+            new FieldSignature(module.CorLibTypeFactory.Int32));
+        ownerDefinition.Fields.Add(fieldDefinition);
+        field.PutExtraData("AsmResolverField", fieldDefinition);
+        var method = new MethodDefinition("Read", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32));
+        ownerDefinition.Methods.Add(method);
+
+        IlGenerator.GenerateIl(methodContext, method);
+
+        Assert.That(fieldDefinition.Attributes & FieldAttributes.FieldAccessMask, Is.EqualTo(FieldAttributes.Public));
+        Assert.That(ownerDefinition.Attributes & TypeAttributes.VisibilityMask, Is.EqualTo(TypeAttributes.Public));
+    }
 }

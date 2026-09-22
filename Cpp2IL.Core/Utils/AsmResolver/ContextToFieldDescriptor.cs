@@ -8,7 +8,9 @@ public static class ContextToFieldDescriptor
 {
     private static FieldDefinition GetFieldDefinition(this FieldAnalysisContext context)
     {
-        return context.GetExtraData<FieldDefinition>("AsmResolverField") ?? throw new($"AsmResolver field not found in method analysis context for {context}");
+        var field = context.GetExtraData<FieldDefinition>("AsmResolverField") ?? throw new($"AsmResolver field not found in method analysis context for {context}");
+        MemberAccessibility.EnsureAccessible(field);
+        return field;
     }
 
     private static FieldSignature ToFieldSignature(this FieldAnalysisContext context)
@@ -25,6 +27,10 @@ public static class ContextToFieldDescriptor
 
     public static IFieldDescriptor ToFieldDescriptor(this ConcreteGenericFieldAnalysisContext context)
     {
+        var field = context.BaseFieldContext.GetExtraData<FieldDefinition>("AsmResolverField")
+            ?? throw new($"AsmResolver field not found in method analysis context for {context.BaseFieldContext}");
+        MemberAccessibility.EnsureAccessible(field);
+
         return new MemberReference(
             context.DeclaringType.ToTypeSignature().ToTypeDefOrRef(),
             context.Name,
