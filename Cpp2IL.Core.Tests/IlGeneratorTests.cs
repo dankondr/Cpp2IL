@@ -578,4 +578,220 @@ public class IlGeneratorTests
         Assert.That(fieldDefinition.Attributes & FieldAttributes.FieldAccessMask, Is.EqualTo(FieldAttributes.Public));
         Assert.That(ownerDefinition.Attributes & TypeAttributes.VisibilityMask, Is.EqualTo(TypeAttributes.Public));
     }
+
+    [Test]
+    public void LongDestinationReceivesWidenedSmallLiteral()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var dest = new LocalVariable("dest", new Register(null, "dest")) { Type = app.SystemTypes.SystemInt64Type };
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, dest, new Immediate(0)),
+            new(1, OpCode.Return)]);
+        context.Locals = [dest];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+        var module = new ModuleDefinition("WidenLiteral.dll");
+        app.SystemTypes.SystemInt64Type.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Int64", TypeAttributes.Public));
+        var owner = new TypeDefinition("Tests", "Widen", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(method);
+
+        IlGenerator.GenerateIl(context, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldc_I4));
+            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Conv_I8));
+            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Stloc));
+        });
+    }
+
+    [Test]
+    public void NarrowDestinationKeepsWideLiteralThenTruncates()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var dest = new LocalVariable("dest", new Register(null, "dest")) { Type = app.SystemTypes.SystemInt32Type };
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, dest, new Immediate(0x100000000L)),
+            new(1, OpCode.Return)]);
+        context.Locals = [dest];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+        var module = new ModuleDefinition("TruncateLiteral.dll");
+        app.SystemTypes.SystemInt32Type.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Int32", TypeAttributes.Public));
+        var owner = new TypeDefinition("Tests", "Truncate", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(method);
+
+        IlGenerator.GenerateIl(context, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldc_I8));
+            Assert.That(il[0].Operand, Is.EqualTo(0x100000000L));
+            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Conv_I4));
+            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Stloc));
+        });
+    }
+
+    [Test]
+    public void BitwiseAndWithInt32OperandNarrowWideLiteral()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var value = new LocalVariable("value", new Register(null, "value")) { Type = app.SystemTypes.SystemInt32Type };
+        var dest = new LocalVariable("dest", new Register(null, "dest")) { Type = app.SystemTypes.SystemInt32Type };
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.And, dest, value, new Immediate(0x100000000L)),
+            new(1, OpCode.Return)]);
+        context.Locals = [value, dest];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+        var module = new ModuleDefinition("BitwiseWidth.dll");
+        app.SystemTypes.SystemInt32Type.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Int32", TypeAttributes.Public));
+        var owner = new TypeDefinition("Tests", "Mask", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(method);
+
+        IlGenerator.GenerateIl(context, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Ldc_I8));
+            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Conv_I4));
+            Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.And));
+            Assert.That(il[4].OpCode, Is.EqualTo(CilOpCodes.Stloc));
+        });
+    }
+
+    [Test]
+    public void CallArgumentWidensInt32LocalToInt64Parameter()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var arg = new LocalVariable("arg", new Register(null, "arg")) { Type = app.SystemTypes.SystemInt32Type };
+        var target = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Take",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [app.SystemTypes.SystemInt64Type]);
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CallVoid, target, arg),
+            new(1, OpCode.Return)]);
+        caller.Locals = [arg];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("ArgWiden.dll");
+        app.SystemTypes.SystemInt32Type.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Int32", TypeAttributes.Public));
+        var type = new TypeDefinition("Tests", "ArgWiden", TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);
+        var targetDefinition = new MethodDefinition("Take", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.Int64]));
+        type.Methods.Add(targetDefinition);
+        target.PutExtraData("AsmResolverMethod", targetDefinition);
+        var definition = new MethodDefinition("Caller", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        type.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Conv_I8));
+            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Call));
+        });
+    }
+
+    [Test]
+    public void ObjectDestinationBoxesIntegerValue()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var source = new LocalVariable("source", new Register(null, "source")) { Type = app.SystemTypes.SystemInt32Type };
+        var dest = new LocalVariable("dest", new Register(null, "dest")); // untyped => object
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, dest, source),
+            new(1, OpCode.Return)]);
+        context.Locals = [source, dest];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+        var module = new ModuleDefinition("BoxMove.dll");
+        app.SystemTypes.SystemInt32Type.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Int32", TypeAttributes.Public));
+        var owner = new TypeDefinition("Tests", "Box", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(method);
+
+        IlGenerator.GenerateIl(context, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Box));
+            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Stloc));
+        });
+    }
+
+    [Test]
+    public void ReturnNarrowsLongLocalToInt32ReturnType()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var value = new LocalVariable("value", new Register(null, "value")) { Type = app.SystemTypes.SystemInt64Type };
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemInt32Type, ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Return, value)]);
+        context.Locals = [value];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+        var module = new ModuleDefinition("RetNarrow.dll");
+        app.SystemTypes.SystemInt32Type.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Int32", TypeAttributes.Public));
+        app.SystemTypes.SystemInt64Type.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Int64", TypeAttributes.Public));
+        var owner = new TypeDefinition("Tests", "RetNarrow", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32));
+        owner.Methods.Add(method);
+
+        IlGenerator.GenerateIl(context, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Conv_I4));
+            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Ret));
+        });
+    }
 }

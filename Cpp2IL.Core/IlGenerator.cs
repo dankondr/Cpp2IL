@@ -390,6 +390,7 @@ public static class IlGenerator
                         LoadLocal(field.Local, method, locals);
 
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, field.Field.FieldType);
+                    EmitStackCoerce(EmittedOperandType(instruction.Operands[1], context), field.Field.FieldType, method);
                     instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
                     break;
                 }
@@ -401,13 +402,15 @@ public static class IlGenerator
                     LoadLocal(target.Array, method, locals);
                     LoadOperand(target.Index, method, locals, writeLine);
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, stored);
+                    EmitStackCoerce(EmittedOperandType(instruction.Operands[1], context), stored, method);
                     instructions.Add(CilOpCodes.Stelem, stored.ToTypeSignature().ToTypeDefOrRef());
                     break;
                 }
 
-                LoadOperand(instruction.Operands[1], method, locals, writeLine,
-                    DestinationType(instruction.Operands[0])
-                    ?? (instruction.Operands[0] is LocalVariable local ? EmittedLocalType(local, context) : null));
+                var moveDestinationType = DestinationType(instruction.Operands[0])
+                    ?? (instruction.Operands[0] is LocalVariable local ? EmittedLocalType(local, context) : null);
+                LoadOperand(instruction.Operands[1], method, locals, writeLine, moveDestinationType);
+                EmitStackCoerce(EmittedOperandType(instruction.Operands[1], context), moveDestinationType, method);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
@@ -441,7 +444,10 @@ public static class IlGenerator
                     // the constructor declares (i.e. drop methodInfo)
                     var constructorArgs = constructorCall.Operands.Skip(ConstructorReceiverIndex(constructorCall) + 1).Take(constructor.Parameters.Count).ToList();
                     for (var i = 0; i < constructorArgs.Count; i++)
+                    {
                         LoadOperand(constructorArgs[i], method, locals, writeLine, constructor.Parameters[i].ParameterType);
+                        EmitStackCoerce(EmittedOperandType(constructorArgs[i], context), constructor.Parameters[i].ParameterType, method);
+                    }
 
                     instructions.Add(CilOpCodes.Newobj, constructor.ToMethodDescriptor());
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine);
@@ -509,7 +515,10 @@ public static class IlGenerator
                 {
                     var firstArgument = instruction.OpCode == OpCode.Call ? 3 : 2;
                     for (var i = 0; i < stringConstructor.Parameters.Count; i++)
+                    {
                         LoadOperand(instruction.Operands[firstArgument + i], method, locals, writeLine, stringConstructor.Parameters[i].ParameterType);
+                        EmitStackCoerce(EmittedOperandType(instruction.Operands[firstArgument + i], context), stringConstructor.Parameters[i].ParameterType, method);
+                    }
                     instructions.Add(CilOpCodes.Newobj, stringConstructor.ToMethodDescriptor());
                     if (instruction.OpCode == OpCode.Call)
                         StoreToOperand(instruction.Operands[1], method, locals, writeLine);
@@ -529,7 +538,25 @@ public static class IlGenerator
                 if (!targetMethod.IsStatic) // Load 'this' param
                 {
                     if ((instruction.Operands.Count - 1) >= thisParamIndex)
+                    {
                         LoadOperand(instruction.Operands[thisParamIndex], method, locals, writeLine, targetMethod.DeclaringType);
+                        // A struct's instance `this` is a managed pointer, not the value —
+                        // coerce toward `&T` (which no stack op can forge) so a ldloca
+                        // receiver is left alone instead of being unboxed. The method's own
+                        // `this` and constructor receivers must stay a bare ldarg.0 for the
+                        // verifier, so they skip coercion entirely.
+                        var thisOperand = instruction.Operands[thisParamIndex];
+                        var isOwnThis = thisOperand is LocalVariable thisLocal
+                            && (thisLocal.IsThis || ReferenceEquals(thisLocal, context.ParameterLocals.FirstOrDefault()));
+                        if (targetMethod.Name is not ".ctor" && !isOwnThis)
+                        {
+                            var thisEmitted = EmittedOperandType(thisOperand, context);
+                            var thisTarget = targetMethod.DeclaringType is { IsValueType: true } declaringStruct
+                                ? new ByRefTypeAnalysisContext(declaringStruct)
+                                : targetMethod.DeclaringType;
+                            EmitStackCoerce(thisEmitted, thisTarget, method);
+                        }
+                    }
                     else
                     {
                         instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Non static method called without 'this' param ({instruction})"));
@@ -549,7 +576,10 @@ public static class IlGenerator
                     var parameterType = targetMethod.Parameters[i].ParameterType;
 
                     if (i < availableArgs)
+                    {
                         LoadOperand(instruction.Operands[callParamIndex + i], method, locals, writeLine, parameterType);
+                        EmitStackCoerce(EmittedOperandType(instruction.Operands[callParamIndex + i], context), parameterType, method);
+                    }
                     else
                         PushDefaultOf(parameterType, instructions);
                 }
@@ -564,7 +594,13 @@ public static class IlGenerator
                 if (!targetMethod.IsVoid)
                 {
                     if (instruction.OpCode == OpCode.Call)
+                    {
+                        EmitStackCoerce(targetMethod.ReturnType,
+                            DestinationType(instruction.Operands[1])
+                            ?? (instruction.Operands[1] is LocalVariable callResult ? EmittedLocalType(callResult, context) : null),
+                            method);
                         StoreToOperand(instruction.Operands[1], method, locals, writeLine);
+                    }
                     else
                         instructions.Add(CilOpCodes.Pop);
                 }
@@ -591,7 +627,10 @@ public static class IlGenerator
                 if (!context.IsVoid)
                 {
                     if (instruction.Operands.Count == 1)
+                    {
                         LoadOperand(instruction.Operands[0], method, locals, writeLine, context.ReturnType);
+                        EmitStackCoerce(EmittedOperandType(instruction.Operands[0], context), context.ReturnType, method);
+                    }
                     else
                         instructions.Add(CilOpCodes.Ldnull); // ret still pops a value even if we lost track of it
                 }
@@ -604,6 +643,13 @@ public static class IlGenerator
 
             case OpCode.ConditionalJump:
                 LoadOperand(instruction.Operands[1], method, locals, writeLine);
+                // brtrue won't pop an i64; the native branch tested the full register
+                // for non-zero, which is exactly `x > 0` unsigned.
+                if (IntegralStackWidth(EmittedOperandType(instruction.Operands[1], context)) == 8)
+                {
+                    instructions.Add(CilOpCodes.Ldc_I8, 0L);
+                    instructions.Add(CilOpCodes.Cgt_Un);
+                }
                 instructions.Add(CilOpCodes.Brtrue, new CilInstructionLabel());
                 break;
 
@@ -645,12 +691,32 @@ public static class IlGenerator
                 // operands are coerced to the (float) result type. A no-op when they already match.
                 var floatConversion = FloatOperationConversion(instruction);
 
-                LoadOperand(instruction.Operands[1], method, locals, writeLine, NullComparisonType(instruction, 1, context));
+                // Integer operations share a single stack type: the widest non-literal operand,
+                // or (for value-producing ops) the destination. Comparison destinations are the
+                // bool result, not the compared type, so they never seed the operand type.
+                var operandType = floatConversion == null
+                    ? BinaryOperandType(instruction, context,
+                        instruction.OpCode is < OpCode.CheckEqual or > OpCode.CheckLessOrEqual)
+                    : null;
+
+                LoadOperand(instruction.Operands[1], method, locals, writeLine,
+                    NullComparisonType(instruction, 1, context) ?? operandType);
                 if (floatConversion is { } conv1)
                     instructions.Add(conv1);
-                LoadOperand(instruction.Operands[2], method, locals, writeLine, NullComparisonType(instruction, 2, context));
+                else
+                    EmitStackCoerce(EmittedOperandType(instruction.Operands[1], context), operandType, method,
+                        instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual);
+                // shl/shr take an i32/n-int shift amount, not the value type.
+                var operand2Type = instruction.OpCode is OpCode.ShiftLeft or OpCode.ShiftRight
+                    ? context.AppContext.SystemTypes.SystemInt32Type
+                    : operandType;
+                LoadOperand(instruction.Operands[2], method, locals, writeLine,
+                    NullComparisonType(instruction, 2, context) ?? operand2Type);
                 if (floatConversion is { } conv2)
                     instructions.Add(conv2);
+                else
+                    EmitStackCoerce(EmittedOperandType(instruction.Operands[2], context), operand2Type, method,
+                        instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual);
 
                 switch (instruction.OpCode)
                 {
@@ -691,6 +757,13 @@ public static class IlGenerator
                     case OpCode.Xor: instructions.Add(CilOpCodes.Xor); break;
                 }
 
+                var resultType = instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual
+                    ? context.AppContext.SystemTypes.SystemInt32Type
+                    : operandType ?? EmittedOperandType(instruction.Operands[1], context);
+                EmitStackCoerce(resultType,
+                    DestinationType(instruction.Operands[0])
+                    ?? (instruction.Operands[0] is LocalVariable resultLocal ? EmittedLocalType(resultLocal, context) : null),
+                    method);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
@@ -1028,33 +1101,58 @@ public static class IlGenerator
         var module = method.DeclaringModule!;
 
         // A null reference reaches us as an integer zero, which would otherwise be emitted as a literal 0
-        // and read back as a cast from a number.
-        if (expectedType is { IsValueType: false } && IsZeroConstant(operand))
+        // and read back as a cast from a number. Runtime handle types lower to native int, where the
+        // zero is an address, not a reference.
+        if (expectedType is { IsValueType: false } && IsZeroConstant(operand) && !IsNativeHandleType(expectedType))
         {
             instructions.Add(CilOpCodes.Ldnull);
             return;
         }
 
+        // Enums share the stack type of their underlying primitive, so literal
+        // emission keys off the underlying contract rather than the enum name.
+        var literalType = expectedType is { IsEnumType: true }
+            ? expectedType.DefaultEnumUnderlyingType ?? expectedType
+            : expectedType;
+
         switch (operand)
         {
-            case Immediate immediate when expectedType?.FullName is "System.IntPtr" or "System.UIntPtr":
+            case Immediate immediate when literalType?.FullName is "System.IntPtr" or "System.UIntPtr":
                 if (immediate.Value is >= int.MinValue and <= int.MaxValue)
                     instructions.Add(CilOpCodes.Ldc_I4, (int)immediate.Value);
                 else
                     instructions.Add(CilOpCodes.Ldc_I8, immediate.Value);
-                instructions.Add(expectedType.FullName == "System.UIntPtr" ? CilOpCodes.Conv_U : CilOpCodes.Conv_I);
+                instructions.Add(literalType.FullName == "System.UIntPtr" ? CilOpCodes.Conv_U : CilOpCodes.Conv_I);
                 break;
-            case Immediate immediate when expectedType?.FullName == "System.Single":
+            case Immediate immediate when literalType?.FullName == "System.Single":
                 instructions.Add(CilOpCodes.Ldc_R4, (float)immediate.Value);
                 break;
-            case Immediate immediate when expectedType?.FullName == "System.Double":
+            case Immediate immediate when literalType?.FullName == "System.Double":
                 instructions.Add(CilOpCodes.Ldc_R8, (double)immediate.Value);
                 break;
-            // A native W-register literal may be represented as unsigned 32-bit in ISIL.
-            // The known managed I4 contract supplies the width; do not truncate arbitrary I8s.
-            case Immediate { Value: >= int.MinValue and <= uint.MaxValue } immediate
-                when expectedType?.FullName is "System.Int32" or "System.UInt32":
-                instructions.Add(CilOpCodes.Ldc_I4, unchecked((int)immediate.Value));
+            case Immediate immediate when literalType?.FullName is "System.Int64" or "System.UInt64":
+                if (immediate.Value is >= int.MinValue and <= int.MaxValue)
+                {
+                    instructions.Add(CilOpCodes.Ldc_I4, (int)immediate.Value);
+                    instructions.Add(literalType.FullName == "System.UInt64" ? CilOpCodes.Conv_U8 : CilOpCodes.Conv_I8);
+                }
+                else
+                    instructions.Add(CilOpCodes.Ldc_I8, immediate.Value);
+                break;
+            // A native W-register literal may be represented as unsigned 32-bit or
+            // wider in ISIL. The known narrow contract supplies the width.
+            case Immediate immediate when literalType?.FullName is "System.Int32" or "System.UInt32"
+                    or "System.Boolean" or "System.Byte" or "System.SByte"
+                    or "System.Int16" or "System.UInt16" or "System.Char":
+                if (immediate.Value is >= int.MinValue and <= uint.MaxValue)
+                    instructions.Add(CilOpCodes.Ldc_I4, unchecked((int)immediate.Value));
+                else
+                {
+                    // Only the low word reaches the managed slot, so keep the literal
+                    // intact and let the conversion truncate instead of the emitter.
+                    instructions.Add(CilOpCodes.Ldc_I8, immediate.Value);
+                    instructions.Add(CilOpCodes.Conv_I4);
+                }
                 break;
             case Immediate { Value: >= int.MinValue and <= int.MaxValue } immediate:
                 instructions.Add(CilOpCodes.Ldc_I4, (int)immediate.Value);
@@ -1312,6 +1410,11 @@ public static class IlGenerator
     {
         if (local.Type != null && local.Type != context.AppContext.SystemTypes.SystemVoidType)
             return local.Type;
+        // `this` loads use ldarg.0, whose stack type is the declaring type (a managed
+        // pointer to it for value-type methods), even when ISIL leaves the local untyped.
+        if (context.DeclaringType is { } declaringType
+            && (local.IsThis || !context.IsStatic && ReferenceEquals(local, context.ParameterLocals.FirstOrDefault())))
+            return declaringType.IsValueType ? new ByRefTypeAnalysisContext(declaringType) : declaringType;
         if (IsBooleanEmissionLocal(local, context))
             return context.AppContext.SystemTypes.SystemBooleanType;
         if (IsNativePointerEmissionLocal(local, context))
@@ -1390,6 +1493,244 @@ public static class IlGenerator
             ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } => array.ElementType,
             _ => null
         };
+
+    // The stack type an operand produces once emitted, before any coercion. Literal
+    // immediates adapt to whatever the consumer asks for, so they report no type.
+    private static TypeAnalysisContext? EmittedOperandType(IOperand operand, MethodAnalysisContext context) =>
+        operand switch
+        {
+            LocalVariable local => EmittedLocalType(local, context),
+            FieldReference field => field.Field.FieldType,
+            ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } => array.ElementType,
+            ArrayLength => context.AppContext.SystemTypes.SystemInt32Type,
+            // ldloca/ldflda/ldelema push a managed pointer, not a native int.
+            AddressOf { Target: LocalVariable addressedLocal }
+                => new ByRefTypeAnalysisContext(EmittedLocalType(addressedLocal, context)),
+            AddressOf { Target: FieldReference addressedField }
+                => new ByRefTypeAnalysisContext(addressedField.Field.FieldType),
+            AddressOf { Target: ArrayAccess { Array.Type: SzArrayTypeAnalysisContext addressedArray } }
+                => new ByRefTypeAnalysisContext(addressedArray.ElementType),
+            AddressOf => context.AppContext.SystemTypes.SystemIntPtrType,
+            ReferenceCast cast => cast.Type,
+            StringLiteral => context.AppContext.SystemTypes.SystemStringType,
+            FloatLiteral => context.AppContext.SystemTypes.SystemSingleType,
+            DoubleLiteral => context.AppContext.SystemTypes.SystemDoubleType,
+            RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext
+                or RuntimeFieldInfoAnalysisContext or StaticFieldStorageTypeAnalysisContext
+                or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext
+                => context.AppContext.SystemTypes.SystemIntPtrType,
+            _ => null
+        };
+
+    // Runtime handle wrappers (klass/method/field/rgctx handles) lower to a raw
+    // pointer-sized value at emission even though their contexts are not value types.
+    private static bool IsNativeHandleType(TypeAnalysisContext type) =>
+        type is RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext
+            or RuntimeFieldInfoAnalysisContext or StaticFieldStorageTypeAnalysisContext
+            or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext;
+
+    // Native width of the type's evaluation-stack representation: 4 for anything
+    // narrowing to i32, 8 for 64-bit primitives, -1 for native-int/pointer/byref
+    // values and 0 for non-integral stack kinds.
+    private static int IntegralStackWidth(TypeAnalysisContext? type)
+    {
+        if (type == null)
+            return 0;
+        if (type is PointerTypeAnalysisContext or ByRefTypeAnalysisContext || IsNativeHandleType(type))
+            return -1;
+
+        return type.FullName switch
+        {
+            "System.Boolean" or "System.Byte" or "System.SByte" or "System.Char"
+                or "System.Int16" or "System.UInt16" or "System.Int32" or "System.UInt32" => 4,
+            "System.Int64" or "System.UInt64" => 8,
+            "System.IntPtr" or "System.UIntPtr" => -1,
+            _ when type is { IsEnumType: true } => IntegralStackWidth(type.DefaultEnumUnderlyingType),
+            _ => 0
+        };
+    }
+
+    private static bool IsUnsignedType(TypeAnalysisContext type) =>
+        type.FullName is "System.Boolean" or "System.Byte" or "System.Char"
+            or "System.UInt16" or "System.UInt32" or "System.UInt64" or "System.UIntPtr"
+        || type is { IsEnumType: true, DefaultEnumUnderlyingType: { } underlying } && IsUnsignedType(underlying);
+
+    // Emits the conversion needed to make a value of `from` acceptable where `to` is
+    // required: primitive width change, box, unbox or reference cast. No-ops whenever
+    // the stack contract already matches or no legal conversion exists.
+    private static void EmitStackCoerce(TypeAnalysisContext? from, TypeAnalysisContext? to, MethodDefinition method,
+        bool convertByRef = false)
+    {
+        // Handle contexts have no managed stack type of their own; everything below
+        // reasons about the native int they emit as.
+        if (from != null && IsNativeHandleType(from))
+            from = from.AppContext.SystemTypes.SystemIntPtrType;
+        if (to != null && IsNativeHandleType(to))
+            to = to.AppContext.SystemTypes.SystemIntPtrType;
+
+        if (from == null || to == null || from.FullName == to.FullName)
+            return;
+
+        // No stack op synthesizes a generic-parameter or byref value from another kind.
+        if (to is GenericParameterTypeAnalysisContext or ByRefTypeAnalysisContext
+            || from is GenericParameterTypeAnalysisContext)
+            return;
+
+        var instructions = method.CilMethodBody!.Instructions;
+        var fromWidth = IntegralStackWidth(from);
+        var toWidth = IntegralStackWidth(to);
+
+        // ceq/cgt/clt cannot merge a managed pointer with anything else, while add/sub
+        // on `&` want the pointer kept as-is, so the conversion is opt-in per site.
+        if (from is ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+            && convertByRef && toWidth != 0)
+        {
+            instructions.Add(CilOpCodes.Conv_I);
+            fromWidth = -1;
+        }
+
+        // A managed pointer read back as a value is an honest dereference: ldobj on
+        // an exact element match, ldind.ref for reference targets.
+        if (from is ByRefTypeAnalysisContext byRef && to is not ByRefTypeAnalysisContext
+            && fromWidth == -1 && !convertByRef)
+        {
+            if (to.IsValueType)
+            {
+                if (byRef.ElementType.FullName == to.FullName && CanEmitTypeToken(to))
+                    instructions.Add(CilOpCodes.Ldobj, to.ToTypeSignature().ToTypeDefOrRef());
+            }
+            else if (!byRef.ElementType.IsValueType)
+                instructions.Add(CilOpCodes.Ldind_Ref);
+            return;
+        }
+
+        if (fromWidth != 0 && toWidth != 0)
+        {
+            if (fromWidth == toWidth)
+                return;
+            if (toWidth < 0)
+                instructions.Add(IsUnsignedType(from) ? CilOpCodes.Conv_U : CilOpCodes.Conv_I);
+            else if (toWidth == 8)
+                instructions.Add(IsUnsignedType(from) ? CilOpCodes.Conv_U8 : CilOpCodes.Conv_I8);
+            else
+                instructions.Add(IsUnsignedType(from) ? CilOpCodes.Conv_U4 : CilOpCodes.Conv_I4);
+            return;
+        }
+
+        var fromIsFloat = from.FullName is "System.Single" or "System.Double";
+        var toIsFloat = to.FullName is "System.Single" or "System.Double";
+
+        if (fromIsFloat && toWidth != 0)
+        {
+            instructions.Add(toWidth == 8 ? CilOpCodes.Conv_I8 : CilOpCodes.Conv_I4);
+            return;
+        }
+
+        if (toIsFloat)
+        {
+            if (fromIsFloat || fromWidth != 0)
+                instructions.Add(to.FullName == "System.Single" ? CilOpCodes.Conv_R4 : CilOpCodes.Conv_R8);
+            return;
+        }
+
+        if (from.IsValueType && !to.IsValueType)
+        {
+            if (CanEmitTypeToken(from))
+                instructions.Add(CilOpCodes.Box, from.ToTypeSignature().ToTypeDefOrRef());
+            // box yields a `from` reference; an interface/other-ref destination still
+            // needs the narrowing cast the verifier requires.
+            if (!IsAssignableToLoose(from, to) && CanEmitTypeToken(to))
+                instructions.Add(CilOpCodes.Castclass, to.ToTypeSignature().ToTypeDefOrRef());
+            return;
+        }
+
+        if (!from.IsValueType && to.IsValueType)
+        {
+            if (CanEmitTypeToken(to))
+                instructions.Add(CilOpCodes.Unbox_Any, to.ToTypeSignature().ToTypeDefOrRef());
+            return;
+        }
+
+        if (!from.IsValueType && !to.IsValueType && !IsAssignableToLoose(from, to) && CanEmitTypeToken(to))
+            instructions.Add(CilOpCodes.Castclass, to.ToTypeSignature().ToTypeDefOrRef());
+    }
+
+    // IsAssignableTo compares context objects by reference, but the emitter sees distinct
+    // context instances for the same instantiated type (e.g. a base generic declaring type
+    // vs. the method's declaring type). Falling back to a name-based hierarchy walk keeps
+    // the cast honest while avoiding no-op castclass instructions ILVerify rejects
+    // (base `this` calls and delegate constructor targets).
+    private static bool IsAssignableToLoose(TypeAnalysisContext derivedType, TypeAnalysisContext baseType)
+    {
+        if (derivedType.IsAssignableTo(baseType))
+            return true;
+
+        // Every reference type is assignable to System.Object, even when the base-type
+        // chain stops at an unresolved referenced type.
+        if (baseType.FullName == "System.Object" && !derivedType.IsValueType)
+            return true;
+
+        var current = derivedType;
+        while (current != null)
+        {
+            if (current.FullName == baseType.FullName)
+                return true;
+            // Generic instances resolved from Il2CppType leave DefaultBaseType unset; the
+            // definition's base is the correct continuation for a name-based walk.
+            current = current.BaseType
+                ?? (current as GenericInstanceTypeAnalysisContext)?.GenericType.BaseType;
+        }
+
+        return derivedType.InterfaceContexts.Any(@interface => IsAssignableToLoose(@interface, baseType));
+    }
+
+    // True when ToTypeSignature can produce a usable operand for box/unbox/castclass.
+    // Reduced test fixtures may not carry the AsmResolver metadata the real pipeline
+    // always has, in which case the coercion is skipped rather than fatal.
+    private static bool CanEmitTypeToken(TypeAnalysisContext? type) => type switch
+    {
+        null => false,
+        GenericInstanceTypeAnalysisContext generic => CanEmitTypeToken(generic.GenericType)
+            && generic.GenericArguments.All(CanEmitTypeToken),
+        WrappedTypeAnalysisContext wrapped => CanEmitTypeToken(wrapped.ElementType),
+        GenericParameterTypeAnalysisContext or SentinelTypeAnalysisContext
+            or RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext
+            or RuntimeFieldInfoAnalysisContext or StaticFieldStorageTypeAnalysisContext
+            or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext => true,
+        _ => type.GetExtraData<TypeDefinition>("AsmResolverType") != null
+    };
+
+    // The shared operand type for a binary instruction: the widest non-literal
+    // operand, or (for value-producing ops) the destination. Comparison destinations
+    // are the bool result, never the compared type, so they must not seed it.
+    private static TypeAnalysisContext? BinaryOperandType(Instruction instruction, MethodAnalysisContext context,
+        bool allowDestination)
+    {
+        TypeAnalysisContext? picked = null;
+        var pickedWidth = 0;
+        foreach (var operand in instruction.Operands.Skip(1))
+        {
+            var width = IntegralStackWidth(EmittedOperandType(operand, context));
+            if (width == 0)
+                continue;
+            if (width < 0)
+                // Pointer/byref/native-int operands make the operation native-int;
+                // returning IntPtr (not the operand's own type) keeps zero literals
+                // as `conv.i` instead of an invalid null/pointer confusion.
+                return context.AppContext.SystemTypes.SystemIntPtrType;
+            if (width > pickedWidth)
+            {
+                picked = EmittedOperandType(operand, context);
+                pickedWidth = width;
+            }
+        }
+
+        if (picked != null || !allowDestination)
+            return picked;
+
+        var destination = EmittedOperandType(instruction.Operands[0], context);
+        return IntegralStackWidth(destination) != 0 ? destination : null;
+    }
 
     private static void LoadLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
     {
