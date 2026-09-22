@@ -465,6 +465,20 @@ public static class IlGenerator
                     constructor = Analysis.AllocationConstructorRecovery.Resolve(instruction, constructor) ?? constructor;
                     constructor = ThisConstructorCallPlan.RetargetToDestinationInstantiation(constructor, allocatedDestination)
                         ?? constructor;
+                    // The resolved .ctor can sit on an abstract declaring type when the
+                    // allocation was mistyped as a base; newobj on abstract is illegal, so
+                    // re-anchor to the concrete destination type's matching .ctor.
+                    if (constructor.DeclaringType is { IsAbstract: true }
+                        && allocatedDestination is { IsAbstract: false } concreteType)
+                    {
+                        var concreteCtor = concreteType.Methods.FirstOrDefault(m =>
+                            m is { IsStatic: false, Name: ".ctor" }
+                            && m.Parameters.Count == constructor.Parameters.Count
+                            && m.Parameters.Zip(constructor.Parameters,
+                                (x, y) => ThisConstructorCallPlan.SameTypeIdentity(x.ParameterType, y.ParameterType)).All(z => z));
+                        if (concreteCtor != null)
+                            constructor = concreteCtor;
+                    }
                     // Operands run [ctor, newObject, arguments..., methodInfo], so take only as many as
                     // the constructor declares (i.e. drop methodInfo)
                     var constructorArgs = constructorCall.Operands.Skip(ConstructorReceiverIndex(constructorCall) + 1).Take(constructor.Parameters.Count).ToList();
@@ -1172,6 +1186,20 @@ public static class IlGenerator
                     distant.Add(call);
             }
 
+            if (calls.Count == 0)
+            {
+                // No .ctor call on `this` survived lifting at all (IL2CPP elides the
+                // trivial Object::.ctor chain); the verifier still requires `this`
+                // initialized before ret, so synthesize the honest base-init call
+                // when the immediate base offers a parameterless .ctor.
+                var baseCtor = FindParameterlessBaseConstructor(immediateBase);
+                if (baseCtor == null || !Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(baseCtor, context))
+                    return null;
+                var synthesized = new ThisConstructorCallPlan();
+                synthesized.PrologueCalls.Add((baseCtor, []));
+                return synthesized;
+            }
+
             if (distant.Count == 0)
                 return null;
 
@@ -1230,6 +1258,28 @@ public static class IlGenerator
                 LocalVariable local => !local.IsThis && !local.IsMethodInfo && context.ParameterLocals.Contains(local),
                 _ => false,
             }) ? arguments : null;
+        }
+
+        private static MethodAnalysisContext? FindParameterlessBaseConstructor(TypeAnalysisContext immediateBase)
+        {
+            var genericInstance = immediateBase as GenericInstanceTypeAnalysisContext;
+            var definition = genericInstance?.GenericType ?? immediateBase;
+
+            MethodAnalysisContext? match = null;
+            foreach (var candidate in definition.Methods)
+            {
+                if (candidate is not { IsStatic: false, Name: ".ctor" } || candidate.Parameters.Count != 0)
+                    continue;
+
+                var concrete = genericInstance != null
+                    ? new ConcreteGenericMethodAnalysisContext(candidate, genericInstance.GenericArguments, [])
+                    : candidate;
+                if (match != null)
+                    return null;
+                match = concrete;
+            }
+
+            return match;
         }
 
         private static MethodAnalysisContext? FindImmediateBaseConstructor(TypeAnalysisContext immediateBase,
@@ -1854,6 +1904,14 @@ public static class IlGenerator
 
     private static TypeAnalysisContext EmittedLocalType(LocalVariable local, MethodAnalysisContext context)
     {
+        // `ldarg` always pushes the declared parameter type: when the lifter tagged the
+        // parameter local with a different type (register reuse packs a Vector3 arg onto a
+        // later parameter register) the declared signature is what the verifier sees.
+        if (!local.IsThis && !local.IsMethodInfo
+            && context.Parameters.FirstOrDefault(p => p.ParameterName == local.Name) is { } parameter)
+            return IsNativeHandleType(parameter.ParameterType)
+                ? context.AppContext.SystemTypes.SystemIntPtrType
+                : parameter.ParameterType;
         if (local.Type != null && local.Type != context.AppContext.SystemTypes.SystemVoidType)
             return IsNativeHandleType(local.Type) ? context.AppContext.SystemTypes.SystemIntPtrType : local.Type;
         // `this` loads use ldarg.0, whose stack type is the declaring type (a managed
