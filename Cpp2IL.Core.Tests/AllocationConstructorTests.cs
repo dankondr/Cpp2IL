@@ -142,8 +142,13 @@ public class AllocationConstructorTests
         IlGenerator.GenerateIl(caller, definition);
 
         var il = definition.CilMethodBody!.Instructions;
-        Assert.That(il.Count(i => i.OpCode == CilOpCodes.Newobj), Is.EqualTo(1));
-        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand == ctorDefinition), Is.True);
+        // A `call` to a reference-type .ctor on a foreign receiver is not legal IL;
+        // the re-init is emitted as newobj + store back to the receiver slot.
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Count(i => i.OpCode == CilOpCodes.Newobj), Is.EqualTo(2));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand == ctorDefinition), Is.False);
+        });
     }
 
     [Test]

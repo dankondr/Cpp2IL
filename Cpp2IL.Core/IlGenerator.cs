@@ -590,18 +590,27 @@ public static class IlGenerator
 
                 var thisParamIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
 
+                // A `call` to a reference-type .ctor on anything but `this` inside a .ctor
+                // is IL2CPP's re-init of an allocated object; emit newobj and store the fresh
+                // object back into the receiver slot instead.
+                IOperand? ctorReinitReceiver = null;
                 if (!targetMethod.IsStatic) // Load 'this' param
                 {
-                    // A struct's instance `this` is a managed pointer to that struct.
-                    var structCallee = targetMethod.Name is not ".ctor"
-                        && targetMethod.DeclaringType is { IsValueType: true } structDeclaring
-                            ? structDeclaring
-                            : null;
+                    // A struct's instance `this` is a managed pointer to that struct -
+                    // `call StructType::.ctor` initializes through it in place too.
+                    var structCallee = targetMethod.DeclaringType is { IsValueType: true } structDeclaring
+                        ? structDeclaring
+                        : null;
+                    var referenceTypeConstructor = targetMethod.Name == ".ctor"
+                        && retargetedBaseConstructor == null && structCallee == null;
                     if ((instruction.Operands.Count - 1) >= thisParamIndex)
                     {
                         var thisOperand = instruction.Operands[thisParamIndex];
                         var isOwnThis = thisOperand is LocalVariable thisLocal
                             && (thisLocal.IsThis || ReferenceEquals(thisLocal, context.ParameterLocals.FirstOrDefault()));
+                        if (referenceTypeConstructor && !isOwnThis)
+                            ctorReinitReceiver = thisOperand;
+
                         // A struct's instance `this` is a managed pointer: when the receiver
                         // is a local of exactly that struct type (a foreach enumerator is the
                         // common case) its address is the honest receiver. Mismatched or
@@ -610,11 +619,11 @@ public static class IlGenerator
                             && locals.TryGetValue(receiverLocal, out var foundReceiver)
                                 ? foundReceiver
                                 : null;
-                        if (!isOwnThis && structCallee != null && receiverCilLocal != null
+                        if (ctorReinitReceiver == null && !isOwnThis && structCallee != null && receiverCilLocal != null
                             && thisOperand is LocalVariable typedReceiverLocal
                             && ThisConstructorCallPlan.SameTypeIdentity(EmittedLocalType(typedReceiverLocal, context), structCallee))
                             instructions.Add(CilOpCodes.Ldloca, receiverCilLocal);
-                        else if (!isOwnThis && structCallee != null
+                        else if (ctorReinitReceiver == null && !isOwnThis && structCallee != null
                             && !ReceiverEmitsStructAddress(thisOperand, context, structCallee))
                         {
                             // Catch/finally register reuse can leave a lost or mistyped
@@ -625,7 +634,7 @@ public static class IlGenerator
                             if (!EmitFallbackStructReceiver(structCallee, context, method, locals))
                                 LoadOperand(thisOperand, method, locals, writeLine, targetMethod.DeclaringType, context);
                         }
-                        else
+                        else if (ctorReinitReceiver == null)
                         {
                             LoadOperand(thisOperand, method, locals, writeLine, targetMethod.DeclaringType, context);
                             // A struct's instance `this` is a managed pointer, not the value —
@@ -633,7 +642,7 @@ public static class IlGenerator
                             // receiver is left alone instead of being unboxed. The method's own
                             // `this` and constructor receivers must stay a bare ldarg.0 for the
                             // verifier, so they skip coercion entirely.
-                            if (targetMethod.Name is not ".ctor" && !isOwnThis)
+                            if (!isOwnThis && (targetMethod.Name is not ".ctor" || structCallee != null))
                             {
                                 var thisEmitted = EmittedOperandType(thisOperand, context);
                                 // An unmanaged pointer to the struct is already a legal receiver.
@@ -697,6 +706,20 @@ public static class IlGenerator
                         PushDefaultOf(parameterType, method, instructions);
                 }
 
+                if (ctorReinitReceiver != null)
+                {
+                    instructions.Add(CilOpCodes.Newobj, importedMethod);
+                    if (instruction.OpCode == OpCode.Call)
+                        instructions.Add(CilOpCodes.Dup); // the constructed object is also the call result
+                    StoreToOperand(ctorReinitReceiver, method, locals, writeLine, context);
+                    if (instruction.OpCode == OpCode.Call)
+                    {
+                        CoerceOrDefault(targetMethod.DeclaringType,
+                            StoreContract(instruction.Operands[1], context), method);
+                        StoreToOperand(instruction.Operands[1], method, locals, writeLine, context);
+                    }
+                    break;
+                }
                 instructions.Add(!targetMethod.IsStatic && retargetedBaseConstructor == null
                         && (instruction.IsVirtualDispatch || targetMethod.DeclaringType?.IsInterface == true)
                     ? CilOpCodes.Callvirt
@@ -1538,7 +1561,8 @@ public static class IlGenerator
                     break;
                 }
 
-                LoadLocal(field.Local, method, locals);
+                LoadOperandIntoSlot(field.Local, field.Field.DeclaringType, callingContext,
+                    method, locals, writeLine);
                 instructions.Add(CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
                 break;
             case MemoryOperand memory:
@@ -3289,7 +3313,8 @@ public static class IlGenerator
                 method.CilMethodBody!.LocalVariables.Add(scratch);
 
                 instructions.Add(CilOpCodes.Stloc, scratch);
-                LoadLocal(field.Local, method, locals);
+                LoadOperandIntoSlot(field.Local, field.Field.DeclaringType, context,
+                    method, locals, writeLine);
                 instructions.Add(CilOpCodes.Ldloc, scratch);
                 instructions.Add(CilOpCodes.Stfld, fieldDescriptor);
                 break;
