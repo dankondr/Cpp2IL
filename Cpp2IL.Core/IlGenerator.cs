@@ -239,7 +239,7 @@ public static class IlGenerator
 
                 var mappedTarget = instructionMap.TryGetValue(target, out var mapped) && mapped.Count > 0
                     ? mapped[0]
-                    : skippedThisConstructorRedirects.GetValueOrDefault(target);
+                    : skippedThisConstructorRedirects.TryGetValue(target, out var redirect) ? redirect : null;
 
                 if (mappedTarget == null)
                 {
@@ -535,7 +535,10 @@ public static class IlGenerator
                     break;
                 }
 
-                var retargetedBaseConstructor = thisConstructorCalls?.Retarget.GetValueOrDefault(instruction);
+                var retargetedBaseConstructor = thisConstructorCalls is not null
+                    && thisConstructorCalls.Retarget.TryGetValue(instruction, out var retargeted)
+                        ? retargeted
+                        : null;
                 if (retargetedBaseConstructor != null)
                     targetMethod = retargetedBaseConstructor;
 
@@ -1558,6 +1561,8 @@ public static class IlGenerator
             return context.AppContext.SystemTypes.SystemBooleanType;
         if (IsNativePointerEmissionLocal(local, context))
             return context.AppContext.SystemTypes.SystemIntPtrType;
+        if (NumericLocalTypes(context).TryGetValue(local, out var numericType) && CanEmitTypeToken(numericType))
+            return numericType;
         return context.AppContext.SystemTypes.SystemObjectType;
     }
 
@@ -1601,6 +1606,171 @@ public static class IlGenerator
         _ => false,
     };
 
+    // Untyped locals that only ever flow through numeric operations get a numeric
+    // CIL type instead of System.Object: union-find merges locals across Move/Phi/
+    // arithmetic edges, concrete numeric contracts (typed mates, fields, params,
+    // returns) seed each class, and any use that needs a non-numeric stack kind
+    // disqualifies the whole class so those locals stay honestly untyped.
+    private static Dictionary<LocalVariable, TypeAnalysisContext> NumericLocalTypes(MethodAnalysisContext context)
+    {
+        if (context.GetExtraData<Dictionary<LocalVariable, TypeAnalysisContext>>("NumericLocalTypes") is { } cached)
+            return cached;
+        var computed = ComputeNumericLocalTypes(context);
+        context.PutExtraData("NumericLocalTypes", computed);
+        return computed;
+    }
+
+    private static Dictionary<LocalVariable, TypeAnalysisContext> ComputeNumericLocalTypes(MethodAnalysisContext context)
+    {
+        var instructions = context.ControlFlowGraph!.Instructions.ToList();
+        var parent = new Dictionary<LocalVariable, LocalVariable>();
+        var constraints = new Dictionary<LocalVariable, List<TypeAnalysisContext>>();
+        var disqualified = new HashSet<LocalVariable>();
+
+        LocalVariable Find(LocalVariable local)
+        {
+            if (!parent.TryGetValue(local, out var p))
+                parent[local] = p = local;
+            return parent[local] == local ? local : parent[local] = Find(parent[local]);
+        }
+
+        void Union(LocalVariable a, LocalVariable b) => parent[Find(a)] = Find(b);
+
+        bool IsNumeric(TypeAnalysisContext? type) =>
+            type != null && type.FullName is "System.Single" or "System.Double" || IntegralStackWidth(type) > 0;
+
+        void AddOperandConstraint(IOperand operand, TypeAnalysisContext? type)
+        {
+            if (operand is not LocalVariable local)
+                return;
+            var root = Find(local);
+            if (type == null)
+                return;
+            if (IsNumeric(type))
+                (constraints.TryGetValue(root, out var list) ? list : constraints[root] = []).Add(type);
+            else
+                disqualified.Add(root);
+        }
+
+        void Disqualify(IOperand operand)
+        {
+            if (operand is LocalVariable local)
+                disqualified.Add(Find(local));
+        }
+
+        void UnionLocalOperands(IEnumerable<IOperand> operands)
+        {
+            LocalVariable? first = null;
+            foreach (var operand in operands)
+                if (operand is LocalVariable local)
+                {
+                    if (first == null) first = local;
+                    else Union(first, local);
+                }
+        }
+
+        foreach (var instruction in instructions)
+        {
+            // Nested locals inside compound operands still carry stack contracts:
+            // field hosts, array bases, address targets and cast sources can never
+            // be numeric.
+            foreach (var operand in instruction.Operands)
+                switch (operand)
+                {
+                    case FieldReference { Local: LocalVariable host }: Disqualify(host); break;
+                    case ArrayAccess { Array: LocalVariable array }:
+                        Disqualify(array);
+                        AddOperandConstraint(((ArrayAccess)operand).Index, context.AppContext.SystemTypes.SystemInt32Type);
+                        break;
+                    case AddressOf { Target: LocalVariable target }: Disqualify(target); break;
+                    case MemoryOperand { Base: LocalVariable memoryBase }: Disqualify(memoryBase); break;
+                    case ReferenceCast { Value: LocalVariable castSource }: Disqualify(castSource); break;
+                    case ArrayLength { Array: LocalVariable lengthArray }: Disqualify(lengthArray); break;
+                }
+
+            var op = instruction.OpCode;
+            if (op is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual)
+            {
+                // The bool result is not the compared type; only operand locals union.
+                UnionLocalOperands(instruction.Operands.Skip(1));
+                foreach (var operand in instruction.Operands.Skip(1))
+                    AddOperandConstraint(operand, DestinationType(operand));
+            }
+            else if (op is OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
+                or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate or OpCode.SignExtend32)
+            {
+                // Result shares the operand family, so the destination unions too.
+                UnionLocalOperands(instruction.Operands);
+                foreach (var operand in instruction.Operands.Skip(1))
+                    AddOperandConstraint(operand, DestinationType(operand));
+            }
+            else if (op is OpCode.ShiftLeft or OpCode.ShiftRight)
+            {
+                UnionLocalOperands([instruction.Operands[0], instruction.Operands[1]]);
+                AddOperandConstraint(instruction.Operands[1], DestinationType(instruction.Operands[1]));
+                AddOperandConstraint(instruction.Operands[2], context.AppContext.SystemTypes.SystemInt32Type);
+            }
+            else if (op is OpCode.Move or OpCode.Phi)
+            {
+                UnionLocalOperands(instruction.Operands);
+                foreach (var operand in instruction.Operands)
+                    AddOperandConstraint(operand, DestinationType(operand));
+            }
+            else if (op is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall)
+            {
+                var target = instruction.Operands[0] as MethodAnalysisContext;
+                var paramIndex = op == OpCode.Call ? (target?.IsStatic == true ? 2 : 3) : (target?.IsStatic == true ? 1 : 2);
+                for (var i = paramIndex; i < instruction.Operands.Count; i++)
+                {
+                    var paramType = target != null && i - paramIndex < target.Parameters.Count
+                        ? target.Parameters[i - paramIndex].ParameterType
+                        : null;
+                    AddOperandConstraint(instruction.Operands[i], paramType);
+                }
+                if (target is { IsStatic: false })
+                    Disqualify(instruction.Operands[op == OpCode.Call ? 2 : 1]);
+                if (op == OpCode.Call && instruction.Operands.Count > 1)
+                    AddOperandConstraint(instruction.Operands[1], target?.ReturnType);
+                if (op == OpCode.IndirectCall)
+                    Disqualify(instruction.Operands[0]);
+            }
+            else if (op == OpCode.Return && instruction.Operands.Count > 0)
+                AddOperandConstraint(instruction.Operands[0], context.ReturnType);
+            else if (op == OpCode.ConditionalJump && instruction.Operands.Count > 1)
+                // brtrue accepts refs and ints alike; too ambiguous to seed a type.
+                Disqualify(instruction.Operands[1]);
+            else if (op is OpCode.Newobj or OpCode.NewArr or OpCode.Throw or OpCode.IndirectJump)
+                foreach (var operand in instruction.Operands)
+                    Disqualify(operand);
+        }
+
+        // Re-key constraints and disqualifications by their final roots.
+        var rootConstraints = new Dictionary<LocalVariable, List<TypeAnalysisContext>>();
+        foreach (var pair in constraints)
+        {
+            var final = Find(pair.Key);
+            (rootConstraints.TryGetValue(final, out var list) ? list : rootConstraints[final] = []).AddRange(pair.Value);
+        }
+        var rootDisqualified = new HashSet<LocalVariable>(disqualified.Select(Find));
+
+        var result = new Dictionary<LocalVariable, TypeAnalysisContext>();
+        var members = parent.Keys.GroupBy(Find);
+        foreach (var group in members)
+        {
+            var root = group.Key;
+            if (rootDisqualified.Contains(root) || !rootConstraints.TryGetValue(root, out var types) || types.Count == 0)
+                continue;
+            var picked = types.FirstOrDefault(t => t.FullName == "System.Double")
+                ?? types.FirstOrDefault(t => t.FullName == "System.Single")
+                ?? types.FirstOrDefault(t => IntegralStackWidth(t) == 8)
+                ?? types[0];
+            foreach (var member in group)
+                if (member.Type == null)
+                    result[member] = picked;
+        }
+        return result;
+    }
+
     private static bool IsZeroConstant(IOperand operand) => operand is Immediate { Value: 0 };
 
     private static TypeAnalysisContext? NullComparisonType(Instruction instruction, int operandIndex, MethodAnalysisContext context)
@@ -1608,7 +1778,11 @@ public static class IlGenerator
         if (instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual)
             || !IsZeroConstant(instruction.Operands[operandIndex])) return null;
         var otherOperand = instruction.Operands[3 - operandIndex];
-        var otherType = DestinationType(otherOperand);
+        // Untyped locals may be inferred as numeric by NumericLocalTypes; the emitted
+        // local type, not the raw analysis type, is the real stack contract.
+        var otherType = otherOperand is LocalVariable otherLocal
+            ? EmittedLocalType(otherLocal, context)
+            : DestinationType(otherOperand);
         // Untyped locals are emitted as System.Object. Match the actual CIL local contract so a
         // zero equality test is a reference-null comparison rather than invalid object-vs-I4 IL.
         if (otherType == null && otherOperand is LocalVariable)

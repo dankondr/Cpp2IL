@@ -731,11 +731,17 @@ public class IlGeneratorTests
         var app = Cpp2IlApi.CurrentAppContext!;
         var source = new LocalVariable("source", new Register(null, "source")) { Type = app.SystemTypes.SystemInt32Type };
         var dest = new LocalVariable("dest", new Register(null, "dest")); // untyped => object
+        // `dest` also flows to an object-typed call arg, which disqualifies numeric
+        // inference and keeps it an honest object local.
+        var target = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Take",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [app.SystemTypes.SystemObjectType]);
         var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
             app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
         context.ControlFlowGraph = new ISILControlFlowGraph([
             new(0, OpCode.Move, dest, source),
-            new(1, OpCode.Return)]);
+            new(1, OpCode.CallVoid, target, dest),
+            new(2, OpCode.Return)]);
         context.Locals = [source, dest];
         context.ParameterLocals = [];
         context.AnalysisWarnings = [];
@@ -745,6 +751,10 @@ public class IlGeneratorTests
         var owner = new TypeDefinition("Tests", "Box", TypeAttributes.Public | TypeAttributes.Class,
             module.CorLibTypeFactory.Object.Type);
         module.TopLevelTypes.Add(owner);
+        var takeDef = new MethodDefinition("Take", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.Object]));
+        owner.Methods.Add(takeDef);
+        target.PutExtraData("AsmResolverMethod", takeDef);
         var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
             MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
         owner.Methods.Add(method);
