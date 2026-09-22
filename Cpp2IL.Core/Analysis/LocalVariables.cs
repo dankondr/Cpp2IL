@@ -423,7 +423,8 @@ public static class LocalVariables
                         changed |= SetTypeIfUnknown(extended, method.AppContext.SystemTypes.SystemInt64Type);
                     break;
                 case OpCode.Move:
-                    changed |= PropagateMove(instruction, method.AppContext.Binary.PointerSizeBytes);
+                    changed |= PropagateMove(instruction, method.AppContext.Binary.PointerSizeBytes,
+                        method.AppContext.SystemTypes.SystemInt32Type);
                     break;
                 case OpCode.Phi:
                     changed |= PropagatePhi(instruction);
@@ -634,7 +635,7 @@ public static class LocalVariables
             _ => null,
         };
 
-    private static bool PropagateMove(Instruction move, int pointerSize)
+    private static bool PropagateMove(Instruction move, int pointerSize, TypeAnalysisContext systemInt32Type)
     {
         var destination = move.Operands[0];
         var source = move.Operands[1];
@@ -651,6 +652,12 @@ public static class LocalVariables
         // Move field, local: a field store types the stored value with the field's type.
         if (destination is FieldReference storeField && source is LocalVariable storeSource)
             return SetTypeIfUnknown(storeSource, storeField.Field.FieldType);
+
+        // ArrayLength is emitted as ldlen/conv.i4, so its result is always Int32 when the
+        // source is a recovered managed array. Do not infer this from arbitrary references.
+        if (destination is LocalVariable lengthDestination
+            && source is ArrayLength { Array.Type: SzArrayTypeAnalysisContext })
+            return SetTypeIfUnknown(lengthDestination, systemInt32Type);
 
         // An element of T[] is a T, whether we loaded it (reference arrays) or only computed its address
         if (destination is LocalVariable { Type: null } elementDest

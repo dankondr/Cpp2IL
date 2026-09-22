@@ -173,4 +173,54 @@ public class IntegerArithmeticTypeTests
         LocalVariables.ResolveTypesAndFields(method);
         Assert.That(result.Type,Is.Null);
     }
+
+    [Test]
+    public void ArrayLengthProducerIsInt32OnlyForRecoveredArrays()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture", app.SystemTypes.SystemVoidType, MethodAttributes.Static, []);
+        var array = new LocalVariable("array", new Register(null, "array"))
+        {
+            Type = new SzArrayTypeAnalysisContext(app.SystemTypes.SystemObjectType)
+        };
+        var length = new LocalVariable("length", new Register(null, "length"));
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, length, new ArrayLength(array)),
+            new(1, OpCode.Return)]);
+        method.Locals = [array, length];
+        method.ParameterLocals = [];
+
+        LocalVariables.ResolveTypesAndFields(method);
+
+        Assert.That(length.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+
+        var pointer = new LocalVariable("pointer", new Register(null, "pointer"))
+        {
+            Type = new PointerTypeAnalysisContext(app.SystemTypes.SystemObjectType)
+        };
+        var pointerLength = new LocalVariable("pointerLength", new Register(null, "pointerLength"));
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, pointerLength, new ArrayLength(pointer)),
+            new(1, OpCode.Return)]);
+        method.Locals = [pointer, pointerLength];
+        method.ParameterLocals = [];
+
+        LocalVariables.ResolveTypesAndFields(method);
+
+        Assert.That(pointerLength.Type, Is.Null);
+
+        var reference = new LocalVariable("reference", new Register(null, "reference"))
+        {
+            Type = app.SystemTypes.SystemObjectType
+        };
+        var referenceLength = new LocalVariable("referenceLength", new Register(null, "referenceLength"));
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, referenceLength, new ArrayLength(reference)),
+            new(1, OpCode.Return)]);
+        method.Locals = [reference, referenceLength];
+
+        LocalVariables.ResolveTypesAndFields(method);
+
+        Assert.That(referenceLength.Type, Is.Null);
+    }
 }
