@@ -113,6 +113,46 @@ public class IntegerArithmeticTypeTests
         Assert.That(masked.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
     }
 
+    [Test]
+    public void BitwiseResultPrefersWideImmediateOverInt32Producer()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture", app.SystemTypes.SystemVoidType, MethodAttributes.Static, []);
+        var input = new LocalVariable("input", new Register(null, "input")) { Type = app.SystemTypes.SystemInt32Type };
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var flag = new LocalVariable("flag", new Register(null, "flag"));
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.And, result, input, new Immediate(0x1_0000_0000L)),
+            new(1, OpCode.CheckEqual, flag, result, new Immediate(0)),
+            new(2, OpCode.Return)]);
+        method.Locals = [input, result, flag];
+        method.ParameterLocals = [];
+
+        LocalVariables.ResolveTypesAndFields(method);
+
+        Assert.That(result.Type, Is.SameAs(app.SystemTypes.SystemInt64Type));
+    }
+
+    [Test]
+    public void BitwiseResultDoesNotWidenForInt32Immediate()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture", app.SystemTypes.SystemVoidType, MethodAttributes.Static, []);
+        var input = new LocalVariable("input", new Register(null, "input")) { Type = app.SystemTypes.SystemInt32Type };
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var flag = new LocalVariable("flag", new Register(null, "flag"));
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.And, result, input, new Immediate(0xFFFF_FFFFL)),
+            new(1, OpCode.CheckEqual, flag, result, new Immediate(0)),
+            new(2, OpCode.Return)]);
+        method.Locals = [input, result, flag];
+        method.ParameterLocals = [];
+
+        LocalVariables.ResolveTypesAndFields(method);
+
+        Assert.That(result.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+    }
+
     [TestCase(0)] // Reference arithmetic is not numeric evidence.
     [TestCase(1)] // Mixed I4/I8 widths are not silently coerced.
     [TestCase(2)] // An oversized immediate must not imply I4 truncation.
