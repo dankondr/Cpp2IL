@@ -118,6 +118,8 @@ public static class IlGenerator
             // Use object if type couldn't be determined, or if it's void, which no locals sig can hold
             if (local.Type != null && local.Type != context.AppContext.SystemTypes.SystemVoidType)
                 ilType = local.Type.ToTypeSignature();
+            else if (IsBooleanEmissionLocal(local, context))
+                ilType = module.CorLibTypeFactory.Boolean;
             else
                 ilType = module.CorLibTypeFactory.Object;
 
@@ -1074,6 +1076,16 @@ public static class IlGenerator
 
     private static bool IsBoolean(IOperand operand, MethodAnalysisContext context) =>
         DestinationType(operand) == context.AppContext.SystemTypes.SystemBooleanType;
+
+    private static bool IsBooleanEmissionLocal(LocalVariable local, MethodAnalysisContext context)
+    {
+        var definitions = context.ControlFlowGraph!.Instructions
+            .Where(instruction => ReferenceEquals(instruction.Destination, local))
+            .ToList();
+        return definitions.Count > 0 && definitions.All(instruction =>
+            instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual
+            || instruction.OpCode == OpCode.Not && IsBoolean(instruction.Operands[1], context));
+    }
 
     private static bool IsZeroConstant(IOperand operand) => operand is Immediate { Value: 0 };
 
