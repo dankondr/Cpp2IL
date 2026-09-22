@@ -691,7 +691,7 @@ public static class IlGenerator
                                 ? new ByRefTypeAnalysisContext(structCallee)
                                 : targetMethod.DeclaringType;
                             var thisEmitted = EmittedOperandType(thisOperand, context);
-                            if (isOwnThis && !StackContractSatisfied(thisEmitted, thisTarget)
+                            if (isOwnThis && thisEmitted != null && !StackAssignableTo(thisEmitted, thisTarget)
                                 && TryEmitThisFieldReceiver(context, thisTarget, method))
                             {
                                 // `this` cannot be the callee's receiver, but the compiler's
@@ -708,7 +708,7 @@ public static class IlGenerator
                                 // `this` must stay a bare ldarg.0 when it already satisfies the
                                 // callee - only a provable contract mismatch earns a coercion.
                                 if ((!isOwnThis && (targetMethod.Name is not ".ctor" || structCallee != null))
-                                    || (isOwnThis && !StackContractSatisfied(thisEmitted, thisTarget)))
+                                    || (isOwnThis && thisEmitted != null && !StackAssignableTo(thisEmitted, thisTarget)))
                                 {
                                     // An unmanaged pointer to the struct is already a legal receiver.
                                     if (thisEmitted is not PointerTypeAnalysisContext)
