@@ -593,10 +593,10 @@ public static class IlGenerator
                 // operands are coerced to the (float) result type. A no-op when they already match.
                 var floatConversion = FloatOperationConversion(instruction);
 
-                LoadOperand(instruction.Operands[1], method, locals, writeLine, NullComparisonType(instruction, 1));
+                LoadOperand(instruction.Operands[1], method, locals, writeLine, NullComparisonType(instruction, 1, context));
                 if (floatConversion is { } conv1)
                     instructions.Add(conv1);
-                LoadOperand(instruction.Operands[2], method, locals, writeLine, NullComparisonType(instruction, 2));
+                LoadOperand(instruction.Operands[2], method, locals, writeLine, NullComparisonType(instruction, 2, context));
                 if (floatConversion is { } conv2)
                     instructions.Add(conv2);
 
@@ -1053,17 +1053,25 @@ public static class IlGenerator
 
     private static bool IsZeroConstant(IOperand operand) => operand is Immediate { Value: 0 };
 
-    private static TypeAnalysisContext? NullComparisonType(Instruction instruction, int operandIndex)
+    private static TypeAnalysisContext? NullComparisonType(Instruction instruction, int operandIndex, MethodAnalysisContext context)
     {
         if (instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual)
             || !IsZeroConstant(instruction.Operands[operandIndex])) return null;
-        var otherType = DestinationType(instruction.Operands[3 - operandIndex]);
+        var otherOperand = instruction.Operands[3 - operandIndex];
+        var otherType = DestinationType(otherOperand);
+        // Untyped locals are emitted as System.Object. Match the actual CIL local contract so a
+        // zero equality test is a reference-null comparison rather than invalid object-vs-I4 IL.
+        if (otherType == null && otherOperand is LocalVariable)
+            return context.AppContext.SystemTypes.SystemObjectType;
         // Runtime handles, unmanaged/byref pointers and unconstrained generic parameters
         // are not managed references, even when their IsValueType property is false.
-        return otherType is { IsValueType: false } && otherType.Type is
-            Il2CppTypeEnum.IL2CPP_TYPE_CLASS or Il2CppTypeEnum.IL2CPP_TYPE_OBJECT or
-            Il2CppTypeEnum.IL2CPP_TYPE_STRING or Il2CppTypeEnum.IL2CPP_TYPE_SZARRAY or
-            Il2CppTypeEnum.IL2CPP_TYPE_ARRAY or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST ? otherType : null;
+        return otherType is not null
+            and not (RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext
+                or RuntimeFieldInfoAnalysisContext or PointerTypeAnalysisContext
+                or ByRefTypeAnalysisContext or GenericParameterTypeAnalysisContext)
+            && (!otherType.IsValueType || otherType.FullName is "System.Object" or "System.String")
+            ? otherType
+            : null;
     }
     
     private static TypeAnalysisContext? DestinationType(IOperand destination) =>

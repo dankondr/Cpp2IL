@@ -53,6 +53,7 @@ public class IlGeneratorTests
     [TestCase(8, false, OpCode.CheckEqual, true)]
     [TestCase(9, false, OpCode.CheckEqual, false)]
     [TestCase(10, false, OpCode.CheckEqual, false)]
+    [TestCase(11, false, OpCode.CheckEqual, true)]
     [TestCase(1, false, OpCode.CheckEqual, false)]
     [TestCase(2, false, OpCode.CheckEqual, false)]
     [TestCase(3, false, OpCode.CheckEqual, false)]
@@ -62,7 +63,7 @@ public class IlGeneratorTests
     public void OnlyReferenceEqualityWithLiteralZeroEmitsNull(int kind, bool reverse, OpCode opcode, bool expectsNull)
     {
         var app=Cpp2IlApi.CurrentAppContext!;
-        var operandType=kind switch {1=>app.SystemTypes.SystemInt32Type,2=>app.SystemTypes.SystemBooleanType,3=>new PointerTypeAnalysisContext(app.SystemTypes.SystemInt32Type),_=>app.SystemTypes.SystemObjectType};
+        TypeAnalysisContext? operandType=kind switch {1=>app.SystemTypes.SystemInt32Type,2=>app.SystemTypes.SystemBooleanType,3=>new PointerTypeAnalysisContext(app.SystemTypes.SystemInt32Type),11=>null,_=>app.SystemTypes.SystemObjectType};
         var list=app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
         if(kind==6)operandType=app.SystemTypes.SystemStringType;
         if(kind==7)operandType=new SzArrayTypeAnalysisContext(app.SystemTypes.SystemObjectType);
