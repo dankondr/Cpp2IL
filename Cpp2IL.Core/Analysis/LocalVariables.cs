@@ -584,11 +584,26 @@ public static class LocalVariables
         if (instruction.Operands[0] is not LocalVariable { Type: null } destination)
             return false;
 
+        TypeAnalysisContext? integerType = null;
         for (var i = 1; i < instruction.Operands.Count; i++)
-            if (IntegerResultType(instruction.Operands[i], method) is { } integerType)
-                return SetTypeIfUnknown(destination, integerType);
+        {
+            var operandType = IntegerResultType(instruction.Operands[i], method)
+                ?? IntegerImmediateType(instruction.Operands[i], method);
+            if (operandType == null)
+                continue;
 
-        return false;
+            // A wide immediate is still a width-bearing operand. Selecting the
+            // first local's type loses that fact for native bitwise lowering.
+            if (operandType.FullName == "System.Int64")
+            {
+                integerType = operandType;
+                break;
+            }
+
+            integerType ??= operandType;
+        }
+
+        return integerType != null && SetTypeIfUnknown(destination, integerType);
     }
 
     private static TypeAnalysisContext? IntegerResultType(IOperand operand, MethodAnalysisContext method)
