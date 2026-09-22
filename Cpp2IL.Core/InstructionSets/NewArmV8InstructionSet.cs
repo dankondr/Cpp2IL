@@ -164,7 +164,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             if (context.IsVoid)
                 instructions.Add(new Instruction(index, OpCode.Return));
             else
-                instructions.Add(new Instruction(index, OpCode.Return, CallingConventions.ReturnOperand(context)));
+                instructions.Add(new Instruction(index, OpCode.Return, CallingConventions.ReturnRegister(context)));
         }
 
         // fix branches
@@ -233,7 +233,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
                 var call = ctx.IsVoid
                     ? Add(address, OpCode.CallVoid, Imm(target))
-                    : Add(address, OpCode.Call, Imm(target), CallingConventions.ReturnOperand(ctx));
+                    : Add(address, OpCode.Call, Imm(target), CallingConventions.ReturnRegister(ctx));
 
                 call.AddOperands(CallingConventions.ResolveForManaged(ctx));
             }
@@ -250,7 +250,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             if (context.IsVoid)
                 Add(address, OpCode.Return);
             else
-                Add(address, OpCode.Return, CallingConventions.ReturnOperand(context));
+                Add(address, OpCode.Return, CallingConventions.ReturnRegister(context));
         }
 
         // for pre/post indexed accesses, apply the base register update on the correct side of the access

@@ -104,7 +104,7 @@ public class SsaForm
             if (Reads(instruction, register))
                 return true;
 
-            if (ContainsRegister(instruction.Destination, register))
+            if (instruction.Destination is Register defined && defined.Number == register.Number)
             {
                 continuePastBlock = false;
                 return false;
@@ -121,10 +121,14 @@ public class SsaForm
         {
             if (i == 0 && instruction.Destination is Register)
                 continue;
-            if (ReferenceEquals(instruction.Operands[i], instruction.Destination))
-                continue;
 
-            var reads = EnumerateRegisters(instruction.Operands[i]).Any(other => other.Number == register.Number);
+            var reads = instruction.Operands[i] switch
+            {
+                Register other => other.Number == register.Number,
+                MemoryOperand memory => (memory.Base as Register?)?.Number == register.Number
+                    || (memory.Index as Register?)?.Number == register.Number,
+                _ => false
+            };
 
             if (reads)
                 return true;
@@ -147,35 +151,20 @@ public class SsaForm
             yield return clobbered;
 
         foreach (var operand in instruction.Operands)
-            foreach (var register in EnumerateRegisters(operand))
-                yield return register;
-    }
-
-    private static IEnumerable<Register> EnumerateRegisters(IOperand operand)
-    {
-        switch (operand)
         {
-            case Register register:
+            if (operand is Register register)
                 yield return register;
-                break;
-            case AggregateOperand aggregate:
-                foreach (var lane in aggregate.Lanes.SelectMany(EnumerateRegisters))
-                    yield return lane;
-                break;
-            case AddressOf { Target: Register addressed }:
+            else if (operand is AddressOf { Target: Register addressed })
                 yield return addressed;
-                break;
-            case MemoryOperand memory:
+            else if (operand is MemoryOperand memory)
+            {
                 if (memory.Base is Register baseRegister)
                     yield return baseRegister;
                 if (memory.Index is Register indexRegister)
                     yield return indexRegister;
-                break;
+            }
         }
     }
-
-    private static bool ContainsRegister(IOperand? operand, Register register)
-        => operand != null && EnumerateRegisters(operand).Any(candidate => candidate.Number == register.Number);
 
     private void InsertPhiFunctions(ISILControlFlowGraph graph, DominatorInfo dominance)
     {
@@ -282,10 +271,6 @@ public class SsaForm
 
                 if (instruction.Destination is Register definition)
                     instruction.Destination = NewName(definition, definedHere);
-                else if (instruction.Destination is AggregateOperand aggregate)
-                    aggregate.ReplaceLanes(aggregate.Lanes.Select(lane => lane is Register register
-                        ? (IOperand)NewName(register, definedHere)
-                        : lane));
 
                 // Nothing to write the new version back into, but taking it off the stack is the point: reads
                 // after this one can't reach back past the call
@@ -332,18 +317,9 @@ public class SsaForm
         {
             var operand = instruction.Operands[i];
 
-            if (ReferenceEquals(operand, instruction.Destination))
-                continue;
-
             if (operand is Register register)
             {
                 instruction.SetOperand(i, CurrentVersion(register.Number));
-            }
-            else if (operand is AggregateOperand aggregate)
-            {
-                aggregate.ReplaceLanes(aggregate.Lanes.Select(lane => lane is Register register
-                    ? (IOperand)CurrentVersion(register.Number)
-                    : lane));
             }
             else if (operand is MemoryOperand memory)
             {

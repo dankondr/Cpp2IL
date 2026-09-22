@@ -79,15 +79,6 @@ public static class DeadCodeEliminator
         {
             switch (operand)
             {
-                case AggregateOperand aggregate:
-                    if (!ReferenceEquals(aggregate, destination))
-                        yield return aggregate;
-                    foreach (var lane in aggregate.Lanes)
-                    {
-                        foreach (var used in UsedOperandLocals(lane, destination))
-                            yield return used;
-                    }
-                    break;
                 case LocalVariable local when !ReferenceEquals(local, destination):
                     yield return local;
                     break;
@@ -124,32 +115,6 @@ public static class DeadCodeEliminator
                     yield return lengthArray;
                     break;
             }
-        }
-    }
-
-    private static IEnumerable<LocalVariable> UsedOperandLocals(IOperand operand, LocalVariable? destination)
-    {
-        switch (operand)
-        {
-            case AggregateOperand aggregate:
-                if (!ReferenceEquals(aggregate, destination))
-                    yield return aggregate;
-                foreach (var lane in aggregate.Lanes)
-                    foreach (var used in UsedOperandLocals(lane, destination))
-                        yield return used;
-                break;
-            case LocalVariable local when !ReferenceEquals(local, destination):
-                yield return local;
-                break;
-            case AddressOf { Target: LocalVariable addressed } when !ReferenceEquals(addressed, destination):
-                yield return addressed;
-                break;
-            case MemoryOperand memory:
-                if (memory.Base is LocalVariable baseLocal && !ReferenceEquals(baseLocal, destination))
-                    yield return baseLocal;
-                if (memory.Index is LocalVariable indexLocal && !ReferenceEquals(indexLocal, destination))
-                    yield return indexLocal;
-                break;
         }
     }
 

@@ -259,15 +259,8 @@ public class ISILControlFlowGraph
                 foreach (var operand in instruction.Sources.Where(operand => !use.Contains(operand)))
                     use.Add(operand);
 
-                if (instruction.Destination is { } destination)
-                {
-                    if (!def.Contains(destination))
-                        def.Add(destination);
-                    if (destination is AggregateOperand aggregate)
-                        foreach (var lane in aggregate.Lanes.OfType<Register>())
-                            if (!def.Contains(lane))
-                                def.Add(lane);
-                }
+                if (instruction.Destination != null && !def.Contains(instruction.Destination))
+                    def.Add(instruction.Destination);
 
                 if (instruction.ImplicitDefinition is { } clobbered && !def.Contains(clobbered))
                     def.Add(clobbered);
