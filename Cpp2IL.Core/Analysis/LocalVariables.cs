@@ -522,33 +522,6 @@ public static class LocalVariables
         if (integerType == null)
             return false;
 
-        // Native lowering often feeds this temporary into another arithmetic or
-        // bitwise operation before the final comparison. Keep inference local to a
-        // numeric use chain; address/reference uses remain barriers.
-        var usedNumerically = false;
-        foreach (var user in method.ControlFlowGraph!.Instructions)
-        {
-            if (ReferenceEquals(user, instruction))
-                continue;
-            foreach (var operand in user.Operands)
-            {
-                if (!ContainsLocal(operand, destination))
-                    continue;
-                if (ReferenceEquals(user.Destination, destination)
-                    || !ReferenceEquals(operand, destination)
-                    || user.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual
-                        or OpCode.CheckGreater or OpCode.CheckLess
-                        or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual
-                        or OpCode.Add or OpCode.Subtract or OpCode.Multiply
-                        or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft
-                        or OpCode.ShiftRight or OpCode.And or OpCode.Or or OpCode.Xor))
-                    return false;
-                usedNumerically = true;
-            }
-        }
-        if (!usedNumerically)
-            return false;
-
         bool Compatible(IOperand operand) => operand is Immediate immediate
             ? integerType.FullName == "System.Int64" || immediate.Value is >= int.MinValue and <= uint.MaxValue
             : IntegerResultType(operand, method) == integerType;
