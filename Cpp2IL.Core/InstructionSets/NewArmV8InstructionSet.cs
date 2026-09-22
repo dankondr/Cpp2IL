@@ -408,7 +408,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             if (ResolveMathMethod(name, isDouble) is { } method)
             {
                 var call = Add(address, OpCode.Call, method, destination);
-                call.AddOperands(source);
+                call.AddOperands([source]);
             }
             else
             {
