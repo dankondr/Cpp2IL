@@ -772,6 +772,17 @@ public static class IlGenerator
                     EmitStackCoerce(EmittedOperandType(instruction.Operands[2], context, operand2Type), operand2Type, method,
                         instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual);
 
+                // Bitwise/shift ops are integer-only in IL. An operand that provably emits
+                // a non-integer (float, struct or concrete reference — unlike an untyped
+                // object local which may still hold a boxed int) makes the operation
+                // unrecoverable; emit an honest diagnostic instead of invalid IL.
+                var unrecoverableIntegerOperation = instruction.OpCode
+                    is OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And or OpCode.Or or OpCode.Xor
+                    && instruction.Operands.Skip(1).Any(operand =>
+                        EmittedOperandType(operand, context, operandType) is { } operandEmitted
+                        && IntegralStackWidth(operandEmitted) == 0
+                        && (operandEmitted.IsValueType || operandEmitted.FullName != "System.Object"));
+
                 switch (instruction.OpCode)
                 {
                     case OpCode.CheckEqual: instructions.Add(CilOpCodes.Ceq); break;
@@ -803,12 +814,23 @@ public static class IlGenerator
                     case OpCode.Divide: instructions.Add(CilOpCodes.Div); break;
                     case OpCode.Modulo: instructions.Add(CilOpCodes.Rem); break;
 
-                    case OpCode.ShiftLeft: instructions.Add(CilOpCodes.Shl); break;
-                    case OpCode.ShiftRight: instructions.Add(CilOpCodes.Shr); break;
-
-                    case OpCode.And: instructions.Add(CilOpCodes.And); break;
-                    case OpCode.Or: instructions.Add(CilOpCodes.Or); break;
-                    case OpCode.Xor: instructions.Add(CilOpCodes.Xor); break;
+                    case OpCode.ShiftLeft:
+                    case OpCode.ShiftRight:
+                    case OpCode.And:
+                    case OpCode.Or:
+                    case OpCode.Xor:
+                        if (unrecoverableIntegerOperation)
+                            EmitUnrecoverableOperation(method, writeLine, $"Unrecoverable integer operation: {instruction}");
+                        else
+                            instructions.Add(instruction.OpCode switch
+                            {
+                                OpCode.ShiftLeft => CilOpCodes.Shl,
+                                OpCode.ShiftRight => CilOpCodes.Shr,
+                                OpCode.And => CilOpCodes.And,
+                                OpCode.Or => CilOpCodes.Or,
+                                _ => CilOpCodes.Xor,
+                            });
+                        break;
                 }
 
                 var resultType = instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual
@@ -832,6 +854,10 @@ public static class IlGenerator
                     instructions.Add(CilOpCodes.Ldc_I4_0);
                     instructions.Add(CilOpCodes.Ceq);
                 }
+                else if (EmittedOperandType(instruction.Operands[1], context) is { } notOperand
+                    && IntegralStackWidth(notOperand) == 0
+                    && (notOperand.IsValueType || notOperand.FullName != "System.Object"))
+                    EmitUnrecoverableOperation(method, writeLine, $"Unrecoverable integer operation: {instruction}");
                 else
                     instructions.Add(CilOpCodes.Not);
 
@@ -2140,6 +2166,23 @@ public static class IlGenerator
                 }
             }
         return picked;
+    }
+
+    // The operation cannot be represented as legal IL (e.g. a bitwise op on a
+    // float or reference operand). Emit the diagnostic and an exception, the same
+    // honest contract as unmanaged memory loads.
+    private static void EmitUnrecoverableOperation(MethodDefinition method, IMethodDescriptor writeLine, string detail)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        var module = method.DeclaringModule!;
+        instructions.Add(CilOpCodes.Ldstr, Diagnostic(detail));
+        instructions.Add(CilOpCodes.Call, writeLine);
+        var exceptionCtor = module.CorLibTypeFactory.CorLibScope
+            .CreateTypeReference("System", "Exception")
+            .CreateMemberReference(".ctor", MethodSignature.CreateInstance(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.String]));
+        instructions.Add(CilOpCodes.Ldstr, Diagnostic(detail));
+        instructions.Add(CilOpCodes.Newobj, exceptionCtor);
+        instructions.Add(CilOpCodes.Throw);
     }
 
     private static void LoadLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
