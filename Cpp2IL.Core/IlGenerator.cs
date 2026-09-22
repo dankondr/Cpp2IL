@@ -303,7 +303,7 @@ public static class IlGenerator
         var currentCount = instructions.Count;
         var startIndex = instructions.Count;
 
-        if (constructorPairs.ContainsValue(instruction))
+        if (constructorPairs.Values.Contains(instruction))
             return [];
 
         var module = method.DeclaringModule!;
