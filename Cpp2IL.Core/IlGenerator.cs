@@ -9,6 +9,7 @@ using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
 using Cpp2IL.Core.Utils.AsmResolver;
 using LibCpp2IL.BinaryStructures;
 
@@ -482,6 +483,27 @@ public static class IlGenerator
                     // Operands run [ctor, newObject, arguments..., methodInfo], so take only as many as
                     // the constructor declares (i.e. drop methodInfo)
                     var constructorArgs = constructorCall.Operands.Skip(ConstructorReceiverIndex(constructorCall) + 1).Take(constructor.Parameters.Count).ToList();
+
+                    // A delegate .ctor verifies only against a function pointer whose
+                    // signature matches the delegate's Invoke. Shared generics erase the
+                    // instantiation to object arguments, so re-derive it from the ldftn
+                    // target's real signature; when nothing satisfies the check, note the
+                    // loss and leave a null delegate rather than an unverifiable newobj.
+                    if (ResolveDelegateConstructor(constructor, constructorArgs, context,
+                            out var delegateFailure) is { } delegateConstructor)
+                        constructor = delegateConstructor;
+                    else if (delegateFailure != null)
+                    {
+                        instructions.Add(CilOpCodes.Ldstr, Diagnostic(delegateFailure));
+                        instructions.Add(CilOpCodes.Call, writeLine);
+                        EmitNullOrDefault(allocatedDestination, method, instructions);
+                        StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
+
+                        constructorCall.OpCode = OpCode.Nop;
+                        constructorCall.SetOperands();
+                        break;
+                    }
+
                     for (var i = 0; i < constructorArgs.Count; i++)
                         LoadOperandIntoSlot(constructorArgs[i], constructor.Parameters[i].ParameterType, context, method, locals, writeLine);
 
@@ -1470,6 +1492,375 @@ public static class IlGenerator
 
         return null;
     }
+
+    // A `newobj SomeDelegate::.ctor(object, native int)` verifies only when the
+    // function pointer on the stack names a method whose signature satisfies the
+    // delegate's Invoke (ILVerify's DelegateCtor check). IL2CPP shares generic
+    // code across reference arguments, so the recovered instantiation is often
+    // erased to System.Object arguments while the ldftn target keeps its
+    // concrete signature - `Func<object, bool>` paired with `bool M(UnitData)`.
+    // When the erased pairing cannot verify, the target's real signature gives
+    // the honest concrete instantiation; when nothing satisfies the check the
+    // site degrades to a diagnostic and a null delegate instead.
+
+    // Returns the .ctor to emit - possibly re-instantiated so Invoke matches the
+    // ldftn target - or null when `constructor` should be emitted unchanged.
+    // `failure` is set to the diagnostic message when no legal emission exists.
+    private static MethodAnalysisContext? ResolveDelegateConstructor(
+        MethodAnalysisContext constructor, IReadOnlyList<IOperand> constructorArgs,
+        MethodAnalysisContext context, out string? failure)
+    {
+        failure = null;
+
+        var delegateType = constructor.DeclaringType;
+        if (constructor.Name != ".ctor" || delegateType == null)
+            return null;
+
+        var delegateDefinition = delegateType is GenericInstanceTypeAnalysisContext genericDelegate
+            ? genericDelegate.GenericType
+            : delegateType;
+        if (!DerivesFromMulticastDelegate(delegateDefinition))
+            return null;
+
+        // A delegate .ctor is only ever (object, native int); anything else the
+        // verifier rejects outright.
+        if (constructor.Parameters.Count != 2
+            || constructor.Parameters[0].ParameterType is { IsValueType: true }
+            or ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+            || constructor.Parameters[1].ParameterType.FullName is not ("System.IntPtr" or "System.UIntPtr"))
+        {
+            failure = $"Unverifiable delegate construction: {delegateType.FullName}.ctor is not (object, native int)";
+            return null;
+        }
+
+        var invoke = delegateDefinition.Methods.FirstOrDefault(m => m is { IsStatic: false, Name: "Invoke" });
+        if (invoke == null)
+        {
+            // A delegate type we can see but cannot find an Invoke on can never
+            // satisfy the check; one whose members were never resolved is left
+            // alone because we cannot prove the pairing either way.
+            if (delegateDefinition.Methods.Count > 0)
+                failure = $"Unverifiable delegate construction: {delegateType.FullName} has no resolvable Invoke";
+            return null;
+        }
+
+        // The function-pointer argument reaches the stack as a method (ldftn)
+        // only for a RuntimeMethodInfo operand; anything else emits a plain
+        // native int the verifier cannot accept.
+        if (constructorArgs.Count < 2
+            || constructorArgs[1] is not RuntimeMethodInfoAnalysisContext { RepresentedMethod: { } represented })
+        {
+            failure = $"Unverifiable delegate construction: {delegateType.FullName} has no resolvable function-pointer target";
+            return null;
+        }
+
+        // The method actually emitted is the visible substitute, exactly as
+        // LoadOperand resolves it for the IntPtr contract.
+        var target = represented;
+        if (!Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(target, context))
+        {
+            if (Analysis.InaccessibleCalleeRecovery.TrySubstitute(target) is { } substitute
+                && Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(substitute, context))
+                target = substitute;
+            else
+            {
+                failure = $"Unverifiable delegate construction: {delegateType.FullName} target {represented.FullNameWithSignature} is inaccessible";
+                return null;
+            }
+        }
+        if (target.Name is ".ctor")
+        {
+            // ldftn cannot name a constructor; the emission degenerates to a
+            // null pointer, which is not a method either.
+            failure = $"Unverifiable delegate construction: {delegateType.FullName} target is a constructor";
+            return null;
+        }
+
+        var isNullTarget = constructorArgs[0] is Immediate { Value: 0 };
+        var objectEmitted = isNullTarget ? null : EmittedOperandType(constructorArgs[0], context);
+
+        // ldftn of a non-final virtual method is only legal on `this` or a boxed
+        // receiver; any other target fails before the signature is even compared.
+        if (!target.IsStatic
+            && (target.Attributes & MethodAttributes.Virtual) != 0
+            && (target.Attributes & MethodAttributes.Final) == 0
+            && target.DeclaringType is not { IsSealed: true }
+            && constructorArgs[0] is not LocalVariable { IsThis: true }
+            && objectEmitted is not { IsValueType: true })
+        {
+            failure = $"Unverifiable delegate construction: {delegateType.FullName} target {target.FullNameWithSignature} is a non-final virtual method";
+            return null;
+        }
+
+        var instantiationArgs = (delegateType as GenericInstanceTypeAnalysisContext)?.GenericArguments;
+
+        // The recovered instantiation already satisfies the verifier: leave it alone.
+        if (DelegateSignatureMatches(invoke, instantiationArgs, target, objectEmitted, isNullTarget))
+            return null;
+
+        if (delegateDefinition.GenericParameters.Count == 0
+            || SolveDelegateInstantiation(delegateDefinition, invoke, target, context,
+                    instantiationArgs) is not { } solved
+            || !DelegateSignatureMatches(invoke, solved, target, objectEmitted, isNullTarget))
+        {
+            failure = $"Unverifiable delegate construction: {delegateType.FullName} cannot be instantiated for target {target.FullNameWithSignature}";
+            return null;
+        }
+
+        var baseConstructor = constructor is ConcreteGenericMethodAnalysisContext concrete
+            ? concrete.BaseMethodContext
+            : null;
+        if (baseConstructor?.DeclaringType == null
+            || !ThisConstructorCallPlan.SameTypeIdentity(baseConstructor.DeclaringType, delegateDefinition))
+            baseConstructor = delegateDefinition.Methods.FirstOrDefault(m =>
+                m is { IsStatic: false, Name: ".ctor" } && m.Parameters.Count == 2);
+        if (baseConstructor == null)
+        {
+            failure = $"Unverifiable delegate construction: {delegateType.FullName} has no resolvable .ctor";
+            return null;
+        }
+
+        return new ConcreteGenericMethodAnalysisContext(baseConstructor, solved, []);
+    }
+
+    private static bool DerivesFromMulticastDelegate(TypeAnalysisContext type)
+    {
+        for (var current = type; current != null;
+             current = current.BaseType ?? (current as GenericInstanceTypeAnalysisContext)?.GenericType.BaseType)
+            if (current.FullName == "System.MulticastDelegate")
+                return true;
+        return false;
+    }
+
+    // Mirrors the verifier's IsDelegateAssignable plus the stack-shape checks
+    // around it: an open delegate takes an ldnull target and a closed one a real
+    // object, Invoke's parameters must be assignable to the target's parameters
+    // pairwise, and the target's return must be assignable to Invoke's return.
+    private static bool DelegateSignatureMatches(
+        MethodAnalysisContext invoke, IReadOnlyList<TypeAnalysisContext>? instantiationArgs,
+        MethodAnalysisContext target, TypeAnalysisContext? objectEmitted, bool isNullTarget)
+    {
+        var invokeParameters = invoke.Parameters
+            .Select(p => InstantiateDelegateType(p.ParameterType, instantiationArgs)).ToList();
+        var invokeReturn = InstantiateDelegateType(invoke.ReturnType, instantiationArgs);
+
+        var totalTargetArgs = target.Parameters.Count + (target.IsStatic ? 0 : 1);
+
+        bool isOpen;
+        if (totalTargetArgs == invokeParameters.Count)
+            isOpen = true;
+        else if (totalTargetArgs == invokeParameters.Count + 1)
+            isOpen = false;
+        else
+            return false;
+
+        // An open delegate takes a null target object, a closed one a real reference.
+        if (isOpen != isNullTarget)
+            return false;
+
+        if (totalTargetArgs == 0)
+            return true; // An open static delegate over a parameterless method.
+
+        var consumedArgs = isOpen ? 1 : 0;
+        if (isOpen)
+        {
+            // Invoke's first parameter stands in for the target's receiver, or
+            // for its first fixed argument when the target is static.
+            var firstTargetArgument = OpenDelegateFirstArgument(target);
+            if (firstTargetArgument == null || !LooseAssignable(invokeParameters[0], firstTargetArgument))
+                return false;
+        }
+        else
+        {
+            // The pushed object must be a reference assignable to the target's
+            // receiver type, or to its first fixed argument for a static target.
+            var firstTargetArgument = target.IsStatic
+                ? target.Parameters[0].ParameterType
+                : target.DeclaringType;
+            if (firstTargetArgument == null || objectEmitted == null
+                || objectEmitted is ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+                    or GenericParameterTypeAnalysisContext
+                || !LooseAssignable(objectEmitted, firstTargetArgument))
+                return false;
+        }
+
+        if (target.IsStatic)
+            consumedArgs--;
+
+        if (invokeParameters.Count - consumedArgs != target.Parameters.Count)
+            return false;
+
+        for (var i = isOpen ? 1 : 0; i < invokeParameters.Count; i++)
+            if (!LooseAssignable(invokeParameters[i], target.Parameters[i - consumedArgs].ParameterType))
+                return false;
+
+        // void only ever matches void.
+        if (invokeReturn.FullName == "System.Void" || target.ReturnType.FullName == "System.Void")
+            return invokeReturn.FullName == target.ReturnType.FullName;
+
+        return LooseAssignable(target.ReturnType, invokeReturn);
+    }
+
+    private static TypeAnalysisContext? OpenDelegateFirstArgument(MethodAnalysisContext target) =>
+        target.IsStatic
+            ? target.Parameters.Count > 0 ? target.Parameters[0].ParameterType : null
+            : target.DeclaringType is { IsValueType: true } valueTypeOwner
+                ? new ByRefTypeAnalysisContext(valueTypeOwner)
+                : target.DeclaringType;
+
+    private static TypeAnalysisContext InstantiateDelegateType(TypeAnalysisContext type,
+        IReadOnlyList<TypeAnalysisContext>? instantiationArgs) =>
+        instantiationArgs == null ? type : GenericInstantiation.Instantiate(type, instantiationArgs, []);
+
+    private static bool LooseAssignable(TypeAnalysisContext from, TypeAnalysisContext to) =>
+        ThisConstructorCallPlan.SameTypeIdentity(from, to) || IsAssignableToLoose(from, to);
+
+    // Rebuilds the delegate's generic arguments from the ldftn target's signature
+    // so Invoke accepts it: each Invoke parameter bounds the generic argument
+    // *below* the matching target parameter (the Invoke argument must be
+    // assignable to it) and the return bounds it *above* the target's return.
+    // Returns null when the arity pairing fails or a parameter has no candidate
+    // satisfying every bound.
+    private static List<TypeAnalysisContext>? SolveDelegateInstantiation(
+        TypeAnalysisContext delegateDefinition, MethodAnalysisContext invoke,
+        MethodAnalysisContext target, MethodAnalysisContext context,
+        IReadOnlyList<TypeAnalysisContext>? fallbackArgs)
+    {
+        var genericParameterCount = delegateDefinition.GenericParameters.Count;
+        var upperBounds = new List<TypeAnalysisContext>?[genericParameterCount];
+        var lowerBounds = new List<TypeAnalysisContext>?[genericParameterCount];
+
+        bool Bind(TypeAnalysisContext bound, bool upper, int index)
+        {
+            // Byrefs, pointers and void are not legal generic arguments.
+            if (bound is ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+                || bound.FullName == "System.Void")
+                return false;
+            var bounds = upper ? upperBounds : lowerBounds;
+            (bounds[index] ??= []).Add(bound);
+            return true;
+        }
+
+        // invokeToTarget: the instantiated Invoke type must be assignable to the
+        // target type (parameter positions); the reverse for the return type.
+        bool Unify(TypeAnalysisContext invokeType, TypeAnalysisContext targetType, bool invokeToTarget)
+        {
+            switch (invokeType)
+            {
+                case GenericParameterTypeAnalysisContext { Type: Il2CppTypeEnum.IL2CPP_TYPE_VAR } parameter
+                    when parameter.Index < genericParameterCount:
+                    return Bind(targetType, invokeToTarget, parameter.Index);
+                case GenericInstanceTypeAnalysisContext invokeInstance
+                    when targetType is GenericInstanceTypeAnalysisContext targetInstance
+                        && ThisConstructorCallPlan.SameTypeIdentity(invokeInstance.GenericType, targetInstance.GenericType)
+                        && invokeInstance.GenericArguments.Count == targetInstance.GenericArguments.Count:
+                    return invokeInstance.GenericArguments
+                        .Zip(targetInstance.GenericArguments, (a, b) => Unify(a, b, invokeToTarget))
+                        .All(result => result);
+                case SzArrayTypeAnalysisContext invokeArray
+                    when targetType is SzArrayTypeAnalysisContext targetArray:
+                    return Unify(invokeArray.ElementType, targetArray.ElementType, invokeToTarget);
+                case ByRefTypeAnalysisContext invokeByRef
+                    when targetType is ByRefTypeAnalysisContext targetByRef:
+                    return Unify(invokeByRef.ElementType, targetByRef.ElementType, invokeToTarget);
+                case PointerTypeAnalysisContext invokePointer
+                    when targetType is PointerTypeAnalysisContext targetPointer:
+                    return Unify(invokePointer.ElementType, targetPointer.ElementType, invokeToTarget);
+                default:
+                    // A concrete leaf moves with no instantiation; the verifier's
+                    // directional assignability is the entire check.
+                    return invokeToTarget
+                        ? LooseAssignable(invokeType, targetType)
+                        : LooseAssignable(targetType, invokeType);
+            }
+        }
+
+        var totalTargetArgs = target.Parameters.Count + (target.IsStatic ? 0 : 1);
+        bool isOpen;
+        if (totalTargetArgs == invoke.Parameters.Count)
+            isOpen = true;
+        else if (totalTargetArgs == invoke.Parameters.Count + 1)
+            isOpen = false;
+        else
+            return null;
+
+        var consumedArgs = isOpen ? 1 : 0;
+        if (isOpen && totalTargetArgs != 0)
+        {
+            var firstTargetArgument = OpenDelegateFirstArgument(target);
+            if (firstTargetArgument == null
+                || !Unify(invoke.Parameters[0].ParameterType, firstTargetArgument, true))
+                return null;
+        }
+        if (target.IsStatic)
+            consumedArgs--;
+
+        for (var i = isOpen ? 1 : 0; i < invoke.Parameters.Count; i++)
+            if (!Unify(invoke.Parameters[i].ParameterType, target.Parameters[i - consumedArgs].ParameterType, true))
+                return null;
+
+        if (invoke.ReturnType.FullName == "System.Void" || target.ReturnType.FullName == "System.Void")
+        {
+            if (invoke.ReturnType.FullName != target.ReturnType.FullName)
+                return null;
+        }
+        else if (!Unify(invoke.ReturnType, target.ReturnType, false))
+            return null;
+
+        var solved = new List<TypeAnalysisContext>(genericParameterCount);
+        var objectType = context.AppContext.SystemTypes.SystemObjectType;
+        for (var i = 0; i < genericParameterCount; i++)
+        {
+            var upper = upperBounds[i];
+            var lower = lowerBounds[i];
+            if (upper == null && lower == null)
+            {
+                // The parameter never reaches Invoke's signature; keep the
+                // recovered argument when there is one.
+                solved.Add(fallbackArgs != null && i < fallbackArgs.Count
+                    ? fallbackArgs[i] : objectType);
+                continue;
+            }
+
+            TypeAnalysisContext? pick = null;
+            foreach (var candidate in (lower ?? []).Concat(upper ?? []))
+            {
+                if (!UsableDelegateArgument(candidate, context))
+                    continue;
+                if ((upper ?? []).All(bound => LooseAssignable(candidate, bound))
+                    && (lower ?? []).All(bound => LooseAssignable(bound, candidate)))
+                {
+                    pick = candidate;
+                    break;
+                }
+            }
+            if (pick == null)
+                return null;
+            solved.Add(pick);
+        }
+        return solved;
+    }
+
+    private static bool UsableDelegateArgument(TypeAnalysisContext type, MethodAnalysisContext context) =>
+        CanEmitTypeToken(type) && DelegateArgumentsCallerOwned(type, context);
+
+    // A generic argument may reference the calling method's own generic
+    // parameters (a generic caller building Action<T>), but never a foreign
+    // owner's - the emitted index would silently rebind to the caller's
+    // parameter at that slot.
+    private static bool DelegateArgumentsCallerOwned(TypeAnalysisContext type, MethodAnalysisContext context) =>
+        type switch
+        {
+            GenericParameterTypeAnalysisContext parameter =>
+                ReferenceEquals(parameter.Owner, context.DeclaringType)
+                || ReferenceEquals(parameter.Owner, context),
+            SzArrayTypeAnalysisContext array => DelegateArgumentsCallerOwned(array.ElementType, context),
+            ArrayTypeAnalysisContext array => DelegateArgumentsCallerOwned(array.ElementType, context),
+            WrappedTypeAnalysisContext wrapped => DelegateArgumentsCallerOwned(wrapped.ElementType, context),
+            GenericInstanceTypeAnalysisContext instance =>
+                instance.GenericArguments.All(argument => DelegateArgumentsCallerOwned(argument, context)),
+            _ => true,
+        };
 
     private static CilOpCode? FloatOperationConversion(Instruction instruction)
     {
