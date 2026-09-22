@@ -5,6 +5,7 @@ using AsmResolver.DotNet;
 using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
+using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -515,6 +516,17 @@ public static class IlGenerator
                 break;
 
             case OpCode.Return:
+                if (instruction.Operands is [var returnedException]
+                    && IsExceptionValueReturnedFromIncompatibleMethod(context, returnedException))
+                {
+                    // IL2CPP exception helpers can leave a constructed exception in the native
+                    // return register after the raise edge was lost. Never emit `ret exception`
+                    // for a method whose managed result cannot hold it.
+                    LoadOperand(returnedException, method, locals, writeLine);
+                    instructions.Add(CilOpCodes.Throw);
+                    break;
+                }
+
                 if (!context.IsVoid)
                 {
                     if (instruction.Operands.Count == 1)
@@ -645,6 +657,26 @@ public static class IlGenerator
         }
 
         return instructions.ToList().GetRange(startIndex, instructions.Count - startIndex); // Return added IL
+    }
+
+    private static bool IsExceptionValueReturnedFromIncompatibleMethod(MethodAnalysisContext context, IOperand operand)
+    {
+        var valueType = operand switch
+        {
+            LocalVariable { Type: { } type } => type,
+            FieldReference { Field.FieldType: { } type } => type,
+            _ => null
+        };
+
+        if (valueType is null || valueType is GenericParameterTypeAnalysisContext
+            || !valueType.IsAssignableTo(context.AppContext.SystemTypes.SystemExceptionType))
+            return false;
+
+        if (context.ReturnType is GenericParameterTypeAnalysisContext
+            || valueType.IsAssignableTo(context.ReturnType))
+            return false;
+
+        return true;
     }
     
     private static int ConstructorReceiverIndex(Instruction constructorCall) => constructorCall.OpCode == OpCode.CallVoid ? 1 : 2;
