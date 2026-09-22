@@ -191,4 +191,213 @@ public class AllocationConstructorTests
             Assert.That(il, Does.Contain(target!.Instruction));
         }
     }
+
+    private static (InjectedTypeAnalysisContext GrandBase, InjectedTypeAnalysisContext Base,
+        InjectedTypeAnalysisContext Derived, NativeCtor DistantCtor, NativeCtor BaseCtor,
+        NativeCtor Context, LocalVariable This) ThisCtorFixture(ApplicationAnalysisContext app,
+            int baseParameters = 0, int distantParameters = 0)
+    {
+        var assembly = app.SystemTypes.SystemObjectType.DeclaringAssembly;
+        var grandBase = new InjectedTypeAnalysisContext(assembly, "Tests", "GrandBase",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public);
+        var immediateBase = new InjectedTypeAnalysisContext(assembly, "Tests", "Base",
+            grandBase, R.TypeAttributes.Public);
+        var derived = new InjectedTypeAnalysisContext(assembly, "Tests", "Derived",
+            immediateBase, R.TypeAttributes.Public);
+        var parameterTypes = Enumerable.Repeat(app.SystemTypes.SystemInt32Type, Math.Max(baseParameters, distantParameters)).ToArray();
+        var distantCtor = new NativeCtor(grandBase, 0x3000);
+        foreach (var parameter in parameterTypes.Take(distantParameters))
+            distantCtor.Parameters.Add(new InjectedParameterAnalysisContext(null, parameter, R.ParameterAttributes.None, distantCtor.Parameters.Count, distantCtor));
+        var baseCtor = new NativeCtor(immediateBase, 0x2000);
+        foreach (var parameter in parameterTypes.Take(baseParameters))
+            baseCtor.Parameters.Add(new InjectedParameterAnalysisContext(null, parameter, R.ParameterAttributes.None, baseCtor.Parameters.Count, baseCtor));
+        grandBase.Methods.Add(distantCtor);
+        immediateBase.Methods.Add(baseCtor);
+        var context = new NativeCtor(derived, 0x1000);
+        var thisLocal = new LocalVariable("this", new Register(null, "this"), derived) { IsThis = true };
+        context.Locals = [thisLocal];
+        context.ParameterLocals = [thisLocal];
+        context.AnalysisWarnings = [];
+        return (grandBase, immediateBase, derived, distantCtor, baseCtor, context, thisLocal);
+    }
+
+    private static (MethodDefinition Distant, MethodDefinition Base, MethodDefinition Definition)
+        ThisCtorDefinitions(ModuleDefinition module, InjectedTypeAnalysisContext grandBase,
+            InjectedTypeAnalysisContext immediateBase, InjectedTypeAnalysisContext derived,
+            NativeCtor distantCtor, NativeCtor baseCtor, NativeCtor context, int parameterCount)
+    {
+        var grandBaseType = new TypeDefinition("Tests", "GrandBase", TypeAttributes.Public,
+            module.CorLibTypeFactory.Object.Type);
+        var baseType = new TypeDefinition("Tests", "Base", TypeAttributes.Public,
+            module.CorLibTypeFactory.Object.Type);
+        var derivedType = new TypeDefinition("Tests", "Derived", TypeAttributes.Public,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(grandBaseType);
+        module.TopLevelTypes.Add(baseType);
+        module.TopLevelTypes.Add(derivedType);
+        var signature = MethodSignature.CreateInstance(module.CorLibTypeFactory.Void,
+            Enumerable.Repeat(module.CorLibTypeFactory.Int32, parameterCount).ToArray());
+        var distant = new MethodDefinition(".ctor", MethodAttributes.Public, signature);
+        grandBaseType.Methods.Add(distant);
+        var baseDefinition = new MethodDefinition(".ctor", MethodAttributes.Public, signature);
+        baseType.Methods.Add(baseDefinition);
+        var definition = new MethodDefinition(".ctor", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        derivedType.Methods.Add(definition);
+        grandBase.PutExtraData("AsmResolverType", grandBaseType);
+        immediateBase.PutExtraData("AsmResolverType", baseType);
+        derived.PutExtraData("AsmResolverType", derivedType);
+        distantCtor.PutExtraData("AsmResolverMethod", distant);
+        baseCtor.PutExtraData("AsmResolverMethod", baseDefinition);
+        return (distant, baseDefinition, definition);
+    }
+
+    [Test]
+    public void DistantParameterlessAncestorCallMovesImmediateBaseCallToPrologue()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var (grandBase, immediateBase, derived, distantCtor, baseCtor, context, thisLocal) = ThisCtorFixture(app);
+        var field = derived.InjectFieldContext("level", app.SystemTypes.SystemInt32Type, R.FieldAttributes.Public);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, new FieldReference(field, thisLocal, 8), new Immediate(2)),
+            new(1, OpCode.CallVoid, distantCtor, thisLocal),
+            new(2, OpCode.Return)]);
+
+        var module = new ModuleDefinition("ThisCtorPrologue.dll");
+        var (distant, baseDefinition, definition) = ThisCtorDefinitions(module, grandBase,
+            immediateBase, derived, distantCtor, baseCtor, context, 0);
+        var fieldDefinition = new FieldDefinition("level", FieldAttributes.Public,
+            new FieldSignature(module.CorLibTypeFactory.Int32));
+        ((TypeDefinition)derived.GetExtraData<TypeDefinition>("AsmResolverType")!).Fields.Add(fieldDefinition);
+        field.PutExtraData("AsmResolverField", fieldDefinition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldarg_0));
+            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Call));
+            Assert.That(il[1].Operand, Is.SameAs(baseDefinition));
+            Assert.That(il.Any(i => i.Operand == distant), Is.False);
+            Assert.That(il[^1].OpCode, Is.EqualTo(CilOpCodes.Ret));
+        });
+        // Base initialization now runs before the field store, matching managed order.
+        Assert.That(il.Select(i => i.OpCode).ToList().IndexOf(CilOpCodes.Stfld),
+            Is.GreaterThan(1));
+    }
+
+    [Test]
+    public void DistantConstructorCallWithConstantArgumentsMovesToPrologue()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var (grandBase, immediateBase, derived, distantCtor, baseCtor, context, thisLocal) = ThisCtorFixture(app, 1, 1);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CallVoid, distantCtor, thisLocal, new Immediate(5)),
+            new(1, OpCode.Return)]);
+
+        var module = new ModuleDefinition("ThisCtorArgPrologue.dll");
+        var (distant, baseDefinition, definition) = ThisCtorDefinitions(module, grandBase,
+            immediateBase, derived, distantCtor, baseCtor, context, 1);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldarg_0));
+            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Ldc_I4));
+            Assert.That(il[1].Operand, Is.EqualTo(5));
+            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Call));
+            Assert.That(il[2].Operand, Is.SameAs(baseDefinition));
+            Assert.That(il.Any(i => i.Operand == distant), Is.False);
+        });
+    }
+
+    [Test]
+    public void DistantConstructorCallWithComputedArgumentsRetargetsInPlace()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var (grandBase, immediateBase, derived, distantCtor, baseCtor, context, thisLocal) = ThisCtorFixture(app, 1, 1);
+        var computed = new LocalVariable("computed", new Register(null, "computed"), app.SystemTypes.SystemInt32Type);
+        context.Locals.Add(computed);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, computed, new Immediate(5)),
+            new(1, OpCode.CallVoid, distantCtor, thisLocal, computed),
+            new(2, OpCode.Return)]);
+
+        var module = new ModuleDefinition("ThisCtorArgInPlace.dll");
+        var intType = new TypeDefinition("System", "Int32", TypeAttributes.Public,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(intType);
+        app.SystemTypes.SystemInt32Type.PutExtraData("AsmResolverType", intType);
+        var (distant, baseDefinition, definition) = ThisCtorDefinitions(module, grandBase,
+            immediateBase, derived, distantCtor, baseCtor, context, 1);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        var call = il.Single(i => i.OpCode == CilOpCodes.Call && i.Operand is MethodDefinition);
+        Assert.Multiple(() =>
+        {
+            Assert.That(call.Operand, Is.SameAs(baseDefinition));
+            Assert.That(il.Any(i => i.Operand == distant), Is.False);
+            // The call stays at its original position: no prologue construction.
+            Assert.That(il.IndexOf(call), Is.GreaterThan(2));
+        });
+    }
+
+    [Test]
+    public void DistantConstructorCallIsDroppedWhenOwnConstructorCallSurvives()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var (grandBase, immediateBase, derived, distantCtor, baseCtor, context, thisLocal) = ThisCtorFixture(app);
+        var ownCtor = new NativeCtor(derived, 0x4000);
+        ownCtor.Parameters.Add(new InjectedParameterAnalysisContext(null, app.SystemTypes.SystemInt32Type, R.ParameterAttributes.None, 0, ownCtor));
+        derived.Methods.Add(ownCtor);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CallVoid, ownCtor, thisLocal, new Immediate(3)),
+            new(1, OpCode.CallVoid, distantCtor, thisLocal),
+            new(2, OpCode.Return)]);
+
+        var module = new ModuleDefinition("ThisCtorChain.dll");
+        var (distant, baseDefinition, definition) = ThisCtorDefinitions(module, grandBase,
+            immediateBase, derived, distantCtor, baseCtor, context, 0);
+        var derivedType = (TypeDefinition)derived.GetExtraData<TypeDefinition>("AsmResolverType")!;
+        var ownDefinition = new MethodDefinition(".ctor", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.Int32]));
+        derivedType.Methods.Add(ownDefinition);
+        ownCtor.PutExtraData("AsmResolverMethod", ownDefinition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.Operand == ownDefinition), Is.True);
+            Assert.That(il.Any(i => i.Operand == distant), Is.False);
+            // The surviving own-constructor call already initializes `this`; no
+            // additional base call is synthesized.
+            Assert.That(il.Any(i => i.Operand == baseDefinition), Is.False);
+        });
+    }
+
+    [Test]
+    public void DistantConstructorCallWithoutBaseMatchIsPreserved()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var (grandBase, immediateBase, derived, distantCtor, baseCtor, context, thisLocal) = ThisCtorFixture(app, 1, 0);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CallVoid, distantCtor, thisLocal),
+            new(1, OpCode.Return)]);
+
+        var module = new ModuleDefinition("ThisCtorNoMatch.dll");
+        var (distant, _, definition) = ThisCtorDefinitions(module, grandBase,
+            immediateBase, derived, distantCtor, baseCtor, context, 0);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand == distant), Is.True);
+    }
 }
