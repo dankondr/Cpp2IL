@@ -37,6 +37,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
     private static Register Reg(Arm64Register reg) => new(null, NormalizeRegister(reg));
 
+    private static bool IsScalarFloatRegister(Arm64Register reg) =>
+        reg is >= Arm64Register.S0 and <= Arm64Register.S31
+            or >= Arm64Register.D0 and <= Arm64Register.D31;
+
     // integer register 31 is SP or ZR depending on context, callers must decide which
     private static bool IsReg31(Arm64Register reg) => reg is Arm64Register.X31 or Arm64Register.W31;
 
@@ -389,8 +393,71 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             Add(address + 2, OpCode.Nop);
         }
 
+        MethodAnalysisContext? ResolveMathMethod(string name, bool isDouble)
+        {
+            var assembly = context.AppContext.SystemTypes.SystemDoubleType.DeclaringAssembly;
+            var mathType = assembly.GetTypeByFullName(isDouble ? "System.Math" : "System.MathF");
+            var numberType = isDouble ? context.AppContext.SystemTypes.SystemDoubleType : context.AppContext.SystemTypes.SystemSingleType;
+            return mathType?.Methods.FirstOrDefault(method =>
+                method.IsStatic && method.Name == name && method.Parameters.Count == 1
+                && method.Parameters[0].ParameterType == numberType);
+        }
+
+        void EmitMathUnary(string name, IOperand destination, IOperand source, bool isDouble)
+        {
+            if (ResolveMathMethod(name, isDouble) is { } method)
+            {
+                var call = Add(address, OpCode.Call, method, destination);
+                call.AddOperands(source);
+            }
+            else
+            {
+                Add(address, OpCode.NotImplemented, new StringLiteral($"ARM64 {name} intrinsic is unavailable for this target framework."));
+            }
+        }
+
         switch (instruction.Mnemonic)
         {
+            case Arm64Mnemonic.FRINTM:
+            case Arm64Mnemonic.FRINTP:
+            case Arm64Mnemonic.FSQRT:
+            case Arm64Mnemonic.FABS:
+                {
+                    var destination = ConvertOperand(instruction, 0);
+                    var source = ConvertOperand(instruction, 1);
+                    if (!IsScalarFloatRegister(instruction.Op0Reg))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction {instruction.Mnemonic} vector form is not supported."));
+                        break;
+                    }
+
+                    var name = instruction.Mnemonic switch
+                    {
+                        Arm64Mnemonic.FRINTM => "Floor",
+                        Arm64Mnemonic.FRINTP => "Ceiling",
+                        Arm64Mnemonic.FSQRT => "Sqrt",
+                        _ => "Abs"
+                    };
+                    EmitMathUnary(name, destination, source, instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31);
+                    break;
+                }
+            case Arm64Mnemonic.FABD:
+                {
+                    var destination = ConvertOperand(instruction, 0);
+                    if (!IsScalarFloatRegister(instruction.Op0Reg))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction FABD vector form is not supported."));
+                        break;
+                    }
+
+                    var difference = new Register(null, "TEMP_FABD");
+                    Add(address, OpCode.Subtract, difference, ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                    EmitMathUnary("Abs", destination, difference, instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31);
+                    break;
+                }
+            case Arm64Mnemonic.DUP:
+                Add(address, OpCode.NotImplemented, new StringLiteral("Instruction DUP vector broadcast is not supported."));
+                break;
             case Arm64Mnemonic.MOV:
             case Arm64Mnemonic.MOVZ:
             case Arm64Mnemonic.FMOV:
@@ -640,7 +707,22 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.EON:
                 {
                     var temp = new Register(null, "TEMP");
-                    Add(address, OpCode.Not, temp, ConvertOperand(instruction, 2));
+                    var shiftedOperand = ConvertOperand(instruction, 2);
+                    if (instruction.Op3Imm != 0 && instruction.Op3ShiftType is not (Arm64ShiftType.LSL or Arm64ShiftType.ASR))
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"{instruction.Mnemonic} shift {instruction.Op3ShiftType} is not supported."));
+                        break;
+                    }
+
+                    if (instruction.Op3Imm != 0)
+                    {
+                        var shifted = new Register(null, "TEMP_BIC_SHIFT");
+                        Add(address, instruction.Op3ShiftType == Arm64ShiftType.LSL ? OpCode.ShiftLeft : OpCode.ShiftRight,
+                            shifted, shiftedOperand, Imm(instruction.Op3Imm));
+                        shiftedOperand = shifted;
+                    }
+
+                    Add(address, OpCode.Not, temp, shiftedOperand);
                     var opCode = instruction.Mnemonic switch
                     {
                         Arm64Mnemonic.ORN => OpCode.Or,
