@@ -440,6 +440,10 @@ public static class IlGenerator
                     && constructorCall.Operands is [MethodAnalysisContext constructor, _, ..])
                 {
                     constructor = Analysis.AllocationConstructorRecovery.Resolve(instruction, constructor) ?? constructor;
+                    constructor = ThisConstructorCallPlan.RetargetToDestinationInstantiation(constructor,
+                            DestinationType(instruction.Operands[0])
+                            ?? (instruction.Operands[0] is LocalVariable allocatedLocal ? EmittedLocalType(allocatedLocal, context) : null))
+                        ?? constructor;
                     // Operands run [ctor, newObject, arguments..., methodInfo], so take only as many as
                     // the constructor declares (i.e. drop methodInfo)
                     var constructorArgs = constructorCall.Operands.Skip(ConstructorReceiverIndex(constructorCall) + 1).Take(constructor.Parameters.Count).ToList();
@@ -458,6 +462,10 @@ public static class IlGenerator
                 else if (instruction.Operands is [_, TypeAnalysisContext allocatedType] && allocatedType.Methods.FirstOrDefault(m => m is { Name: ".ctor", Parameters.Count: 0 }) is { } parameterlessCtor)
                 {
                     // Nothing to fuse with, so the allocation was self-contained. The type is still right, so construct it bare.
+                    parameterlessCtor = ThisConstructorCallPlan.RetargetToDestinationInstantiation(parameterlessCtor,
+                            DestinationType(instruction.Operands[0])
+                            ?? (instruction.Operands[0] is LocalVariable allocatedLocal ? EmittedLocalType(allocatedLocal, context) : null))
+                        ?? parameterlessCtor;
                     instructions.Add(CilOpCodes.Newobj, parameterlessCtor.ToMethodDescriptor());
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 }
@@ -986,6 +994,26 @@ public static class IlGenerator
             a is GenericInstanceTypeAnalysisContext left
             && b is GenericInstanceTypeAnalysisContext right
             && left.GenericType.FullName == right.GenericType.FullName;
+
+        // IL2CPP shares generic code across reference-type arguments, so the lifter may tag
+        // a `newobj` with `List<object>` while every use site wants `List<string>`. When the
+        // allocated type and the destination are instantiations of the same generic
+        // definition, rebuild the constructor against the destination's instantiation.
+        internal static MethodAnalysisContext? RetargetToDestinationInstantiation(MethodAnalysisContext constructor,
+            TypeAnalysisContext? destinationType)
+        {
+            if (destinationType is not GenericInstanceTypeAnalysisContext destination
+                || constructor.DeclaringType is not GenericInstanceTypeAnalysisContext source
+                || !SameTypeIdentity(source.GenericType, destination.GenericType)
+                || source.GenericArguments.Count != destination.GenericArguments.Count
+                || source.GenericArguments.Zip(destination.GenericArguments, SameTypeIdentity).All(match => match))
+                return null;
+
+            var baseConstructor = constructor is ConcreteGenericMethodAnalysisContext concrete
+                ? concrete.BaseMethodContext
+                : constructor;
+            return new ConcreteGenericMethodAnalysisContext(baseConstructor, destination.GenericArguments, []);
+        }
 
         private static bool SameMethodIdentity(MethodAnalysisContext a, MethodAnalysisContext b)
         {
