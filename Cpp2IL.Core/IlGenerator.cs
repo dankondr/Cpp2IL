@@ -135,8 +135,19 @@ public static class IlGenerator
         // Generate IL
         Dictionary<Instruction, List<CilInstruction>> instructionMap = [];
         var constructorPairs = FindConstructorPairs(context);
+        var thisConstructorCalls = ThisConstructorCallPlan.Create(context);
         Dictionary<Block, CilInstruction> blockEntryMap = [];
         List<(CilInstruction BranchInstruction, Block TargetBlock)> pendingBlockBranchFixups = [];
+
+        // An inlined-away constructor chain is re-anchored to the immediate base
+        // constructor at the top of the body, where managed code runs it.
+        foreach (var (constructor, arguments) in thisConstructorCalls?.PrologueCalls ?? [])
+        {
+            body.Instructions.Add(CilOpCodes.Ldarg_0);
+            for (var i = 0; i < arguments.Length; i++)
+                LoadOperand(arguments[i], definition, locals, writeLine, constructor.Parameters[i].ParameterType);
+            body.Instructions.Add(CilOpCodes.Call, constructor.ToMethodDescriptor());
+        }
 
         foreach (var block in context.ControlFlowGraph!.Blocks)
         {
@@ -148,7 +159,7 @@ public static class IlGenerator
 
             foreach (var instruction in block.Instructions)
             {
-                var generated = GenerateInstructions(instruction, context, definition, locals, writeLine, constructorPairs);
+                var generated = GenerateInstructions(instruction, context, definition, locals, writeLine, constructorPairs, thisConstructorCalls);
                 instructionMap.Add(instruction, generated);
 
                 if (!blockEntryMap.ContainsKey(block) && generated.Count > 0)
@@ -176,6 +187,33 @@ public static class IlGenerator
                 pendingBlockBranchFixups.Add((bridge, successor));
             }
         }
+
+        // Branches that land on a skipped this-constructor call resume at whatever
+        // executes next, like fused constructor calls retargeting to their allocation.
+        Dictionary<Instruction, CilInstruction> skippedThisConstructorRedirects = [];
+        if (thisConstructorCalls != null)
+        {
+            foreach (var skipped in thisConstructorCalls.Skip)
+            {
+                var skippedBlock = context.ControlFlowGraph.FindBlockByInstruction(skipped);
+                if (skippedBlock == null)
+                    continue;
+
+                CilInstruction? redirect = null;
+                for (var i = skippedBlock.Instructions.IndexOf(skipped) + 1; i < skippedBlock.Instructions.Count && redirect == null; i++)
+                    if (instructionMap.TryGetValue(skippedBlock.Instructions[i], out var mapped) && mapped.Count > 0)
+                        redirect = mapped[0];
+
+                if (redirect == null)
+                    foreach (var successor in skippedBlock.Successors)
+                        if ((redirect = ResolveBlockEntryInstruction(successor, blockEntryMap)) != null)
+                            break;
+
+                if (redirect != null)
+                    skippedThisConstructorRedirects[skipped] = redirect;
+            }
+        }
+
         // Set IL branch targets
         foreach (var kvp in instructionMap)
         {
@@ -199,7 +237,11 @@ public static class IlGenerator
                 // branches that landed on it to the paired allocation that does survive emission.
                 target = ConstructorAllocationForCall(target, constructorPairs) ?? target;
 
-                if (!instructionMap.ContainsKey(target))
+                var mappedTarget = instructionMap.TryGetValue(target, out var mapped) && mapped.Count > 0
+                    ? mapped[0]
+                    : skippedThisConstructorRedirects.GetValueOrDefault(target);
+
+                if (mappedTarget == null)
                 {
                     context.AddWarning($"Branch target not in ISIL to IL map: {instruction} --- {target}");
                     ilBranch.OpCode = CilOpCodes.Nop;
@@ -207,7 +249,7 @@ public static class IlGenerator
                     continue;
                 }
 
-                ilBranch.Operand = new CilInstructionLabel(instructionMap[target][0]);
+                ilBranch.Operand = new CilInstructionLabel(mappedTarget);
             }
         }
         
@@ -297,7 +339,7 @@ public static class IlGenerator
 
     private static List<CilInstruction> GenerateInstructions(Instruction instruction, MethodAnalysisContext context,
         MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
-        IReadOnlyDictionary<Instruction, Instruction> constructorPairs)
+        IReadOnlyDictionary<Instruction, Instruction> constructorPairs, ThisConstructorCallPlan? thisConstructorCalls)
     {
         var body = method.CilMethodBody!;
         var instructions = body.Instructions;
@@ -305,6 +347,9 @@ public static class IlGenerator
         var startIndex = instructions.Count;
 
         if (constructorPairs.Values.Contains(instruction))
+            return [];
+
+        if (thisConstructorCalls?.Skip.Contains(instruction) == true)
             return [];
 
         var module = method.DeclaringModule!;
@@ -473,6 +518,10 @@ public static class IlGenerator
                     break;
                 }
 
+                var retargetedBaseConstructor = thisConstructorCalls?.Retarget.GetValueOrDefault(instruction);
+                if (retargetedBaseConstructor != null)
+                    targetMethod = retargetedBaseConstructor;
+
                 var importedMethod = targetMethod.ToMethodDescriptor();
 
                 var thisParamIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
@@ -505,7 +554,10 @@ public static class IlGenerator
                         PushDefaultOf(parameterType, instructions);
                 }
 
-                instructions.Add(!targetMethod.IsStatic && (instruction.IsVirtualDispatch || targetMethod.DeclaringType?.IsInterface == true) ? CilOpCodes.Callvirt : CilOpCodes.Call, importedMethod);
+                instructions.Add(!targetMethod.IsStatic && retargetedBaseConstructor == null
+                        && (instruction.IsVirtualDispatch || targetMethod.DeclaringType?.IsInterface == true)
+                    ? CilOpCodes.Callvirt
+                    : CilOpCodes.Call, importedMethod);
 
                 // the lifter's guess at whether the callee returns anything can disagree with the
                 // signature we later resolved, so go by the signature and balance the stack
@@ -714,6 +766,182 @@ public static class IlGenerator
         }
 
         return null;
+    }
+
+    // IL2CPP inlines constructor chains, so a derived .ctor can be left calling a
+    // distant ancestor .ctor on `this` (e.g. MonoBehaviour or Object) instead of the
+    // immediate base. The verifier only accepts own-type or direct-base .ctor calls
+    // on `this`, so provable calls are re-anchored to the immediate base .ctor:
+    // parameterless calls move to the prologue (managed order runs base init before
+    // field stores), calls whose arguments are all parameters/constants may follow
+    // them, and everything else is retargeted in place or left as evidence.
+    private sealed class ThisConstructorCallPlan
+    {
+        public readonly HashSet<Instruction> Skip = [];
+        public readonly Dictionary<Instruction, MethodAnalysisContext> Retarget = [];
+        public readonly List<(MethodAnalysisContext Constructor, IOperand[] Arguments)> PrologueCalls = [];
+
+        public static ThisConstructorCallPlan? Create(MethodAnalysisContext context)
+        {
+            if (context is not { IsStatic: false, Name: ".ctor" }
+                || context.DeclaringType is not { IsValueType: false } declaringType
+                || declaringType.BaseType is not { } immediateBase)
+                return null;
+
+            List<(Instruction Instruction, MethodAnalysisContext Callee)> calls = [];
+            foreach (var instruction in context.ControlFlowGraph!.Instructions)
+            {
+                if (!instruction.IsCall
+                    || instruction.Operands[0] is not MethodAnalysisContext { IsStatic: false, Name: ".ctor" } callee
+                    || instruction.Operands.Count <= ConstructorReceiverIndex(instruction)
+                    || instruction.Operands[ConstructorReceiverIndex(instruction)] is not LocalVariable { IsThis: true })
+                    continue;
+
+                calls.Add((instruction, callee));
+            }
+
+            List<(Instruction Instruction, MethodAnalysisContext Callee)> distant = [];
+            var hasLegalInitialization = false;
+            foreach (var call in calls)
+            {
+                if (SameTypeIdentity(call.Callee.DeclaringType, declaringType)
+                    || SameTypeIdentity(call.Callee.DeclaringType, immediateBase))
+                    hasLegalInitialization = true;
+                else if (IsDistantAncestorOf(declaringType, call.Callee.DeclaringType)
+                         || SameGenericDefinition(call.Callee.DeclaringType, immediateBase))
+                    distant.Add(call);
+            }
+
+            if (distant.Count == 0)
+                return null;
+
+            var plan = new ThisConstructorCallPlan();
+            if (hasLegalInitialization)
+            {
+                // The genuine initialization call survived; further ancestor calls are
+                // remnants of the chain it was inlined from.
+                foreach (var (instruction, _) in distant)
+                    plan.Skip.Add(instruction);
+                return plan;
+            }
+
+            List<(Instruction Instruction, MethodAnalysisContext Replacement)> resolved = [];
+            foreach (var (instruction, callee) in distant)
+                if (FindImmediateBaseConstructor(immediateBase, callee) is { } match)
+                    resolved.Add((instruction, match));
+
+            if (resolved.Count == 0
+                || resolved.Any(r => !SameMethodIdentity(r.Replacement, resolved[0].Replacement)))
+                return null;
+
+            var replacement = resolved[0].Replacement;
+            if (replacement.Parameters.Count == 0)
+            {
+                foreach (var (instruction, _) in resolved)
+                    plan.Skip.Add(instruction);
+                plan.PrologueCalls.Add((replacement, []));
+                return plan;
+            }
+
+            if (resolved.Count == 1
+                && PrologueArguments(resolved[0].Instruction, replacement, context) is { } prologueArguments)
+            {
+                plan.Skip.Add(resolved[0].Instruction);
+                plan.PrologueCalls.Add((replacement, prologueArguments));
+                return plan;
+            }
+
+            foreach (var (instruction, method) in resolved)
+                plan.Retarget[instruction] = method;
+            return plan;
+        }
+
+        private static IOperand[]? PrologueArguments(Instruction call, MethodAnalysisContext replacement,
+            MethodAnalysisContext context)
+        {
+            var receiver = ConstructorReceiverIndex(call);
+            if (call.Operands.Count < receiver + 1 + replacement.Parameters.Count)
+                return null;
+
+            var arguments = call.Operands.Skip(receiver + 1).Take(replacement.Parameters.Count).ToArray();
+            return arguments.All(a => a switch
+            {
+                Immediate or StringLiteral or FloatLiteral or DoubleLiteral or TypeAnalysisContext => true,
+                LocalVariable local => !local.IsThis && !local.IsMethodInfo && context.ParameterLocals.Contains(local),
+                _ => false,
+            }) ? arguments : null;
+        }
+
+        private static MethodAnalysisContext? FindImmediateBaseConstructor(TypeAnalysisContext immediateBase,
+            MethodAnalysisContext distantCallee)
+        {
+            var genericInstance = immediateBase as GenericInstanceTypeAnalysisContext;
+            var definition = genericInstance?.GenericType ?? immediateBase;
+
+            MethodAnalysisContext? match = null;
+            foreach (var candidate in definition.Methods)
+            {
+                if (candidate is not { IsStatic: false, Name: ".ctor" }
+                    || candidate.Parameters.Count != distantCallee.Parameters.Count)
+                    continue;
+
+                var concrete = genericInstance != null
+                    ? new ConcreteGenericMethodAnalysisContext(candidate, genericInstance.GenericArguments, [])
+                    : candidate;
+                if (!SameMethodSignature(concrete, distantCallee))
+                    continue;
+
+                if (match != null)
+                    return null;
+                match = concrete;
+            }
+
+            return match;
+        }
+
+        private static bool IsDistantAncestorOf(TypeAnalysisContext declaringType, TypeAnalysisContext? target)
+        {
+            if (target == null)
+                return false;
+            for (var ancestor = declaringType.BaseType?.BaseType; ancestor != null; ancestor = ancestor.BaseType)
+                if (SameTypeIdentity(ancestor, target) || SameGenericDefinition(ancestor, target))
+                    return true;
+            return false;
+        }
+
+        private static bool SameGenericDefinition(TypeAnalysisContext? a, TypeAnalysisContext? b) =>
+            a is GenericInstanceTypeAnalysisContext left
+            && b is GenericInstanceTypeAnalysisContext right
+            && left.GenericType.FullName == right.GenericType.FullName;
+
+        private static bool SameMethodIdentity(MethodAnalysisContext a, MethodAnalysisContext b)
+        {
+            var aBase = a is ConcreteGenericMethodAnalysisContext concreteA ? concreteA.BaseMethodContext : a;
+            var bBase = b is ConcreteGenericMethodAnalysisContext concreteB ? concreteB.BaseMethodContext : b;
+            return ReferenceEquals(aBase, bBase) && SameMethodSignature(a, b);
+        }
+
+        // The matched base .ctor is declared on a different type than the distant
+        // callee by definition, so identity is a name + signature comparison only.
+        private static bool SameMethodSignature(MethodAnalysisContext a, MethodAnalysisContext b) =>
+            a.Name == b.Name
+            && a.Parameters.Count == b.Parameters.Count
+            && a.Parameters.Zip(b.Parameters, (x, y) => SameTypeIdentity(x.ParameterType, y.ParameterType)).All(z => z);
+
+        // Concrete generic method contexts build their declaring type fresh, and identical
+        // metadata types can arrive as different context objects, so compare structurally.
+        private static bool SameTypeIdentity(TypeAnalysisContext? a, TypeAnalysisContext? b)
+        {
+            if (a == null || b == null)
+                return false;
+            if (ReferenceEquals(a, b) || a.FullName == b.FullName)
+                return true;
+            return a is GenericInstanceTypeAnalysisContext left
+                && b is GenericInstanceTypeAnalysisContext right
+                && SameTypeIdentity(left.GenericType, right.GenericType)
+                && left.GenericArguments.Count == right.GenericArguments.Count
+                && left.GenericArguments.Zip(right.GenericArguments, SameTypeIdentity).All(z => z);
+        }
     }
 
     // Try find the constructor call for an allocation. CFG traversal may place the
