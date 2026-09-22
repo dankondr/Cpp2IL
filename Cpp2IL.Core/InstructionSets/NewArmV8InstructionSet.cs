@@ -521,12 +521,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 Add(address, OpCode.Not, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
                 break;
             case Arm64Mnemonic.ADR:
-                Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1))
+                    .NativeIntegerWidthBits = context.AppContext.Binary.PointerSizeBytes * 8;
                 break;
             case Arm64Mnemonic.ADRP:
                 {
                     var target = (long)(address & ~0xFFFUL) + instruction.Op1Imm;
-                    Add(address, OpCode.Move, ConvertOperand(instruction, 0), Imm(target));
+                    Add(address, OpCode.Move, ConvertOperand(instruction, 0), Imm(target))
+                        .NativeIntegerWidthBits = context.AppContext.Binary.PointerSizeBytes * 8;
                     adrpOffsets![NormalizeRegister(instruction.Op0Reg)] = (ulong)target;
                     break;
                 }

@@ -68,4 +68,12 @@ public class Arm64MissingOpsTests
         var and = Lift(0x721f791f).Single(i => i.OpCode == OpCode.And); // tst w8, #0xfffffffe
         Assert.That(and.Operands[2], Is.EqualTo(new Immediate(-2)));
     }
+
+    [TestCase(0x10000000u)] // adr x0, #0
+    [TestCase(0x90000000u)] // adrp x0, #0
+    public void AddressInstructionsRetainPointerWidth(uint word)
+    {
+        var move = Lift(word).Single(i => i.OpCode == OpCode.Move);
+        Assert.That(move.NativeIntegerWidthBits, Is.EqualTo(64));
+    }
 }
