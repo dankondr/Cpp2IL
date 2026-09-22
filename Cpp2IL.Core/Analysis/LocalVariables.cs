@@ -41,6 +41,14 @@ public static class LocalVariables
             {
                 var operand = instruction.Operands[i];
 
+                if (operand is AggregateOperand aggregate)
+                {
+                    aggregate.ReplaceLanes(aggregate.Lanes.Select(lane => ReplaceRegisters(lane, locals)));
+                    if (!method.Locals.Contains(aggregate))
+                        method.Locals.Add(aggregate);
+                    continue;
+                }
+
                 if (operand is Register register)
                     instruction.SetOperand(i, locals[register]);
 
@@ -66,7 +74,11 @@ public static class LocalVariables
             }
         }
 
-        method.Locals = locals.Select(kv => kv.Value).ToList();
+        var aggregateLocals = instructions.SelectMany(instruction => instruction.Operands)
+            .OfType<AggregateOperand>()
+            .Distinct()
+            .Cast<LocalVariable>();
+        method.Locals = locals.Select(kv => kv.Value).Concat(aggregateLocals).ToList();
 
         // Return local names
         var retValIndex = 0;
@@ -117,6 +129,19 @@ public static class LocalVariables
 
             if (operandIndex >= method.ParameterOperands.Count)
                 break;
+
+            if (method.ParameterOperands[operandIndex] is AggregateOperand aggregate)
+            {
+                aggregate.Name = method.Parameters[i].ParameterName;
+                aggregate.IsAggregateParameter = true;
+                foreach (var lane in aggregate.Lanes.OfType<LocalVariable>())
+                {
+                    lane.Name = method.Parameters[i].ParameterName;
+                    lane.Type = aggregate.ElementType;
+                }
+                paramLocals.Add(aggregate);
+                continue;
+            }
 
             if (method.ParameterOperands[operandIndex] is not Register reg)
                 continue;
@@ -181,6 +206,14 @@ public static class LocalVariables
 
         foreach (var operand in instruction.Operands)
         {
+            if (operand is AggregateOperand aggregate)
+            {
+                foreach (var lane in aggregate.Lanes.OfType<Register>())
+                    if (!registers.Contains(lane))
+                        registers.Add(lane);
+                continue;
+            }
+
             if (operand is AddressOf { Target: Register addressed })
             {
                 if (!registers.Contains(addressed))
@@ -212,6 +245,22 @@ public static class LocalVariables
         }
 
         return registers;
+    }
+
+    private static IOperand ReplaceRegisters(IOperand operand, Dictionary<Register, LocalVariable> locals)
+    {
+        if (operand is AggregateOperand aggregate)
+        {
+            aggregate.ReplaceLanes(aggregate.Lanes.Select(lane => ReplaceRegisters(lane, locals)));
+            return aggregate;
+        }
+
+        return operand switch
+        {
+            Register register => locals[register],
+            AddressOf { Target: Register addressed } => new AddressOf(locals[addressed]),
+            _ => operand
+        };
     }
 
     /// <summary>
