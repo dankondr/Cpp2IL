@@ -1156,7 +1156,11 @@ public static class IlGenerator
         // A null reference reaches us as an integer zero, which would otherwise be emitted as a literal 0
         // and read back as a cast from a number. Runtime handle types lower to native int, where the
         // zero is an address, not a reference.
-        if (expectedType is { IsValueType: false } && IsZeroConstant(operand) && !IsNativeHandleType(expectedType))
+        // Byrefs, unmanaged pointers and generic parameters are not managed
+        // references either; their zeroes are handled inside the switch.
+        if (expectedType is { IsValueType: false } && IsZeroConstant(operand) && !IsNativeHandleType(expectedType)
+            && expectedType is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+                or GenericParameterTypeAnalysisContext))
         {
             instructions.Add(CilOpCodes.Ldnull);
             return;
@@ -1206,6 +1210,29 @@ public static class IlGenerator
                     instructions.Add(CilOpCodes.Ldc_I8, immediate.Value);
                     instructions.Add(CilOpCodes.Conv_I4);
                 }
+                break;
+            // ref/out/in slots need a managed pointer; a fresh local is the only
+            // honest default, same as in PushDefaultOf.
+            case Immediate when literalType is ByRefTypeAnalysisContext byRefLiteral
+                    && CanEmitTypeToken(byRefLiteral.ElementType):
+                var byRefLocal = new CilLocalVariable(byRefLiteral.ElementType.ToTypeSignature());
+                method.CilMethodBody!.LocalVariables.Add(byRefLocal);
+                instructions.Add(CilOpCodes.Ldloca, byRefLocal);
+                break;
+            // An unmanaged pointer accepts a native int, so a literal survives as
+            // an address value rather than a broken null.
+            case Immediate immediate when literalType is PointerTypeAnalysisContext:
+                if (immediate.Value is >= int.MinValue and <= int.MaxValue)
+                    instructions.Add(CilOpCodes.Ldc_I4, (int)immediate.Value);
+                else
+                    instructions.Add(CilOpCodes.Ldc_I8, immediate.Value);
+                instructions.Add(CilOpCodes.Conv_I);
+                break;
+            // A literal in a non-primitive value-type or generic-parameter slot is a
+            // dropped operand, not a real value; default(T) is the only honest filler.
+            case Immediate when literalType is { IsValueType: true } or GenericParameterTypeAnalysisContext
+                    && CanEmitTypeToken(literalType):
+                EmitDefaultValueLocal(literalType, method, instructions);
                 break;
             case Immediate { Value: >= int.MinValue and <= int.MaxValue } immediate:
                 instructions.Add(CilOpCodes.Ldc_I4, (int)immediate.Value);
@@ -1493,22 +1520,26 @@ public static class IlGenerator
             case "System.IntPtr": instructions.Add(CilOpCodes.Ldc_I4_0); instructions.Add(CilOpCodes.Conv_I); break;
             case "System.UIntPtr": instructions.Add(CilOpCodes.Ldc_I4_0); instructions.Add(CilOpCodes.Conv_U); break;
             default:
-                // `newobj .ctor()` fails to resolve on types that do not declare one
-                // explicitly (the verifier will not invent the implicit struct ctor),
-                // so default(T) goes through a zero-initialized temp local instead.
                 if (CanEmitTypeToken(type))
-                {
-                    var signature = type.ToTypeSignature();
-                    var tempLocal = new CilLocalVariable(signature);
-                    method.CilMethodBody!.LocalVariables.Add(tempLocal);
-                    instructions.Add(CilOpCodes.Ldloca, tempLocal);
-                    instructions.Add(CilOpCodes.Initobj, signature.ToTypeDefOrRef());
-                    instructions.Add(CilOpCodes.Ldloc, tempLocal);
-                }
+                    EmitDefaultValueLocal(type, method, instructions);
                 else
                     instructions.Add(CilOpCodes.Ldc_I4_0);
                 break;
         }
+    }
+
+    // `newobj .ctor()` fails to resolve on types that do not declare one explicitly
+    // (the verifier will not invent the implicit struct ctor), so default(T) goes
+    // through a zero-initialized temp local instead.
+    private static void EmitDefaultValueLocal(TypeAnalysisContext type, MethodDefinition method,
+        CilInstructionCollection instructions)
+    {
+        var signature = type.ToTypeSignature();
+        var tempLocal = new CilLocalVariable(signature);
+        method.CilMethodBody!.LocalVariables.Add(tempLocal);
+        instructions.Add(CilOpCodes.Ldloca, tempLocal);
+        instructions.Add(CilOpCodes.Initobj, signature.ToTypeDefOrRef());
+        instructions.Add(CilOpCodes.Ldloc, tempLocal);
     }
 
     private static bool IsBoolean(IOperand operand, MethodAnalysisContext context) =>
@@ -1619,6 +1650,8 @@ public static class IlGenerator
             // a reference contract emits ldnull, which is the contract type itself.
             Immediate immediate => expectedType is null ? null
                 : immediate.Value == 0 && expectedType is { IsValueType: false } && !IsNativeHandleType(expectedType)
+                    && expectedType is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+                        or GenericParameterTypeAnalysisContext)
                     ? expectedType
                     : EmittedImmediateType(immediate, expectedType, context),
             LocalVariable local => EmittedLocalType(local, context),
@@ -1663,17 +1696,31 @@ public static class IlGenerator
         var literalType = expectedType is { IsEnumType: true }
             ? expectedType.DefaultEnumUnderlyingType ?? expectedType
             : expectedType;
-        return literalType?.FullName switch
+        return literalType switch
         {
-            "System.IntPtr" or "System.UIntPtr" => literalType,
-            "System.Single" => systemTypes.SystemSingleType,
-            "System.Double" => systemTypes.SystemDoubleType,
-            "System.Int64" or "System.UInt64" => literalType,
-            "System.Int32" or "System.UInt32" or "System.Boolean" or "System.Byte" or "System.SByte"
-                or "System.Int16" or "System.UInt16" or "System.Char" => systemTypes.SystemInt32Type,
-            _ => immediate.Value is >= int.MinValue and <= int.MaxValue
-                ? systemTypes.SystemInt32Type
-                : systemTypes.SystemInt64Type,
+            // ldloca of a fresh local produces the managed pointer itself.
+            ByRefTypeAnalysisContext => literalType,
+            // Unmanaged pointers take the literal as a native-int address.
+            PointerTypeAnalysisContext => systemTypes.SystemIntPtrType,
+            // default(T) on a struct or generic parameter produces T itself.
+            { IsValueType: true } or GenericParameterTypeAnalysisContext
+                when literalType!.FullName is not ("System.IntPtr" or "System.UIntPtr" or "System.Single"
+                    or "System.Double" or "System.Int64" or "System.UInt64" or "System.Int32" or "System.UInt32"
+                    or "System.Boolean" or "System.Byte" or "System.SByte" or "System.Int16" or "System.UInt16"
+                    or "System.Char")
+                && CanEmitTypeToken(literalType) => literalType,
+            _ => literalType?.FullName switch
+            {
+                "System.IntPtr" or "System.UIntPtr" => literalType,
+                "System.Single" => systemTypes.SystemSingleType,
+                "System.Double" => systemTypes.SystemDoubleType,
+                "System.Int64" or "System.UInt64" => literalType,
+                "System.Int32" or "System.UInt32" or "System.Boolean" or "System.Byte" or "System.SByte"
+                    or "System.Int16" or "System.UInt16" or "System.Char" => systemTypes.SystemInt32Type,
+                _ => immediate.Value is >= int.MinValue and <= int.MaxValue
+                    ? systemTypes.SystemInt32Type
+                    : systemTypes.SystemInt64Type,
+            }
         };
     }
 
