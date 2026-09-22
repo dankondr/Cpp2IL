@@ -197,6 +197,9 @@ public static class IlGenerator
                 }
 
                 var target = (Instruction)instruction.Operands[0];
+                // A fused constructor call is not serialized as its own IL instruction. Retarget
+                // branches that landed on it to the paired allocation that does survive emission.
+                target = ConstructorAllocationForCall(target, constructorPairs) ?? target;
 
                 if (!instructionMap.ContainsKey(target))
                 {
@@ -304,8 +307,7 @@ public static class IlGenerator
         var startIndex = instructions.Count;
 
         if (constructorPairs.Values.Contains(instruction))
-            // Keep the instruction addressable: branches may target the paired call's block.
-            return [new CilInstruction(CilOpCodes.Nop)];
+            return [];
 
         var module = method.DeclaringModule!;
 
@@ -700,6 +702,18 @@ public static class IlGenerator
         }
 
         return pairs;
+    }
+
+    private static Instruction? ConstructorAllocationForCall(Instruction constructorCall,
+        IReadOnlyDictionary<Instruction, Instruction> constructorPairs)
+    {
+        foreach (var pair in constructorPairs)
+        {
+            if (ReferenceEquals(pair.Value, constructorCall))
+                return pair.Key;
+        }
+
+        return null;
     }
 
     // Try find the constructor call for an allocation. CFG traversal may place the
