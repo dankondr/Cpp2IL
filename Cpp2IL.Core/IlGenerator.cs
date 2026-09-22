@@ -942,7 +942,8 @@ public static class IlGenerator
                     break;
                 }
 
-                if (expectedType?.FullName is "System.IntPtr" or "System.UIntPtr")
+                if (expectedType?.FullName is "System.IntPtr" or "System.UIntPtr"
+                    || expectedType is RuntimeClassTypeAnalysisContext)
                 {
                     var handleLocal = new CilLocalVariable(runtimeTypeHandle.ToTypeSignature(true));
                     method.CilMethodBody!.LocalVariables.Add(handleLocal);

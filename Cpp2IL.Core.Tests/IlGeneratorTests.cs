@@ -86,11 +86,14 @@ public class IlGeneratorTests
 
     [TestCase("System.RuntimeTypeHandle", false)]
     [TestCase("System.IntPtr", true)]
+    [TestCase("runtime-class", true)]
     public void TypeTokenMatchesExpectedRuntimeRepresentation(string expectedName, bool expectsHandleValueCall)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
-        var expected = app.AssembliesByName["mscorlib"].GetTypeByFullName(expectedName)!;
         var sourceType = app.SystemTypes.SystemStringType;
+        var expected = expectedName == "runtime-class"
+            ? new RuntimeClassTypeAnalysisContext(sourceType, sourceType.DeclaringAssembly)
+            : app.AssembliesByName["mscorlib"].GetTypeByFullName(expectedName)!;
         var result = new LocalVariable("result", new Register(null, "result")) { Type = expected };
         var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
             app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
@@ -102,7 +105,8 @@ public class IlGeneratorTests
         context.AnalysisWarnings = [];
 
         var module = new ModuleDefinition("RuntimeTypeHandle.dll");
-        expected.PutExtraData("AsmResolverType", new TypeDefinition("System", expected.Name,
+        var emittedType = expected is RuntimeClassTypeAnalysisContext ? app.SystemTypes.SystemIntPtrType : expected;
+        emittedType.PutExtraData("AsmResolverType", new TypeDefinition("System", emittedType.Name,
             TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout,
             module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType")));
         var sourceDefinition = new TypeDefinition("System", "String", TypeAttributes.Public | TypeAttributes.Class,
