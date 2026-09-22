@@ -1027,4 +1027,243 @@ public class IlGeneratorTests
             Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.Call));
         });
     }
+
+    private static void SeedCorLibTypes(ApplicationAnalysisContext app, ModuleDefinition module,
+        params TypeAnalysisContext[] types)
+    {
+        foreach (var type in types)
+        {
+            var baseRef = type is { IsValueType: true }
+                ? module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType")
+                : null;
+            type.PutExtraData("AsmResolverType",
+                new TypeDefinition(type.Namespace, type.Name,
+                    TypeAttributes.Public | (type.IsValueType ? TypeAttributes.Sealed | TypeAttributes.SequentialLayout : TypeAttributes.Class),
+                    baseRef));
+        }
+    }
+
+    private (MethodAnalysisContext caller, MethodDefinition method) ForeignCaller(ApplicationAnalysisContext app,
+        ModuleDefinition module, List<Instruction> instructions, List<LocalVariable> locals)
+    {
+        var callerType = new InjectedTypeAnalysisContext(app.AssembliesByName["UnityEngine.CoreModule"],
+            "Tests", "ForeignCaller", app.SystemTypes.SystemObjectType,
+            System.Reflection.TypeAttributes.Public | System.Reflection.TypeAttributes.Class);
+        var caller = callerType.InjectMethodContext("Run", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static);
+        caller.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        caller.Locals = locals;
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var type = new TypeDefinition("Tests", "ForeignCaller", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        type.Methods.Add(method);
+        return (caller, method);
+    }
+
+    [Test]
+    public void InlinedCorlibAddWithResizeCallRetargetsToPublicAdd()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var addWithResize = listDefinition.Methods.FirstOrDefault(m => m.Name == "AddWithResize");
+        Assert.That(addWithResize, Is.Not.Null, "2022 fixture corlib should expose List<T>.AddWithResize");
+        Assert.That(addWithResize!.Attributes & ReflectionMethodAttributes.MemberAccessMask,
+            Is.Not.EqualTo(ReflectionMethodAttributes.Public));
+        var intType = app.SystemTypes.SystemInt32Type;
+        var callee = new ConcreteGenericMethodAnalysisContext(addWithResize, [intType], []);
+        var list = new LocalVariable("list", new Register(null, "list"))
+            { Type = new GenericInstanceTypeAnalysisContext(listDefinition, [intType]) };
+        var item = new LocalVariable("item", new Register(null, "item")) { Type = intType };
+        var module = new ModuleDefinition("AddWithResize.dll");
+        var listTypeDefinition = new TypeDefinition("System.Collections.Generic", "List`1",
+            TypeAttributes.Public | TypeAttributes.Class);
+        listTypeDefinition.GenericParameters.Add(new GenericParameter("T"));
+        listDefinition.PutExtraData("AsmResolverType", listTypeDefinition);
+        SeedCorLibTypes(app, module, intType, app.SystemTypes.SystemVoidType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.CallVoid, callee, list, item),
+            new(1, OpCode.Return)], [list, item]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var calls = method.CilMethodBody!.Instructions
+            .Where(i => i.OpCode == CilOpCodes.Call || i.OpCode == CilOpCodes.Callvirt).ToList();
+        Assert.That(calls.Any(c => c.Operand is MemberReference { Name: { } name } && name.ToString() == "Add"), Is.True,
+            () => string.Join("\n", method.CilMethodBody.Instructions.Select(i => i.ToString())));
+        Assert.That(calls.Any(c => c.Operand?.ToString()?.Contains("AddWithResize") == true), Is.False);
+    }
+
+    [Test]
+    public void InlinedCorlibAddWithResizeLdftnRetargetsToPublicAdd()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var addWithResize = listDefinition.Methods.FirstOrDefault(m => m.Name == "AddWithResize");
+        Assert.That(addWithResize, Is.Not.Null);
+        var intType = app.SystemTypes.SystemInt32Type;
+        var callee = new ConcreteGenericMethodAnalysisContext(addWithResize!, [intType], []);
+        var ptr = new LocalVariable("ptr", new Register(null, "ptr")) { Type = app.SystemTypes.SystemIntPtrType };
+        var methodInfo = new RuntimeMethodInfoAnalysisContext(callee, app.AssembliesByName["UnityEngine.CoreModule"]);
+        var module = new ModuleDefinition("AddWithResizeFtn.dll");
+        var listTypeDefinition = new TypeDefinition("System.Collections.Generic", "List`1",
+            TypeAttributes.Public | TypeAttributes.Class);
+        listTypeDefinition.GenericParameters.Add(new GenericParameter("T"));
+        listDefinition.PutExtraData("AsmResolverType", listTypeDefinition);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemIntPtrType,
+            app.SystemTypes.SystemVoidType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, ptr, methodInfo),
+            new(1, OpCode.Return)], [ptr]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var ldftn = method.CilMethodBody!.Instructions.Where(i => i.OpCode == CilOpCodes.Ldftn).ToList();
+        Assert.That(ldftn, Has.Count.EqualTo(1));
+        Assert.That(ldftn[0].Operand is MemberReference { Name: { } name } && name.ToString() == "Add", Is.True,
+            $"expected ldftn of List<T>.Add, got {ldftn[0].Operand}");
+    }
+
+    [Test]
+    public void PrivateCorlibThrowHelperCallEmitsDiagnosticStub()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var math = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Math")!;
+        var throwMinMax = math.Methods.FirstOrDefault(m => m.Name == "ThrowMinMaxException");
+        Assert.That(throwMinMax, Is.Not.Null);
+        Assert.That(throwMinMax!.Attributes & ReflectionMethodAttributes.MemberAccessMask,
+            Is.Not.EqualTo(ReflectionMethodAttributes.Public));
+        var intType = app.SystemTypes.SystemInt32Type;
+        var callee = new ConcreteGenericMethodAnalysisContext(throwMinMax, [], [intType]);
+        var a = new LocalVariable("a", new Register(null, "a")) { Type = intType };
+        var b = new LocalVariable("b", new Register(null, "b")) { Type = intType };
+        var module = new ModuleDefinition("ThrowHelper.dll");
+        SeedCorLibTypes(app, module, intType, app.SystemTypes.SystemVoidType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.CallVoid, callee, a, b),
+            new(1, OpCode.Return)], [a, b]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Throw), Is.True);
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Newobj), Is.True);
+        Assert.That(il.Any(i => (i.OpCode == CilOpCodes.Call || i.OpCode == CilOpCodes.Callvirt
+                || i.OpCode == CilOpCodes.Ldftn || i.OpCode == CilOpCodes.Newobj)
+            && i.Operand?.ToString()?.Contains("ThrowMinMaxException") == true), Is.False);
+    }
+
+    [Test]
+    public void PrivateCorlibThrowHelperLdftnEmitsNativeZero()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var math = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Math")!;
+        var throwMinMax = math.Methods.FirstOrDefault(m => m.Name == "ThrowMinMaxException");
+        Assert.That(throwMinMax, Is.Not.Null);
+        var callee = new ConcreteGenericMethodAnalysisContext(throwMinMax!, [], [app.SystemTypes.SystemInt32Type]);
+        var ptr = new LocalVariable("ptr", new Register(null, "ptr")) { Type = app.SystemTypes.SystemIntPtrType };
+        var methodInfo = new RuntimeMethodInfoAnalysisContext(callee, app.AssembliesByName["UnityEngine.CoreModule"]);
+        var module = new ModuleDefinition("ThrowHelperFtn.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemIntPtrType, app.SystemTypes.SystemVoidType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, ptr, methodInfo),
+            new(1, OpCode.Return)], [ptr]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldftn), Is.False);
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldc_I4_0), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Conv_I), Is.True);
+        });
+    }
+
+    [Test]
+    public void PublicGenericCalleeOnVisibleInstantiationStaysDirect()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var intType = app.SystemTypes.SystemInt32Type;
+        var add = listDefinition.Methods.First(m => m.Name == "Add" && m.Parameters.Count == 1);
+        var callee = new ConcreteGenericMethodAnalysisContext(add, [intType], []);
+        var list = new LocalVariable("list", new Register(null, "list"))
+            { Type = new GenericInstanceTypeAnalysisContext(listDefinition, [intType]) };
+        var item = new LocalVariable("item", new Register(null, "item")) { Type = intType };
+        var module = new ModuleDefinition("VisibleAdd.dll");
+        var listTypeDefinition = new TypeDefinition("System.Collections.Generic", "List`1",
+            TypeAttributes.Public | TypeAttributes.Class);
+        listTypeDefinition.GenericParameters.Add(new GenericParameter("T"));
+        listDefinition.PutExtraData("AsmResolverType", listTypeDefinition);
+        SeedCorLibTypes(app, module, intType, app.SystemTypes.SystemVoidType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.CallVoid, callee, list, item),
+            new(1, OpCode.Return)], [list, item]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var calls = method.CilMethodBody!.Instructions
+            .Where(i => i.OpCode == CilOpCodes.Call || i.OpCode == CilOpCodes.Callvirt).ToList();
+        Assert.That(calls.Any(c => c.Operand is MemberReference { Name: { } name } && name.ToString() == "Add"), Is.True,
+            () => string.Join("\n", method.CilMethodBody.Instructions.Select(i => i.ToString())));
+        Assert.That(method.CilMethodBody.Instructions.Any(i => i.Operand is string s && s.Contains("Inaccessible callee")), Is.False);
+    }
+
+    [Test]
+    public void PrivateGenericCalleeOnOwnTypeStaysDirect()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var addWithResize = listDefinition.Methods.FirstOrDefault(m => m.Name == "AddWithResize");
+        Assert.That(addWithResize, Is.Not.Null);
+        var intType = app.SystemTypes.SystemInt32Type;
+        var callee = new ConcreteGenericMethodAnalysisContext(addWithResize!, [intType], []);
+        // A method declared on List<T> itself may name its own private member.
+        var caller = new InjectedMethodAnalysisContext(listDefinition, "Run", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        var list = new LocalVariable("list", new Register(null, "list"))
+            { Type = new GenericInstanceTypeAnalysisContext(listDefinition, [intType]) };
+        var item = new LocalVariable("item", new Register(null, "item")) { Type = intType };
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CallVoid, callee, list, item),
+            new(1, OpCode.Return)]);
+        caller.Locals = [list, item];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("OwnPrivate.dll");
+        var listTypeDefinition = new TypeDefinition("System.Collections.Generic", "List`1",
+            TypeAttributes.Public | TypeAttributes.Class);
+        listTypeDefinition.GenericParameters.Add(new GenericParameter("T"));
+        listDefinition.PutExtraData("AsmResolverType", listTypeDefinition);
+        SeedCorLibTypes(app, module, intType, app.SystemTypes.SystemVoidType);
+        var type = new TypeDefinition("Tests", "OwnCaller", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        type.Methods.Add(method);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var calls = method.CilMethodBody!.Instructions
+            .Where(i => i.OpCode == CilOpCodes.Call || i.OpCode == CilOpCodes.Callvirt).ToList();
+        Assert.That(calls.Any(c => c.Operand?.ToString()?.Contains("AddWithResize") == true), Is.True,
+            () => string.Join("\n", method.CilMethodBody.Instructions.Select(i => i.ToString())));
+    }
 }

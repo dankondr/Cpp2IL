@@ -145,7 +145,7 @@ public static class IlGenerator
         {
             body.Instructions.Add(CilOpCodes.Ldarg_0);
             for (var i = 0; i < arguments.Length; i++)
-                LoadOperand(arguments[i], definition, locals, writeLine, constructor.Parameters[i].ParameterType);
+                LoadOperand(arguments[i], definition, locals, writeLine, constructor.Parameters[i].ParameterType, context);
             body.Instructions.Add(CilOpCodes.Call, constructor.ToMethodDescriptor());
         }
 
@@ -303,7 +303,26 @@ public static class IlGenerator
     // Limit so we don't run into the 16mb limit (see AsmResolver issue #775)
     private static string Diagnostic(string message) 
         => message.Length <= 250 ? message : message[..250] + "…";
-    
+
+    // Replaces a call the verifier could never resolve with the standard diagnostic stub:
+    // note the unnameable callee, then throw. The ISIL operands are never loaded, so the
+    // stack stays balanced and the destination (if any) keeps its default.
+    private static void EmitInaccessibleCalleeStub(MethodAnalysisContext callee, MethodDefinition method,
+        IMethodDescriptor writeLine)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        var module = method.DeclaringModule!;
+        var diagnostic = Diagnostic($"Inaccessible callee: {callee.FullNameWithSignature}");
+        instructions.Add(CilOpCodes.Ldstr, diagnostic);
+        instructions.Add(CilOpCodes.Call, writeLine);
+        instructions.Add(CilOpCodes.Ldstr, diagnostic);
+        instructions.Add(CilOpCodes.Newobj, module.CorLibTypeFactory.CorLibScope
+            .CreateTypeReference("System", "Exception")
+            .CreateMemberReference(".ctor", MethodSignature.CreateInstance(module.CorLibTypeFactory.Void,
+                [module.CorLibTypeFactory.String])));
+        instructions.Add(CilOpCodes.Throw);
+    }
+
     private static Block? TryResolveJumpTargetBlock(Instruction jumpInstruction, ISILControlFlowGraph cfg)
     {
         if (jumpInstruction.Operands.Count == 0)
@@ -379,7 +398,7 @@ public static class IlGenerator
                     && store.AccessSize == context.AppContext.Binary.PointerSizeBytes)
                 {
                     LoadLocal(address, method, locals);
-                    LoadOperand(instruction.Operands[1], method, locals, writeLine, referent);
+                    LoadOperand(instruction.Operands[1], method, locals, writeLine, referent, context);
                     instructions.Add(CilOpCodes.Stind_Ref);
                     break;
                 }
@@ -389,7 +408,7 @@ public static class IlGenerator
                     if (!field.Field.IsStatic)
                         LoadLocal(field.Local, method, locals);
 
-                    LoadOperand(instruction.Operands[1], method, locals, writeLine, field.Field.FieldType);
+                    LoadOperand(instruction.Operands[1], method, locals, writeLine, field.Field.FieldType, context);
                     EmitStackCoerce(EmittedOperandType(instruction.Operands[1], context, field.Field.FieldType), field.Field.FieldType, method);
                     instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
                     break;
@@ -401,14 +420,14 @@ public static class IlGenerator
                 {
                     LoadLocal(target.Array, method, locals);
                     LoadOperand(target.Index, method, locals, writeLine);
-                    LoadOperand(instruction.Operands[1], method, locals, writeLine, stored);
+                    LoadOperand(instruction.Operands[1], method, locals, writeLine, stored, context);
                     EmitStackCoerce(EmittedOperandType(instruction.Operands[1], context, stored), stored, method);
                     instructions.Add(CilOpCodes.Stelem, stored.ToTypeSignature().ToTypeDefOrRef());
                     break;
                 }
 
                 var moveDestinationType = StoreContract(instruction.Operands[0], context);
-                LoadOperand(instruction.Operands[1], method, locals, writeLine, moveDestinationType);
+                LoadOperand(instruction.Operands[1], method, locals, writeLine, moveDestinationType, context);
                 EmitStackCoerce(EmittedOperandType(instruction.Operands[1], context, moveDestinationType), moveDestinationType, method);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
@@ -449,7 +468,7 @@ public static class IlGenerator
                     var constructorArgs = constructorCall.Operands.Skip(ConstructorReceiverIndex(constructorCall) + 1).Take(constructor.Parameters.Count).ToList();
                     for (var i = 0; i < constructorArgs.Count; i++)
                     {
-                        LoadOperand(constructorArgs[i], method, locals, writeLine, constructor.Parameters[i].ParameterType);
+                        LoadOperand(constructorArgs[i], method, locals, writeLine, constructor.Parameters[i].ParameterType, context);
                         EmitStackCoerce(EmittedOperandType(constructorArgs[i], context, constructor.Parameters[i].ParameterType), constructor.Parameters[i].ParameterType, method);
                     }
 
@@ -541,6 +560,23 @@ public static class IlGenerator
                 if (retargetedBaseConstructor != null)
                     targetMethod = retargetedBaseConstructor;
 
+                // IL2CPP leaves direct calls to corlib members managed code could never name: the
+                // internal slow paths of inlined BCL operations (List<T>.AddWithResize, private
+                // Math.ThrowMinMaxException) or shared-generic instantiations over non-public
+                // marker types. Swap in the honest public equivalent when one exists; otherwise
+                // leave a diagnostic stub rather than a reference the verifier rejects.
+                if (!Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(targetMethod, context))
+                {
+                    if (Analysis.InaccessibleCalleeRecovery.TrySubstitute(targetMethod) is { } accessibleCallee
+                        && Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(accessibleCallee, context))
+                        targetMethod = accessibleCallee;
+                    else
+                    {
+                        EmitInaccessibleCalleeStub(targetMethod, method, writeLine);
+                        break;
+                    }
+                }
+
                 var importedMethod = targetMethod.ToMethodDescriptor();
 
                 var thisParamIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
@@ -629,7 +665,7 @@ public static class IlGenerator
                         }
                         else
                         {
-                            LoadOperand(argumentOperand, method, locals, writeLine, parameterType);
+                            LoadOperand(argumentOperand, method, locals, writeLine, parameterType, context);
                             EmitStackCoerce(EmittedOperandType(argumentOperand, context, parameterType), parameterType, method);
                         }
                     }
@@ -680,7 +716,7 @@ public static class IlGenerator
                 {
                     if (instruction.Operands.Count == 1)
                     {
-                        LoadOperand(instruction.Operands[0], method, locals, writeLine, context.ReturnType);
+                        LoadOperand(instruction.Operands[0], method, locals, writeLine, context.ReturnType, context);
                         EmitStackCoerce(EmittedOperandType(instruction.Operands[0], context, context.ReturnType), context.ReturnType, method);
                     }
                     else
@@ -1228,7 +1264,7 @@ public static class IlGenerator
 
     private static void LoadOperand(IOperand operand, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
-        TypeAnalysisContext? expectedType = null)
+        TypeAnalysisContext? expectedType = null, MethodAnalysisContext? callingContext = null)
     {
         var instructions = method.CilMethodBody!.Instructions;
 
@@ -1402,14 +1438,24 @@ public static class IlGenerator
                 // A delegate constructor takes its target as a native pointer, which is exactly ldftn.
                 // ldftn cannot name a .ctor though; the unresolved placeholder below stays
                 // verifier-legal (a native-int zero) instead of fabricating a function pointer.
-                if (expectedType?.FullName == "System.IntPtr" && runtimeMethod.RepresentedMethod.Name is not ".ctor")
+                var represented = runtimeMethod.RepresentedMethod;
+                var representedVisible = callingContext == null
+                    || Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(represented, callingContext);
+                if (!representedVisible)
                 {
-                    instructions.Add(CilOpCodes.Ldftn, runtimeMethod.RepresentedMethod.ToMethodDescriptor());
+                    // The same invisible corlib helpers show up as function pointers; the honest
+                    // substitutes are the ones a direct call would use.
+                    represented = Analysis.InaccessibleCalleeRecovery.TrySubstitute(represented) ?? represented;
+                    representedVisible = Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(represented, callingContext!);
+                }
+                if (expectedType?.FullName == "System.IntPtr" && represented.Name is not ".ctor" && representedVisible)
+                {
+                    instructions.Add(CilOpCodes.Ldftn, represented.ToMethodDescriptor());
                     break;
                 }
-                if (expectedType?.FullName == "System.RuntimeMethodHandle")
+                if (expectedType?.FullName == "System.RuntimeMethodHandle" && representedVisible)
                 {
-                    instructions.Add(CilOpCodes.Ldtoken, runtimeMethod.RepresentedMethod.ToMethodDescriptor());
+                    instructions.Add(CilOpCodes.Ldtoken, represented.ToMethodDescriptor());
                     break;
                 }
 
