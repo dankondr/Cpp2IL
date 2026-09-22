@@ -41,14 +41,6 @@ public static class LocalVariables
             {
                 var operand = instruction.Operands[i];
 
-                if (operand is AggregateOperand aggregate)
-                {
-                    aggregate.ReplaceLanes(aggregate.Lanes.Select(lane => ReplaceRegisters(lane, locals)));
-                    if (!method.Locals.Contains(aggregate))
-                        method.Locals.Add(aggregate);
-                    continue;
-                }
-
                 if (operand is Register register)
                     instruction.SetOperand(i, locals[register]);
 
@@ -74,11 +66,7 @@ public static class LocalVariables
             }
         }
 
-        var aggregateLocals = instructions.SelectMany(instruction => instruction.Operands)
-            .OfType<AggregateOperand>()
-            .Distinct()
-            .Cast<LocalVariable>();
-        method.Locals = locals.Select(kv => kv.Value).Concat(aggregateLocals).ToList();
+        method.Locals = locals.Select(kv => kv.Value).ToList();
 
         // Return local names
         var retValIndex = 0;
@@ -129,19 +117,6 @@ public static class LocalVariables
 
             if (operandIndex >= method.ParameterOperands.Count)
                 break;
-
-            if (method.ParameterOperands[operandIndex] is AggregateOperand aggregate)
-            {
-                aggregate.Name = method.Parameters[i].ParameterName;
-                aggregate.IsAggregateParameter = true;
-                foreach (var lane in aggregate.Lanes.OfType<LocalVariable>())
-                {
-                    lane.Name = method.Parameters[i].ParameterName;
-                    lane.Type = aggregate.ElementType;
-                }
-                paramLocals.Add(aggregate);
-                continue;
-            }
 
             if (method.ParameterOperands[operandIndex] is not Register reg)
                 continue;
@@ -206,14 +181,6 @@ public static class LocalVariables
 
         foreach (var operand in instruction.Operands)
         {
-            if (operand is AggregateOperand aggregate)
-            {
-                foreach (var lane in aggregate.Lanes.OfType<Register>())
-                    if (!registers.Contains(lane))
-                        registers.Add(lane);
-                continue;
-            }
-
             if (operand is AddressOf { Target: Register addressed })
             {
                 if (!registers.Contains(addressed))
@@ -245,22 +212,6 @@ public static class LocalVariables
         }
 
         return registers;
-    }
-
-    private static IOperand ReplaceRegisters(IOperand operand, Dictionary<Register, LocalVariable> locals)
-    {
-        if (operand is AggregateOperand aggregate)
-        {
-            aggregate.ReplaceLanes(aggregate.Lanes.Select(lane => ReplaceRegisters(lane, locals)));
-            return aggregate;
-        }
-
-        return operand switch
-        {
-            Register register => locals[register],
-            AddressOf { Target: Register addressed } => new AddressOf(locals[addressed]),
-            _ => operand
-        };
     }
 
     /// <summary>
@@ -472,7 +423,8 @@ public static class LocalVariables
                         changed |= SetTypeIfUnknown(extended, method.AppContext.SystemTypes.SystemInt64Type);
                     break;
                 case OpCode.Move:
-                    changed |= PropagateMove(instruction, method.AppContext.Binary.PointerSizeBytes);
+                    changed |= PropagateMove(instruction, method.AppContext.Binary.PointerSizeBytes,
+                        method.AppContext.SystemTypes.SystemInt32Type);
                     break;
                 case OpCode.Phi:
                     changed |= PropagatePhi(instruction);
@@ -683,7 +635,7 @@ public static class LocalVariables
             _ => null,
         };
 
-    private static bool PropagateMove(Instruction move, int pointerSize)
+    private static bool PropagateMove(Instruction move, int pointerSize, TypeAnalysisContext systemInt32Type)
     {
         var destination = move.Operands[0];
         var source = move.Operands[1];
@@ -700,6 +652,12 @@ public static class LocalVariables
         // Move field, local: a field store types the stored value with the field's type.
         if (destination is FieldReference storeField && source is LocalVariable storeSource)
             return SetTypeIfUnknown(storeSource, storeField.Field.FieldType);
+
+        // ArrayLength is emitted as ldlen/conv.i4, so its result is always Int32 when the
+        // source is a recovered managed array. Do not infer this from arbitrary references.
+        if (destination is LocalVariable lengthDestination
+            && source is ArrayLength { Array.Type: SzArrayTypeAnalysisContext })
+            return SetTypeIfUnknown(lengthDestination, systemInt32Type);
 
         // An element of T[] is a T, whether we loaded it (reference arrays) or only computed its address
         if (destination is LocalVariable { Type: null } elementDest

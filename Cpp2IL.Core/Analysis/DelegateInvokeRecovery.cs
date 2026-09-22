@@ -76,7 +76,7 @@ public static class DelegateInvokeRecovery
         {
             var operands = new List<IOperand> { invoke };
             if (!invoke.IsVoid)
-                operands.Add(callingConventions.ReturnLocalOperand(invoke, "delegateTailCallResult"));
+                operands.Add(new LocalVariable("delegateTailCallResult", callingConventions.ReturnRegister(invoke), invoke.ReturnType));
             operands.AddRange(call.Operands.Skip(2));
             call.SetOperands(operands);
             call.OpCode = invoke.IsVoid ? OpCode.CallVoid : OpCode.Call;

@@ -129,6 +129,42 @@ public class IlGeneratorTests
     }
 
     [Test]
+    public void FloatingComparisonConvertsIntegerImmediateToOperandWidth()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var value = new LocalVariable("value", new Register(null, "value")) { Type = app.SystemTypes.SystemDoubleType };
+        var result = new LocalVariable("result", new Register(null, "result")) { Type = app.SystemTypes.SystemBooleanType };
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, value, new Immediate(0)),
+            new(1, OpCode.CheckEqual, result, value, new Immediate(0)),
+            new(2, OpCode.Return)]);
+        context.Locals = [value, result];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("FloatingComparison.dll");
+        var type = new TypeDefinition("Tests", "FloatingComparison", TypeAttributes.Public,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);
+        app.SystemTypes.SystemDoubleType.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Double", TypeAttributes.Public));
+        app.SystemTypes.SystemBooleanType.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Boolean", TypeAttributes.Public));
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        type.Methods.Add(method);
+
+        IlGenerator.GenerateIl(context, method);
+
+        var instructions = method.CilMethodBody!.Instructions;
+        Assert.That(instructions.Select(i => i.OpCode), Does.Contain(CilOpCodes.Ldc_R8));
+        Assert.That(instructions.Select(i => i.OpCode), Does.Contain(CilOpCodes.Conv_R8));
+        Assert.That(instructions.Select(i => i.OpCode), Does.Contain(CilOpCodes.Ceq));
+    }
+
+    [Test]
     public void InvalidStackRemainsExplicitlyDiagnosedAndBodyIsPreserved()
     {
         var app = Cpp2IlApi.CurrentAppContext!;

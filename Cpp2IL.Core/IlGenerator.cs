@@ -589,9 +589,9 @@ public static class IlGenerator
                     && TryEmitExactTypeComparison(instruction, method, locals, writeLine))
                     break;
 
-                // Float arithmetic on a promoted integer operand needs an explicit conversion, so both
+                // Float operations on a promoted integer operand need an explicit conversion, so both
                 // operands are coerced to the (float) result type. A no-op when they already match.
-                var floatConversion = FloatArithmeticConversion(instruction);
+                var floatConversion = FloatOperationConversion(instruction);
 
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, NullComparisonType(instruction, 1));
                 if (floatConversion is { } conv1)
@@ -758,18 +758,38 @@ public static class IlGenerator
         return null;
     }
 
-    private static CilOpCode? FloatArithmeticConversion(Instruction instruction)
+    private static CilOpCode? FloatOperationConversion(Instruction instruction)
     {
-        if (instruction.OpCode is not (OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo))
+        if (instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckGreater or OpCode.CheckLess
+            or OpCode.CheckNotEqual or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual
+            or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo))
             return null;
 
-        return (instruction.Operands[0] as LocalVariable)?.Type?.FullName switch
+        var resultType = (instruction.Operands[0] as LocalVariable)?.Type?.FullName;
+        if (resultType is "System.Single")
+            return CilOpCodes.Conv_R4;
+        if (resultType is "System.Double")
+            return CilOpCodes.Conv_R8;
+
+        var operandType = instruction.Operands.Skip(1).Take(2)
+            .Select(FloatOperandType)
+            .FirstOrDefault(type => type != null);
+        return operandType switch
         {
             "System.Single" => CilOpCodes.Conv_R4,
             "System.Double" => CilOpCodes.Conv_R8,
             _ => null,
         };
     }
+
+    private static string? FloatOperandType(IOperand operand) => operand switch
+    {
+        FloatLiteral => "System.Single",
+        DoubleLiteral => "System.Double",
+        LocalVariable { Type.FullName: var type } when type is "System.Single" or "System.Double" => type,
+        FieldReference { Field.FieldType.FullName: var type } when type is "System.Single" or "System.Double" => type,
+        _ => null,
+    };
 
     private static void LoadOperand(IOperand operand, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
@@ -789,8 +809,11 @@ public static class IlGenerator
 
         switch (operand)
         {
-            case AggregateOperand aggregate:
-                LoadAggregate(aggregate, method, locals, writeLine);
+            case Immediate immediate when expectedType?.FullName == "System.Single":
+                instructions.Add(CilOpCodes.Ldc_R4, (float)immediate.Value);
+                break;
+            case Immediate immediate when expectedType?.FullName == "System.Double":
+                instructions.Add(CilOpCodes.Ldc_R8, (double)immediate.Value);
                 break;
             // A native W-register literal may be represented as unsigned 32-bit in ISIL.
             // The known managed I4 contract supplies the width; do not truncate arbitrary I8s.
@@ -1077,10 +1100,6 @@ public static class IlGenerator
 
         switch (operand)
         {
-            case AggregateOperand aggregate:
-                StoreAggregate(aggregate, method, locals, writeLine);
-                break;
-
             case LocalVariable local:
                 instructions.Add(CilOpCodes.Stloc, locals[local]);
                 break;
@@ -1141,47 +1160,6 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Call, writeLine);
                 instructions.Add(CilOpCodes.Pop);
                 break;
-        }
-    }
-
-    private static void LoadAggregate(AggregateOperand aggregate, MethodDefinition method,
-        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
-    {
-        var instructions = method.CilMethodBody!.Instructions;
-        if (aggregate.IsAggregateParameter)
-        {
-            LoadLocal(aggregate, method, locals);
-            return;
-        }
-
-        var temporary = new CilLocalVariable(aggregate.AggregateType.ToTypeSignature());
-        method.CilMethodBody.LocalVariables.Add(temporary);
-        var fields = aggregate.AggregateType.Fields.Where(field => !field.IsStatic).ToArray();
-        for (var i = 0; i < fields.Length && i < aggregate.Lanes.Count; i++)
-        {
-            instructions.Add(CilOpCodes.Ldloca, temporary);
-            LoadOperand(aggregate.Lanes[i], method, locals, writeLine, fields[i].FieldType);
-            instructions.Add(CilOpCodes.Stfld, fields[i].ToFieldDescriptor());
-        }
-        instructions.Add(CilOpCodes.Ldloc, temporary);
-    }
-
-    private static void StoreAggregate(AggregateOperand aggregate, MethodDefinition method,
-        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
-    {
-        var instructions = method.CilMethodBody!.Instructions;
-        var temporary = new CilLocalVariable(aggregate.AggregateType.ToTypeSignature());
-        method.CilMethodBody.LocalVariables.Add(temporary);
-        instructions.Add(CilOpCodes.Stloc, temporary);
-
-        var fields = aggregate.AggregateType.Fields.Where(field => !field.IsStatic).ToArray();
-        for (var i = 0; i < fields.Length && i < aggregate.Lanes.Count; i++)
-        {
-            // ldfld consumes a managed pointer for a value-type instance. Loading the
-            // struct value itself would produce unverifiable IL on the generated path.
-            instructions.Add(CilOpCodes.Ldloca, temporary);
-            instructions.Add(CilOpCodes.Ldfld, fields[i].ToFieldDescriptor());
-            StoreToOperand(aggregate.Lanes[i], method, locals, writeLine);
         }
     }
 }

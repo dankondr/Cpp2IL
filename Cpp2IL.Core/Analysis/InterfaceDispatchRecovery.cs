@@ -215,8 +215,7 @@ public static class InterfaceDispatchRecovery
             var operands = new List<IOperand> { resolved };
 
             if (!resolved.IsVoid)
-                    operands.Add(callingConventions?.ReturnLocalOperand(resolved, "interfaceTailCallResult")
-                        ?? new LocalVariable("interfaceTailCallResult", new Register(null, "rax"), resolved.ReturnType));
+                operands.Add(new LocalVariable("interfaceTailCallResult", callingConventions?.ReturnRegister(resolved) ?? new Register(null, "rax")));
 
             operands.AddRange(dispatch.Operands.Skip(2));
             dispatch.SetOperands(operands);
