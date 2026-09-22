@@ -933,13 +933,34 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Conv_I);
                 break;
             case TypeAnalysisContext type:
-                //typeof(T)
                 var corLibScope = module.CorLibTypeFactory.CorLibScope;
+                var runtimeTypeHandle = corLibScope.CreateTypeReference("System", "RuntimeTypeHandle");
+
+                if (expectedType?.FullName == "System.RuntimeTypeHandle")
+                {
+                    instructions.Add(CilOpCodes.Ldtoken, type.ToTypeSignature().ToTypeDefOrRef());
+                    break;
+                }
+
+                if (expectedType?.FullName is "System.IntPtr" or "System.UIntPtr")
+                {
+                    var handleLocal = new CilLocalVariable(runtimeTypeHandle.ToTypeSignature(true));
+                    method.CilMethodBody!.LocalVariables.Add(handleLocal);
+                    var getValue = runtimeTypeHandle.CreateMemberReference("get_Value",
+                        MethodSignature.CreateInstance(corLibScope.CreateTypeReference("System", "IntPtr").ToTypeSignature(true)));
+                    instructions.Add(CilOpCodes.Ldtoken, type.ToTypeSignature().ToTypeDefOrRef());
+                    instructions.Add(CilOpCodes.Stloc, handleLocal);
+                    instructions.Add(CilOpCodes.Ldloca, handleLocal);
+                    instructions.Add(CilOpCodes.Call, getValue);
+                    break;
+                }
+
+                // typeof(T)
                 var typeFromHandle = corLibScope
                     .CreateTypeReference("System", "Type")
                     .CreateMemberReference("GetTypeFromHandle", MethodSignature.CreateStatic(
                         corLibScope.CreateTypeReference("System", "Type").ToTypeSignature(false),
-                        [corLibScope.CreateTypeReference("System", "RuntimeTypeHandle").ToTypeSignature(true)]));
+                        [runtimeTypeHandle.ToTypeSignature(true)]));
 
                 instructions.Add(CilOpCodes.Ldtoken, type.ToTypeSignature().ToTypeDefOrRef());
                 instructions.Add(CilOpCodes.Call, typeFromHandle);
