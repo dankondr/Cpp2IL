@@ -104,6 +104,54 @@ public class IntegerArithmeticTypeTests
         });
     }
 
+    [Test]
+    public void BooleanNotCanFlowThroughMaskedBooleanToKnownResult()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, []);
+        var input = new LocalVariable("input", new Register(null, "input")) { Type = app.SystemTypes.SystemBooleanType };
+        var inverted = new LocalVariable("inverted", new Register(null, "inverted"));
+        var masked = new LocalVariable("masked", new Register(null, "masked")) { Type = app.SystemTypes.SystemBooleanType };
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Not, inverted, input),
+            new(1, OpCode.And, masked, new Immediate(1), inverted),
+            new(2, OpCode.Return)]);
+        method.Locals = [input, inverted, masked];
+        method.ParameterLocals = [];
+
+        LocalVariables.ResolveTypesAndFields(method);
+
+        Assert.That(inverted.Type, Is.SameAs(app.SystemTypes.SystemBooleanType));
+    }
+
+    [Test]
+    public void LateArrayRecoveryTypesLengthAndIndex()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, []);
+        var array = new LocalVariable("array", new Register(null, "array"))
+            { Type = new SzArrayTypeAnalysisContext(app.SystemTypes.SystemObjectType) };
+        var length = new LocalVariable("length", new Register(null, "length"));
+        var index = new LocalVariable("index", new Register(null, "index"));
+        var value = new LocalVariable("value", new Register(null, "value"));
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, length, new ArrayLength(array)),
+            new(1, OpCode.Move, value, new ArrayAccess(array, index)),
+            new(2, OpCode.Return)]);
+        method.Locals = [array, length, index, value];
+        method.ParameterLocals = [];
+
+        LocalVariables.ResolveLateGeneratedTypes(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(length.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+            Assert.That(index.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+        });
+    }
+
     [TestCase(OpCode.Add)]
     [TestCase(OpCode.Subtract)]
     [TestCase(OpCode.Multiply)]

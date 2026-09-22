@@ -444,6 +444,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Runs late so the array type and length reach the allocation call as operands after copy propagation has inlined them
         ArrayRecovery.Run(this);
+        LocalVariables.ResolveLateGeneratedTypes(this);
 
         LocalVariables.TypeAddressedLocals(this);
 

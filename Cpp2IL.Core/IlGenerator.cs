@@ -362,7 +362,9 @@ public static class IlGenerator
                     break;
                 }
 
-                LoadOperand(instruction.Operands[1], method, locals, writeLine, DestinationType(instruction.Operands[0]));
+                LoadOperand(instruction.Operands[1], method, locals, writeLine,
+                    DestinationType(instruction.Operands[0])
+                    ?? (instruction.Operands[0] is LocalVariable ? context.AppContext.SystemTypes.SystemObjectType : null));
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 

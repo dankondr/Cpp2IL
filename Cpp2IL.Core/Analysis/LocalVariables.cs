@@ -488,9 +488,11 @@ public static class LocalVariables
                 if (user.OpCode is OpCode.And or OpCode.Or or OpCode.Xor
                     && user.Destination is LocalVariable combined
                     && user.Sources.All(source => ReferenceEquals(source, local)
-                        || source is LocalVariable { Type.FullName: "System.Boolean" })
+                        || source is LocalVariable { Type.FullName: "System.Boolean" }
+                        || source is Immediate { Value: 0 or 1 })
                     && (combined.Type == null || combined.Type.FullName == "System.Boolean")
-                    && IsGuardOnlyResult(combined, user, method, active))
+                    && (combined.Type?.FullName == "System.Boolean"
+                        || IsGuardOnlyResult(combined, user, method, active)))
                 {
                     reachesGuard = true;
                     continue;
@@ -500,6 +502,40 @@ public static class LocalVariables
         }
         active.Remove(local);
         return reachesGuard;
+    }
+
+    public static void ResolveLateGeneratedTypes(MethodAnalysisContext method)
+    {
+        var int32 = method.AppContext.SystemTypes.SystemInt32Type;
+        var changed = true;
+
+        while (changed)
+        {
+            changed = false;
+            foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            {
+                if (instruction.OpCode == OpCode.Move
+                    && instruction.Operands is [LocalVariable destination, ArrayLength])
+                    changed |= SetTypeIfUnknown(destination, int32);
+
+                foreach (var access in instruction.Operands.OfType<ArrayAccess>())
+                    if (access.Index is LocalVariable index)
+                        changed |= SetTypeIfUnknown(index, int32);
+
+                if (instruction.OpCode is OpCode.CheckGreater or OpCode.CheckLess
+                    or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual)
+                {
+                    var left = instruction.Operands[1];
+                    var right = instruction.Operands[2];
+                    if (left is LocalVariable leftLocal)
+                        changed |= SetTypeIfUnknown(leftLocal,
+                            IntegerResultType(right, method) ?? IntegerImmediateType(right, method));
+                    if (right is LocalVariable rightLocal)
+                        changed |= SetTypeIfUnknown(rightLocal,
+                            IntegerResultType(left, method) ?? IntegerImmediateType(left, method));
+                }
+            }
+        }
     }
 
     private static bool PropagateBooleanResult(Instruction instruction, MethodAnalysisContext method)
