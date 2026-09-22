@@ -84,6 +84,47 @@ public class IlGeneratorTests
         Assert.That(method.CilMethodBody!.Instructions.Any(i=>i.OpCode==CilOpCodes.Ldnull),Is.EqualTo(expectsNull));
     }
 
+    [TestCase("System.RuntimeTypeHandle", false)]
+    [TestCase("System.IntPtr", true)]
+    public void TypeTokenMatchesExpectedRuntimeRepresentation(string expectedName, bool expectsHandleValueCall)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var expected = app.AssembliesByName["mscorlib"].GetTypeByFullName(expectedName)!;
+        var sourceType = app.SystemTypes.SystemStringType;
+        var result = new LocalVariable("result", new Register(null, "result")) { Type = expected };
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, result, sourceType),
+            new(1, OpCode.Return)]);
+        context.Locals = [result];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("RuntimeTypeHandle.dll");
+        expected.PutExtraData("AsmResolverType", new TypeDefinition("System", expected.Name,
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType")));
+        var sourceDefinition = new TypeDefinition("System", "String", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(sourceDefinition);
+        sourceType.PutExtraData("AsmResolverType", sourceDefinition);
+        var owner = new TypeDefinition("Tests", "Handles", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(method);
+
+        IlGenerator.GenerateIl(context, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldtoken), Is.True);
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldloca), Is.EqualTo(expectsHandleValueCall));
+        Assert.That(il.Any(i => i.Operand?.ToString()?.Contains("get_Value") == true), Is.EqualTo(expectsHandleValueCall));
+        Assert.That(il.Any(i => i.Operand?.ToString()?.Contains("GetTypeFromHandle") == true), Is.False);
+    }
+
     [Test]
     public void UnreachableAnalysisWarningDoesNotMakeSerializedBodyUnrunnable()
     {
