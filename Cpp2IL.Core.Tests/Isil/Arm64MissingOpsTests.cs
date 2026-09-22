@@ -53,4 +53,19 @@ public class Arm64MissingOpsTests
             && i.Operands[1].ToString() == "X8"
             && i.Operands[2].Equals(new Immediate(31))), Is.True);
     }
+
+    [Test]
+    public void WordMaddRetainsIntegerWidthOnBothLoweredOperations()
+    {
+        var il = Lift(0x1b080288); // madd w8, w20, w8, w0
+        Assert.That(il.Where(i => i.OpCode is OpCode.Multiply or OpCode.Add)
+            .Select(i => i.NativeIntegerWidthBits), Is.EqualTo(new int?[] { 32, 32 }));
+    }
+
+    [Test]
+    public void WordLogicalImmediateIsSignNormalized()
+    {
+        var and = Lift(0x721f791f).Single(i => i.OpCode == OpCode.And); // tst w8, #0xfffffffe
+        Assert.That(and.Operands[2], Is.EqualTo(new Immediate(-2)));
+    }
 }

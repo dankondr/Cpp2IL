@@ -236,6 +236,7 @@ public static class LocalVariables
         SeedMethodInfoTypes(method);
         SeedComparisonResults(method);
         SeedFloatLiterals(method);
+        SeedNativeIntegerWidths(method);
 
         // Everywhere there's a CallVoid after a Newobj, we can resolve the constructor call.
         MetadataResolver.ResolveConstructorCalls(method);
@@ -444,7 +445,7 @@ public static class LocalVariables
                     break;
                 case OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
                     or OpCode.ShiftLeft or OpCode.ShiftRight:
-                    changed |= PropagateIntegerResult(instruction, method);
+                    changed |= PropagateBooleanResult(instruction, method) || PropagateIntegerResult(instruction, method);
                     break;
             }
         }
@@ -484,11 +485,32 @@ public static class LocalVariables
                     reachesGuard = true;
                     continue;
                 }
+                if (user.OpCode is OpCode.And or OpCode.Or or OpCode.Xor
+                    && user.Destination is LocalVariable combined
+                    && user.Sources.All(source => ReferenceEquals(source, local)
+                        || source is LocalVariable { Type.FullName: "System.Boolean" })
+                    && (combined.Type == null || combined.Type.FullName == "System.Boolean")
+                    && IsGuardOnlyResult(combined, user, method, active))
+                {
+                    reachesGuard = true;
+                    continue;
+                }
                 return false;
             }
         }
         active.Remove(local);
         return reachesGuard;
+    }
+
+    private static bool PropagateBooleanResult(Instruction instruction, MethodAnalysisContext method)
+    {
+        if (instruction.OpCode is not (OpCode.And or OpCode.Or or OpCode.Xor)
+            || instruction.Destination is not LocalVariable { Type: null } destination
+            || instruction.Sources.Count == 0
+            || instruction.Sources.Any(source => source is not LocalVariable { Type.FullName: "System.Boolean" }))
+            return false;
+
+        return SetTypeIfUnknown(destination, method.AppContext.SystemTypes.SystemBooleanType);
     }
 
     // A local assigned a float/double literal (a lifted rodata constant load) is that float type
@@ -505,6 +527,15 @@ public static class LocalVariables
                 DoubleLiteral => method.AppContext.SystemTypes.SystemDoubleType,
                 _ => destination.Type,
             };
+        }
+    }
+
+    private static void SeedNativeIntegerWidths(MethodAnalysisContext method)
+    {
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction.NativeIntegerWidthBits == 32 && instruction.Destination is LocalVariable destination)
+                SetTypeIfUnknown(destination, method.AppContext.SystemTypes.SystemInt32Type);
         }
     }
 

@@ -41,6 +41,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         reg is >= Arm64Register.S0 and <= Arm64Register.S31
             or >= Arm64Register.D0 and <= Arm64Register.D31;
 
+    private static bool IsWordRegister(Arm64Register reg) => reg is >= Arm64Register.W0 and <= Arm64Register.W31;
+
     // integer register 31 is SP or ZR depending on context, callers must decide which
     private static bool IsReg31(Arm64Register reg) => reg is Arm64Register.X31 or Arm64Register.W31;
 
@@ -206,6 +208,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             return newInstruction;
         }
 
+        Instruction AddInteger(ulong address, OpCode opCode, params List<IOperand> operands)
+        {
+            var generated = Add(address, opCode, operands);
+            if (instruction.Op0Kind == Arm64OperandKind.Register && IsWordRegister(instruction.Op0Reg))
+                generated.NativeIntegerWidthBits = 32;
+            return generated;
+        }
+
         void AddCallAt(ulong target)
         {
             if (context.AppContext.MethodsByAddress.TryGetValue(target, out var possibleMethods) && possibleMethods.Count > 0)
@@ -306,12 +316,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
             Add(address, OpCode.CheckLess, flagC, op0, op1); // arm's C is the inverse of a borrow
             Add(address, OpCode.Not, flagC, flagC);
-            Add(address, OpCode.Subtract, temp1, op0, op1);
+            AddInteger(address, OpCode.Subtract, temp1, op0, op1);
             Add(address, OpCode.CheckLess, flagN, temp1, Imm(0));
             Add(address, OpCode.CheckEqual, flagZ, temp1, Imm(0));
-            Add(address, OpCode.Xor, temp2, op0, op1);
-            Add(address, OpCode.Xor, temp3, op0, temp1);
-            Add(address, OpCode.And, temp4, temp2, temp3);
+            AddInteger(address, OpCode.Xor, temp2, op0, op1);
+            AddInteger(address, OpCode.Xor, temp3, op0, temp1);
+            AddInteger(address, OpCode.And, temp4, temp2, temp3);
             Add(address, OpCode.CheckLess, flagV, temp4, Imm(0));
         }
 
@@ -643,6 +653,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     // a discarded result means this is only about the flags
                     var dest = IsReg31(instruction.Op0Reg) ? new Register(null, "TEMP") : ConvertOperand(instruction, 0);
 
+                    // A following numeric conversion is still represented as a Move and can
+                    // coalesce back into this result, so direct ADD/SUB width is not stable yet.
                     Add(address, isSubtract ? OpCode.Subtract : OpCode.Add, dest, src1, src2);
 
                     if (setsFlags)
@@ -669,7 +681,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 else
                 {
                     var negated = new Register(null, "TEMP");
-                    Add(address, OpCode.Negate, negated, ConvertOperand(instruction, 1));
+                    AddInteger(address, OpCode.Negate, negated, ConvertOperand(instruction, 1));
                     EmitCompareFlags(ConvertOperand(instruction, 0), negated);
                 }
 
@@ -677,7 +689,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.TST:
                 {
                     var temp = new Register(null, "TEMP");
-                    Add(address, OpCode.And, temp, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                    AddInteger(address, OpCode.And, temp, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
                     EmitResultFlags(temp);
                     break;
                 }
@@ -694,7 +706,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     };
 
                     var dest = IsReg31(instruction.Op0Reg) ? new Register(null, "TEMP") : ConvertOperand(instruction, 0);
-                    Add(address, opCode, dest, ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                    AddInteger(address, opCode, dest, ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
 
                     if (instruction.Mnemonic == Arm64Mnemonic.ANDS)
                         EmitResultFlags(dest);
@@ -769,22 +781,22 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 }
             case Arm64Mnemonic.NEG:
             case Arm64Mnemonic.FNEG:
-                Add(address, OpCode.Negate, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                AddInteger(address, OpCode.Negate, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
                 break;
             case Arm64Mnemonic.LSL:
-                Add(address, OpCode.ShiftLeft, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                AddInteger(address, OpCode.ShiftLeft, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
             case Arm64Mnemonic.LSR:
             case Arm64Mnemonic.ASR:
-                Add(address, OpCode.ShiftRight, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                AddInteger(address, OpCode.ShiftRight, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
             case Arm64Mnemonic.UBFX:
             case Arm64Mnemonic.SBFX:
                 {
                     // dest = (src >> lsb) & ((1 << width) - 1)
                     var dest = ConvertOperand(instruction, 0);
-                    Add(address, OpCode.ShiftRight, dest, ConvertOperand(instruction, 1), Imm(instruction.Op2Imm));
-                    Add(address, OpCode.And, dest, dest, Imm((1L << (int)instruction.Op3Imm) - 1));
+                    AddInteger(address, OpCode.ShiftRight, dest, ConvertOperand(instruction, 1), Imm(instruction.Op2Imm));
+                    AddInteger(address, OpCode.And, dest, dest, Imm((1L << (int)instruction.Op3Imm) - 1));
                     break;
                 }
             case Arm64Mnemonic.UBFIZ:
@@ -793,14 +805,16 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     // dest = (src & ((1 << width) - 1)) << shift
                     var dest = ConvertOperand(instruction, 0);
                     var temp = new Register(null, "TEMP");
-                    Add(address, OpCode.And, temp, ConvertOperand(instruction, 1), Imm((1L << (int)instruction.Op3Imm) - 1));
-                    Add(address, OpCode.ShiftLeft, dest, temp, Imm(instruction.Op2Imm));
+                    AddInteger(address, OpCode.And, temp, ConvertOperand(instruction, 1), Imm((1L << (int)instruction.Op3Imm) - 1));
+                    AddInteger(address, OpCode.ShiftLeft, dest, temp, Imm(instruction.Op2Imm));
                     break;
                 }
             case Arm64Mnemonic.MUL:
             case Arm64Mnemonic.FMUL:
             case Arm64Mnemonic.SMULL:
             case Arm64Mnemonic.UMULL:
+                // Integer-to-float conversions are still represented as moves and can be
+                // coalesced into this result, so a direct MUL width is not yet stable here.
                 Add(address, OpCode.Multiply, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
             case Arm64Mnemonic.MNEG:
@@ -809,8 +823,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.FNMUL:
                 {
                     var dest = ConvertOperand(instruction, 0);
-                    Add(address, OpCode.Multiply, dest, ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
-                    Add(address, OpCode.Negate, dest, dest);
+                    AddInteger(address, OpCode.Multiply, dest, ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                    AddInteger(address, OpCode.Negate, dest, dest);
                     break;
                 }
             case Arm64Mnemonic.MADD:
@@ -823,8 +837,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     // rd = ra +/- rn * rm
                     var isAdd = instruction.Mnemonic is Arm64Mnemonic.MADD or Arm64Mnemonic.SMADDL or Arm64Mnemonic.UMADDL;
                     var temp = new Register(null, "TEMP");
-                    Add(address, OpCode.Multiply, temp, ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
-                    Add(address, isAdd ? OpCode.Add : OpCode.Subtract, ConvertOperand(instruction, 0), ConvertOperand(instruction, 3), temp);
+                    AddInteger(address, OpCode.Multiply, temp, ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                    AddInteger(address, isAdd ? OpCode.Add : OpCode.Subtract, ConvertOperand(instruction, 0), ConvertOperand(instruction, 3), temp);
                     break;
                 }
             case Arm64Mnemonic.EXTR:
@@ -842,15 +856,15 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     var regSize = instruction.Op0Reg is >= Arm64Register.X0 and <= Arm64Register.X31 ? 64 : 32;
                     var temp = new Register(null, "TEMP");
                     var temp2 = new Register(null, "TEMP2");
-                    Add(address, OpCode.ShiftRight, temp, ConvertOperand(instruction, 2), Imm(lsb));
-                    Add(address, OpCode.ShiftLeft, temp2, ConvertOperand(instruction, 1), Imm(regSize - lsb));
-                    Add(address, OpCode.Or, dest, temp, temp2);
+                    AddInteger(address, OpCode.ShiftRight, temp, ConvertOperand(instruction, 2), Imm(lsb));
+                    AddInteger(address, OpCode.ShiftLeft, temp2, ConvertOperand(instruction, 1), Imm(regSize - lsb));
+                    AddInteger(address, OpCode.Or, dest, temp, temp2);
                     break;
                 }
             case Arm64Mnemonic.SDIV:
             case Arm64Mnemonic.UDIV:
             case Arm64Mnemonic.FDIV:
-                Add(address, OpCode.Divide, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                AddInteger(address, OpCode.Divide, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
             case Arm64Mnemonic.FADD:
                 Add(address, OpCode.Add, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
@@ -1029,6 +1043,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
             if (kind == Arm64OperandKind.ImmediatePcRelative)
                 imm += (long)instruction.Address;
+
+            if (kind == Arm64OperandKind.Immediate
+                && instruction.Op0Kind == Arm64OperandKind.Register
+                && IsWordRegister(instruction.Op0Reg)
+                && imm is >= 0 and <= uint.MaxValue)
+                imm = unchecked((int)(uint)imm);
 
             return new Immediate(imm);
         }

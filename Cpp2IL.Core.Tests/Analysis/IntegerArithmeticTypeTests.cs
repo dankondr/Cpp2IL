@@ -76,6 +76,34 @@ public class IntegerArithmeticTypeTests
         else Assert.That(first.Type, Is.Null);
     }
 
+    [Test]
+    public void BooleanNotCanFlowThroughBooleanAndToGuard()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, []);
+        var left = new LocalVariable("left", new Register(null, "left")) { Type = app.SystemTypes.SystemBooleanType };
+        var right = new LocalVariable("right", new Register(null, "right")) { Type = app.SystemTypes.SystemBooleanType };
+        var inverted = new LocalVariable("inverted", new Register(null, "inverted"));
+        var combined = new LocalVariable("combined", new Register(null, "combined"));
+        var taken = new Instruction(4, OpCode.Return);
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Not, inverted, left),
+            new(1, OpCode.And, combined, inverted, right),
+            new(2, OpCode.ConditionalJump, taken, combined),
+            new(3, OpCode.Return), taken]);
+        method.Locals = [left, right, inverted, combined];
+        method.ParameterLocals = [];
+
+        LocalVariables.ResolveTypesAndFields(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(inverted.Type, Is.SameAs(app.SystemTypes.SystemBooleanType));
+            Assert.That(combined.Type, Is.SameAs(app.SystemTypes.SystemBooleanType));
+        });
+    }
+
     [TestCase(OpCode.Add)]
     [TestCase(OpCode.Subtract)]
     [TestCase(OpCode.Multiply)]
@@ -187,6 +215,28 @@ public class IntegerArithmeticTypeTests
             new(1, OpCode.Move, loaded, new MemoryOperand(result, addend: 0x18)),
             new(2, OpCode.Return)]);
         method.Locals = [input, result, loaded];
+        method.ParameterLocals = [];
+
+        LocalVariables.ResolveTypesAndFields(method);
+
+        Assert.That(result.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+    }
+
+    [Test]
+    public void NativeWordArithmeticTypesAnOtherwiseUnknownResult()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, []);
+        var left = new LocalVariable("left", new Register(null, "left"));
+        var right = new LocalVariable("right", new Register(null, "right"));
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var arithmetic = new Instruction(0, OpCode.Multiply, result, left, right)
+        {
+            NativeIntegerWidthBits = 32
+        };
+        method.ControlFlowGraph = new ISILControlFlowGraph([arithmetic, new(1, OpCode.Return)]);
+        method.Locals = [left, right, result];
         method.ParameterLocals = [];
 
         LocalVariables.ResolveTypesAndFields(method);

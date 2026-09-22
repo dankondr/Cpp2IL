@@ -35,6 +35,9 @@ public class Instruction : IOperand
     // method (for example base.M()) must not acquire this flag.
     public bool IsVirtualDispatch;
 
+    // Native integer arithmetic can carry a width that register normalization erases.
+    public int? NativeIntegerWidthBits;
+
     public bool IsFallThrough =>
         OpCode switch
         {
