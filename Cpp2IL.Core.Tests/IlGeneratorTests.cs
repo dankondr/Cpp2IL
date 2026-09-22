@@ -156,6 +156,36 @@ public class IlGeneratorTests
     }
 
     [Test]
+    public void UntypedBooleanNotResultUsesBooleanLocal()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var input = new LocalVariable("input", new Register(null, "input"))
+            { Type = app.SystemTypes.SystemBooleanType };
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Not, result, input),
+            new(1, OpCode.Return)]);
+        context.Locals = [input, result];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+        var module = new ModuleDefinition("BooleanNot.dll");
+        app.SystemTypes.SystemBooleanType.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Boolean", TypeAttributes.Public));
+        var owner = new TypeDefinition("Tests", "BooleanNot", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(method);
+
+        IlGenerator.GenerateIl(context, method);
+
+        Assert.That(method.CilMethodBody!.LocalVariables[1].VariableType.FullName, Is.EqualTo("System.Boolean"));
+    }
+
+    [Test]
     public void UnreachableAnalysisWarningDoesNotMakeSerializedBodyUnrunnable()
     {
         var app = Cpp2IlApi.CurrentAppContext!;
