@@ -617,19 +617,20 @@ public static class IlGenerator
                 // is IL2CPP's re-init of an allocated object; emit newobj and store the fresh
                 // object back into the receiver slot instead.
                 IOperand? ctorReinitReceiver = null;
+                // A struct's instance `this` is a managed pointer to that struct -
+                // `call StructType::.ctor` initializes through it in place too.
+                var structCallee = !targetMethod.IsStatic && targetMethod.DeclaringType is { IsValueType: true } structDeclaring
+                    ? structDeclaring
+                    : null;
+                var isOwnThis = false;
                 if (!targetMethod.IsStatic) // Load 'this' param
                 {
-                    // A struct's instance `this` is a managed pointer to that struct -
-                    // `call StructType::.ctor` initializes through it in place too.
-                    var structCallee = targetMethod.DeclaringType is { IsValueType: true } structDeclaring
-                        ? structDeclaring
-                        : null;
                     var referenceTypeConstructor = targetMethod.Name == ".ctor"
                         && retargetedBaseConstructor == null && structCallee == null;
                     if ((instruction.Operands.Count - 1) >= thisParamIndex)
                     {
                         var thisOperand = instruction.Operands[thisParamIndex];
-                        var isOwnThis = thisOperand is LocalVariable thisLocal
+                        isOwnThis = thisOperand is LocalVariable thisLocal
                             && (thisLocal.IsThis || ReferenceEquals(thisLocal, context.ParameterLocals.FirstOrDefault()));
                         if (referenceTypeConstructor && !isOwnThis)
                             ctorReinitReceiver = thisOperand;
@@ -743,8 +744,22 @@ public static class IlGenerator
                     }
                     break;
                 }
+                // ECMA III.3.19: a `call` to a non-final virtual method on a non-sealed
+                // reference type only verifies on the caller's own `this` pointer (or a
+                // boxed value type). IL2CPP resolves virtual dispatches it can prove into
+                // direct calls on ordinary locals/fields, and Enum::ToString-style callee
+                // recovery lands on a virtual member of a reference type; the verifiable
+                // spelling of those calls is `callvirt`, which also matches the slot
+                // dispatch the native code actually performed. A receiver that is the
+                // caller's own `this` keeps `call` so base calls stay non-virtual.
+                var directCallToVirtual = !targetMethod.IsStatic && retargetedBaseConstructor == null
+                    && structCallee == null
+                    && targetMethod.IsVirtual && !targetMethod.IsFinal
+                    && targetMethod.DeclaringType is { IsSealed: false }
+                    && !isOwnThis;
                 instructions.Add(!targetMethod.IsStatic && retargetedBaseConstructor == null
-                        && (instruction.IsVirtualDispatch || targetMethod.DeclaringType?.IsInterface == true)
+                        && (instruction.IsVirtualDispatch || targetMethod.DeclaringType?.IsInterface == true
+                            || directCallToVirtual)
                     ? CilOpCodes.Callvirt
                     : CilOpCodes.Call, importedMethod);
 
@@ -2507,6 +2522,22 @@ public static class IlGenerator
             else if (!byRef.ElementType.IsValueType)
             {
                 instructions.Add(CilOpCodes.Ldind_Ref);
+                // ldind.ref yields the element reference; a narrower reference slot
+                // still needs the same castclass a plain value would.
+                if (!IsAssignableToLoose(byRef.ElementType, to) && CanEmitTypeToken(to))
+                    instructions.Add(CilOpCodes.Castclass, to.ToTypeSignature().ToTypeDefOrRef());
+                return true;
+            }
+            // A value-type element reaches a reference slot only through ldobj+box,
+            // and only where the boxed type is genuinely assignable to the slot -
+            // an enum receiver for System.Enum::ToString is the common case. An
+            // unrelated value type stays unbridgeable so the caller's honest
+            // default replaces it instead of fabricating a conversion.
+            else if (IsAssignableToLoose(byRef.ElementType, to) && CanEmitTypeToken(byRef.ElementType))
+            {
+                var elementToken = byRef.ElementType.ToTypeSignature().ToTypeDefOrRef();
+                instructions.Add(CilOpCodes.Ldobj, elementToken);
+                instructions.Add(CilOpCodes.Box, elementToken);
                 return true;
             }
 
@@ -2721,11 +2752,13 @@ public static class IlGenerator
             if (convertByRef && toWidth != 0)
                 return true; // conv.i lands the native-int kind, then width rules apply
             if (from is ByRefTypeAnalysisContext byRef)
-                // ldobj on an exact element match, ldind.ref for a reference target;
-                // anything else emits nothing and stays uncoercible.
+                // A reference element reaches any reference slot through ldind.ref plus
+                // the narrowing cast a plain value would need; a value-type element
+                // needs ldobj+box, which honestly lands only where the boxed type is
+                // assignable. Anything else emits nothing and stays uncoercible.
                 return to.IsValueType
                     ? byRef.ElementType.FullName == to.FullName
-                    : !byRef.ElementType.IsValueType && StackAssignableTo(byRef.ElementType, to);
+                    : !byRef.ElementType.IsValueType || IsAssignableToLoose(byRef.ElementType, to);
             // An unmanaged pointer is a native int: numeric coercions apply but it
             // can never box, unbox or castclass into a managed slot.
             return toWidth != 0;
