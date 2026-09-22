@@ -29,6 +29,16 @@ public static class ArrayRecovery
         GroupInitialisers(method.ControlFlowGraph!);
     }
 
+    // Whether RecoverAccesses would resolve this operand into an ArrayLength or
+    // ArrayAccess for the given array type.
+    internal static bool ResolvesAccess(MemoryOperand memory, SzArrayTypeAnalysisContext arrayType, int pointerSize)
+    {
+        if (memory.Index == null && memory.Scale == 0 && memory.Addend == LengthOffset(pointerSize))
+            return true;
+
+        return ElementIndex(memory, arrayType, pointerSize) != null;
+    }
+
     private static void RecoverAccesses(MethodAnalysisContext method)
     {
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;

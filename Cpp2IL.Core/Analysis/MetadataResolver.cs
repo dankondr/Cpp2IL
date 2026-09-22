@@ -227,40 +227,72 @@ public static class MetadataResolver
         return changed;
     }
 
-    // SSA pre-indexed stores can leave subsequent accesses relative to a field address
-    // rather than the object. Preserve the address producer for any other consumers.
+    // SSA pre-indexed accesses can leave subsequent loads and stores relative to an
+    // address alias (alias = root + displacement) rather than the object or array
+    // itself. Folding the alias back into the base is an exact substitution, but is
+    // only worthwhile where the folded form resolves to a known access shape: an
+    // instance field at that offset, the array length slot, or an element boundary.
     private static bool NormalizeObjectAddressAliases(MethodAnalysisContext method)
     {
         var instructions = method.ControlFlowGraph!.Instructions;
         var definitions = instructions.Where(i => i.Destination is LocalVariable)
             .GroupBy(i => (LocalVariable)i.Destination!)
             .Where(g => g.Count() == 1).ToDictionary(g => g.Key, g => g.Single());
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
         var changed = false;
         foreach (var instruction in instructions)
         for (var i = 0; i < instruction.Operands.Count; i++)
         {
-            if (instruction.Operands[i] is not MemoryOperand { Base: LocalVariable alias, Index: null, Scale: 0 } memory
+            if (instruction.Operands[i] is not MemoryOperand { Base: LocalVariable alias } memory
                 || !definitions.TryGetValue(alias, out var definition)
                 || definition is not { OpCode: OpCode.Add, Operands: [_, LocalVariable root, Immediate displacement] }
-                || alias.Type != null || ReferenceEquals(root, alias) || root.Type?.Definition == null || root.Type.IsValueType)
+                || alias.Type is { IsValueType: true }
+                || ReferenceEquals(root, alias)
+                || root.Type is not { IsValueType: false } rootType)
                 continue;
             long offset;
             try { offset = checked(memory.Addend + displacement.Value); }
             catch (System.OverflowException) { continue; }
-            // Do not obscure an interior value-type/array address that this field
-            // resolver cannot represent. Only fold to an exact named object field.
-            var hasField = false;
-            for (var owner = root.Type; owner != null && !hasField; owner = owner.BaseType)
-                hasField = owner.Fields.Any(f => !f.IsStatic && (f.Attributes & FieldAttributes.Literal) == 0
-                    && f.BackingData?.FieldOffset == offset);
-            if (!hasField)
+            var folded = memory;
+            folded.Base = root;
+            folded.Addend = offset;
+            if (!ResolvesToKnownAccess(rootType, folded, pointerSize))
                 continue;
-            memory.Base = root;
-            memory.Addend = offset;
-            instruction.SetOperand(i, memory);
+            instruction.SetOperand(i, folded);
             changed = true;
         }
         return changed;
+    }
+
+    private static bool ResolvesToKnownAccess(TypeAnalysisContext owner, MemoryOperand memory, int pointerSize)
+    {
+        if (owner is SzArrayTypeAnalysisContext arrayType)
+            return ArrayRecovery.ResolvesAccess(memory, arrayType, pointerSize);
+
+        return memory.Index == null && memory.Scale == 0 && FindInstanceFieldAtOffset(owner, memory.Addend) != null;
+    }
+
+    // Mirrors the owner selection in ResolveFieldOffsets: generic definitions have
+    // all-0 metadata offsets, so their layout is recomputed instead.
+    private static FieldAnalysisContext? FindInstanceFieldAtOffset(TypeAnalysisContext owner, long offset)
+    {
+        if (owner is GenericInstanceTypeAnalysisContext genericOwner)
+            return genericOwner.GenericArguments.Any(a => a.IsValueType)
+                ? null
+                : GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner.GenericType, offset);
+
+        if (owner.GenericParameters.Count > 0)
+            return GenericInstanceFieldLayout.FindFieldAtOffset(owner, offset);
+
+        // an inherited field exists on the base type but sits at the same offset in
+        // the derived layout, so the whole chain is searched
+        for (var candidate = owner; candidate != null; candidate = candidate.BaseType)
+            if (candidate.Fields.FirstOrDefault(f => !f.IsStatic
+                    && (f.Attributes & FieldAttributes.Literal) == 0 // consts have no storage but their metadata offset is 0, which would match
+                    && f.BackingData?.FieldOffset == offset) is { } field)
+                return field;
+
+        return null;
     }
 
     private static void ResolveCalls(MethodAnalysisContext method)
