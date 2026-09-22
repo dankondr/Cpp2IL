@@ -743,6 +743,37 @@ public static class IlGenerator
                 // operands are coerced to the (float) result type. A no-op when they already match.
                 var floatConversion = FloatOperationConversion(instruction);
 
+                // `&T`/`ref T` + N is field addressing, not arithmetic: the native
+                // add computes the address of the field at byte offset N. Emit the
+                // field access itself instead of invalid pointer math.
+                if (instruction.OpCode is OpCode.Add or OpCode.Subtract
+                    && TryResolveFieldAddressArithmetic(instruction, context) is { } fieldAddress)
+                {
+                    LoadOperand(fieldAddress.Base, method, locals, writeLine);
+                    // Fields found on a generic instance's definition must be
+                    // referenced on the instantiation, or the verifier sees an
+                    // instance type mismatch against the base operand.
+                    var resolvedField = fieldAddress.Owner is GenericInstanceTypeAnalysisContext fieldGit
+                        ? new ConcreteGenericFieldAnalysisContext(fieldAddress.Field, fieldGit)
+                        : fieldAddress.Field;
+                    var fieldContract = StoreContract(instruction.Operands[0], context);
+                    TypeAnalysisContext? fieldResult;
+                    if (fieldContract is ByRefTypeAnalysisContext fieldByRef
+                        && fieldByRef.ElementType.FullName == resolvedField.FieldType.FullName)
+                    {
+                        instructions.Add(CilOpCodes.Ldflda, resolvedField.ToFieldDescriptor());
+                        fieldResult = fieldContract;
+                    }
+                    else
+                    {
+                        instructions.Add(CilOpCodes.Ldfld, resolvedField.ToFieldDescriptor());
+                        fieldResult = resolvedField.FieldType;
+                    }
+                    EmitStackCoerce(fieldResult, fieldContract, method);
+                    StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                    break;
+                }
+
                 // Integer operations share a single stack type: the widest non-literal operand,
                 // or (for value-producing ops) the destination. Comparison destinations are the
                 // bool result, not the compared type, so they never seed the operand type.
@@ -757,7 +788,8 @@ public static class IlGenerator
                     instructions.Add(conv1);
                 else
                     EmitStackCoerce(EmittedOperandType(instruction.Operands[1], context, operandType), operandType, method,
-                        instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual);
+                        instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual
+                            or OpCode.Add or OpCode.Subtract);
                 // shl/shr take an i32/n-int shift amount, not the value type.
                 var operand2Type = instruction.OpCode is OpCode.ShiftLeft or OpCode.ShiftRight
                     ? context.AppContext.SystemTypes.SystemInt32Type
@@ -768,7 +800,8 @@ public static class IlGenerator
                     instructions.Add(conv2);
                 else
                     EmitStackCoerce(EmittedOperandType(instruction.Operands[2], context, operand2Type), operand2Type, method,
-                        instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual);
+                        instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual
+                            or OpCode.Add or OpCode.Subtract);
 
                 // Bitwise/shift ops are integer-only in IL. An operand that provably emits
                 // a non-integer (float, struct or concrete reference — unlike an untyped
@@ -2010,11 +2043,19 @@ public static class IlGenerator
             return;
 
         // No stack op synthesizes a generic-parameter or byref value from another kind.
-        if (to is GenericParameterTypeAnalysisContext or ByRefTypeAnalysisContext
-            || from is GenericParameterTypeAnalysisContext)
+        if (to is GenericParameterTypeAnalysisContext or ByRefTypeAnalysisContext)
             return;
 
         var instructions = method.CilMethodBody!.Instructions;
+
+        // A generic-parameter value into a reference slot boxes like any value
+        // type; box !T is the standard generic-store sequence.
+        if (from is GenericParameterTypeAnalysisContext)
+        {
+            if (!to.IsValueType && CanEmitTypeToken(from))
+                instructions.Add(CilOpCodes.Box, from.ToTypeSignature().ToTypeDefOrRef());
+            return;
+        }
         var fromWidth = IntegralStackWidth(from);
         var toWidth = IntegralStackWidth(to);
 
@@ -2137,6 +2178,43 @@ public static class IlGenerator
             or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext => true,
         _ => type.GetExtraData<TypeDefinition>("AsmResolverType") != null
     };
+
+    private sealed record FieldAddressArithmetic(IOperand Base, TypeAnalysisContext Owner, FieldAnalysisContext Field);
+
+    // `&T`/`ref T` +|- a byte-offset literal is the address of the instance field at
+    // that offset, not integer math. The base is whichever operand emits as a managed
+    // pointer or reference; the other must be a non-negative literal.
+    private static FieldAddressArithmetic? TryResolveFieldAddressArithmetic(Instruction instruction,
+        MethodAnalysisContext context)
+    {
+        for (var i = 1; i <= 2; i++)
+        {
+            var baseOperand = instruction.Operands[i];
+            var offsetOperand = instruction.Operands[3 - i];
+            if (offsetOperand is not Immediate { Value: >= 0 } offset)
+                continue;
+            // `literal - pointer` has no meaning; only the pointer-on-the-left form.
+            if (instruction.OpCode == OpCode.Subtract && i == 2)
+                continue;
+            var owner = EmittedOperandType(baseOperand, context) switch
+            {
+                ByRefTypeAnalysisContext byRef => byRef.ElementType,
+                PointerTypeAnalysisContext => null,
+                { IsValueType: false } reference => reference,
+                // ldarg.0 of a struct method's own `this` pushes &T even though the
+                // local is declared T, so the addend still reaches a field.
+                { IsValueType: true } valueType when baseOperand is LocalVariable { IsThis: true }
+                    => valueType,
+                _ => null
+            };
+            if (owner == null)
+                continue;
+            if (Analysis.MetadataResolver.FindInstanceFieldAtOffset(owner, offset.Value) is { } field
+                && CanEmitTypeToken(field.FieldType))
+                return new FieldAddressArithmetic(baseOperand, owner, field);
+        }
+        return null;
+    }
 
     // The shared operand type for a binary instruction: the widest non-literal
     // operand, or (for value-producing ops) the destination. Comparison destinations
