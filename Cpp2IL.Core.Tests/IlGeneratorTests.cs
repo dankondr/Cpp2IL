@@ -130,6 +130,32 @@ public class IlGeneratorTests
     }
 
     [Test]
+    public void UntypedLocalZeroUsesItsEmittedObjectContract()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var local = new LocalVariable("value", new Register(null, "value"));
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, local, new Immediate(0)),
+            new(1, OpCode.Return)]);
+        context.Locals = [local];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+        var module = new ModuleDefinition("UntypedZero.dll");
+        var owner = new TypeDefinition("Tests", "UntypedZero", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(method);
+
+        IlGenerator.GenerateIl(context, method);
+
+        Assert.That(method.CilMethodBody!.Instructions.Any(i => i.OpCode == CilOpCodes.Ldnull), Is.True);
+    }
+
+    [Test]
     public void UnreachableAnalysisWarningDoesNotMakeSerializedBodyUnrunnable()
     {
         var app = Cpp2IlApi.CurrentAppContext!;
