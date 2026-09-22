@@ -453,7 +453,7 @@ public class IlGeneratorTests
     [TestCase(false, true, false)]
     [TestCase(true, true, false)]
     [TestCase(false, false, true)]
-    [TestCase(false, false, false)] // direct base/virtual calls must remain direct
+    [TestCase(false, false, false)] // a virtual callee on a non-`this` receiver must dispatch virtually
     public void InterfaceCallPreservesRuntimeDispatch(bool isStatic, bool isInterface, bool virtualDispatch)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
@@ -480,7 +480,165 @@ public class IlGeneratorTests
             MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
         type.Methods.Add(method);
         IlGenerator.GenerateIl(caller, method);
-        Assert.That(method.CilMethodBody!.Instructions.Any(i => i.OpCode == (!isStatic && (isInterface || virtualDispatch) ? CilOpCodes.Callvirt : CilOpCodes.Call) && i.Operand == targetDefinition), Is.True);
+        // ECMA III.3.19: `call` to a non-final virtual on a non-sealed type only verifies
+        // on the caller's own `this` pointer (or a boxed value type). Every non-static row
+        // targets a non-final virtual with a placeholder receiver, so `callvirt` is the
+        // only verifiable spelling; the static target keeps `call`.
+        Assert.That(method.CilMethodBody!.Instructions.Any(i => i.OpCode == (!isStatic ? CilOpCodes.Callvirt : CilOpCodes.Call) && i.Operand == targetDefinition), Is.True);
+    }
+
+    [Test]
+    public void DirectCallToVirtualOnAddressOfObjectEmitsCallvirtAndNarrowingCast()
+    {
+        // Enum::ToString is a non-final virtual on a non-sealed reference type and the
+        // recovered receiver is the address of an object local: `call` cannot verify on
+        // a non-`this` receiver and the dereferenced object is not statically an Enum.
+        // The honest emission is ldind.ref + castclass + callvirt.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var enumType = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Enum")!;
+        var toString = enumType.GetMethod("ToString", 0);
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var result = new LocalVariable("result", new Register(null, "result"))
+            { Type = app.SystemTypes.SystemStringType };
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Call, toString, result, new AddressOf(receiver)),
+            new(1, OpCode.Return)]);
+        caller.Locals = [receiver, result];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("VirtualThis.dll");
+        var enumDefinition = new TypeDefinition("System", "Enum",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(enumDefinition);
+        enumType.PutExtraData("AsmResolverType", enumDefinition);
+        app.SystemTypes.SystemStringType.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "String", TypeAttributes.Public | TypeAttributes.Class,
+                module.CorLibTypeFactory.Object.Type));
+        var toStringDefinition = new MethodDefinition("ToString", MethodAttributes.Public | MethodAttributes.Virtual,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.String));
+        enumDefinition.Methods.Add(toStringDefinition);
+        toString.PutExtraData("AsmResolverMethod", toStringDefinition);
+        var owner = new TypeDefinition("Tests", "Host", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(method);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Callvirt && i.Operand == toStringDefinition), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand == toStringDefinition), Is.False);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldind_Ref), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Castclass), Is.True);
+        });
+    }
+
+    [Test]
+    public void DirectCallToVirtualOnEnumAddressEmitsBoxedReceiver()
+    {
+        // The same virtual callee with the address of a genuinely enum-typed local
+        // recovers the real receiver: ldobj + box leaves a boxed enum on the stack,
+        // which is assignable to System.Enum and verifiable under callvirt.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var enumType = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Enum")!;
+        var toString = enumType.GetMethod("ToString", 0);
+        var myEnum = new InjectedTypeAnalysisContext(enumType.DeclaringAssembly,
+            "Tests", "MyEnum", enumType, System.Reflection.TypeAttributes.Public);
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver")) { Type = myEnum };
+        var result = new LocalVariable("result", new Register(null, "result"))
+            { Type = app.SystemTypes.SystemStringType };
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Call, toString, result, new AddressOf(receiver)),
+            new(1, OpCode.Return)]);
+        caller.Locals = [receiver, result];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("VirtualEnum.dll");
+        var enumDefinition = new TypeDefinition("System", "Enum",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(enumDefinition);
+        enumType.PutExtraData("AsmResolverType", enumDefinition);
+        app.SystemTypes.SystemStringType.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "String", TypeAttributes.Public | TypeAttributes.Class,
+                module.CorLibTypeFactory.Object.Type));
+        var toStringDefinition = new MethodDefinition("ToString", MethodAttributes.Public | MethodAttributes.Virtual,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.String));
+        enumDefinition.Methods.Add(toStringDefinition);
+        toString.PutExtraData("AsmResolverMethod", toStringDefinition);
+        myEnum.PutExtraData("AsmResolverType", new TypeDefinition("Tests", "MyEnum",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout,
+            enumDefinition));
+        var owner = new TypeDefinition("Tests", "Host", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(method);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Callvirt && i.Operand == toStringDefinition), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldobj), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Box), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldnull), Is.False);
+        });
+    }
+
+    [Test]
+    public void DirectCallToVirtualOnOwnThisStaysCall()
+    {
+        // `call` to a non-final virtual is still the right (and only verifiable)
+        // spelling for base calls: the receiver is the caller's own `this`.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "Tests", "Base", app.SystemTypes.SystemObjectType, System.Reflection.TypeAttributes.Public);
+        var speak = owner.InjectMethodContext("Speak", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Virtual);
+        var thisLocal = new LocalVariable("this", new Register(null, "this")) { Type = owner, IsThis = true };
+        var caller = new InjectedMethodAnalysisContext(owner, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CallVoid, speak, thisLocal),
+            new(1, OpCode.Return)]);
+        caller.Locals = [thisLocal];
+        caller.ParameterLocals = [thisLocal];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("BaseCall.dll");
+        var ownerDefinition = new TypeDefinition("Tests", "Base",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(ownerDefinition);
+        owner.PutExtraData("AsmResolverType", ownerDefinition);
+        var speakDefinition = new MethodDefinition("Speak", MethodAttributes.Public | MethodAttributes.Virtual,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        ownerDefinition.Methods.Add(speakDefinition);
+        speak.PutExtraData("AsmResolverMethod", speakDefinition);
+        var method = new MethodDefinition("Run", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        ownerDefinition.Methods.Add(method);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand == speakDefinition), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Callvirt && i.Operand == speakDefinition), Is.False);
+        });
     }
 
     [Test]
