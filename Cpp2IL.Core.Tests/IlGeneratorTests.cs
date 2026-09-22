@@ -153,6 +153,69 @@ public class IlGeneratorTests
         Assert.That(method.CilMethodBody.Instructions[^1].OpCode, Is.EqualTo(CilOpCodes.Throw));
     }
 
+    [Test]
+    public void TypedPointerMemoryLoadUsesThePointerElementType()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        app.SystemTypes.SystemInt32Type.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Int32", TypeAttributes.Public));
+        var pointerType = new PointerTypeAnalysisContext(app.SystemTypes.SystemInt32Type);
+        var pointer = new LocalVariable("pointer", new Register(null, "pointer"), pointerType);
+        var result = new LocalVariable("result", new Register(null, "result")) { Type = app.SystemTypes.SystemInt32Type };
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Read",
+            app.SystemTypes.SystemInt32Type, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, [pointerType]);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, result, new MemoryOperand(pointer)),
+            new(1, OpCode.Return, result)]);
+        context.Locals = [pointer, result];
+        context.ParameterLocals = [pointer];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("TypedPointerLoad.dll");
+        var type = new TypeDefinition("Tests", "TypedPointerLoad", TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);
+        var method = new MethodDefinition("Read", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32, [module.CorLibTypeFactory.Int32.MakePointerType()]));
+        type.Methods.Add(method);
+        method.ParameterDefinitions.Add(new ParameterDefinition(1, "pointer", 0));
+
+        IlGenerator.GenerateIl(context, method);
+
+        Assert.That(method.CilMethodBody!.Instructions.Any(i => i.OpCode == CilOpCodes.Ldobj), Is.True);
+        Assert.That(method.CilMethodBody.Instructions.Any(i => i.Operand is string text && text.Contains("Unmanaged memory load")), Is.False);
+    }
+
+    [Test]
+    public void UnknownMemoryLoadRemainsExplicitlyUnresolved()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        app.SystemTypes.SystemInt32Type.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Int32", TypeAttributes.Public));
+        var result = new LocalVariable("result", new Register(null, "result")) { Type = app.SystemTypes.SystemInt32Type };
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Read",
+            app.SystemTypes.SystemInt32Type, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, result, new MemoryOperand(addend: 0x1234)),
+            new(1, OpCode.Return, result)]);
+        context.Locals = [result];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("UnknownMemoryLoad.dll");
+        var type = new TypeDefinition("Tests", "UnknownMemoryLoad", TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);
+        var method = new MethodDefinition("Read", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32));
+        type.Methods.Add(method);
+
+        IlGenerator.GenerateIl(context, method);
+
+        var instructions = method.CilMethodBody!.Instructions;
+        Assert.That(instructions.Any(i => i.Operand is string text && text.Contains("Unmanaged memory load")), Is.True);
+        Assert.That(instructions.Any(i => i.OpCode == CilOpCodes.Throw), Is.True);
+        Assert.That(instructions.Any(i => i.OpCode == CilOpCodes.Conv_I || i.OpCode == CilOpCodes.Ldc_I4_0), Is.False);
+    }
+
     [TestCase(0L, 0L)]
     [TestCase(0x7fffffffL, 34359738352L)]
     [TestCase(0x80000000L, -34359738368L)]
