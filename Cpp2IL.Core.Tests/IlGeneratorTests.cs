@@ -317,6 +317,8 @@ public class IlGeneratorTests
         methodContext.AnalysisWarnings = [];
 
         var module = new ModuleDefinition("PrivateFieldAccess.dll");
+        app.SystemTypes.SystemInt32Type.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Int32", TypeAttributes.Public));
         var ownerDefinition = new TypeDefinition("Tests", "PrivateOwner", TypeAttributes.NotPublic | TypeAttributes.Class,
             module.CorLibTypeFactory.Object.Type);
         module.TopLevelTypes.Add(ownerDefinition);
