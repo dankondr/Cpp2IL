@@ -2331,6 +2331,17 @@ public static class IlGenerator
             StaticFieldStorageTypeAnalysisContext or RgctxTableTypeAnalysisContext
                 or MethodRgctxTableTypeAnalysisContext
                 => context.AppContext.SystemTypes.SystemIntPtrType,
+            // A bare type operand (ldtoken): LoadOperand emits ldtoken + GetTypeFromHandle
+            // for ordinary contracts, the bare handle for RuntimeTypeHandle, or a native
+            // pointer for handle contracts — report what is actually pushed.
+            TypeAnalysisContext => expectedType?.FullName switch
+            {
+                "System.RuntimeTypeHandle" => ResolveSystemType(context, "System.RuntimeTypeHandle"),
+                "System.IntPtr" or "System.UIntPtr" => context.AppContext.SystemTypes.SystemIntPtrType,
+                _ when expectedType is RuntimeClassTypeAnalysisContext
+                    => context.AppContext.SystemTypes.SystemIntPtrType,
+                _ => ResolveSystemType(context, "System.Type"),
+            },
             _ => null
         };
 
