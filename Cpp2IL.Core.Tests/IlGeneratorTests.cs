@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using AsmResolver.DotNet;
+using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
 using AsmResolver.PE.DotNet.Metadata.Tables;
@@ -52,7 +53,9 @@ public class IlGeneratorTests
     [TestCase(7, false, OpCode.CheckEqual, true)]
     [TestCase(8, false, OpCode.CheckEqual, true)]
     [TestCase(9, false, OpCode.CheckEqual, false)]
-    [TestCase(10, false, OpCode.CheckEqual, false)]
+    // An unconstrained T tested against zero is the canonical `box T; ldnull; ceq`
+    // null check - a reference comparison, so ldnull is emitted.
+    [TestCase(10, false, OpCode.CheckEqual, true)]
     [TestCase(11, false, OpCode.CheckEqual, true)]
     [TestCase(1, false, OpCode.CheckEqual, false)]
     [TestCase(2, false, OpCode.CheckEqual, false)]
@@ -303,6 +306,8 @@ public class IlGeneratorTests
         IlGenerator.GenerateIl(context, method);
 
         var instructions = method.CilMethodBody!.Instructions;
+        // The immediate adapts to the operand width at load time (ldc.r8), so no raw
+        // int ever reaches the ceq - the conversion the name promises, just folded.
         Assert.That(instructions.Select(i => i.OpCode), Does.Contain(CilOpCodes.Ldc_R8));
         // The immediate is loaded directly at double width, so no separate
         // conversion is needed; it must not reach ceq as an integer.
@@ -1196,6 +1201,180 @@ public class IlGeneratorTests
         });
     }
 
+    private static InjectedTypeAnalysisContext InjectedVector(ApplicationAnalysisContext app) =>
+        new(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "UnityEngine", "Vector3", app.SystemTypes.SystemValueTypeType, System.Reflection.TypeAttributes.Public);
+
+    private static TypeDefinition EmitVectorDefinition(ModuleDefinition module, TypeAnalysisContext vector)
+    {
+        var vectorDef = new TypeDefinition("UnityEngine", "Vector3",
+            TypeAttributes.Public | TypeAttributes.SequentialLayout,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType"));
+        module.TopLevelTypes.Add(vectorDef);
+        vector.PutExtraData("AsmResolverType", vectorDef);
+        return vectorDef;
+    }
+
+    [Test]
+    public void IntLocalInStructArgumentSlotEmitsDefault()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = InjectedVector(app);
+        var target = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Place",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [vector]);
+        var intLocal = new LocalVariable("i", new Register(null, "i")) { Type = app.SystemTypes.SystemInt32Type };
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, intLocal, new Immediate(3)),
+            new(1, OpCode.CallVoid, target, intLocal),
+            new(2, OpCode.Return)]);
+        caller.Locals = [intLocal];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("StructArg.dll");
+        var vectorDef = EmitVectorDefinition(module, vector);
+        app.SystemTypes.SystemInt32Type.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Int32", TypeAttributes.Public));
+        var owner = new TypeDefinition("Tests", "Place", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var targetDef = new MethodDefinition("Place", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [vectorDef.ToTypeSignature()]));
+        owner.Methods.Add(targetDef);
+        target.PutExtraData("AsmResolverMethod", targetDef);
+        var definition = new MethodDefinition("Caller", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        // The int local can never occupy the Vector3 slot; default(Vector3) is emitted instead.
+        var callIndex = il.Select((i, idx) => (i, idx)).First(t => t.i.OpCode == CilOpCodes.Call).idx;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il[callIndex - 3].OpCode, Is.EqualTo(CilOpCodes.Ldloca));
+            Assert.That(il[callIndex - 2].OpCode, Is.EqualTo(CilOpCodes.Initobj));
+            Assert.That(il[callIndex - 1].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+        });
+    }
+
+    [Test]
+    public void IntLocalStoredIntoStructLocalEmitsDefault()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = InjectedVector(app);
+        var vectorLocal = new LocalVariable("v", new Register(null, "v")) { Type = vector };
+        var intLocal = new LocalVariable("i", new Register(null, "i")) { Type = app.SystemTypes.SystemInt32Type };
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, vectorLocal, intLocal),
+            new(1, OpCode.Return)]);
+        context.Locals = [vectorLocal, intLocal];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+        var module = new ModuleDefinition("StructStore.dll");
+        EmitVectorDefinition(module, vector);
+        app.SystemTypes.SystemInt32Type.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Int32", TypeAttributes.Public));
+        var owner = new TypeDefinition("Tests", "Run", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var definition = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        // stloc of an int into a Vector3 local is invalid; the store keeps default(Vector3).
+        var stlocIndex = il.Select((i, idx) => (i, idx)).Last(t => t.i.OpCode == CilOpCodes.Stloc).idx;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il[stlocIndex - 3].OpCode, Is.EqualTo(CilOpCodes.Ldloca));
+            Assert.That(il[stlocIndex - 2].OpCode, Is.EqualTo(CilOpCodes.Initobj));
+            Assert.That(il[stlocIndex - 1].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+            Assert.That(il[^1].OpCode, Is.EqualTo(CilOpCodes.Ret));
+        });
+    }
+
+    [Test]
+    public void ImmediateStoredThroughSimpleMemoryDestinationUsesBaseLocalContract()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = InjectedVector(app);
+        var vectorLocal = new LocalVariable("v", new Register(null, "v")) { Type = vector };
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, new MemoryOperand(vectorLocal), new Immediate(0)),
+            new(1, OpCode.Return)]);
+        context.Locals = [vectorLocal];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+        var module = new ModuleDefinition("StructMemoryStore.dll");
+        EmitVectorDefinition(module, vector);
+        var owner = new TypeDefinition("Tests", "Run", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var definition = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        // [v] is a plain stloc into the Vector3 local, so the immediate must be default(Vector3).
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Initobj), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldc_I4 || i.OpCode == CilOpCodes.Ldc_I4_0), Is.False);
+            Assert.That(il[^2].OpCode, Is.EqualTo(CilOpCodes.Stloc));
+            Assert.That(il[^1].OpCode, Is.EqualTo(CilOpCodes.Ret));
+        });
+    }
+
+    [Test]
+    public void StructComparedToZeroEmitsBoxedNullCheck()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = InjectedVector(app);
+        var vectorLocal = new LocalVariable("v", new Register(null, "v")) { Type = vector };
+        var result = new LocalVariable("r", new Register(null, "r")) { Type = app.SystemTypes.SystemBooleanType };
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CheckEqual, result, vectorLocal, new Immediate(0)),
+            new(1, OpCode.Return)]);
+        context.Locals = [vectorLocal, result];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+        var module = new ModuleDefinition("StructEq.dll");
+        EmitVectorDefinition(module, vector);
+        app.SystemTypes.SystemBooleanType.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Boolean", TypeAttributes.Public));
+        var owner = new TypeDefinition("Tests", "Run", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var definition = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        // ceq cannot pair a Vector3 with an int; the honest form is the null test: box; ldnull; ceq.
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Box), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldnull), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ceq), Is.True);
+        });
+    }
+
     [Test]
     public void PublicGenericCalleeOnVisibleInstantiationStaysDirect()
     {
@@ -1375,6 +1554,44 @@ public class IlGeneratorTests
     }
 
     [Test]
+    public void OrderingCompareOnStructEmitsDefaultBool()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = InjectedVector(app);
+        var vectorLocal = new LocalVariable("v", new Register(null, "v")) { Type = vector };
+        var result = new LocalVariable("r", new Register(null, "r")) { Type = app.SystemTypes.SystemBooleanType };
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CheckLess, result, vectorLocal, new Immediate(1)),
+            new(1, OpCode.Return)]);
+        context.Locals = [vectorLocal, result];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+        var module = new ModuleDefinition("StructLt.dll");
+        EmitVectorDefinition(module, vector);
+        app.SystemTypes.SystemBooleanType.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Boolean", TypeAttributes.Public));
+        var owner = new TypeDefinition("Tests", "Run", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var definition = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        // Ordering on a struct has no answer; emit the honest diagnostic throw,
+        // never a clt on Vector3.
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Clt), Is.False);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Throw), Is.True);
+        });
+    }
+
+    [Test]
     public void MoveFromUnbridgeableTypeToStructSlotEmitsDefaultValue()
     {
         var app = Cpp2IlApi.CurrentAppContext!;
@@ -1412,9 +1629,55 @@ public class IlGeneratorTests
         Assert.Multiple(() =>
         {
             Assert.That(method.CilMethodBody.LocalVariables, Has.Count.EqualTo(3));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Pop), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldloca), Is.True);
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Initobj), Is.True);
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stloc), Is.True);
+        });
+    }
+
+    [Test]
+    public void CallResultIntoStructLocalEmitsDefault()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = InjectedVector(app);
+        var target = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Count",
+            app.SystemTypes.SystemInt32Type, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        var vectorLocal = new LocalVariable("v", new Register(null, "v")) { Type = vector };
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Call, target, vectorLocal),
+            new(1, OpCode.Return)]);
+        caller.Locals = [vectorLocal];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("StructResult.dll");
+        EmitVectorDefinition(module, vector);
+        var owner = new TypeDefinition("Tests", "Place", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var targetDef = new MethodDefinition("Count", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32));
+        owner.Methods.Add(targetDef);
+        target.PutExtraData("AsmResolverMethod", targetDef);
+        var definition = new MethodDefinition("Caller", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        // The int return value cannot land in a Vector3 local: it is popped and the
+        // store keeps default(Vector3).
+        var stlocIndex = il.Select((i, idx) => (i, idx)).Last(t => t.i.OpCode == CilOpCodes.Stloc).idx;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il[stlocIndex - 4].OpCode, Is.EqualTo(CilOpCodes.Pop));
+            Assert.That(il[stlocIndex - 3].OpCode, Is.EqualTo(CilOpCodes.Ldloca));
+            Assert.That(il[stlocIndex - 2].OpCode, Is.EqualTo(CilOpCodes.Initobj));
+            Assert.That(il[stlocIndex - 1].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+            Assert.That(il[^1].OpCode, Is.EqualTo(CilOpCodes.Ret));
         });
     }
 }

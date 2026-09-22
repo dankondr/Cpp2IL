@@ -137,7 +137,7 @@ public static class IlGenerator
         {
             body.Instructions.Add(CilOpCodes.Ldarg_0);
             for (var i = 0; i < arguments.Length; i++)
-                LoadOperand(arguments[i], definition, locals, writeLine, constructor.Parameters[i].ParameterType, context);
+                LoadOperandIntoSlot(arguments[i], constructor.Parameters[i].ParameterType, context, definition, locals, writeLine);
             body.Instructions.Add(CilOpCodes.Call, constructor.ToMethodDescriptor());
         }
 
@@ -390,8 +390,7 @@ public static class IlGenerator
                     && store.AccessSize == context.AppContext.Binary.PointerSizeBytes)
                 {
                     LoadLocal(address, method, locals);
-                    LoadOperand(instruction.Operands[1], method, locals, writeLine, referent, context);
-                    CoerceOrDefault(EmittedOperandType(instruction.Operands[1], context, referent), referent, method);
+                    LoadOperandIntoSlot(instruction.Operands[1], referent, context, method, locals, writeLine);
                     instructions.Add(CilOpCodes.Stind_Ref);
                     break;
                 }
@@ -407,8 +406,7 @@ public static class IlGenerator
                     if (!field.Field.IsStatic)
                         LoadLocal(field.Local, method, locals);
 
-                    LoadOperand(instruction.Operands[1], method, locals, writeLine, field.Field.FieldType, context);
-                    CoerceOrDefault(EmittedOperandType(instruction.Operands[1], context, field.Field.FieldType), field.Field.FieldType, method);
+                    LoadOperandIntoSlot(instruction.Operands[1], field.Field.FieldType, context, method, locals, writeLine);
                     instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
                     break;
                 }
@@ -421,21 +419,22 @@ public static class IlGenerator
                     LoadOperand(target.Index, method, locals, writeLine, null, context);
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, stored, context);
                     CoerceOrDefault(EmittedOperandType(instruction.Operands[1], context, stored), stored, method);
+                    if (IntegralStackWidth(DestinationType(target.Index)) == 8)
+                        instructions.Add(CilOpCodes.Conv_I4);
                     instructions.Add(CilOpCodes.Stelem, stored.ToTypeSignature().ToTypeDefOrRef());
                     break;
                 }
 
                 var moveDestinationType = StoreContract(instruction.Operands[0], context);
-                LoadOperand(instruction.Operands[1], method, locals, writeLine, moveDestinationType, context);
-                CoerceOrDefault(EmittedOperandType(instruction.Operands[1], context, moveDestinationType), moveDestinationType, method);
+                LoadOperandIntoSlot(instruction.Operands[1], moveDestinationType, context, method, locals, writeLine);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 break;
 
             case OpCode.SignExtend32:
-                LoadOperand(instruction.Operands[1], method, locals, writeLine, null, context);
+                LoadOperandIntoSlot(instruction.Operands[1], context.AppContext.SystemTypes.SystemInt32Type, context, method, locals, writeLine);
                 instructions.Add(CilOpCodes.Conv_I4);
                 instructions.Add(CilOpCodes.Conv_I8);
-                CoerceOrDefault(context.AppContext.SystemTypes.SystemInt64Type,
+                EmitStackCoerceOrDefault(context.AppContext.SystemTypes.SystemInt64Type,
                     StoreContract(instruction.Operands[0], context), method);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 break;
@@ -444,14 +443,14 @@ public static class IlGenerator
                 var newArrayDestination = StoreContract(instruction.Operands[0], context);
                 if (instruction.Operands is [_, SzArrayTypeAnalysisContext { ElementType: { } newArrayElement }, { } length])
                 {
-                    LoadOperand(length, method, locals, writeLine, null, context);
+                    LoadOperandIntoSlot(length, context.AppContext.SystemTypes.SystemInt32Type, context, method, locals, writeLine);
                     instructions.Add(CilOpCodes.Newarr, newArrayElement.ToTypeSignature().ToTypeDefOrRef());
                     CoerceOrDefault(new SzArrayTypeAnalysisContext(newArrayElement), newArrayDestination, method);
                 }
                 else if (newArrayDestination is { IsValueType: true } && CanEmitTypeToken(newArrayDestination))
                     EmitDefaultValueLocal(newArrayDestination, method, instructions);
                 else
-                    instructions.Add(CilOpCodes.Ldnull);
+                    EmitNullOrDefault(StoreContract(instruction.Operands[0], context), method, instructions);
 
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 break;
@@ -470,13 +469,11 @@ public static class IlGenerator
                     // the constructor declares (i.e. drop methodInfo)
                     var constructorArgs = constructorCall.Operands.Skip(ConstructorReceiverIndex(constructorCall) + 1).Take(constructor.Parameters.Count).ToList();
                     for (var i = 0; i < constructorArgs.Count; i++)
-                    {
-                        LoadOperand(constructorArgs[i], method, locals, writeLine, constructor.Parameters[i].ParameterType, context);
-                        CoerceOrDefault(EmittedOperandType(constructorArgs[i], context, constructor.Parameters[i].ParameterType), constructor.Parameters[i].ParameterType, method);
-                    }
+                        LoadOperandIntoSlot(constructorArgs[i], constructor.Parameters[i].ParameterType, context, method, locals, writeLine);
 
                     instructions.Add(CilOpCodes.Newobj, constructor.ToMethodDescriptor());
-                    CoerceOrDefault(constructor.DeclaringType, allocatedDestination, method);
+                    EmitStackCoerceOrDefault(constructor.DeclaringType,
+                        StoreContract(instruction.Operands[0], context), method);
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
 
                     constructorCall.OpCode = OpCode.Nop;
@@ -488,15 +485,13 @@ public static class IlGenerator
                     parameterlessCtor = ThisConstructorCallPlan.RetargetToDestinationInstantiation(parameterlessCtor, allocatedDestination)
                         ?? parameterlessCtor;
                     instructions.Add(CilOpCodes.Newobj, parameterlessCtor.ToMethodDescriptor());
-                    CoerceOrDefault(parameterlessCtor.DeclaringType, allocatedDestination, method);
+                    EmitStackCoerceOrDefault(parameterlessCtor.DeclaringType ?? allocatedType,
+                        StoreContract(instruction.Operands[0], context), method);
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 }
                 else
                 {
-                    if (allocatedDestination is { IsValueType: true } && CanEmitTypeToken(allocatedDestination))
-                        EmitDefaultValueLocal(allocatedDestination, method, instructions);
-                    else
-                        instructions.Add(CilOpCodes.Ldnull);
+                    EmitNullOrDefault(StoreContract(instruction.Operands[0], context), method, instructions);
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 }
                 break;
@@ -505,13 +500,12 @@ public static class IlGenerator
                 if (instruction.Operands is [_, TypeAnalysisContext boxedType, var boxedValue])
                 {
                     // il2cpp_value_box takes the value by address, but IL boxes it by value
-                    var boxedOperand = boxedValue is AddressOf { Target: LocalVariable byRef } ? byRef : boxedValue;
-                    LoadOperand(boxedOperand, method, locals, writeLine, boxedType, context);
-                    CoerceOrDefault(EmittedOperandType(boxedOperand, context, boxedType), boxedType, method);
+                    LoadOperandIntoSlot(boxedValue is AddressOf { Target: LocalVariable byRef } ? byRef : boxedValue,
+                        boxedType, context, method, locals, writeLine);
                     instructions.Add(CilOpCodes.Box, boxedType.ToTypeSignature().ToTypeDefOrRef());
                 }
                 else
-                    instructions.Add(CilOpCodes.Ldnull);
+                    EmitNullOrDefault(StoreContract(instruction.Operands[0], context), method, instructions);
 
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 break;
@@ -554,10 +548,7 @@ public static class IlGenerator
                 {
                     var firstArgument = instruction.OpCode == OpCode.Call ? 3 : 2;
                     for (var i = 0; i < stringConstructor.Parameters.Count; i++)
-                    {
-                        LoadOperand(instruction.Operands[firstArgument + i], method, locals, writeLine, stringConstructor.Parameters[i].ParameterType, context);
-                        CoerceOrDefault(EmittedOperandType(instruction.Operands[firstArgument + i], context, stringConstructor.Parameters[i].ParameterType), stringConstructor.Parameters[i].ParameterType, method);
-                    }
+                        LoadOperandIntoSlot(instruction.Operands[firstArgument + i], stringConstructor.Parameters[i].ParameterType, context, method, locals, writeLine);
                     instructions.Add(CilOpCodes.Newobj, stringConstructor.ToMethodDescriptor());
                     if (instruction.OpCode == OpCode.Call)
                     {
@@ -700,10 +691,7 @@ public static class IlGenerator
                             PushDefaultOf(parameterType, method, instructions);
                         }
                         else
-                        {
-                            LoadOperand(argumentOperand, method, locals, writeLine, parameterType, context);
-                            CoerceOrDefault(EmittedOperandType(argumentOperand, context, parameterType), parameterType, method);
-                        }
+                            LoadOperandIntoSlot(argumentOperand, parameterType, context, method, locals, writeLine);
                     }
                     else
                         PushDefaultOf(parameterType, method, instructions);
@@ -720,9 +708,8 @@ public static class IlGenerator
                 {
                     if (instruction.OpCode == OpCode.Call)
                     {
-                        CoerceOrDefault(targetMethod.ReturnType,
-                            StoreContract(instruction.Operands[1], context),
-                            method);
+                        EmitStackCoerceOrDefault(targetMethod.ReturnType,
+                            StoreContract(instruction.Operands[1], context), method);
                         StoreToOperand(instruction.Operands[1], method, locals, writeLine, context);
                     }
                     else
@@ -751,14 +738,9 @@ public static class IlGenerator
                 if (!context.IsVoid)
                 {
                     if (instruction.Operands.Count == 1)
-                    {
-                        LoadOperand(instruction.Operands[0], method, locals, writeLine, context.ReturnType, context);
-                        CoerceOrDefault(EmittedOperandType(instruction.Operands[0], context, context.ReturnType), context.ReturnType, method);
-                    }
-                    else if (context.ReturnType is { IsValueType: true } returnValueType && CanEmitTypeToken(returnValueType))
-                        EmitDefaultValueLocal(returnValueType, method, instructions);
+                        LoadOperandIntoSlot(instruction.Operands[0], context.ReturnType, context, method, locals, writeLine);
                     else
-                        instructions.Add(CilOpCodes.Ldnull); // ret still pops a value even if we lost track of it
+                        EmitNullOrDefault(context.ReturnType, method, instructions); // ret still pops a value even if we lost track of it
                 }
                 instructions.Add(CilOpCodes.Ret);
                 break;
@@ -768,13 +750,22 @@ public static class IlGenerator
                 break;
 
             case OpCode.ConditionalJump:
+                var conditionType = EmittedOperandType(instruction.Operands[1], context);
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, null, context);
                 // brtrue won't pop an i64; the native branch tested the full register
                 // for non-zero, which is exactly `x > 0` unsigned.
-                if (IntegralStackWidth(EmittedOperandType(instruction.Operands[1], context)) == 8)
+                if (IntegralStackWidth(conditionType) == 8)
                 {
                     instructions.Add(CilOpCodes.Ldc_I8, 0L);
                     instructions.Add(CilOpCodes.Cgt_Un);
+                }
+                else if (conditionType is { IsValueType: true } && IntegralStackWidth(conditionType) == 0)
+                {
+                    // brtrue cannot test a non-integral value type (or a float); the
+                    // condition is unrecoverable, so default it to false rather than
+                    // leave a struct on the stack.
+                    instructions.Add(CilOpCodes.Pop);
+                    instructions.Add(CilOpCodes.Ldc_I4_0);
                 }
                 instructions.Add(CilOpCodes.Brtrue, new CilInstructionLabel());
                 break;
@@ -821,13 +812,11 @@ public static class IlGenerator
                 if (TryEmitRecoveredIntegerOperation(instruction, context, method, locals, writeLine))
                     break;
 
+                var isComparison = instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual;
+
                 // Float operations on a promoted integer operand need an explicit conversion, so both
                 // operands are coerced to the (float) result type. A no-op when they already match.
                 var floatConversion = FloatOperationConversion(instruction);
-                var floatTarget = floatConversion == null ? null
-                    : floatConversion == CilOpCodes.Conv_R4
-                        ? context.AppContext.SystemTypes.SystemSingleType
-                        : context.AppContext.SystemTypes.SystemDoubleType;
 
                 // `&T`/`ref T` + N is field addressing, not arithmetic: the native
                 // add computes the address of the field at byte offset N. Emit the
@@ -862,72 +851,24 @@ public static class IlGenerator
 
                 // Integer operations share a single stack type: the widest non-literal operand,
                 // or (for value-producing ops) the destination. Comparison destinations are the
-                // bool result, not the compared type, so they never seed the operand type.
+                // bool result, not the compared type, so they never seed the operand type. A float
+                // conversion supplies the shared contract itself.
                 var operandType = floatConversion == null
-                    ? BinaryOperandType(instruction, context,
-                        instruction.OpCode is < OpCode.CheckEqual or > OpCode.CheckLessOrEqual)
-                    : null;
+                    ? BinaryOperandType(instruction, context, !isComparison)
+                    : floatConversion == CilOpCodes.Conv_R4
+                        ? context.AppContext.SystemTypes.SystemSingleType
+                        : context.AppContext.SystemTypes.SystemDoubleType;
 
                 // No operand claimed an integer width (e.g. two references or a struct
                 // reaching a bitwise op): the slot still has to be an integer, so coerce
-                // to i4 and let EmitStackCoerce produce unbox/ldobj/placeholder as needed.
-                if (operandType == null && floatConversion == null
-                    && instruction.OpCode is < OpCode.CheckEqual or > OpCode.CheckLessOrEqual)
+                // to i4 and let the slot loader produce unbox/placeholder as needed.
+                if (operandType == null && floatConversion == null && !isComparison)
                     operandType = context.AppContext.SystemTypes.SystemInt32Type;
 
-                // A comparison whose operands cannot share a stack type (e.g. a
-                // managed reference against an integer literal) has no legal IL
-                // form; emit the honest diagnostic rather than an invalid ceq.
-                if (instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual
-                    && operandType == null && floatConversion == null)
-                {
-                    var emitted1 = EmittedOperandType(instruction.Operands[1], context,
-                        NullComparisonType(instruction, 1, context))
-                        ?? (instruction.Operands[1] is Immediate literal1
-                            ? EmittedImmediateType(literal1, null, context) : null);
-                    var emitted2 = EmittedOperandType(instruction.Operands[2], context,
-                        NullComparisonType(instruction, 2, context))
-                        ?? (instruction.Operands[2] is Immediate literal2
-                            ? EmittedImmediateType(literal2, null, context) : null);
-                    var refShape1 = emitted1 is { IsValueType: false }
-                        and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext);
-                    var refShape2 = emitted2 is { IsValueType: false }
-                        and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext);
-                    var comparable = emitted1 == null || emitted2 == null
-                        || (IntegralStackWidth(emitted1) != 0 && IntegralStackWidth(emitted2) != 0)
-                        || (refShape1 && refShape2);
-                    if (!comparable)
-                    {
-                        EmitUnrecoverableOperation(method, writeLine,
-                            $"Unrecoverable comparison: {instruction}");
-                        break;
-                    }
-                }
-
-                LoadOperand(instruction.Operands[1], method, locals, writeLine,
-                    NullComparisonType(instruction, 1, context) ?? floatTarget ?? operandType, context);
-                if (floatConversion is { } conv1)
-                    // The coerce emits the float conversion itself, and unwraps boxed
-                    // numerics the raw conv would have rejected.
-                    EmitStackCoerce(EmittedOperandType(instruction.Operands[1], context, floatTarget),
-                        floatTarget, method);
-                else
-                    CoerceOrDefault(EmittedOperandType(instruction.Operands[1], context, operandType), operandType, method,
-                        instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual
-                            or OpCode.Add or OpCode.Subtract);
                 // shl/shr take an i32/n-int shift amount, not the value type.
                 var operand2Type = instruction.OpCode is OpCode.ShiftLeft or OpCode.ShiftRight
                     ? context.AppContext.SystemTypes.SystemInt32Type
                     : operandType;
-                LoadOperand(instruction.Operands[2], method, locals, writeLine,
-                    NullComparisonType(instruction, 2, context) ?? floatTarget ?? operand2Type, context);
-                if (floatConversion is { } conv2)
-                    EmitStackCoerce(EmittedOperandType(instruction.Operands[2], context, floatTarget),
-                        floatTarget, method);
-                else
-                    CoerceOrDefault(EmittedOperandType(instruction.Operands[2], context, operand2Type), operand2Type, method,
-                        instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual
-                            or OpCode.Add or OpCode.Subtract);
 
                 // Bitwise/shift ops are integer-only in IL. An operand that provably emits
                 // a non-integer (float, struct or concrete reference — unlike an untyped
@@ -939,6 +880,56 @@ public static class IlGenerator
                         EmittedOperandType(operand, context, operandType) is { } operandEmitted
                         && IntegralStackWidth(operandEmitted) == 0
                         && (operandEmitted.IsValueType || operandEmitted.FullName != "System.Object"));
+
+                // A managed pointer operand in add/sub carries its own stack kind: pointer
+                // arithmetic keeps the `&` rather than coercing to a shared numeric type.
+                var operand1Natural = instruction.OpCode is OpCode.Add or OpCode.Subtract
+                    ? EmittedOperandType(instruction.Operands[1], context)
+                    : null;
+                var operand2Natural = instruction.OpCode is OpCode.Add or OpCode.Subtract
+                    ? EmittedOperandType(instruction.Operands[2], context)
+                    : null;
+                var contract1 = NullComparisonType(instruction, 1, context)
+                    ?? (operand1Natural is ByRefTypeAnalysisContext ? operand1Natural : operandType);
+                var contract2 = NullComparisonType(instruction, 2, context)
+                    ?? (operand2Natural is ByRefTypeAnalysisContext ? operand2Natural : operand2Type);
+
+                // The stack types after loading under the contract - a missing contract
+                // leaves the operand's natural emission.
+                var stack1 = contract1 ?? NaturalEmittedType(instruction.Operands[1], context);
+                var stack2 = contract2 ?? NaturalEmittedType(instruction.Operands[2], context);
+                var emitted1 = EmittedOperandType(instruction.Operands[1], context, contract1);
+                var emitted2 = EmittedOperandType(instruction.Operands[2], context, contract2);
+                var operandsUsable = isComparison
+                    ? OperandsShareComparableKind(instruction.OpCode, stack1, stack2)
+                    : NumericStackKind(instruction.OpCode, stack1) && NumericStackKind(instruction.OpCode, stack2)
+                        && !(instruction.OpCode == OpCode.Add
+                            && stack1 is ByRefTypeAnalysisContext && stack2 is ByRefTypeAnalysisContext);
+                if (unrecoverableIntegerOperation
+                    || !StackContractSatisfied(emitted1, contract1, isComparison)
+                    || !StackContractSatisfied(emitted2, contract2, isComparison)
+                    || !operandsUsable)
+                {
+                    if (unrecoverableIntegerOperation)
+                        EmitUnrecoverableOperation(method, writeLine, $"Unrecoverable integer operation: {instruction}");
+                    // No shared stack kind exists for this operation (e.g. a Vector3
+                    // tested against an int, or a struct fed to add). Equality still
+                    // has honest answers - a shared native-int lowering covers
+                    // integral/pointer operands, and a zero literal on a managed or
+                    // generic operand is the null test - while ordering and
+                    // arithmetic have none, so they default to false/zero.
+                    else if (instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual)
+                        || !(TryEmitNativeIntEquality(instruction, context, method, locals, writeLine)
+                            || TryEmitReferenceEquality(instruction, context, method, locals, writeLine)))
+                        EmitUnrecoverableOperation(method, writeLine, $"Unrecoverable operation: {instruction}");
+                    EmitStackCoerceOrDefault(context.AppContext.SystemTypes.SystemInt32Type,
+                        StoreContract(instruction.Operands[0], context), method);
+                    StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
+                    break;
+                }
+
+                LoadOperandIntoSlot(instruction.Operands[1], contract1, context, method, locals, writeLine, isComparison);
+                LoadOperandIntoSlot(instruction.Operands[2], contract2, context, method, locals, writeLine, isComparison);
 
                 switch (instruction.OpCode)
                 {
@@ -971,31 +962,22 @@ public static class IlGenerator
                     case OpCode.Divide: instructions.Add(CilOpCodes.Div); break;
                     case OpCode.Modulo: instructions.Add(CilOpCodes.Rem); break;
 
-                    case OpCode.ShiftLeft:
-                    case OpCode.ShiftRight:
-                    case OpCode.And:
-                    case OpCode.Or:
-                    case OpCode.Xor:
-                        if (unrecoverableIntegerOperation)
-                            EmitUnrecoverableOperation(method, writeLine, $"Unrecoverable integer operation: {instruction}");
-                        else
-                            instructions.Add(instruction.OpCode switch
-                            {
-                                OpCode.ShiftLeft => CilOpCodes.Shl,
-                                OpCode.ShiftRight => CilOpCodes.Shr,
-                                OpCode.And => CilOpCodes.And,
-                                OpCode.Or => CilOpCodes.Or,
-                                _ => CilOpCodes.Xor,
-                            });
-                        break;
+                    case OpCode.ShiftLeft: instructions.Add(CilOpCodes.Shl); break;
+                    case OpCode.ShiftRight: instructions.Add(CilOpCodes.Shr); break;
+                    case OpCode.And: instructions.Add(CilOpCodes.And); break;
+                    case OpCode.Or: instructions.Add(CilOpCodes.Or); break;
+                    case OpCode.Xor: instructions.Add(CilOpCodes.Xor); break;
                 }
 
-                var resultType = instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual
+                var resultType = isComparison
                     ? context.AppContext.SystemTypes.SystemInt32Type
-                    : operandType ?? EmittedOperandType(instruction.Operands[1], context);
-                CoerceOrDefault(resultType,
-                    StoreContract(instruction.Operands[0], context),
-                    method);
+                    : stack1 is ByRefTypeAnalysisContext resultByRef
+                            && instruction.OpCode is OpCode.Add or OpCode.Subtract
+                        ? stack2 is ByRefTypeAnalysisContext
+                            ? context.AppContext.SystemTypes.SystemIntPtrType // &-& is a native int
+                            : resultByRef // & +/- i keeps the managed pointer
+                        : operandType ?? EmittedOperandType(instruction.Operands[1], context);
+                EmitStackCoerceOrDefault(resultType, StoreContract(instruction.Operands[0], context), method, true);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 break;
 
@@ -1022,8 +1004,23 @@ public static class IlGenerator
                 var unaryResultType = unaryOperandType is ByRefTypeAnalysisContext or PointerTypeAnalysisContext
                     ? context.AppContext.SystemTypes.SystemIntPtrType
                     : unaryOperandType;
+                // The operand kinds the operation can honestly consume: integral
+                // kinds for either op, floats for neg, and managed pointers already
+                // lowered to native int above. Structs, generic parameters and
+                // reference operands have no decode - neg on them is unrecoverable.
+                var unaryOperandUsable = unaryOperandType == null
+                    || unaryOperandType is ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+                    || IntegralStackWidth(unaryOperandType) != 0
+                    || instruction.OpCode == OpCode.Negate
+                        && unaryOperandType.FullName is "System.Single" or "System.Double";
+
                 if (instruction.OpCode == OpCode.Negate)
-                    instructions.Add(CilOpCodes.Neg);
+                {
+                    if (unaryOperandUsable)
+                        instructions.Add(CilOpCodes.Neg);
+                    else
+                        EmitUnrecoverableOperation(method, writeLine, $"Unrecoverable integer operation: {instruction}");
+                }
                 else if (unaryOperandType is { IsValueType: false }
                     and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext
                         or GenericParameterTypeAnalysisContext)
@@ -1040,14 +1037,13 @@ public static class IlGenerator
                     instructions.Add(CilOpCodes.Ceq);
                     unaryResultType = context.AppContext.SystemTypes.SystemInt32Type;
                 }
-                else if (unaryOperandType is { IsValueType: true } provable
-                    && IntegralStackWidth(provable) == 0)
+                else if (!unaryOperandUsable)
                     // `not` on a struct/float has no honest decode; keep the diagnostic.
                     EmitUnrecoverableOperation(method, writeLine, $"Unrecoverable integer operation: {instruction}");
                 else
                     instructions.Add(CilOpCodes.Not);
 
-                CoerceOrDefault(unaryResultType, StoreContract(instruction.Operands[0], context), method);
+                EmitStackCoerceOrDefault(unaryResultType, StoreContract(instruction.Operands[0], context), method);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 break;
             }
@@ -1516,12 +1512,17 @@ public static class IlGenerator
             case AddressOf { Target: ArrayAccess elementAddress }:
                 LoadLocal(elementAddress.Array, method, locals);
                 LoadOperand(elementAddress.Index, method, locals, writeLine, null, callingContext);
+                // ldelema takes an i4 or native-int index; a wider index must narrow.
+                if (IntegralStackWidth(DestinationType(elementAddress.Index)) == 8)
+                    instructions.Add(CilOpCodes.Conv_I4);
                 instructions.Add(CilOpCodes.Ldelema,
                     ((SzArrayTypeAnalysisContext)elementAddress.Array.Type!).ElementType.ToTypeSignature().ToTypeDefOrRef());
                 break;
             case ArrayAccess arrayAccess:
                 LoadLocal(arrayAccess.Array, method, locals);
                 LoadOperand(arrayAccess.Index, method, locals, writeLine, null, callingContext);
+                if (IntegralStackWidth(DestinationType(arrayAccess.Index)) == 8)
+                    instructions.Add(CilOpCodes.Conv_I4);
                 instructions.Add(CilOpCodes.Ldelem,
                     ((SzArrayTypeAnalysisContext)arrayAccess.Array.Type!).ElementType.ToTypeSignature().ToTypeDefOrRef());
                 break;
@@ -1765,6 +1766,23 @@ public static class IlGenerator
             return;
         }
 
+        // An unmanaged pointer slot takes a native-int zero (the honest null address);
+        // ldnull below would be a reference, not a pointer.
+        if (type is PointerTypeAnalysisContext)
+        {
+            instructions.Add(CilOpCodes.Ldc_I4_0);
+            instructions.Add(CilOpCodes.Conv_I);
+            return;
+        }
+
+        // default(T) on a generic parameter is initobj on a T local - the same
+        // emission the compiler uses - because ldnull is only legal for reference Ts.
+        if (type is GenericParameterTypeAnalysisContext && CanEmitTypeToken(type))
+        {
+            EmitDefaultValueLocal(type, method, instructions);
+            return;
+        }
+
         if (!type.IsValueType)
         {
             instructions.Add(CilOpCodes.Ldnull);
@@ -1778,6 +1796,12 @@ public static class IlGenerator
             case "System.Int64" or "System.UInt64": instructions.Add(CilOpCodes.Ldc_I8, 0L); break;
             case "System.IntPtr": instructions.Add(CilOpCodes.Ldc_I4_0); instructions.Add(CilOpCodes.Conv_I); break;
             case "System.UIntPtr": instructions.Add(CilOpCodes.Ldc_I4_0); instructions.Add(CilOpCodes.Conv_U); break;
+            // The small integral types share the i4 stack kind; a literal zero is the
+            // cheapest default and verifies the same as an initobj temp.
+            case "System.Int32" or "System.UInt32" or "System.Boolean" or "System.Byte"
+                or "System.SByte" or "System.Int16" or "System.UInt16" or "System.Char":
+                instructions.Add(CilOpCodes.Ldc_I4_0);
+                break;
             default:
                 if (CanEmitTypeToken(type))
                     EmitDefaultValueLocal(type, method, instructions);
@@ -2308,8 +2332,12 @@ public static class IlGenerator
         // cannot take !T by any stack op, so that pairing stays unbridgeable.
         if (from is GenericParameterTypeAnalysisContext)
         {
-            if (!to.IsValueType && CanEmitTypeToken(from))
+            if (!to.IsValueType && to is not PointerTypeAnalysisContext && CanEmitTypeToken(from))
+            {
                 instructions.Add(CilOpCodes.Box, from.ToTypeSignature().ToTypeDefOrRef());
+                if (!IsAssignableToLoose(from, to) && CanEmitTypeToken(to))
+                    instructions.Add(CilOpCodes.Castclass, to.ToTypeSignature().ToTypeDefOrRef());
+            }
             return !to.IsValueType;
         }
         var fromWidth = IntegralStackWidth(from);
@@ -2496,6 +2524,287 @@ public static class IlGenerator
             match = pair.Value;
         }
         return match;
+    }
+
+    // True when a raw stack value of type `from` already satisfies a `to` slot with
+    // no conversion: identical types, the same reduced integral kind (the i4 family
+    // includes enums/bool/char), the shared native-int kind, or a reference
+    // assignable to the slot type.
+    private static bool StackAssignableTo(TypeAnalysisContext from, TypeAnalysisContext to)
+    {
+        if (from.FullName == to.FullName)
+            return true;
+        if (from is ByRefTypeAnalysisContext || to is ByRefTypeAnalysisContext
+            || from is GenericParameterTypeAnalysisContext || to is GenericParameterTypeAnalysisContext)
+            return false; // only the identical type above satisfies these slots
+        if (from is PointerTypeAnalysisContext || to is PointerTypeAnalysisContext)
+            return IntegralStackWidth(from) < 0 && IntegralStackWidth(to) < 0;
+        var fromWidth = IntegralStackWidth(from);
+        var toWidth = IntegralStackWidth(to);
+        if (fromWidth > 0 && fromWidth == toWidth)
+            return true;
+        if (fromWidth < 0 && toWidth < 0)
+            return true;
+        return !from.IsValueType && !to.IsValueType && IsAssignableToLoose(from, to);
+    }
+
+    // Mirrors EmitStackCoerce: true when a `from` value can occupy a `to` slot -
+    // either it already does or a legal conversion exists. This is a stack-kind
+    // question only: EmitStackCoerce already skips conversions whose type token is
+    // missing, so a metadata gap degrades to the old pass-through instead of
+    // discarding a recoverable value. When it returns false the operand can never
+    // satisfy the slot (e.g. an int into a Vector3 argument) and the site should
+    // emit default(to) rather than leave an uncoercible value on the stack.
+    private static bool StackContractSatisfied(TypeAnalysisContext? from, TypeAnalysisContext? to,
+        bool convertByRef = false)
+    {
+        if (from != null && IsNativeHandleType(from))
+            from = from.AppContext.SystemTypes.SystemIntPtrType;
+        if (to != null && IsNativeHandleType(to))
+            to = to.AppContext.SystemTypes.SystemIntPtrType;
+
+        if (from == null || to == null || from.FullName == to.FullName)
+            return true;
+
+        // No stack op synthesizes a generic-parameter or byref destination value;
+        // only the identical type already satisfies those slots.
+        if (to is GenericParameterTypeAnalysisContext or ByRefTypeAnalysisContext)
+            return StackAssignableTo(from, to);
+
+        // A T source fits a managed reference through box T; nothing else is legal.
+        if (from is GenericParameterTypeAnalysisContext)
+            return !to.IsValueType && to is not PointerTypeAnalysisContext;
+
+        var fromWidth = IntegralStackWidth(from);
+        var toWidth = IntegralStackWidth(to);
+
+        // A raw pointer slot takes a native-int value: an integral/native source
+        // reaches it through conv.i, a managed pointer needs the opt-in convertByRef.
+        if (to is PointerTypeAnalysisContext)
+            return fromWidth != 0 || from is ByRefTypeAnalysisContext && convertByRef;
+
+        if (from is ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+        {
+            if (convertByRef && toWidth != 0)
+                return true; // conv.i lands the native-int kind, then width rules apply
+            if (from is ByRefTypeAnalysisContext byRef)
+                // ldobj on an exact element match, ldind.ref for a reference target;
+                // anything else emits nothing and stays uncoercible.
+                return to.IsValueType
+                    ? byRef.ElementType.FullName == to.FullName
+                    : !byRef.ElementType.IsValueType && StackAssignableTo(byRef.ElementType, to);
+            // An unmanaged pointer is a native int: numeric coercions apply but it
+            // can never box, unbox or castclass into a managed slot.
+            return toWidth != 0;
+        }
+
+        if (fromWidth != 0 && toWidth != 0)
+            return true; // conv.i/u/u4/u8 lands the target's stack kind
+        if (from.FullName is "System.Single" or "System.Double" && toWidth != 0)
+            return true;
+        if (to.FullName is "System.Single" or "System.Double")
+            return from.FullName is "System.Single" or "System.Double" || fromWidth != 0;
+        if (from.IsValueType && !to.IsValueType)
+            return true; // box, plus castclass when the reference target narrows
+        if (!from.IsValueType && to.IsValueType)
+            return true; // unbox.any accepts any managed reference
+        if (!from.IsValueType && !to.IsValueType)
+            return true; // castclass narrows any reference pair
+        return StackAssignableTo(from, to);
+    }
+
+    // Loads an operand for a consumer slot with a known type contract. When the
+    // operand's emitted type can never satisfy the contract (e.g. an int local in
+    // a Vector3 argument slot) the operand is dropped and default(contract) is
+    // emitted instead - the only honest filler for a value that was not recovered.
+    private static void LoadOperandIntoSlot(IOperand operand, TypeAnalysisContext? contract,
+        MethodAnalysisContext context, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
+        bool convertByRef = false)
+    {
+        var emitted = EmittedOperandType(operand, context, contract);
+        if (contract == null || StackContractSatisfied(emitted, contract, convertByRef))
+        {
+            LoadOperand(operand, method, locals, writeLine, contract, context);
+            EmitStackCoerce(emitted, contract, method, convertByRef);
+            return;
+        }
+        PushDefaultOf(contract, method, method.CilMethodBody!.Instructions);
+    }
+
+    // Coerces an already-emitted stack value into a slot contract. When no legal
+    // coercion exists the value is replaced by default(contract) - same as a
+    // dropped operand - so the consuming store still sees a compatible type.
+    private static void EmitStackCoerceOrDefault(TypeAnalysisContext? from, TypeAnalysisContext? contract,
+        MethodDefinition method, bool convertByRef = false)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        if (contract == null || StackContractSatisfied(from, contract, convertByRef))
+        {
+            EmitStackCoerce(from, contract, method, convertByRef);
+            return;
+        }
+        instructions.Add(CilOpCodes.Pop);
+        PushDefaultOf(contract, method, instructions);
+    }
+
+    // A missing value for a value-type or generic-parameter slot is default(T);
+    // everything else gets the usual null.
+    private static void EmitNullOrDefault(TypeAnalysisContext? contract, MethodDefinition method,
+        CilInstructionCollection instructions)
+    {
+        if (contract is { IsValueType: true } or GenericParameterTypeAnalysisContext)
+            PushDefaultOf(contract, method, instructions);
+        else
+            instructions.Add(CilOpCodes.Ldnull);
+    }
+
+    // The type an operand actually emits with no consumer contract - immediates
+    // take their natural width instead of adapting to a consumer.
+    private static TypeAnalysisContext? NaturalEmittedType(IOperand operand, MethodAnalysisContext context) =>
+        operand is Immediate immediate
+            ? EmittedImmediateType(immediate, null, context)
+            : EmittedOperandType(operand, context);
+
+    // Whether two emitted stack values can legally meet a comparison opcode: ceq
+    // pairs equal primitive widths, any two managed references or two native ints;
+    // relational ops pair equal numeric widths (or an i4 with a native int).
+    // Anything else - including every value-type pairing - cannot be compared.
+    private static bool OperandsShareComparableKind(OpCode opCode, TypeAnalysisContext? a, TypeAnalysisContext? b)
+    {
+        if (a == null || b == null)
+            return true; // Unknown emission (e.g. a throwing stub) - leave it alone.
+        if (a is GenericParameterTypeAnalysisContext || b is GenericParameterTypeAnalysisContext)
+            return false;
+
+        var aWidth = IntegralStackWidth(a);
+        var bWidth = IntegralStackWidth(b);
+        var aIsFloat = a.FullName is "System.Single" or "System.Double";
+        var bIsFloat = b.FullName is "System.Single" or "System.Double";
+        var aNumeric = aWidth != 0 || aIsFloat;
+        var bNumeric = bWidth != 0 || bIsFloat;
+
+        if (aNumeric && bNumeric)
+        {
+            if (opCode is OpCode.CheckEqual or OpCode.CheckNotEqual)
+                return aWidth == bWidth && aIsFloat == bIsFloat;
+            if (aIsFloat != bIsFloat)
+                return false; // float and integer kinds never pair
+            if (aWidth < 0 || bWidth < 0)
+                return aWidth == bWidth || aWidth == 4 || bWidth == 4; // rel ops allow i4 with native int
+            return aWidth == bWidth;
+        }
+
+        if (opCode is OpCode.CheckEqual or OpCode.CheckNotEqual)
+        {
+            var aIsRef = !a.IsValueType && a is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext);
+            var bIsRef = !b.IsValueType && b is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext);
+            if (aIsRef && bIsRef)
+                return true; // ceq compares any two managed references
+            return aWidth < 0 && bWidth < 0; // ceq also pairs two native ints
+        }
+        return false;
+    }
+
+    // The stack kinds a binary numeric op can combine: arithmetic accepts
+    // integral and float operands (managed pointers in add/sub for pointer
+    // arithmetic), bitwise and shift ops accept integral kinds only. A null
+    // type is an unknown emission and is left alone.
+    private static bool NumericStackKind(OpCode opCode, TypeAnalysisContext? type) => type switch
+    {
+        null => true,
+        ByRefTypeAnalysisContext => opCode is OpCode.Add or OpCode.Subtract,
+        _ => IntegralStackWidth(type) != 0
+            || type.FullName is "System.Single" or "System.Double"
+                && opCode is OpCode.Add or OpCode.Subtract or OpCode.Multiply
+                    or OpCode.Divide or OpCode.Modulo
+    };
+
+    // Equality between integral or pointer operands lowers to ceq on two native
+    // ints - every side converts through conv.i (a zero literal is then the
+    // native null-address test). Returns false when an operand cannot become a
+    // native int, leaving callers to try the reference form or default.
+    private static bool TryEmitNativeIntEquality(Instruction instruction, MethodAnalysisContext context,
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        var nativeInt = context.AppContext.SystemTypes.SystemIntPtrType;
+        var operands = instruction.Operands.Skip(1).Take(2).ToList();
+        foreach (var operand in operands)
+        {
+            var emitted = NaturalEmittedType(operand, context);
+            if (emitted == null || emitted is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext)
+                && !IsNativeHandleType(emitted) && IntegralStackWidth(emitted) == 0)
+                return false; // a struct, float or reference side cannot lower to a native int
+        }
+        foreach (var operand in operands)
+        {
+            LoadOperand(operand, method, locals, writeLine, null, context);
+            EmitStackCoerce(NaturalEmittedType(operand, context), nativeInt, method, true);
+        }
+        instructions.Add(CilOpCodes.Ceq);
+        if (instruction.OpCode == OpCode.CheckNotEqual)
+        {
+            instructions.Add(CilOpCodes.Ldc_I4_0);
+            instructions.Add(CilOpCodes.Ceq);
+        }
+        return true;
+    }
+
+    // An equality test between incompatible stack kinds still has an honest answer
+    // in IL: boxed values compare by reference, and a zero literal is the native
+    // code's null test. Emits both operands as references followed by ceq (with the
+    // != inversion for CheckNotEqual). Returns false when a side cannot become a
+    // reference, leaving callers to emit the default false.
+    private static bool TryEmitReferenceEquality(Instruction instruction, MethodAnalysisContext context,
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        var operands = instruction.Operands.Skip(1).Take(2).ToList();
+        // Verify every side first: a partial emission would leave a stray value on
+        // the stack when the fallback default is emitted instead.
+        var emitted = new List<TypeAnalysisContext?>(operands.Count);
+        foreach (var operand in operands)
+        {
+            if (operand is Immediate { Value: 0 })
+            {
+                emitted.Add(null); // the zero literal becomes ldnull below
+                continue;
+            }
+
+            var emittedType = NaturalEmittedType(operand, context);
+            if (emittedType is null or PointerTypeAnalysisContext or ByRefTypeAnalysisContext
+                || IsNativeHandleType(emittedType))
+                return false; // pointer and unknown emissions cannot become references
+            if ((emittedType.IsValueType || emittedType is GenericParameterTypeAnalysisContext)
+                && !CanEmitTypeToken(emittedType))
+                return false; // a value side that cannot box cannot become a reference either
+            emitted.Add(emittedType);
+        }
+
+        for (var i = 0; i < operands.Count; i++)
+        {
+            if (emitted[i] == null)
+            {
+                // The native test compared against zero - on a managed operand
+                // that is exactly a null comparison.
+                instructions.Add(CilOpCodes.Ldnull);
+                continue;
+            }
+
+            LoadOperand(operands[i], method, locals, writeLine, null, context);
+            if (emitted[i] is { IsValueType: true } or GenericParameterTypeAnalysisContext)
+                instructions.Add(CilOpCodes.Box, emitted[i]!.ToTypeSignature().ToTypeDefOrRef());
+            // Reference-kind values pass through as they are.
+        }
+
+        instructions.Add(CilOpCodes.Ceq);
+        if (instruction.OpCode == OpCode.CheckNotEqual)
+        {
+            instructions.Add(CilOpCodes.Ldc_I4_0);
+            instructions.Add(CilOpCodes.Ceq);
+        }
+        return true;
     }
 
     // IsAssignableTo compares context objects by reference, but the emitter sees distinct
@@ -2994,6 +3303,8 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Stloc, elementScratch);
                 LoadLocal(arrayAccess.Array, method, locals);
                 LoadOperand(arrayAccess.Index, method, locals, writeLine, null, context);
+                if (IntegralStackWidth(DestinationType(arrayAccess.Index)) == 8)
+                    instructions.Add(CilOpCodes.Conv_I4);
                 instructions.Add(CilOpCodes.Ldloc, elementScratch);
                 instructions.Add(CilOpCodes.Stelem, elementType.ToTypeSignature().ToTypeDefOrRef());
                 break;
