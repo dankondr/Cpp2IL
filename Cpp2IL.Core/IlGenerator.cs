@@ -805,22 +805,29 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
                 break;
             case MemoryOperand memory:
-                if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
-                    && memory.Base is LocalVariable local2)
+                if (TryGetDeterministicMemoryReferent(memory, expectedType, out var referent))
                 {
-                    LoadLocal(local2, method, locals);
+                    LoadLocal((LocalVariable)memory.Base!, method, locals);
 
-                    // A load through a managed pointer (byref) dereferences it to yield the referent.
-                    if (local2.Type is ByRefTypeAnalysisContext { ElementType: { } referent })
-                        instructions.Add(referent.IsValueType
-                            ? new CilInstruction(CilOpCodes.Ldobj, referent.ToTypeSignature().ToTypeDefOrRef())
-                            : new CilInstruction(CilOpCodes.Ldind_Ref));
+                    // A zero-offset load through a typed pointer/byref is an actual managed
+                    // dereference. Everything else stays unresolved below: ISIL has no proof
+                    // that an arbitrary native address or offset names a managed field.
+                    instructions.Add(referent switch
+                    {
+                        PointerTypeAnalysisContext or ByRefTypeAnalysisContext => new CilInstruction(CilOpCodes.Ldind_I),
+                        { IsValueType: true } => new CilInstruction(CilOpCodes.Ldobj, referent.ToTypeSignature().ToTypeDefOrRef()),
+                        _ => new CilInstruction(CilOpCodes.Ldind_Ref)
+                    });
                     break;
                 }
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand));
                 instructions.Add(CilOpCodes.Call, writeLine);
-                instructions.Add(CilOpCodes.Ldc_I4_0);
-                instructions.Add(CilOpCodes.Conv_I);
+                var exceptionCtor = module.CorLibTypeFactory.CorLibScope
+                    .CreateTypeReference("System", "Exception")
+                    .CreateMemberReference(".ctor", MethodSignature.CreateInstance(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.String]));
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand));
+                instructions.Add(CilOpCodes.Newobj, exceptionCtor);
+                instructions.Add(CilOpCodes.Throw);
                 break;
             case RuntimeMethodInfoAnalysisContext runtimeMethod:
                 // A delegate constructor takes its target as a native pointer, which is exactly ldftn.
@@ -919,6 +926,32 @@ public static class IlGenerator
 
         local = null!;
         return false;
+    }
+
+    private static bool TryGetDeterministicMemoryReferent(MemoryOperand memory, TypeAnalysisContext? expectedType,
+        out TypeAnalysisContext referent)
+    {
+        referent = null!;
+        if (memory.Index != null || memory.Addend != 0 || memory.Scale != 0
+            || memory.Base is not LocalVariable { Type: ByRefTypeAnalysisContext or PointerTypeAnalysisContext } local
+            || local.Type is not WrappedTypeAnalysisContext pointer)
+            return false;
+
+        referent = pointer.ElementType;
+        if (referent is GenericParameterTypeAnalysisContext || expectedType is GenericParameterTypeAnalysisContext)
+            return false;
+
+        if (expectedType is null)
+            return true;
+
+        if (referent is PointerTypeAnalysisContext or ByRefTypeAnalysisContext
+            || expectedType is PointerTypeAnalysisContext or ByRefTypeAnalysisContext)
+            return referent.FullName == expectedType.FullName;
+
+        return referent.IsValueType == expectedType.IsValueType
+            && (referent.IsValueType
+                ? referent.FullName == expectedType.FullName
+                : referent.IsAssignableTo(expectedType));
     }
 
     private static void PushDefaultOf(TypeAnalysisContext type, CilInstructionCollection instructions)
