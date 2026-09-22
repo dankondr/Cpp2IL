@@ -1,0 +1,3 @@
+[submodule "vendor/Disarm"]
+	path = vendor/Disarm
+	url = https://github.com/dankondr/Disarm.git
