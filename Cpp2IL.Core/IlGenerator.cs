@@ -1193,7 +1193,7 @@ public static class IlGenerator
                 // initialized before ret, so synthesize the honest base-init call
                 // when the immediate base offers a parameterless .ctor.
                 var baseCtor = FindParameterlessBaseConstructor(immediateBase);
-                if (baseCtor == null || !Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(baseCtor, context))
+                if (baseCtor == null || !IsAccessibleBaseConstructor(baseCtor, context))
                     return null;
                 var synthesized = new ThisConstructorCallPlan();
                 synthesized.PrologueCalls.Add((baseCtor, []));
@@ -1280,6 +1280,27 @@ public static class IlGenerator
             }
 
             return match;
+        }
+
+        // A derived .ctor may always name its direct base .ctor on `this`: family
+        // access covers protected bases, and only truly private or cross-assembly
+        // assembly-only constructors are out of reach.
+        private static bool IsAccessibleBaseConstructor(MethodAnalysisContext constructor,
+            MethodAnalysisContext caller)
+        {
+            var access = constructor.Attributes & MethodAttributes.MemberAccessMask;
+            if (access is MethodAttributes.Public or MethodAttributes.Family)
+                return true;
+
+            var sameAssembly = constructor.DeclaringType?.DeclaringAssembly != null
+                && ReferenceEquals(caller.DeclaringType?.DeclaringAssembly,
+                    constructor.DeclaringType.DeclaringAssembly);
+            return access switch
+            {
+                MethodAttributes.FamORAssem => true,
+                MethodAttributes.Assembly or MethodAttributes.FamANDAssem => sameAssembly,
+                _ => false,
+            };
         }
 
         private static MethodAnalysisContext? FindImmediateBaseConstructor(TypeAnalysisContext immediateBase,
