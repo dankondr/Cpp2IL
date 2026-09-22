@@ -1157,7 +1157,7 @@ public static class IlGenerator
         var temporary = new CilLocalVariable(aggregate.AggregateType.ToTypeSignature());
         method.CilMethodBody.LocalVariables.Add(temporary);
         var fields = aggregate.AggregateType.Fields.Where(field => !field.IsStatic).ToArray();
-        for (var i = 0; i < fields.Length; i++)
+        for (var i = 0; i < fields.Length && i < aggregate.Lanes.Count; i++)
         {
             instructions.Add(CilOpCodes.Ldloca, temporary);
             LoadOperand(aggregate.Lanes[i], method, locals, writeLine, fields[i].FieldType);
@@ -1177,7 +1177,9 @@ public static class IlGenerator
         var fields = aggregate.AggregateType.Fields.Where(field => !field.IsStatic).ToArray();
         for (var i = 0; i < fields.Length && i < aggregate.Lanes.Count; i++)
         {
-            instructions.Add(CilOpCodes.Ldloc, temporary);
+            // ldfld consumes a managed pointer for a value-type instance. Loading the
+            // struct value itself would produce unverifiable IL on the generated path.
+            instructions.Add(CilOpCodes.Ldloca, temporary);
             instructions.Add(CilOpCodes.Ldfld, fields[i].ToFieldDescriptor());
             StoreToOperand(aggregate.Lanes[i], method, locals, writeLine);
         }
