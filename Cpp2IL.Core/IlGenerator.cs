@@ -304,7 +304,8 @@ public static class IlGenerator
         var startIndex = instructions.Count;
 
         if (constructorPairs.Values.Contains(instruction))
-            return [];
+            // Keep the instruction addressable: branches may target the paired call's block.
+            return [new CilInstruction(CilOpCodes.Nop)];
 
         var module = method.DeclaringModule!;
 
