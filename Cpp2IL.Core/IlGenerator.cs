@@ -875,6 +875,35 @@ public static class IlGenerator
                     && instruction.OpCode is < OpCode.CheckEqual or > OpCode.CheckLessOrEqual)
                     operandType = context.AppContext.SystemTypes.SystemInt32Type;
 
+                // A comparison whose operands cannot share a stack type (e.g. a
+                // managed reference against an integer literal) has no legal IL
+                // form; emit the honest diagnostic rather than an invalid ceq.
+                if (instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual
+                    && operandType == null && floatConversion == null)
+                {
+                    var emitted1 = EmittedOperandType(instruction.Operands[1], context,
+                        NullComparisonType(instruction, 1, context))
+                        ?? (instruction.Operands[1] is Immediate literal1
+                            ? EmittedImmediateType(literal1, null, context) : null);
+                    var emitted2 = EmittedOperandType(instruction.Operands[2], context,
+                        NullComparisonType(instruction, 2, context))
+                        ?? (instruction.Operands[2] is Immediate literal2
+                            ? EmittedImmediateType(literal2, null, context) : null);
+                    var refShape1 = emitted1 is { IsValueType: false }
+                        and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext);
+                    var refShape2 = emitted2 is { IsValueType: false }
+                        and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext);
+                    var comparable = emitted1 == null || emitted2 == null
+                        || (IntegralStackWidth(emitted1) != 0 && IntegralStackWidth(emitted2) != 0)
+                        || (refShape1 && refShape2);
+                    if (!comparable)
+                    {
+                        EmitUnrecoverableOperation(method, writeLine,
+                            $"Unrecoverable comparison: {instruction}");
+                        break;
+                    }
+                }
+
                 LoadOperand(instruction.Operands[1], method, locals, writeLine,
                     NullComparisonType(instruction, 1, context) ?? floatTarget ?? operandType, context);
                 if (floatConversion is { } conv1)
