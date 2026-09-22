@@ -2123,7 +2123,23 @@ public static class IlGenerator
             return picked;
 
         var destination = EmittedOperandType(instruction.Operands[0], context);
-        return IntegralStackWidth(destination) != 0 ? destination : null;
+        if (IntegralStackWidth(destination) != 0)
+            return destination;
+
+        // All-literal arithmetic (e.g. native pointer math kept as ldc+add) still
+        // produces a concrete width on the stack: the widest literal's natural
+        // emission. Naming it keeps mixed-width adds valid and result coercion honest.
+        foreach (var operand in instruction.Operands.Skip(1))
+            if (operand is Immediate literal)
+            {
+                var literalType = EmittedImmediateType(literal, null, context);
+                if (IntegralStackWidth(literalType) > pickedWidth)
+                {
+                    picked = literalType;
+                    pickedWidth = IntegralStackWidth(literalType);
+                }
+            }
+        return picked;
     }
 
     private static void LoadLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
