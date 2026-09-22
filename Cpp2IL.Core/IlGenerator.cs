@@ -922,7 +922,8 @@ public static class IlGenerator
                 // add computes the address of the field at byte offset N. Emit the
                 // field access itself instead of invalid pointer math.
                 if (instruction.OpCode is OpCode.Add or OpCode.Subtract
-                    && TryResolveFieldAddressArithmetic(instruction, context) is { } fieldAddress)
+                    && TryResolveFieldAddressArithmetic(instruction, context) is { } fieldAddress
+                    && FieldUsableFrom(fieldAddress.Field, context, writeAccess: true))
                 {
                     LoadOperand(fieldAddress.Base, method, locals, writeLine, null, context);
                     // Fields found on a generic instance's definition must be
@@ -989,10 +990,14 @@ public static class IlGenerator
                 var operand2Natural = instruction.OpCode is OpCode.Add or OpCode.Subtract
                     ? EmittedOperandType(instruction.Operands[2], context)
                     : null;
+                // A managed pointer cannot participate in any binary op (ILVerify
+                // rejects `&` in add/sub entirely), so the operand's contract is
+                // the element it will be dereferenced to. Pointer arithmetic that
+                // names a field is recovered earlier by the address resolver.
                 var contract1 = NullComparisonType(instruction, 1, context)
-                    ?? (operand1Natural is ByRefTypeAnalysisContext ? operand1Natural : operandType);
+                    ?? (operand1Natural is ByRefTypeAnalysisContext byRef1 ? byRef1.ElementType : operandType);
                 var contract2 = NullComparisonType(instruction, 2, context)
-                    ?? (operand2Natural is ByRefTypeAnalysisContext ? operand2Natural : operand2Type);
+                    ?? (operand2Natural is ByRefTypeAnalysisContext byRef2 ? byRef2.ElementType : operand2Type);
 
                 // The stack types after loading under the contract - a missing contract
                 // leaves the operand's natural emission.
@@ -2913,65 +2918,33 @@ public static class IlGenerator
         var fromWidth = IntegralStackWidth(from);
         var toWidth = IntegralStackWidth(to);
 
-        // ceq/cgt/clt cannot merge a managed pointer with anything else, while add/sub
-        // on `&` want the pointer kept as-is, so the conversion is opt-in per site.
-        if (from is ByRefTypeAnalysisContext or PointerTypeAnalysisContext
-            && convertByRef && toWidth != 0)
+        // An unmanaged pointer already is a native int to the verifier; conv.i
+        // lands the requested width. Managed pointers take no conversion at all:
+        // conv.*/binary ops reject `&`, so a `&` reaching a numeric slot must be
+        // dereferenced instead (handled by the block below).
+        if (from is PointerTypeAnalysisContext && convertByRef && toWidth != 0)
         {
             instructions.Add(CilOpCodes.Conv_I);
             fromWidth = -1;
         }
 
-        // A managed pointer read back as a value is an honest dereference: ldobj on
-        // an exact element match, ldind.ref for reference targets. Neither deref
-        // finishes the job by itself - the value on the stack is still the
-        // element type, so the element still has to satisfy the slot's contract.
+        // A managed pointer read back as a value is an honest dereference: ldobj
+        // for value elements, ldind.ref for references. Neither deref finishes
+        // the job by itself - the value on the stack is still the element type,
+        // so the element still has to satisfy the slot's contract.
         if (from is ByRefTypeAnalysisContext byRef && to is not ByRefTypeAnalysisContext
-            && fromWidth == -1 && !convertByRef)
+            && fromWidth == -1)
         {
-            if (to.IsValueType)
-            {
-                if (byRef.ElementType.FullName == to.FullName && CanEmitTypeToken(to))
-                {
-                    instructions.Add(CilOpCodes.Ldobj, to.ToTypeSignature().ToTypeDefOrRef());
-                    return true;
-                }
-                if (IntegralStackWidth(byRef.ElementType) > 0 && toWidth != 0
-                    && CanEmitTypeToken(byRef.ElementType))
-                {
-                    instructions.Add(CilOpCodes.Ldobj, byRef.ElementType.ToTypeSignature().ToTypeDefOrRef());
-                    return EmitStackCoerce(byRef.ElementType, to, method);
-                }
-            }
-            else if (byRef.ElementType is { IsValueType: false }
-                and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext))
-            {
-                // ldind.ref yields the element reference; a narrowing slot
-                // still needs the castclass the contract requires.
+            var element = byRef.ElementType;
+            if (element is ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+                || element.IsValueType && !CanEmitTypeToken(element)
+                || !StackContractSatisfied(element, to, convertByRef))
+                return false;
+            if (element.IsValueType)
+                instructions.Add(CilOpCodes.Ldobj, element.ToTypeSignature().ToTypeDefOrRef());
+            else
                 instructions.Add(CilOpCodes.Ldind_Ref);
-                return EmitStackCoerce(byRef.ElementType, to, method);
-            }
-            else if (byRef.ElementType is { IsValueType: true } && CanEmitTypeToken(byRef.ElementType))
-            {
-                // `&T` with a value element reaching a reference slot reads the
-                // value and lets the normal value->reference sequence box it.
-                instructions.Add(CilOpCodes.Ldobj, byRef.ElementType.ToTypeSignature().ToTypeDefOrRef());
-                return EmitStackCoerce(byRef.ElementType, to, method);
-            }
-
-            // The slot wants an integer; the address itself is the honest value there.
-            // `&` only converts through conv.i, so narrower slots truncate the
-            // resulting native int with a second legal conversion.
-            if (toWidth != 0)
-            {
-                instructions.Add(CilOpCodes.Conv_I);
-                if (toWidth == 8)
-                    instructions.Add(CilOpCodes.Conv_I8);
-                else if (toWidth > 0)
-                    instructions.Add(CilOpCodes.Conv_I4);
-                return true;
-            }
-            return false;
+            return EmitStackCoerce(element, to, method, convertByRef);
         }
 
         if (fromWidth != 0 && toWidth != 0)
@@ -3194,22 +3167,16 @@ public static class IlGenerator
 
         if (from is ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
         {
-            if (convertByRef && toWidth != 0)
-                return true; // conv.i lands the native-int kind, then width rules apply
-            if (from is ByRefTypeAnalysisContext byRef)
-                // Mirror EmitStackCoerce: ldobj on an exact element match (or an
-                // integral element into a numeric slot), conv.i when the slot
-                // takes the raw address, ldind.ref + element coerce for a
-                // reference element, and ldobj + box for a value element into a
-                // reference slot.
-                return to.IsValueType
-                    ? byRef.ElementType.FullName == to.FullName && CanEmitTypeToken(to)
-                        || toWidth != 0
-                    : byRef.ElementType is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
-                        && (!byRef.ElementType.IsValueType || CanEmitTypeToken(byRef.ElementType));
-            // An unmanaged pointer is a native int: numeric coercions apply but it
-            // can never box, unbox or castclass into a managed slot.
-            return toWidth != 0;
+            // An unmanaged pointer already is a native int; the opt-in convertByRef
+            // conv.i or the target's own width rules apply. A managed pointer can
+            // only reach a non-& slot through dereference, so the mirror is the
+            // element's own satisfiability.
+            if (from is PointerTypeAnalysisContext)
+                return toWidth != 0;
+            var element = ((ByRefTypeAnalysisContext)from).ElementType;
+            return element is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+                && (!element.IsValueType || CanEmitTypeToken(element))
+                && StackContractSatisfied(element, to, convertByRef);
         }
 
         if (fromWidth != 0 && toWidth != 0)
@@ -3350,6 +3317,10 @@ public static class IlGenerator
             if (emitted == null || emitted is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext)
                 && !IsNativeHandleType(emitted) && IntegralStackWidth(emitted) == 0)
                 return false; // a struct, float or reference side cannot lower to a native int
+            // conv.* rejects managed pointers, so a `&` side only reaches native
+            // int when its pointee can: `&x` lowers to the dereferenced value.
+            if (!StackContractSatisfied(emitted, nativeInt, convertByRef: true))
+                return false;
         }
         foreach (var operand in operands)
         {
@@ -3513,7 +3484,13 @@ public static class IlGenerator
         var pickedWidth = 0;
         foreach (var operand in instruction.Operands.Skip(1))
         {
-            var width = IntegralStackWidth(EmittedOperandType(operand, context));
+            var emitted = EmittedOperandType(operand, context);
+            // A managed pointer operand participates through its dereferenced
+            // element (conv/binary ops reject `&`), so the element's width - not
+            // the pointer kind - decides the shared numeric contract.
+            var width = IntegralStackWidth(emitted is ByRefTypeAnalysisContext byRefOperand
+                ? byRefOperand.ElementType
+                : emitted);
             if (width == 0)
                 continue;
             if (width < 0)
@@ -3599,6 +3576,7 @@ public static class IlGenerator
         // destination, the whole operation is the field access itself.
         if (instruction.OpCode is OpCode.Or or OpCode.Add
             && FindAddressOffsetField(instruction, context, out var address, out var addressField)
+            && FieldUsableFrom(addressField, context)
             && (ThisConstructorCallPlan.SameTypeIdentity(addressField.FieldType, destinationType)
                 || IntegralStackWidth(addressField.FieldType) != 0
                     && destinationType is not ByRefTypeAnalysisContext and not PointerTypeAnalysisContext
@@ -3613,6 +3591,7 @@ public static class IlGenerator
 
         // `packed >> N`/`packed OP mask`: the surviving bytes are a field.
         if (TryGetPackedFieldAccess(instruction, context, out var packed, out var packedField, out var otherOperand)
+            && FieldUsableFrom(packedField, context)
             && EmitManagedAddress(packed, method, context, locals, writeLine))
         {
             var fieldType = packedField.FieldType;
