@@ -1077,15 +1077,34 @@ public static class IlGenerator
     private static bool IsBoolean(IOperand operand, MethodAnalysisContext context) =>
         DestinationType(operand) == context.AppContext.SystemTypes.SystemBooleanType;
 
-    private static bool IsBooleanEmissionLocal(LocalVariable local, MethodAnalysisContext context)
+    private static bool IsBooleanEmissionLocal(LocalVariable local, MethodAnalysisContext context) =>
+        IsBooleanEmissionLocal(local, context, []);
+
+    private static bool IsBooleanEmissionLocal(LocalVariable local, MethodAnalysisContext context,
+        HashSet<LocalVariable> active)
     {
+        if (!active.Add(local))
+            return false;
         var definitions = context.ControlFlowGraph!.Instructions
             .Where(instruction => ReferenceEquals(instruction.Destination, local))
             .ToList();
-        return definitions.Count > 0 && definitions.All(instruction =>
+        var result = definitions.Count > 0 && definitions.All(instruction =>
             instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual
-            || instruction.OpCode == OpCode.Not && IsBoolean(instruction.Operands[1], context));
+            || instruction.OpCode == OpCode.Not && IsBooleanEmissionOperand(instruction.Operands[1], context, active)
+            || instruction.OpCode is OpCode.And or OpCode.Or or OpCode.Xor
+                && instruction.Operands.Skip(1).All(operand => IsBooleanEmissionOperand(operand, context, active)));
+        active.Remove(local);
+        return result;
     }
+
+    private static bool IsBooleanEmissionOperand(IOperand operand, MethodAnalysisContext context,
+        HashSet<LocalVariable> active) => operand switch
+    {
+        Immediate { Value: 0 or 1 } => true,
+        LocalVariable { Type.FullName: "System.Boolean" } => true,
+        LocalVariable local when local.Type == null => IsBooleanEmissionLocal(local, context, active),
+        _ => false,
+    };
 
     private static bool IsZeroConstant(IOperand operand) => operand is Immediate { Value: 0 };
 

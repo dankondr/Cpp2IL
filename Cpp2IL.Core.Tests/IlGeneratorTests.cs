@@ -162,12 +162,14 @@ public class IlGeneratorTests
         var input = new LocalVariable("input", new Register(null, "input"))
             { Type = app.SystemTypes.SystemBooleanType };
         var result = new LocalVariable("result", new Register(null, "result"));
+        var masked = new LocalVariable("masked", new Register(null, "masked"));
         var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
             app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
         context.ControlFlowGraph = new ISILControlFlowGraph([
             new(0, OpCode.Not, result, input),
-            new(1, OpCode.Return)]);
-        context.Locals = [input, result];
+            new(1, OpCode.And, masked, new Immediate(1), result),
+            new(2, OpCode.Return)]);
+        context.Locals = [input, result, masked];
         context.ParameterLocals = [];
         context.AnalysisWarnings = [];
         var module = new ModuleDefinition("BooleanNot.dll");
@@ -182,7 +184,11 @@ public class IlGeneratorTests
 
         IlGenerator.GenerateIl(context, method);
 
-        Assert.That(method.CilMethodBody!.LocalVariables[1].VariableType.FullName, Is.EqualTo("System.Boolean"));
+        Assert.Multiple(() =>
+        {
+            Assert.That(method.CilMethodBody!.LocalVariables[1].VariableType.FullName, Is.EqualTo("System.Boolean"));
+            Assert.That(method.CilMethodBody.LocalVariables[2].VariableType.FullName, Is.EqualTo("System.Boolean"));
+        });
     }
 
     [Test]
