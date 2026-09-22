@@ -113,16 +113,12 @@ public static class IlGenerator
         Dictionary<LocalVariable, CilLocalVariable> locals = [];
         foreach (var local in context.Locals)
         {
-            TypeSignature ilType;
-
-            // Use object if type couldn't be determined, or if it's void, which no locals sig can hold
-            if (local.Type != null && local.Type != context.AppContext.SystemTypes.SystemVoidType)
-                ilType = local.Type.ToTypeSignature();
-            else if (IsBooleanEmissionLocal(local, context))
-                ilType = module.CorLibTypeFactory.Boolean;
-            else
-                ilType = module.CorLibTypeFactory.Object;
-
+            var emittedType = EmittedLocalType(local, context);
+            var ilType = emittedType == context.AppContext.SystemTypes.SystemObjectType
+                ? module.CorLibTypeFactory.Object
+                : emittedType == context.AppContext.SystemTypes.SystemBooleanType
+                    ? module.CorLibTypeFactory.Boolean
+                    : emittedType.ToTypeSignature();
             var ilLocal = new CilLocalVariable(ilType);
             body.LocalVariables.Add(ilLocal);
             locals.Add(local, ilLocal);
@@ -366,7 +362,7 @@ public static class IlGenerator
 
                 LoadOperand(instruction.Operands[1], method, locals, writeLine,
                     DestinationType(instruction.Operands[0])
-                    ?? (instruction.Operands[0] is LocalVariable ? context.AppContext.SystemTypes.SystemObjectType : null));
+                    ?? (instruction.Operands[0] is LocalVariable local ? EmittedLocalType(local, context) : null));
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
@@ -813,6 +809,13 @@ public static class IlGenerator
 
         switch (operand)
         {
+            case Immediate immediate when expectedType?.FullName is "System.IntPtr" or "System.UIntPtr":
+                if (immediate.Value is >= int.MinValue and <= int.MaxValue)
+                    instructions.Add(CilOpCodes.Ldc_I4, (int)immediate.Value);
+                else
+                    instructions.Add(CilOpCodes.Ldc_I8, immediate.Value);
+                instructions.Add(expectedType.FullName == "System.UIntPtr" ? CilOpCodes.Conv_U : CilOpCodes.Conv_I);
+                break;
             case Immediate immediate when expectedType?.FullName == "System.Single":
                 instructions.Add(CilOpCodes.Ldc_R4, (float)immediate.Value);
                 break;
@@ -1076,6 +1079,28 @@ public static class IlGenerator
 
     private static bool IsBoolean(IOperand operand, MethodAnalysisContext context) =>
         DestinationType(operand) == context.AppContext.SystemTypes.SystemBooleanType;
+
+    private static TypeAnalysisContext EmittedLocalType(LocalVariable local, MethodAnalysisContext context)
+    {
+        if (local.Type != null && local.Type != context.AppContext.SystemTypes.SystemVoidType)
+            return local.Type;
+        if (IsBooleanEmissionLocal(local, context))
+            return context.AppContext.SystemTypes.SystemBooleanType;
+        if (IsNativePointerEmissionLocal(local, context))
+            return context.AppContext.SystemTypes.SystemIntPtrType;
+        return context.AppContext.SystemTypes.SystemObjectType;
+    }
+
+    private static bool IsNativePointerEmissionLocal(LocalVariable local, MethodAnalysisContext context)
+    {
+        var definitions = context.ControlFlowGraph!.Instructions
+            .Where(instruction => ReferenceEquals(instruction.Destination, local))
+            .ToList();
+        return definitions.Count > 0 && definitions.All(instruction =>
+            instruction.NativeIntegerWidthBits == context.AppContext.Binary.PointerSizeBytes * 8
+            && instruction.OpCode == OpCode.Move
+            && instruction.Operands[1] is Immediate);
+    }
 
     private static bool IsBooleanEmissionLocal(LocalVariable local, MethodAnalysisContext context) =>
         IsBooleanEmissionLocal(local, context, []);
