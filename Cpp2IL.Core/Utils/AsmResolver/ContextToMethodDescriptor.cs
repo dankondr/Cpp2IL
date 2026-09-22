@@ -9,7 +9,9 @@ public static class ContextToMethodDescriptor
 {
     private static MethodDefinition GetMethodDefinition(this MethodAnalysisContext context)
     {
-        return context.GetExtraData<MethodDefinition>("AsmResolverMethod") ?? throw new($"AsmResolver method not found in method analysis context for {context}");
+        var method = context.GetExtraData<MethodDefinition>("AsmResolverMethod") ?? throw new($"AsmResolver method not found in method analysis context for {context}");
+        MemberAccessibility.EnsureAccessible(method);
+        return method;
     }
 
     private static MethodSignature ToMethodSignature(this MethodAnalysisContext context)
