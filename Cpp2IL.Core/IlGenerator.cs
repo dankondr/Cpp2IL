@@ -550,22 +550,40 @@ public static class IlGenerator
                 {
                     if ((instruction.Operands.Count - 1) >= thisParamIndex)
                     {
-                        LoadOperand(instruction.Operands[thisParamIndex], method, locals, writeLine, targetMethod.DeclaringType);
-                        // A struct's instance `this` is a managed pointer, not the value —
-                        // coerce toward `&T` (which no stack op can forge) so a ldloca
-                        // receiver is left alone instead of being unboxed. The method's own
-                        // `this` and constructor receivers must stay a bare ldarg.0 for the
-                        // verifier, so they skip coercion entirely.
                         var thisOperand = instruction.Operands[thisParamIndex];
                         var isOwnThis = thisOperand is LocalVariable thisLocal
                             && (thisLocal.IsThis || ReferenceEquals(thisLocal, context.ParameterLocals.FirstOrDefault()));
-                        if (targetMethod.Name is not ".ctor" && !isOwnThis)
+                        // A struct's instance `this` is a managed pointer: when the receiver
+                        // is a local of exactly that struct type (a foreach enumerator is the
+                        // common case) its address is the honest receiver. Mismatched or
+                        // non-addressable operands keep the old value+coerce path.
+                        var receiverCilLocal = thisOperand is LocalVariable receiverLocal
+                            && locals.TryGetValue(receiverLocal, out var foundReceiver)
+                                ? foundReceiver
+                                : null;
+                        var structReceiver = targetMethod.Name is not ".ctor" && !isOwnThis
+                            && targetMethod.DeclaringType is { IsValueType: true } structDeclaring
+                            && receiverCilLocal != null
+                            && thisOperand is LocalVariable typedReceiverLocal
+                            && ThisConstructorCallPlan.SameTypeIdentity(EmittedLocalType(typedReceiverLocal, context), structDeclaring);
+                        if (structReceiver)
+                            instructions.Add(CilOpCodes.Ldloca, receiverCilLocal);
+                        else
                         {
-                            var thisEmitted = EmittedOperandType(thisOperand, context);
-                            var thisTarget = targetMethod.DeclaringType is { IsValueType: true } declaringStruct
-                                ? new ByRefTypeAnalysisContext(declaringStruct)
-                                : targetMethod.DeclaringType;
-                            EmitStackCoerce(thisEmitted, thisTarget, method);
+                            LoadOperand(thisOperand, method, locals, writeLine, targetMethod.DeclaringType);
+                            // A struct's instance `this` is a managed pointer, not the value —
+                            // coerce toward `&T` (which no stack op can forge) so a ldloca
+                            // receiver is left alone instead of being unboxed. The method's own
+                            // `this` and constructor receivers must stay a bare ldarg.0 for the
+                            // verifier, so they skip coercion entirely.
+                            if (targetMethod.Name is not ".ctor" && !isOwnThis)
+                            {
+                                var thisEmitted = EmittedOperandType(thisOperand, context);
+                                var thisTarget = targetMethod.DeclaringType is { IsValueType: true } declaringStruct
+                                    ? new ByRefTypeAnalysisContext(declaringStruct)
+                                    : targetMethod.DeclaringType;
+                                EmitStackCoerce(thisEmitted, thisTarget, method);
+                            }
                         }
                     }
                     else
@@ -1059,7 +1077,7 @@ public static class IlGenerator
 
         // Concrete generic method contexts build their declaring type fresh, and identical
         // metadata types can arrive as different context objects, so compare structurally.
-        private static bool SameTypeIdentity(TypeAnalysisContext? a, TypeAnalysisContext? b)
+        internal static bool SameTypeIdentity(TypeAnalysisContext? a, TypeAnalysisContext? b)
         {
             if (a == null || b == null)
                 return false;
