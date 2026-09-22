@@ -92,6 +92,27 @@ public class IntegerArithmeticTypeTests
         Assert.That(result.Type,Is.SameAs(app.SystemTypes.SystemInt32Type));
     }
 
+    [Test]
+    public void IntegerProducerStaysTypedThroughBitwiseConsumer()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture", app.SystemTypes.SystemVoidType, MethodAttributes.Static, []);
+        var input = new LocalVariable("input", new Register(null, "input")) { Type = app.SystemTypes.SystemInt32Type };
+        var sum = new LocalVariable("sum", new Register(null, "sum"));
+        var masked = new LocalVariable("masked", new Register(null, "masked"));
+        var flag = new LocalVariable("flag", new Register(null, "flag"));
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Add, sum, input, new Immediate(1)),
+            new(1, OpCode.And, masked, sum, new Immediate(1)),
+            new(2, OpCode.CheckEqual, flag, masked, new Immediate(0)),
+            new(3, OpCode.Return)]);
+        method.Locals = [input, sum, masked, flag];
+        method.ParameterLocals = [];
+        LocalVariables.ResolveTypesAndFields(method);
+        Assert.That(sum.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+        Assert.That(masked.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+    }
+
     [TestCase(0)] // Reference arithmetic is not numeric evidence.
     [TestCase(1)] // Mixed I4/I8 widths are not silently coerced.
     [TestCase(2)] // An oversized immediate must not imply I4 truncation.
