@@ -136,6 +136,7 @@ public static class IlGenerator
 
         // Generate IL
         Dictionary<Instruction, List<CilInstruction>> instructionMap = [];
+        var constructorPairs = FindConstructorPairs(context);
         Dictionary<Block, CilInstruction> blockEntryMap = [];
         List<(CilInstruction BranchInstruction, Block TargetBlock)> pendingBlockBranchFixups = [];
 
@@ -149,7 +150,7 @@ public static class IlGenerator
 
             foreach (var instruction in block.Instructions)
             {
-                var generated = GenerateInstructions(instruction, context, definition, locals, writeLine);
+                var generated = GenerateInstructions(instruction, context, definition, locals, writeLine, constructorPairs);
                 instructionMap.Add(instruction, generated);
 
                 if (!blockEntryMap.ContainsKey(block) && generated.Count > 0)
@@ -294,12 +295,16 @@ public static class IlGenerator
     }
 
     private static List<CilInstruction> GenerateInstructions(Instruction instruction, MethodAnalysisContext context,
-        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
+        IReadOnlyDictionary<Instruction, Instruction> constructorPairs)
     {
         var body = method.CilMethodBody!;
         var instructions = body.Instructions;
         var currentCount = instructions.Count;
         var startIndex = instructions.Count;
+
+        if (constructorPairs.ContainsValue(instruction))
+            return [];
 
         var module = method.DeclaringModule!;
 
@@ -380,7 +385,8 @@ public static class IlGenerator
             case OpCode.Newobj:
                 // Try and fuse our Newobj + the follow up constructor CallVoid into one IL newobj.
                 // If we can't, just fall back to an Ldnull.
-                if (FindConstructorCall(context, instruction) is { Operands: [MethodAnalysisContext constructor, _, ..] } constructorCall)
+                if (constructorPairs.TryGetValue(instruction, out var constructorCall)
+                    && constructorCall.Operands is [MethodAnalysisContext constructor, _, ..])
                 {
                     constructor = Analysis.AllocationConstructorRecovery.Resolve(instruction, constructor) ?? constructor;
                     // Operands run [ctor, newObject, arguments..., methodInfo], so take only as many as
@@ -681,7 +687,22 @@ public static class IlGenerator
     
     private static int ConstructorReceiverIndex(Instruction constructorCall) => constructorCall.OpCode == OpCode.CallVoid ? 1 : 2;
 
-    // Try find the follow up CallVoid for a constructor, after a Newobj.
+    private static Dictionary<Instruction, Instruction> FindConstructorPairs(MethodAnalysisContext context)
+    {
+        var instructions = context.ControlFlowGraph!.Instructions;
+        var pairs = new Dictionary<Instruction, Instruction>();
+
+        foreach (var allocation in instructions.Where(i => i.OpCode == OpCode.Newobj))
+        {
+            if (FindConstructorCall(context, allocation) is { } constructorCall)
+                pairs[allocation] = constructorCall;
+        }
+
+        return pairs;
+    }
+
+    // Try find the constructor call for an allocation. CFG traversal may place the
+    // call before the allocation even though both operate on the same SSA local.
     private static Instruction? FindConstructorCall(MethodAnalysisContext context, Instruction newobj)
     {
         var newObject = newobj.Operands[0];
@@ -694,6 +715,19 @@ public static class IlGenerator
             return null;
 
         for (var i = index + 1; i < instructions.Count; i++)
+        {
+            var candidate = instructions[i];
+
+            if (candidate is not { OpCode: OpCode.Call or OpCode.CallVoid, Operands: [MethodAnalysisContext { Name: ".ctor" }, ..] })
+                continue;
+
+            var receiver = ConstructorReceiverIndex(candidate);
+
+            if (candidate.Operands.Count > receiver && ReferenceEquals(candidate.Operands[receiver], newObject))
+                return candidate;
+        }
+
+        for (var i = 0; i < index; i++)
         {
             var candidate = instructions[i];
 

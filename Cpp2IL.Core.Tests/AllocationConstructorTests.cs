@@ -64,4 +64,85 @@ public class AllocationConstructorTests
         IlGenerator.GenerateIl(caller, definition);
         Assert.That(definition.CilMethodBody!.Instructions.Single(i => i.OpCode == CilOpCodes.Newobj).Operand, Is.SameAs(ctorDefinition));
     }
+
+    [Test]
+    public void ConstructorCallBeforeAllocationIsFusedForTheSameLocal()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly, "Tests", "Capture",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public);
+        var allocated = new InjectedTypeAnalysisContext(owner.DeclaringAssembly, "Tests", "Item",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public);
+        var ctor = new NativeCtor(allocated, 0x1000);
+        allocated.Methods.Add(ctor);
+        var result = new LocalVariable("result", new Register(null, "result"), allocated);
+        var caller = new InjectedMethodAnalysisContext(owner, "Create", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public | R.MethodAttributes.Static, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CallVoid, ctor, result),
+            new(1, OpCode.Newobj, result, allocated),
+            new(2, OpCode.Return)]);
+        caller.Locals = [result]; caller.ParameterLocals = []; caller.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("AllocationOrder.dll");
+        var type = new TypeDefinition("Tests", "Capture", TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);
+        var itemType = new TypeDefinition("Tests", "Item", TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(itemType);
+        var ctorDefinition = new MethodDefinition(".ctor", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        itemType.Methods.Add(ctorDefinition);
+        allocated.PutExtraData("AsmResolverType", itemType);
+        ctor.PutExtraData("AsmResolverMethod", ctorDefinition);
+        var definition = new MethodDefinition("Create", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        type.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.That(il.Count(i => i.OpCode == CilOpCodes.Newobj), Is.EqualTo(1));
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand == ctorDefinition), Is.False);
+    }
+
+    [Test]
+    public void ConstructorCallForDifferentLocalIsNotFused()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly, "Tests", "Capture",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public);
+        var allocated = new InjectedTypeAnalysisContext(owner.DeclaringAssembly, "Tests", "Item",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public);
+        var ctor = new NativeCtor(allocated, 0x1000);
+        allocated.Methods.Add(ctor);
+        var result = new LocalVariable("result", new Register(null, "result"), allocated);
+        var other = new LocalVariable("other", new Register(null, "other"), allocated);
+        var caller = new InjectedMethodAnalysisContext(owner, "Create", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public | R.MethodAttributes.Static, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CallVoid, ctor, other),
+            new(1, OpCode.Newobj, result, allocated),
+            new(2, OpCode.Return)]);
+        caller.Locals = [result, other]; caller.ParameterLocals = []; caller.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("AllocationOrderNegative.dll");
+        var type = new TypeDefinition("Tests", "Capture", TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);
+        var itemType = new TypeDefinition("Tests", "Item", TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(itemType);
+        var ctorDefinition = new MethodDefinition(".ctor", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        itemType.Methods.Add(ctorDefinition);
+        allocated.PutExtraData("AsmResolverType", itemType);
+        ctor.PutExtraData("AsmResolverMethod", ctorDefinition);
+        var definition = new MethodDefinition("Create", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        type.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.That(il.Count(i => i.OpCode == CilOpCodes.Newobj), Is.EqualTo(1));
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand == ctorDefinition), Is.True);
+    }
 }
