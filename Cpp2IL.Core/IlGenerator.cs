@@ -405,7 +405,7 @@ public static class IlGenerator
                         break;
                     }
                     if (!field.Field.IsStatic)
-                        LoadOperandIntoSlot(field.Local, field.Field.DeclaringType, context, method, locals, writeLine);
+                        LoadOperandIntoSlot(field.Local, FieldBaseContract(field.Field), context, method, locals, writeLine);
 
                     LoadOperandIntoSlot(instruction.Operands[1], field.Field.FieldType, context, method, locals, writeLine);
                     instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
@@ -2046,7 +2046,7 @@ public static class IlGenerator
                     break;
                 }
                 if (!addressedField.Field.IsStatic)
-                    LoadOperandIntoSlot(addressedField.Local, addressedField.Field.DeclaringType,
+                    LoadOperandIntoSlot(addressedField.Local, FieldBaseContract(addressedField.Field),
                         callingContext, method, locals, writeLine);
                 instructions.Add(addressedField.Field.IsStatic ? CilOpCodes.Ldsflda : CilOpCodes.Ldflda,
                     addressedField.Field.ToFieldDescriptor());
@@ -2077,7 +2077,7 @@ public static class IlGenerator
                     break;
                 }
 
-                LoadOperandIntoSlot(field.Local, field.Field.DeclaringType, callingContext,
+                LoadOperandIntoSlot(field.Local, FieldBaseContract(field.Field), callingContext,
                     method, locals, writeLine);
                 instructions.Add(CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
                 break;
@@ -3733,6 +3733,14 @@ public static class IlGenerator
     // ldfld/ldflda need the field visible from the emitting method; writing or
     // taking the address additionally requires that initonly fields only be
     // touched from the declaring type's own constructor.
+    // Instance field ops on a value type take a managed pointer receiver (`&T`),
+    // not the value itself - ldfld/stfld on a bare T would read or mutate a temp
+    // copy, and stfld initonly is only legal through `this`.
+    private static TypeAnalysisContext? FieldBaseContract(FieldAnalysisContext field)
+        => field.DeclaringType is { IsValueType: true } valueOwner
+            ? new ByRefTypeAnalysisContext(valueOwner)
+            : field.DeclaringType;
+
     private static bool FieldUsableFrom(FieldAnalysisContext field, MethodAnalysisContext context,
         bool writeAccess = false)
     {
@@ -3894,7 +3902,7 @@ public static class IlGenerator
                 method.CilMethodBody!.LocalVariables.Add(scratch);
 
                 instructions.Add(CilOpCodes.Stloc, scratch);
-                LoadOperandIntoSlot(field.Local, field.Field.DeclaringType, context,
+                LoadOperandIntoSlot(field.Local, FieldBaseContract(field.Field), context,
                     method, locals, writeLine);
                 instructions.Add(CilOpCodes.Ldloc, scratch);
                 instructions.Add(CilOpCodes.Stfld, fieldDescriptor);
