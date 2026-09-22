@@ -184,6 +184,8 @@ public class Instruction : IOperand
         if (OpCode == OpCode.Return && _operands.Count == 1)
             sources.Add(_operands[0]);
 
+        sources = sources.SelectMany(ExpandAggregate).ToList();
+
         if (constantsOnly)
             sources = sources.Where(o => !IsConstantValue(o)).ToList();
 
@@ -233,6 +235,19 @@ public class Instruction : IOperand
             MemoryOperand memory => memory.IsConstant,
             _ => true
         };
+
+    private static IEnumerable<IOperand> ExpandAggregate(IOperand operand)
+    {
+        if (operand is not AggregateOperand aggregate)
+        {
+            yield return operand;
+            yield break;
+        }
+
+        yield return aggregate;
+        foreach (var lane in aggregate.Lanes.SelectMany(ExpandAggregate))
+            yield return lane;
+    }
 
     // Deliberately not Equals/GetHashCode. Instructions are identity objects: the graph, stack analyzer and
     // IL generator all key sets and dictionaries on the specific instruction instance, and generated

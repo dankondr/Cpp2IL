@@ -789,6 +789,9 @@ public static class IlGenerator
 
         switch (operand)
         {
+            case AggregateOperand aggregate:
+                LoadAggregate(aggregate, method, locals, writeLine);
+                break;
             // A native W-register literal may be represented as unsigned 32-bit in ISIL.
             // The known managed I4 contract supplies the width; do not truncate arbitrary I8s.
             case Immediate { Value: >= int.MinValue and <= uint.MaxValue } immediate
@@ -1074,6 +1077,10 @@ public static class IlGenerator
 
         switch (operand)
         {
+            case AggregateOperand aggregate:
+                StoreAggregate(aggregate, method, locals, writeLine);
+                break;
+
             case LocalVariable local:
                 instructions.Add(CilOpCodes.Stloc, locals[local]);
                 break;
@@ -1134,6 +1141,47 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Call, writeLine);
                 instructions.Add(CilOpCodes.Pop);
                 break;
+        }
+    }
+
+    private static void LoadAggregate(AggregateOperand aggregate, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        if (aggregate.IsAggregateParameter)
+        {
+            LoadLocal(aggregate, method, locals);
+            return;
+        }
+
+        var temporary = new CilLocalVariable(aggregate.AggregateType.ToTypeSignature());
+        method.CilMethodBody.LocalVariables.Add(temporary);
+        var fields = aggregate.AggregateType.Fields.Where(field => !field.IsStatic).ToArray();
+        for (var i = 0; i < fields.Length && i < aggregate.Lanes.Count; i++)
+        {
+            instructions.Add(CilOpCodes.Ldloca, temporary);
+            LoadOperand(aggregate.Lanes[i], method, locals, writeLine, fields[i].FieldType);
+            instructions.Add(CilOpCodes.Stfld, fields[i].ToFieldDescriptor());
+        }
+        instructions.Add(CilOpCodes.Ldloc, temporary);
+    }
+
+    private static void StoreAggregate(AggregateOperand aggregate, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        var temporary = new CilLocalVariable(aggregate.AggregateType.ToTypeSignature());
+        method.CilMethodBody.LocalVariables.Add(temporary);
+        instructions.Add(CilOpCodes.Stloc, temporary);
+
+        var fields = aggregate.AggregateType.Fields.Where(field => !field.IsStatic).ToArray();
+        for (var i = 0; i < fields.Length && i < aggregate.Lanes.Count; i++)
+        {
+            // ldfld consumes a managed pointer for a value-type instance. Loading the
+            // struct value itself would produce unverifiable IL on the generated path.
+            instructions.Add(CilOpCodes.Ldloca, temporary);
+            instructions.Add(CilOpCodes.Ldfld, fields[i].ToFieldDescriptor());
+            StoreToOperand(aggregate.Lanes[i], method, locals, writeLine);
         }
     }
 }

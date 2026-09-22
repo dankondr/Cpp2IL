@@ -14,6 +14,20 @@ public abstract class BaseCallingConventionResolver
 
     public abstract Register ReturnRegister(MethodAnalysisContext ctx);
 
+    public virtual IOperand ReturnOperand(MethodAnalysisContext ctx) => ReturnRegister(ctx);
+
+    public LocalVariable ReturnLocalOperand(MethodAnalysisContext ctx, string name)
+    {
+        var operand = ReturnOperand(ctx);
+        if (operand is AggregateOperand aggregate)
+        {
+            aggregate.Name = name;
+            return aggregate;
+        }
+
+        return new LocalVariable(name, (Register)operand, ctx.ReturnType);
+    }
+
     public abstract bool ReturnsViaHiddenBuffer(MethodAnalysisContext ctx);
 
     public abstract Register? HiddenReturnBufferRegister(MethodAnalysisContext ctx);
@@ -56,7 +70,7 @@ public abstract class BaseCallingConventionResolver
     }
 
     // TODO Fix handling of params on the stack here
-    public void RemapRawArguments(Instruction call, MethodAnalysisContext resolved)
+    public virtual void RemapRawArguments(Instruction call, MethodAnalysisContext resolved)
     {
         var app = resolved.AppContext;
 

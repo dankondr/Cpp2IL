@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -122,6 +123,14 @@ public class StackAnalyzer
                 {
                     var op = instruction.Operands[i];
 
+                    if (op is AggregateOperand aggregate)
+                    {
+                        if (state == null && aggregate.Lanes.Any(lane => lane is StackOffset))
+                            state = _instructionState[instruction].Size;
+                        aggregate.ReplaceLanes(aggregate.Lanes.Select(lane => RewriteStackLane(lane, state, instruction)));
+                        continue;
+                    }
+
                     var slot = op switch
                     {
                         StackOffset direct => direct,
@@ -222,6 +231,12 @@ public class StackAnalyzer
             {
                 var operand = instruction.Operands[i];
 
+                if (operand is AggregateOperand aggregate)
+                {
+                    aggregate.ReplaceLanes(aggregate.Lanes.Select(ReplaceStackLane));
+                    continue;
+                }
+
                 if (operand is StackOffset offset)
                     instruction.SetOperand(i, new Register(null, NameForSlot(offset)));
 
@@ -235,10 +250,28 @@ public class StackAnalyzer
         {
             var parameter = method.ParameterOperands[i];
 
+            if (parameter is AggregateOperand aggregate)
+            {
+                aggregate.ReplaceLanes(aggregate.Lanes.Select(ReplaceStackLane));
+                continue;
+            }
+
             if (parameter is StackOffset offset)
                 method.ParameterOperands[i] = new Register(null, NameForSlot(offset));
         }
     }
 
     private static string NameForSlot(StackOffset offset) => offset.Offset < 0 ? $"stack_-{-offset.Offset:X}" : $"stack_{offset.Offset:X}";
+
+    private static IOperand RewriteStackLane(IOperand operand, int? state, Instruction instruction)
+    {
+        if (operand is not StackOffset offset)
+            return operand;
+
+        var actual = (state ?? throw new InvalidOperationException($"No stack state for {instruction}")) + offset.Offset;
+        return new StackOffset(actual);
+    }
+
+    private static IOperand ReplaceStackLane(IOperand operand)
+        => operand is StackOffset offset ? new Register(null, NameForSlot(offset)) : operand;
 }

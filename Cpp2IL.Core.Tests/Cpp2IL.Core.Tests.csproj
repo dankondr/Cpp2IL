@@ -11,6 +11,7 @@
 
     <ItemGroup>
         <ProjectReference Include="..\Cpp2IL.Core\Cpp2IL.Core.csproj" />
+        <ProjectReference Include="..\vendor\Disarm\Disarm\Disarm.csproj" />
     </ItemGroup>
 
     <ItemGroup>

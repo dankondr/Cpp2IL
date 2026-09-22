@@ -674,7 +674,8 @@ public static class MetadataResolver
             {
                 var operands = new List<IOperand> { resolved };
                 if (!resolved.IsVoid)
-                    operands.Add(new LocalVariable("virtualTailCallResult", resolved.AppContext.InstructionSet.CallingConventionResolver?.ReturnRegister(resolved) ?? new Register(null, "return"), resolved.ReturnType));
+                    operands.Add(resolved.AppContext.InstructionSet.CallingConventionResolver?.ReturnLocalOperand(resolved, "virtualTailCallResult")
+                        ?? new LocalVariable("virtualTailCallResult", new Register(null, "return"), resolved.ReturnType));
                 operands.AddRange(instruction.Operands.Skip(2));
                 instruction.SetOperands(operands);
             }
