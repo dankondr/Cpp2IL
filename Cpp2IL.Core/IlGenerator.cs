@@ -124,14 +124,6 @@ public static class IlGenerator
             locals.Add(local, ilLocal);
         }
 
-        /* foreach (var instruction in context.ControlFlowGraph!.Instructions)
-        {
-            body.Instructions.Add(CilOpCodes.Ldstr, instruction.ToString());
-            body.Instructions.Add(CilOpCodes.Call, _importer!.ImportMethod(_writeLine!));
-        }
-        body.Instructions.Add(CilOpCodes.Ldstr, "-------------------------------------------------------------------------");
-        body.Instructions.Add(CilOpCodes.Call, _importer!.ImportMethod(_writeLine!)); */
-
         // Generate IL
         Dictionary<Instruction, List<CilInstruction>> instructionMap = [];
         var constructorPairs = FindConstructorPairs(context);
@@ -775,9 +767,21 @@ public static class IlGenerator
                     && TryEmitExactTypeComparison(instruction, method, locals, writeLine))
                     break;
 
+                // Integer ops on operands that cannot legally sit in an integer slot are
+                // native idioms the lifter mistyped: `&slot | N`/`&slot + N` names a field
+                // inside a struct local, `packed >> 32`/`packed & mask` selects a field out
+                // of a value lifted as one unit, and `x ^ x`/`x - x` folds to zero for any
+                // operand kind. Recover the managed equivalent when layout allows it.
+                if (TryEmitRecoveredIntegerOperation(instruction, context, method, locals, writeLine))
+                    break;
+
                 // Float operations on a promoted integer operand need an explicit conversion, so both
                 // operands are coerced to the (float) result type. A no-op when they already match.
                 var floatConversion = FloatOperationConversion(instruction);
+                var floatTarget = floatConversion == null ? null
+                    : floatConversion == CilOpCodes.Conv_R4
+                        ? context.AppContext.SystemTypes.SystemSingleType
+                        : context.AppContext.SystemTypes.SystemDoubleType;
 
                 // `&T`/`ref T` + N is field addressing, not arithmetic: the native
                 // add computes the address of the field at byte offset N. Emit the
@@ -818,10 +822,20 @@ public static class IlGenerator
                         instruction.OpCode is < OpCode.CheckEqual or > OpCode.CheckLessOrEqual)
                     : null;
 
+                // No operand claimed an integer width (e.g. two references or a struct
+                // reaching a bitwise op): the slot still has to be an integer, so coerce
+                // to i4 and let EmitStackCoerce produce unbox/ldobj/placeholder as needed.
+                if (operandType == null && floatConversion == null
+                    && instruction.OpCode is < OpCode.CheckEqual or > OpCode.CheckLessOrEqual)
+                    operandType = context.AppContext.SystemTypes.SystemInt32Type;
+
                 LoadOperand(instruction.Operands[1], method, locals, writeLine,
-                    NullComparisonType(instruction, 1, context) ?? operandType);
+                    NullComparisonType(instruction, 1, context) ?? floatTarget ?? operandType);
                 if (floatConversion is { } conv1)
-                    instructions.Add(conv1);
+                    // The coerce emits the float conversion itself, and unwraps boxed
+                    // numerics the raw conv would have rejected.
+                    EmitStackCoerce(EmittedOperandType(instruction.Operands[1], context, floatTarget),
+                        floatTarget, method);
                 else
                     EmitStackCoerce(EmittedOperandType(instruction.Operands[1], context, operandType), operandType, method,
                         instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual
@@ -831,9 +845,10 @@ public static class IlGenerator
                     ? context.AppContext.SystemTypes.SystemInt32Type
                     : operandType;
                 LoadOperand(instruction.Operands[2], method, locals, writeLine,
-                    NullComparisonType(instruction, 2, context) ?? operand2Type);
+                    NullComparisonType(instruction, 2, context) ?? floatTarget ?? operand2Type);
                 if (floatConversion is { } conv2)
-                    instructions.Add(conv2);
+                    EmitStackCoerce(EmittedOperandType(instruction.Operands[2], context, floatTarget),
+                        floatTarget, method);
                 else
                     EmitStackCoerce(EmittedOperandType(instruction.Operands[2], context, operand2Type), operand2Type, method,
                         instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual
@@ -911,28 +926,56 @@ public static class IlGenerator
 
             case OpCode.Not:
             case OpCode.Negate:
-                LoadOperand(instruction.Operands[1], method, locals, writeLine);
+            {
+                var unaryOperandType = EmittedOperandType(instruction.Operands[1], context);
+                if (unaryOperandType is PointerTypeAnalysisContext)
+                {
+                    // `not`/`neg` on a raw pointer: the pointer is lost, keep the
+                    // operation on a native-int placeholder instead of an invalid `*`.
+                    instructions.Add(CilOpCodes.Ldc_I4_0);
+                    instructions.Add(CilOpCodes.Conv_I);
+                }
+                else
+                {
+                    LoadOperand(instruction.Operands[1], method, locals, writeLine);
+                    // `not`/`neg` on `&x` really means the pointed value; the coerce
+                    // dereferences an integral element or drops a lost one for zero.
+                    if (unaryOperandType is ByRefTypeAnalysisContext)
+                        EmitStackCoerce(unaryOperandType, context.AppContext.SystemTypes.SystemIntPtrType, method);
+                }
 
+                var unaryResultType = unaryOperandType is ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+                    ? context.AppContext.SystemTypes.SystemIntPtrType
+                    : unaryOperandType;
                 if (instruction.OpCode == OpCode.Negate)
                     instructions.Add(CilOpCodes.Neg);
+                else if (unaryOperandType is { IsValueType: false }
+                    and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+                        or GenericParameterTypeAnalysisContext)
+                    && !IsNativeHandleType(unaryOperandType))
+                {
+                    // `!x` on a reference is a null test; there is no bitwise-not of an object.
+                    instructions.Add(CilOpCodes.Ldnull);
+                    instructions.Add(CilOpCodes.Ceq);
+                    unaryResultType = context.AppContext.SystemTypes.SystemInt32Type;
+                }
                 else if (IsBoolean(instruction.Operands[1], context))
                 {
                     instructions.Add(CilOpCodes.Ldc_I4_0);
                     instructions.Add(CilOpCodes.Ceq);
+                    unaryResultType = context.AppContext.SystemTypes.SystemInt32Type;
                 }
-                else if (EmittedOperandType(instruction.Operands[1], context) is { } notOperand
-                    && IntegralStackWidth(notOperand) == 0
-                    && (notOperand.IsValueType || notOperand.FullName != "System.Object"))
+                else if (unaryOperandType is { IsValueType: true } provable
+                    && IntegralStackWidth(provable) == 0)
+                    // `not` on a struct/float has no honest decode; keep the diagnostic.
                     EmitUnrecoverableOperation(method, writeLine, $"Unrecoverable integer operation: {instruction}");
                 else
                     instructions.Add(CilOpCodes.Not);
 
-                var unaryResultType = instruction.OpCode == OpCode.Not && IsBoolean(instruction.Operands[1], context)
-                    ? context.AppContext.SystemTypes.SystemInt32Type
-                    : EmittedOperandType(instruction.Operands[1], context);
                 EmitStackCoerce(unaryResultType, StoreContract(instruction.Operands[0], context), method);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
+            }
 
             default:
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Unknown instruction: {instruction}"));
@@ -1750,6 +1793,9 @@ public static class IlGenerator
         var parent = new Dictionary<LocalVariable, LocalVariable>();
         var constraints = new Dictionary<LocalVariable, List<TypeAnalysisContext>>();
         var disqualified = new HashSet<LocalVariable>();
+        // Locals that must be numeric because they feed an op with no non-numeric
+        // stack form (add/sub/mul/bitwise/shift — unlike ceq, which refs also take).
+        var numericOpUse = new HashSet<LocalVariable>();
 
         LocalVariable Find(LocalVariable local)
         {
@@ -1763,12 +1809,25 @@ public static class IlGenerator
         bool IsNumeric(TypeAnalysisContext? type) =>
             type != null && type.FullName is "System.Single" or "System.Double" || IntegralStackWidth(type) > 0;
 
+        // Contracts a boxed numeric still satisfies — a value stored into one of
+        // these slots can legitimately be an int/float, so they neither seed a
+        // numeric type nor disqualify the class.
+        bool IsBoxingCompatible(TypeAnalysisContext type) =>
+            type.FullName is "System.Object" or "System.ValueType"
+                or "System.IComparable" or "System.IFormattable" or "System.IConvertible";
+
         void AddOperandConstraint(IOperand operand, TypeAnalysisContext? type)
         {
             if (operand is not LocalVariable local)
                 return;
             var root = Find(local);
-            if (type == null)
+            // Reference slots are boxing-compatible: any numeric value reaches them
+            // through box/castclass, and any reference reaches numerics through
+            // unbox.any — neither forbids a numeric inference. Managed pointers,
+            // raw pointers and concrete structs do.
+            if (type == null || IsBoxingCompatible(type)
+                || type is { IsValueType: false }
+                    and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext))
                 return;
             if (IsNumeric(type))
                 (constraints.TryGetValue(root, out var list) ? list : constraints[root] = []).Add(type);
@@ -1791,6 +1850,46 @@ public static class IlGenerator
                     if (first == null) first = local;
                     else Union(first, local);
                 }
+        }
+
+        // What an operand pushes, using only declared types (no inference) so it
+        // can seed constraints while the inference itself is still running. A
+        // managed address, struct value or concrete reference anchors the whole
+        // union class: a slot that has to receive one can never be an Int32.
+        TypeAnalysisContext? DeclaredStackType(IOperand operand)
+        {
+            var type = operand switch
+            {
+                LocalVariable local => local.Type,
+                FieldReference field => field.Field.FieldType,
+                ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } => array.ElementType,
+                ArrayLength => context.AppContext.SystemTypes.SystemInt32Type,
+                AddressOf { Target: LocalVariable addressed }
+                    => new ByRefTypeAnalysisContext(addressed.Type ?? context.AppContext.SystemTypes.SystemObjectType),
+                AddressOf { Target: FieldReference addressedField }
+                    => new ByRefTypeAnalysisContext(addressedField.Field.FieldType),
+                AddressOf { Target: ArrayAccess { Array.Type: SzArrayTypeAnalysisContext addressedArray } }
+                    => new ByRefTypeAnalysisContext(addressedArray.ElementType),
+                AddressOf => context.AppContext.SystemTypes.SystemIntPtrType,
+                ReferenceCast cast => cast.Type,
+                StringLiteral => context.AppContext.SystemTypes.SystemStringType,
+                FloatLiteral => context.AppContext.SystemTypes.SystemSingleType,
+                DoubleLiteral => context.AppContext.SystemTypes.SystemDoubleType,
+                _ => null
+            };
+            return type != null && IsNativeHandleType(type) ? type.AppContext.SystemTypes.SystemIntPtrType : type;
+        }
+
+        // Every local in the instruction is constrained by the declared shapes of
+        // its operand mates: Move(&x -> v) disqualifies v, Move(v -> intField)
+        // seeds int, and arith results inherit the operand family.
+        void SeedMateConstraints(IEnumerable<IOperand> instructionOperands)
+        {
+            var operands = instructionOperands.ToList();
+            foreach (var local in operands.OfType<LocalVariable>())
+                foreach (var mate in operands)
+                    if (!ReferenceEquals(mate, local))
+                        AddOperandConstraint(local, DeclaredStackType(mate));
         }
 
         foreach (var instruction in instructions)
@@ -1825,13 +1924,24 @@ public static class IlGenerator
             {
                 // Result shares the operand family, so the destination unions too.
                 UnionLocalOperands(instruction.Operands);
-                foreach (var operand in instruction.Operands.Skip(1))
+                foreach (var operand in instruction.Operands)
+                {
+                    if (operand is LocalVariable numericLocal)
+                        numericOpUse.Add(Find(numericLocal));
                     AddOperandConstraint(operand, DestinationType(operand));
+                }
+                foreach (var source in instruction.Operands.Skip(1))
+                    AddOperandConstraint(instruction.Operands[0], DeclaredStackType(source));
             }
             else if (op is OpCode.ShiftLeft or OpCode.ShiftRight)
             {
                 UnionLocalOperands([instruction.Operands[0], instruction.Operands[1]]);
+                foreach (var operand in instruction.Operands.Take(2))
+                    if (operand is LocalVariable shiftLocal)
+                        numericOpUse.Add(Find(shiftLocal));
+                AddOperandConstraint(instruction.Operands[0], DestinationType(instruction.Operands[0]));
                 AddOperandConstraint(instruction.Operands[1], DestinationType(instruction.Operands[1]));
+                AddOperandConstraint(instruction.Operands[0], DeclaredStackType(instruction.Operands[1]));
                 AddOperandConstraint(instruction.Operands[2], context.AppContext.SystemTypes.SystemInt32Type);
             }
             else if (op is OpCode.Move or OpCode.Phi)
@@ -1839,6 +1949,7 @@ public static class IlGenerator
                 UnionLocalOperands(instruction.Operands);
                 foreach (var operand in instruction.Operands)
                     AddOperandConstraint(operand, DestinationType(operand));
+                SeedMateConstraints(instruction.Operands);
             }
             else if (op is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall)
             {
@@ -1877,17 +1988,25 @@ public static class IlGenerator
         }
         var rootDisqualified = new HashSet<LocalVariable>(disqualified.Select(Find));
 
+        var rootNumericOpUse = new HashSet<LocalVariable>(numericOpUse.Select(Find));
+        var systemTypes = context.AppContext.SystemTypes;
+
         var result = new Dictionary<LocalVariable, TypeAnalysisContext>();
         var members = parent.Keys.GroupBy(Find);
         foreach (var group in members)
         {
             var root = group.Key;
-            if (rootDisqualified.Contains(root) || !rootConstraints.TryGetValue(root, out var types) || types.Count == 0)
+            if (rootDisqualified.Contains(root))
                 continue;
-            var picked = types.FirstOrDefault(t => t.FullName == "System.Double")
-                ?? types.FirstOrDefault(t => t.FullName == "System.Single")
-                ?? types.FirstOrDefault(t => IntegralStackWidth(t) == 8)
-                ?? types[0];
+            var hasTypes = rootConstraints.TryGetValue(root, out var types) && types.Count > 0;
+            if (!hasTypes && !rootNumericOpUse.Contains(root))
+                continue;
+            var picked = hasTypes
+                ? types!.FirstOrDefault(t => t.FullName == "System.Double")
+                    ?? types.FirstOrDefault(t => t.FullName == "System.Single")
+                    ?? types.FirstOrDefault(t => IntegralStackWidth(t) == 8)
+                    ?? types[0]
+                : systemTypes.SystemInt32Type;
             foreach (var member in group)
                 if (member.Type == null)
                     result[member] = picked;
@@ -2123,6 +2242,12 @@ public static class IlGenerator
             {
                 if (byRef.ElementType.FullName == to.FullName && CanEmitTypeToken(to))
                     instructions.Add(CilOpCodes.Ldobj, to.ToTypeSignature().ToTypeDefOrRef());
+                else if (IntegralStackWidth(byRef.ElementType) > 0 && toWidth != 0
+                    && CanEmitTypeToken(byRef.ElementType))
+                {
+                    instructions.Add(CilOpCodes.Ldobj, byRef.ElementType.ToTypeSignature().ToTypeDefOrRef());
+                    EmitStackCoerce(byRef.ElementType, to, method);
+                }
             }
             else if (!byRef.ElementType.IsValueType)
                 instructions.Add(CilOpCodes.Ldind_Ref);
@@ -2325,6 +2450,281 @@ public static class IlGenerator
         instructions.Add(CilOpCodes.Ldstr, Diagnostic(detail));
         instructions.Add(CilOpCodes.Newobj, exceptionCtor);
         instructions.Add(CilOpCodes.Throw);
+    }
+
+    // Integer ops on operands that cannot legally sit in an integer slot are
+    // native idioms the lifter mistyped: `&slot | N`/`&slot + N` names a field
+    // inside a struct local, `packed >> 32`/`packed & mask` selects a field out
+    // of a value lifted as one unit, and `x ^ x`/`x - x` folds to zero for any
+    // operand kind. Recovers the managed equivalent when layout allows it.
+    private static bool TryEmitRecoveredIntegerOperation(Instruction instruction, MethodAnalysisContext context,
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        if (instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual)
+            return false;
+
+        var instructions = method.CilMethodBody!.Instructions;
+        var destinationType = DestinationType(instruction.Operands[0])
+            ?? (instruction.Operands[0] is LocalVariable resultLocal ? EmittedLocalType(resultLocal, context) : null);
+
+        // `x ^ x`/`x - x` is provably zero even when the operand's own type is lost.
+        if (instruction.OpCode is OpCode.Xor or OpCode.Subtract
+            && IsSameStorage(instruction.Operands[1], instruction.Operands[2])
+            && IntegralStackWidth(EmittedOperandType(instruction.Operands[1], context)) <= 0)
+        {
+            instructions.Add(CilOpCodes.Ldc_I4_0);
+            EmitStackCoerce(context.AppContext.SystemTypes.SystemInt32Type, destinationType, method);
+            StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+            return true;
+        }
+
+        // `&local OP const` computes the address of a field inside the local's
+        // value type; when a field sits at exactly that offset and can feed the
+        // destination, the whole operation is the field access itself.
+        if (instruction.OpCode is OpCode.Or or OpCode.Add
+            && FindAddressOffsetField(instruction, context, out var address, out var addressField)
+            && (ThisConstructorCallPlan.SameTypeIdentity(addressField.FieldType, destinationType)
+                || IntegralStackWidth(addressField.FieldType) != 0
+                    && destinationType is not ByRefTypeAnalysisContext and not PointerTypeAnalysisContext
+                    && IntegralStackWidth(destinationType) != 0)
+            && EmitManagedAddress(address, method, context, locals, writeLine))
+        {
+            instructions.Add(CilOpCodes.Ldfld, addressField.ToFieldDescriptor());
+            EmitStackCoerce(addressField.FieldType, destinationType, method);
+            StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+            return true;
+        }
+
+        // `packed >> N`/`packed OP mask`: the surviving bytes are a field.
+        if (TryGetPackedFieldAccess(instruction, context, out var packed, out var packedField, out var otherOperand)
+            && EmitManagedAddress(packed, method, context, locals, writeLine))
+        {
+            var fieldType = packedField.FieldType;
+            instructions.Add(CilOpCodes.Ldfld, packedField.ToFieldDescriptor());
+            if (otherOperand != null)
+            {
+                // The op applies to the low-word field only; that is exact for the
+                // masked range (and for wraps/shifts the field itself is the answer).
+                LoadOperand(otherOperand, method, locals, writeLine, fieldType);
+                EmitStackCoerce(EmittedOperandType(otherOperand, context, fieldType), fieldType, method);
+                instructions.Add(instruction.OpCode switch
+                {
+                    OpCode.And => new CilInstruction(CilOpCodes.And),
+                    OpCode.Or => new CilInstruction(CilOpCodes.Or),
+                    OpCode.Xor => new CilInstruction(CilOpCodes.Xor),
+                    OpCode.Add => new CilInstruction(CilOpCodes.Add),
+                    OpCode.Subtract => new CilInstruction(CilOpCodes.Sub),
+                    OpCode.Multiply => new CilInstruction(CilOpCodes.Mul),
+                    OpCode.Divide => new CilInstruction(CilOpCodes.Div),
+                    OpCode.Modulo => new CilInstruction(CilOpCodes.Rem),
+                    _ => new CilInstruction(CilOpCodes.Nop),
+                });
+            }
+            EmitStackCoerce(fieldType, destinationType, method);
+            StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsSameStorage(IOperand left, IOperand right) => (left, right) switch
+    {
+        (LocalVariable x, LocalVariable y) => ReferenceEquals(x, y),
+        (FieldReference x, FieldReference y)
+            => ReferenceEquals(x.Field, y.Field) && ReferenceEquals(x.Local, y.Local),
+        (Immediate x, Immediate y) => x.Value == y.Value,
+        _ => false,
+    };
+
+    // `&local OP const`: the constant names a byte offset inside the local's
+    // value type. Returns the field sitting at exactly that offset.
+    private static bool FindAddressOffsetField(Instruction instruction, MethodAnalysisContext context,
+        out LocalVariable address, out FieldAnalysisContext field)
+    {
+        address = null!;
+        field = null!;
+        for (var i = 1; i <= 2; i++)
+        {
+            if (instruction.Operands[i] is not AddressOf { Target: LocalVariable target }
+                || instruction.Operands[3 - i] is not Immediate { Value: >= 0 and <= int.MaxValue } offset)
+                continue;
+            var slotType = EmittedLocalType(target, context);
+            if (slotType is not { IsValueType: true })
+                continue;
+            var candidate = FindInstanceField(slotType, (int)offset.Value, requireIntegral: false, context);
+            if (candidate == null)
+                continue;
+            address = target;
+            field = candidate;
+            return true;
+        }
+        return false;
+    }
+
+    // `packed >> N` selects the field covering the surviving high bytes;
+    // `packed OP mask` applies the op to the low-word field. Only fires when the
+    // packed operand emits as a non-integral value type.
+    private static bool TryGetPackedFieldAccess(Instruction instruction, MethodAnalysisContext context,
+        out IOperand packed, out FieldAnalysisContext field, out IOperand? other)
+    {
+        packed = null!;
+        field = null!;
+        other = null;
+        for (var i = 1; i <= 2; i++)
+        {
+            var operand = instruction.Operands[i];
+            // A struct method's `this` is an address (`&T`), never a packed value;
+            // `this + N` is field addressing and belongs to the field resolver.
+            if (operand is LocalVariable { IsThis: true })
+                continue;
+            var operandType = EmittedOperandType(operand, context);
+            if (operandType is not { IsValueType: true } || IntegralStackWidth(operandType) != 0)
+                continue;
+            var mate = instruction.Operands[3 - i];
+
+            if (instruction.OpCode is OpCode.ShiftRight && i == 1
+                && mate is Immediate { Value: >= 8 and < 64 } shift
+                && shift.Value % 8 == 0
+                && FindInstanceField(operandType, (int)(shift.Value / 8), requireIntegral: true, context) is { } shiftedField
+                && PrimitiveByteSize(shiftedField.FieldType) * 8 >= 64 - shift.Value)
+            {
+                packed = operand;
+                field = shiftedField;
+                return true;
+            }
+
+            // The low word of an add/sub/mul/bitwise op is exact, so applying it
+            // to the low-word field is honest. Division, modulo and shifts mix
+            // across the whole value, so they never qualify here. Subtraction is
+            // only honest when the packed value is the left operand.
+            var lowWordOp = instruction.OpCode is OpCode.And or OpCode.Or or OpCode.Xor
+                or OpCode.Add or OpCode.Multiply || instruction.OpCode is OpCode.Subtract && i == 1;
+            if (lowWordOp
+                && mate is Immediate { Value: var mask }
+                && FindInstanceField(operandType, 0, requireIntegral: true, context) is { } lowField
+                && unchecked((ulong)mask) <= LowMask(PrimitiveByteSize(lowField.FieldType)))
+            {
+                packed = operand;
+                field = lowField;
+                other = mate;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static ulong LowMask(int byteSize) =>
+        byteSize >= 8 ? ulong.MaxValue : byteSize <= 0 ? 0UL : (1UL << (byteSize * 8)) - 1;
+
+    // Instance fields of a possibly generic-instance type, concretized against
+    // the instance so field types come back instantiated.
+    private static IEnumerable<FieldAnalysisContext> InstanceFields(TypeAnalysisContext type) =>
+        type is GenericInstanceTypeAnalysisContext generic
+            ? generic.GenericType.Fields.Select(field => field.MakeConcreteGenericField(generic.GenericArguments))
+            : type.Fields;
+
+    private static FieldAnalysisContext? FindInstanceField(TypeAnalysisContext? type, int offset, bool requireIntegral,
+        MethodAnalysisContext context) =>
+        type == null ? null
+            : InstanceFields(type).FirstOrDefault(field => !field.IsStatic && field.Offset == offset
+                && (!requireIntegral || IntegralStackWidth(field.FieldType) != 0)
+                && FieldUsableFrom(field, context));
+
+    private static bool CanEmitFieldToken(FieldAnalysisContext field) =>
+        (field is ConcreteGenericFieldAnalysisContext concrete ? concrete.BaseFieldContext : field)
+            .GetExtraData<FieldDefinition>("AsmResolverField") != null;
+
+    // ldfld/ldflda need the field visible from the emitting method; taking the
+    // address additionally requires that initonly fields only be addressed from
+    // the declaring type's own constructor.
+    private static bool FieldUsableFrom(FieldAnalysisContext field, MethodAnalysisContext context,
+        bool addressTaken = false)
+    {
+        if (!CanEmitFieldToken(field))
+            return false;
+        var attrs = field.Attributes;
+        if (addressTaken && (attrs & FieldAttributes.InitOnly) != 0
+            && !(context.Name is ".ctor" or ".cctor"
+                && field.DeclaringType != null && context.DeclaringType != null
+                && ThisConstructorCallPlan.SameTypeIdentity(field.DeclaringType, context.DeclaringType)))
+            return false;
+        var callerType = context.DeclaringType;
+        var declaring = field.DeclaringType;
+        if (declaring == null || callerType == null)
+            return true;
+        var sameAssembly = ReferenceEquals(callerType.DeclaringAssembly, declaring.DeclaringAssembly);
+        var sameType = ThisConstructorCallPlan.SameTypeIdentity(declaring, callerType);
+        return (attrs & FieldAttributes.FieldAccessMask) switch
+        {
+            FieldAttributes.Public => true,
+            FieldAttributes.Private => sameType,
+            FieldAttributes.Assembly => sameAssembly,
+            FieldAttributes.Family => sameType || callerType.IsAssignableTo(declaring),
+            FieldAttributes.FamANDAssem => sameAssembly && (sameType || callerType.IsAssignableTo(declaring)),
+            FieldAttributes.FamORAssem => sameAssembly || sameType || callerType.IsAssignableTo(declaring),
+            _ => false,
+        };
+    }
+
+    // Byte size of a primitive or enum field; 0 when the layout is not known.
+    private static int PrimitiveByteSize(TypeAnalysisContext? type) => type?.FullName switch
+    {
+        "System.Boolean" or "System.Byte" or "System.SByte" => 1,
+        "System.Int16" or "System.UInt16" or "System.Char" => 2,
+        "System.Int32" or "System.UInt32" or "System.Single" => 4,
+        "System.Int64" or "System.UInt64" or "System.Double" => 8,
+        "System.IntPtr" or "System.UIntPtr" => 8,
+        _ when type is { IsEnumType: true } => PrimitiveByteSize(type.DefaultEnumUnderlyingType),
+        _ => 0,
+    };
+
+    // Pushes a managed address (`&`) or object reference that ldfld/ldflda can
+    // consume for the given storage operand. Returns false for anything that has
+    // no managed address.
+    private static bool EmitManagedAddress(IOperand operand, MethodDefinition method,
+        MethodAnalysisContext context, Dictionary<LocalVariable, CilLocalVariable> locals,
+        IMethodDescriptor writeLine)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        switch (operand)
+        {
+            case LocalVariable { IsThis: true }:
+                instructions.Add(CilOpCodes.Ldarg_0);
+                return true;
+            case LocalVariable local:
+                var parameter = method.Parameters.FirstOrDefault(p => p.Name == local.Name);
+                if (EmittedLocalType(local, context) is { IsValueType: false })
+                {
+                    if (parameter != null)
+                        instructions.Add(CilOpCodes.Ldarg, parameter);
+                    else
+                        instructions.Add(CilOpCodes.Ldloc, locals[local]);
+                }
+                else if (parameter != null)
+                    instructions.Add(CilOpCodes.Ldarga, parameter);
+                else
+                    instructions.Add(CilOpCodes.Ldloca, locals[local]);
+                return true;
+            case FieldReference { Field.IsStatic: true } staticField:
+                if (!FieldUsableFrom(staticField.Field, context, addressTaken: true))
+                    return false;
+                instructions.Add(CilOpCodes.Ldsflda, staticField.Field.ToFieldDescriptor());
+                return true;
+            case FieldReference field:
+                if (!FieldUsableFrom(field.Field, context, addressTaken: true)
+                    || !EmitManagedAddress(field.Local, method, context, locals, writeLine))
+                    return false;
+                instructions.Add(CilOpCodes.Ldflda, field.Field.ToFieldDescriptor());
+                return true;
+            case ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } access:
+                LoadLocal(access.Array, method, locals);
+                LoadOperand(access.Index, method, locals, writeLine);
+                instructions.Add(CilOpCodes.Ldelema, array.ElementType.ToTypeSignature().ToTypeDefOrRef());
+                return true;
+            default:
+                return false;
+        }
     }
 
     private static void LoadLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)

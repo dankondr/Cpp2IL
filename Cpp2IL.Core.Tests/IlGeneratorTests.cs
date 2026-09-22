@@ -304,7 +304,9 @@ public class IlGeneratorTests
 
         var instructions = method.CilMethodBody!.Instructions;
         Assert.That(instructions.Select(i => i.OpCode), Does.Contain(CilOpCodes.Ldc_R8));
-        Assert.That(instructions.Select(i => i.OpCode), Does.Contain(CilOpCodes.Conv_R8));
+        // The immediate is loaded directly at double width, so no separate
+        // conversion is needed; it must not reach ceq as an integer.
+        Assert.That(instructions.Select(i => i.OpCode), Does.Not.Contain(CilOpCodes.Ldc_I4));
         Assert.That(instructions.Select(i => i.OpCode), Does.Contain(CilOpCodes.Ceq));
     }
 
@@ -730,9 +732,10 @@ public class IlGeneratorTests
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var source = new LocalVariable("source", new Register(null, "source")) { Type = app.SystemTypes.SystemInt32Type };
-        var dest = new LocalVariable("dest", new Register(null, "dest")); // untyped => object
-        // `dest` also flows to an object-typed call arg, which disqualifies numeric
-        // inference and keeps it an honest object local.
+        var dest = new LocalVariable("dest", new Register(null, "dest")); // untyped
+        // `dest` also flows to an object-typed call arg, which is boxing-compatible
+        // and no longer disqualifies numeric inference: dest emits Int32 and the
+        // box happens at the object-typed call site instead.
         var target = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Take",
             app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
             [app.SystemTypes.SystemObjectType]);
@@ -765,8 +768,10 @@ public class IlGeneratorTests
         Assert.Multiple(() =>
         {
             Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
-            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Box));
-            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Stloc));
+            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Stloc));
+            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+            Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.Box));
+            Assert.That(il[4].OpCode, Is.EqualTo(CilOpCodes.Call));
         });
     }
 
