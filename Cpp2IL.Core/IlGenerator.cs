@@ -4546,6 +4546,13 @@ public static class IlGenerator
             OpCode.Move => definition.Operands[1] is LocalVariable source && aliases.Contains(source),
             OpCode.Phi => definition.Operands.Skip(1)
                 .All(source => source is LocalVariable phi && aliases.Contains(phi)),
+            // alias +/- a constant displacement is still rooted in `this`: a
+            // FieldReference operand asserts its base is the object itself, so
+            // wherever such a local feeds an initonly store the only legal
+            // receiver managed code could have used is ldarg.0.
+            OpCode.Add or OpCode.Subtract => definition.Operands[1] is LocalVariable source
+                && aliases.Contains(source)
+                && definition.Operands.Skip(2).All(operand => operand is Immediate),
             _ => false,
         };
 
