@@ -118,6 +118,8 @@ public static class IlGenerator
         foreach (var local in context.Locals)
         {
             var emittedType = EmittableLocalType(EmittedLocalType(local, context), context);
+            if (System.Environment.GetEnvironmentVariable("CPP2IL_DEBUG_LOCALS") == "1")
+                System.Console.Error.WriteLine($"[local] {context.Name} {local.Name}: core={EmittedLocalTypeCore(local, context)?.GetType().Name}:{EmittedLocalTypeCore(local, context)?.FullName} -> emitted={emittedType.GetType().Name}:{emittedType.FullName}");
             var ilType = emittedType == context.AppContext.SystemTypes.SystemObjectType
                 ? module.CorLibTypeFactory.Object
                 : emittedType == context.AppContext.SystemTypes.SystemBooleanType
@@ -949,6 +951,39 @@ public static class IlGenerator
 
                 // Load normal params
                 var callParamIndex = instruction.OpCode == OpCode.Call ? (targetMethod.IsStatic ? 2 : 3) : (targetMethod.IsStatic ? 1 : 2);
+
+                // A `call` to a delegate .ctor lowers to `newobj` below, so the
+                // function-pointer requirement from the fused allocation path
+                // applies here too; without a resolvable ldftn target the
+                // honest result is a diagnostic and a null delegate.
+                if (ctorReinitReceiver != null || ctorNoReceiver)
+                {
+                    var callCtorArgs = instruction.Operands.Skip(callParamIndex)
+                        .Take(targetMethod.Parameters.Count).ToList();
+                    if (ResolveDelegateConstructor(targetMethod, callCtorArgs, context,
+                            out var callDelegateFailure) is { } callDelegateCtor)
+                    {
+                        targetMethod = callDelegateCtor;
+                        importedMethod = targetMethod.ToMethodDescriptor();
+                    }
+                    else if (callDelegateFailure != null)
+                    {
+                        instructions.Add(CilOpCodes.Ldstr, Diagnostic(callDelegateFailure));
+                        instructions.Add(CilOpCodes.Call, writeLine);
+                        if (ctorReinitReceiver != null)
+                        {
+                            EmitNullOrDefault(StoreContract(ctorReinitReceiver, context), method, instructions, context);
+                            StoreToOperand(ctorReinitReceiver, method, locals, writeLine, context);
+                        }
+                        if (instruction.OpCode == OpCode.Call)
+                        {
+                            EmitNullOrDefault(StoreContract(instruction.Operands[1], context), method, instructions, context);
+                            StoreToOperand(instruction.Operands[1], method, locals, writeLine, context);
+                        }
+                        break;
+                    }
+                }
+
                 // A call whose target was only identified after lifting still carries the operands the
                 // unknown-callee convention gave it, which may be fewer than the method actually takes.
                 // The stack still has to match the signature, so anything missing gets a placeholder.
@@ -2091,17 +2126,31 @@ public static class IlGenerator
         var delegateDefinition = delegateType is GenericInstanceTypeAnalysisContext genericDelegate
             ? genericDelegate.GenericType
             : delegateType;
-        if (!DerivesFromMulticastDelegate(delegateDefinition))
-            return null;
 
-        // A delegate .ctor is only ever (object, native int); anything else the
-        // verifier rejects outright.
+        // A delegate .ctor is only ever (object, native int); any other shape
+        // is an ordinary constructor and keeps the plain emission path.
         if (constructor.Parameters.Count != 2
             || constructor.Parameters[0].ParameterType is { IsValueType: true }
             or ByRefTypeAnalysisContext or PointerTypeAnalysisContext
             || constructor.Parameters[1].ParameterType.FullName is not ("System.IntPtr" or "System.UIntPtr"))
         {
-            failure = $"Unverifiable delegate construction: {delegateType.FullName}.ctor is not (object, native int)";
+            if (DerivesFromMulticastDelegate(delegateDefinition))
+                failure = $"Unverifiable delegate construction: {delegateType.FullName}.ctor is not (object, native int)";
+            return null;
+        }
+        if (!DerivesFromMulticastDelegate(delegateDefinition)
+            && HierarchyResolvesToNonDelegate(delegateDefinition))
+            return null;
+
+        // The function-pointer argument reaches the stack as a method (ldftn)
+        // only for a RuntimeMethodInfo operand; anything else emits a plain
+        // native int the verifier cannot accept - and on a delegate .ctor a
+        // non-method stack value crashes the verifier outright, so this check
+        // has to run even when Invoke itself cannot be resolved.
+        if (constructorArgs.Count < 2
+            || constructorArgs[1] is not RuntimeMethodInfoAnalysisContext { RepresentedMethod: { } represented })
+        {
+            failure = $"Unverifiable delegate construction: {delegateType.FullName} has no resolvable function-pointer target";
             return null;
         }
 
@@ -2113,16 +2162,6 @@ public static class IlGenerator
             // alone because we cannot prove the pairing either way.
             if (delegateDefinition.Methods.Count > 0)
                 failure = $"Unverifiable delegate construction: {delegateType.FullName} has no resolvable Invoke";
-            return null;
-        }
-
-        // The function-pointer argument reaches the stack as a method (ldftn)
-        // only for a RuntimeMethodInfo operand; anything else emits a plain
-        // native int the verifier cannot accept.
-        if (constructorArgs.Count < 2
-            || constructorArgs[1] is not RuntimeMethodInfoAnalysisContext { RepresentedMethod: { } represented })
-        {
-            failure = $"Unverifiable delegate construction: {delegateType.FullName} has no resolvable function-pointer target";
             return null;
         }
 
@@ -2193,6 +2232,27 @@ public static class IlGenerator
         }
 
         return new ConcreteGenericMethodAnalysisContext(baseConstructor, solved, []);
+    }
+
+    // Whether the base chain resolves to a concrete non-delegate root
+    // (System.Object/ValueType/Enum). A chain that ends without reaching one -
+    // the common case for a corlib delegate like Func`2 whose base was never
+    // resolved - is indistinguishable from an actual delegate, so the
+    // function-pointer requirement must still apply: the verifier resolves the
+    // hierarchy from the reference assemblies and crashes on a plain native int.
+    private static bool HierarchyResolvesToNonDelegate(TypeAnalysisContext type)
+    {
+        for (var current = type; current != null;
+             current = current.BaseType ?? (current as GenericInstanceTypeAnalysisContext)?.GenericType.BaseType)
+        {
+            if (current.FullName is "System.MulticastDelegate" or "System.Delegate")
+                return false;
+            if (current.FullName is "System.Object" or "System.ValueType" or "System.Enum")
+                return true;
+            if (current.BaseType == null)
+                return false;
+        }
+        return false;
     }
 
     private static bool DerivesFromMulticastDelegate(TypeAnalysisContext type)
@@ -2423,9 +2483,19 @@ public static class IlGenerator
     private static bool DelegateArgumentsCallerOwned(TypeAnalysisContext type, MethodAnalysisContext context) =>
         type switch
         {
-            GenericParameterTypeAnalysisContext parameter =>
-                ReferenceEquals(parameter.Owner, context.DeclaringType)
-                || ReferenceEquals(parameter.Owner, context),
+            GenericParameterTypeAnalysisContext parameter => parameter.Type switch
+            {
+                // Reference equality alone is not enough: the owner's generic
+                // container must actually cover the index, otherwise the emitted
+                // signature names a slot that does not exist.
+                Il2CppTypeEnum.IL2CPP_TYPE_VAR =>
+                    ReferenceEquals(parameter.Owner, context.DeclaringType)
+                    && parameter.Index < context.DeclaringType.GenericParameters.Count,
+                Il2CppTypeEnum.IL2CPP_TYPE_MVAR =>
+                    ReferenceEquals(parameter.Owner, context)
+                    && parameter.Index < context.GenericParameters.Count,
+                _ => false,
+            },
             SzArrayTypeAnalysisContext array => DelegateArgumentsCallerOwned(array.ElementType, context),
             ArrayTypeAnalysisContext array => DelegateArgumentsCallerOwned(array.ElementType, context),
             WrappedTypeAnalysisContext wrapped => DelegateArgumentsCallerOwned(wrapped.ElementType, context),
@@ -3031,10 +3101,13 @@ public static class IlGenerator
         // A generic parameter is the method's own type variable: ldarg/stloc
         // signatures name it directly, and no placeholder could stand in for it.
         if (type is GenericParameterTypeAnalysisContext)
-            return type;
+            return context == null || DelegateArgumentsCallerOwned(type, context)
+                ? type
+                : context.AppContext.SystemTypes.SystemObjectType;
         if (context?.DeclaringType == null
             || !CanEmitTypeToken(type)
-            || Analysis.InaccessibleCalleeRecovery.IsVisibleType(type, context.DeclaringType))
+            || (Analysis.InaccessibleCalleeRecovery.IsVisibleType(type, context.DeclaringType)
+                && DelegateArgumentsCallerOwned(type, context)))
             return type;
         return type switch
         {
@@ -4198,7 +4271,8 @@ public static class IlGenerator
     private static bool TypeTokenUsableFrom(TypeAnalysisContext? type, MethodAnalysisContext? context) =>
         CanEmitTypeToken(type)
             && (context?.DeclaringType == null
-                || Analysis.InaccessibleCalleeRecovery.IsVisibleType(type, context.DeclaringType));
+                || (Analysis.InaccessibleCalleeRecovery.IsVisibleType(type, context.DeclaringType)
+                    && DelegateArgumentsCallerOwned(type, context)));
 
     private sealed record FieldAddressArithmetic(IOperand Base, TypeAnalysisContext Owner, FieldAnalysisContext Field);
 
