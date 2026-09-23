@@ -15,63 +15,42 @@ internal static class AccessibilityExtensions
             return true;
 
         var declaringTypesHierarchy = referenceType.GetTypeAndDeclaringTypes().ToArray();
-        var inheritsFromIndex = declaringTypesHierarchy.IndexOf(t => referencingType.IsAssignableTo(t));
-        var declaringTypeIndex = Array.IndexOf(declaringTypesHierarchy, referencingType);
-
-        if (referenceType.DeclaringAssembly == referencingType.DeclaringAssembly /*or internals visible*/)
+        var referencingNesting = referencingType.GetTypeAndDeclaringTypes().ToArray();
+        var sameAssembly = referenceType.DeclaringAssembly == referencingType.DeclaringAssembly /*or internals visible*/;
+        if (!sameAssembly
+            && !referenceType.DeclaringAssembly.IsDependencyOf(referencingType.DeclaringAssembly))
         {
-            for (var i = 0; i < declaringTypesHierarchy.Length; i++)
-            {
-                if (i == declaringTypeIndex - 1)
-                {
-                    //All nested classes are accesible to their immediate declaring type.
-                }
-                else if (i == inheritsFromIndex - 1)
-                {
-                    if (declaringTypesHierarchy[i].Visibility is TypeAttributes.NestedPrivate)
-                    {
-                        return false;
-                    }
-                }
-                else
-                {
-                    if (declaringTypesHierarchy[i].Visibility is TypeAttributes.NestedPrivate or TypeAttributes.NestedFamily or TypeAttributes.NestedFamANDAssem)
-                    {
-                        return false;
-                    }
-                }
-            }
-
-            return true;
-        }
-        else if (referenceType.DeclaringAssembly.IsDependencyOf(referencingType.DeclaringAssembly))
-        {
-            for (var i = 0; i < declaringTypesHierarchy.Length; i++)
-            {
-                if (i == declaringTypeIndex - 1)
-                {
-                    //All nested classes are accesible to their immediate declaring type.
-                }
-                else if (i == inheritsFromIndex - 1)
-                {
-                    if (declaringTypesHierarchy[i].Visibility is TypeAttributes.NotPublic or TypeAttributes.NestedPrivate or TypeAttributes.NestedAssembly or TypeAttributes.NestedFamANDAssem)
-                    {
-                        return false;
-                    }
-                }
-                else
-                {
-                    if (declaringTypesHierarchy[i].Visibility is TypeAttributes.NotPublic or TypeAttributes.NestedPrivate or TypeAttributes.NestedFamily or TypeAttributes.NestedAssembly or TypeAttributes.NestedFamANDAssem or TypeAttributes.NestedFamORAssem)
-                    {
-                        return false;
-                    }
-                }
-            }
-
-            return true;
+            return false;
         }
 
-        return false;
+        for (var i = 0; i < declaringTypesHierarchy.Length; i++)
+        {
+            var current = declaringTypesHierarchy[i];
+            var parent = i + 1 < declaringTypesHierarchy.Length ? declaringTypesHierarchy[i + 1] : null;
+            // A type nested inside the member's declaring type is in its friend nest:
+            // it sees the parent's private members, which includes the nested type itself.
+            var withinParent = parent != null && referencingNesting.Contains(parent);
+            var familyToParent = parent != null && (withinParent || referencingType.IsAssignableTo(parent));
+            var visible = parent == null
+                ? sameAssembly || current.Visibility is not TypeAttributes.NotPublic
+                : sameAssembly
+                    ? current.Visibility switch
+                    {
+                        TypeAttributes.NestedPrivate => withinParent,
+                        TypeAttributes.NestedFamily or TypeAttributes.NestedFamANDAssem => familyToParent,
+                        _ => true,
+                    }
+                    : current.Visibility switch
+                    {
+                        TypeAttributes.NestedPublic => true,
+                        TypeAttributes.NestedFamily or TypeAttributes.NestedFamORAssem => referencingType.IsAssignableTo(parent),
+                        _ => false,
+                    };
+            if (!visible)
+                return false;
+        }
+
+        return true;
     }
 
     public static bool IsAssignableTo(this TypeAnalysisContext derivedType, TypeAnalysisContext baseType)
