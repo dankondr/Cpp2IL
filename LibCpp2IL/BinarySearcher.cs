@@ -128,8 +128,8 @@ public class BinarySearcher(Il2CppBinary binary, Il2CppMetadata metadata, int me
 
         if (pMscorlibCodegenEntryInCodegenModulesList.Count == 0)
         {
-            LibLogger.ErrorNewline("\t\t\tNo codegen modules found for mscorlib! Aborting search.");
-            return 0;
+            LibLogger.ErrorNewline("\t\t\tNo codegen modules found for mscorlib! Falling back to direct codegen module array scan.");
+            return FindCodeRegistrationViaModulesArrayScan();
         }
 
         var ptrSize = (binary.is32Bit ? 4u : 8u);
@@ -196,8 +196,8 @@ public class BinarySearcher(Il2CppBinary binary, Il2CppMetadata metadata, int me
                 var unbacktrackedModules = FindCodegenModules(0);
                 if (unbacktrackedModules.Count < 1)
                 {
-                    LibLogger.WarnNewline("Fallback search failed to find a valid pCodegen modules pointer.");
-                    return 0;
+                    LibLogger.WarnNewline("Fallback search failed to find a valid pCodegen modules pointer. Trying direct codegen module array scan.");
+                    return FindCodeRegistrationViaModulesArrayScan();
                 }
                 else
                 {
@@ -249,6 +249,65 @@ public class BinarySearcher(Il2CppBinary binary, Il2CppMetadata metadata, int me
                 LibLogger.VerboseNewline("Looks good!");
                 return address;
             }
+        }
+
+        return FindCodeRegistrationViaModulesArrayScan();
+    }
+
+    private ulong FindCodeRegistrationViaModulesArrayScan()
+    {
+        //Last-resort locator for binaries where the codegen module list cannot be reached from the
+        //mscorlib name chain (seen on ARMv7 Unity 6 binaries): scan the raw binary for a
+        //(count, pointer) pair where the pointer targets an array of pointers to
+        //Il2CppCodeGenModule structs. codeGenModulesCount and addrCodeGenModulePtrs are the final
+        //two fields of Il2CppCodeRegistration, so the registration address follows directly.
+        var raw = binary.GetRawBinaryContent();
+        var ptrSize = binary.is32Bit ? 4 : 8;
+        var maxModules = Math.Max((ulong)metadata.imageDefinitions.Length, 4000);
+
+        for (var offset = 0; offset + 2 * ptrSize <= raw.Length; offset += ptrSize)
+        {
+            var count = binary.is32Bit
+                ? BitConverter.ToUInt32(raw[offset..])
+                : BitConverter.ToUInt64(raw[offset..]);
+
+            if (count < 2 || count > maxModules)
+                continue;
+
+            var arrayVa = binary.is32Bit
+                ? BitConverter.ToUInt32(raw[(offset + ptrSize)..])
+                : BitConverter.ToUInt64(raw[(offset + ptrSize)..]);
+
+            if (!binary.TryMapVirtualAddressToRaw(arrayVa, out _))
+                continue;
+
+            //Validate: the first few array entries point at structs whose first field points
+            //at a "*.dll" module name.
+            var check = (int)Math.Min(count, 3);
+            var valid = 0;
+            for (var i = 0; i < check; i++)
+            {
+                var moduleVa = binary.ReadNUintArrayAtVirtualAddress(arrayVa + (ulong)(i * ptrSize), 1)[0];
+                if (!binary.TryMapVirtualAddressToRaw(moduleVa, out _))
+                    break;
+                var nameVa = binary.ReadNUintArrayAtVirtualAddress(moduleVa, 1)[0];
+                if (!binary.TryMapVirtualAddressToRaw(nameVa, out var nameOff))
+                    break;
+                if (binary.ReadStringToNull(nameOff)?.EndsWith(".dll", StringComparison.Ordinal) == true)
+                    valid++;
+            }
+
+            if (valid < Math.Min(2, check))
+                continue;
+
+            if (!binary.TryMapRawAddressToVirtual((uint)offset, out var countVa))
+                continue;
+
+            var structSize = (ulong)Il2CppCodeRegistration.GetStructSize(binary.is32Bit, metadata.MetadataVersion);
+            var codeReg = countVa - (structSize - (ulong)(2 * ptrSize));
+
+            LibLogger.VerboseNewline($"\t\t\tModules array scan found codeGenModulesCount={count} at 0x{countVa:X} -> pCodeReg = 0x{codeReg:X}");
+            return codeReg;
         }
 
         return 0;

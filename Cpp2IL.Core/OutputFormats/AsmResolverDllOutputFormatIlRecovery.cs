@@ -78,7 +78,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         if (shouldSkip)
         {
             status = "intentional-stub";
-            FillMethodBodyWithStub(methodDefinition);
+            FillMethodBodyWithStub(methodDefinition, methodContext);
             return;
         }
 
@@ -91,7 +91,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             if (methodContext.ConvertedIsil.Count == 0)
             {
                 status = "unresolved";
-                FillMethodBodyWithStub(methodDefinition);
+                FillMethodBodyWithStub(methodDefinition, methodContext);
             }
             else
                 IlGenerator.GenerateIl(methodContext, methodDefinition);
