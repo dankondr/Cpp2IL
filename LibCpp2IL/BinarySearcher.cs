@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
@@ -268,15 +269,15 @@ public class BinarySearcher(Il2CppBinary binary, Il2CppMetadata metadata, int me
         for (var offset = 0; offset + 2 * ptrSize <= raw.Length; offset += ptrSize)
         {
             var count = binary.is32Bit
-                ? BitConverter.ToUInt32(raw[offset..])
-                : BitConverter.ToUInt64(raw[offset..]);
+                ? BinaryPrimitives.ReadUInt32LittleEndian(raw.Slice(offset, 4))
+                : BinaryPrimitives.ReadUInt64LittleEndian(raw.Slice(offset, 8));
 
             if (count < 2 || count > maxModules)
                 continue;
 
             var arrayVa = binary.is32Bit
-                ? BitConverter.ToUInt32(raw[(offset + ptrSize)..])
-                : BitConverter.ToUInt64(raw[(offset + ptrSize)..]);
+                ? BinaryPrimitives.ReadUInt32LittleEndian(raw.Slice(offset + ptrSize, 4))
+                : BinaryPrimitives.ReadUInt64LittleEndian(raw.Slice(offset + ptrSize, 8));
 
             if (!binary.TryMapVirtualAddressToRaw(arrayVa, out _))
                 continue;

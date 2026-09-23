@@ -118,8 +118,6 @@ public static class IlGenerator
         foreach (var local in context.Locals)
         {
             var emittedType = EmittableLocalType(EmittedLocalType(local, context), context);
-            if (System.Environment.GetEnvironmentVariable("CPP2IL_DEBUG_LOCALS") == "1")
-                System.Console.Error.WriteLine($"[local] {context.Name} {local.Name}: core={EmittedLocalTypeCore(local, context)?.GetType().Name}:{EmittedLocalTypeCore(local, context)?.FullName} -> emitted={emittedType.GetType().Name}:{emittedType.FullName}");
             var ilType = emittedType == context.AppContext.SystemTypes.SystemObjectType
                 ? module.CorLibTypeFactory.Object
                 : emittedType == context.AppContext.SystemTypes.SystemBooleanType
