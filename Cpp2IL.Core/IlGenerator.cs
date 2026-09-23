@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Signatures;
@@ -290,6 +291,19 @@ public static class IlGenerator
             instructions.Add(CilOpCodes.Call, writeLine);
             instructions.Add(CilOpCodes.Ldnull);
             instructions.Add(CilOpCodes.Throw);
+
+            // The verifier rejects any push past the declared bound, and the
+            // CilMethodBody default of 0 makes the first push of an otherwise
+            // stack-consistent body report StackOverflow. The honest ceiling is
+            // everything the body can push: an instruction never pushes more than
+            // its opcode's push count, so no path exceeds their sum.
+            body.MaxStack = (int)System.Math.Min(ushort.MaxValue,
+                instructions.Sum(instruction => instruction.OpCode.StackBehaviourPush switch
+                {
+                    CilStackBehaviour.Push0 => 0L,
+                    CilStackBehaviour.Push1_Push1 => 2L,
+                    _ => 1L,
+                }));
         }
     }
 
@@ -405,7 +419,13 @@ public static class IlGenerator
                         break;
                     }
                     if (!field.Field.IsStatic)
-                        LoadOperandIntoSlot(field.Local, FieldBaseContract(field.Field), context, method, locals, writeLine);
+                    {
+                        if (RequiresThisPointerReceiver(field.Field, context)
+                            && ThisAliasLocals(context).Contains(field.Local))
+                            instructions.Add(CilOpCodes.Ldarg_0);
+                        else
+                            LoadOperandIntoSlot(field.Local, FieldBaseContract(field.Field), context, method, locals, writeLine);
+                    }
 
                     LoadOperandIntoSlot(instruction.Operands[1], field.Field.FieldType, context, method, locals, writeLine);
                     instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
@@ -579,15 +599,27 @@ public static class IlGenerator
 
             case OpCode.Call:
             case OpCode.CallVoid:
+                var retargetedBaseConstructor = thisConstructorCalls is not null
+                    && thisConstructorCalls.Retarget.TryGetValue(instruction, out var retargeted)
+                        ? retargeted
+                        : null;
+
                 if (instruction.Operands[0] is not MethodAnalysisContext targetMethod)
                 {
-                    if (instruction.Operands[0] is Immediate targetAddress)
-                        instructions.Add(CilOpCodes.Ldstr, $"Method not found @{targetAddress.UnsignedValue:X}");
-                    else // Probably key function. Just the target, the full operand dump is huge and blows the 16MB #US heap limit
-                        instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Unknown call target operand: {instruction.Operands[0]}"));
+                    // An unresolved call on `this` inside a .ctor can be the lost
+                    // base-init call; ThisConstructorCallPlan re-anchors those to
+                    // the recovered .ctor instead of the usual diagnostic stub.
+                    if (retargetedBaseConstructor == null)
+                    {
+                        if (instruction.Operands[0] is Immediate targetAddress)
+                            instructions.Add(CilOpCodes.Ldstr, $"Method not found @{targetAddress.UnsignedValue:X}");
+                        else // Probably key function. Just the target, the full operand dump is huge and blows the 16MB #US heap limit
+                            instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Unknown call target operand: {instruction.Operands[0]}"));
 
-                    instructions.Add(CilOpCodes.Call, writeLine);
-                    break;
+                        instructions.Add(CilOpCodes.Call, writeLine);
+                        break;
+                    }
+                    targetMethod = retargetedBaseConstructor;
                 }
 
                 if (Analysis.StringConstructorRecovery.Resolve(instruction, targetMethod) is { } stringConstructor)
@@ -608,10 +640,6 @@ public static class IlGenerator
                     break;
                 }
 
-                var retargetedBaseConstructor = thisConstructorCalls is not null
-                    && thisConstructorCalls.Retarget.TryGetValue(instruction, out var retargeted)
-                        ? retargeted
-                        : null;
                 if (retargetedBaseConstructor != null)
                     targetMethod = retargetedBaseConstructor;
 
@@ -1236,15 +1264,21 @@ public static class IlGenerator
                 return null;
 
             List<(Instruction Instruction, MethodAnalysisContext Callee)> calls = [];
+            List<Instruction> unresolvedThisCalls = [];
             foreach (var instruction in context.ControlFlowGraph!.Instructions)
             {
                 if (!instruction.IsCall
-                    || instruction.Operands[0] is not MethodAnalysisContext { IsStatic: false, Name: ".ctor" } callee
                     || instruction.Operands.Count <= ConstructorReceiverIndex(instruction)
                     || instruction.Operands[ConstructorReceiverIndex(instruction)] is not LocalVariable { IsThis: true })
                     continue;
 
-                calls.Add((instruction, callee));
+                if (instruction.Operands[0] is MethodAnalysisContext { IsStatic: false, Name: ".ctor" } callee)
+                    calls.Add((instruction, callee));
+                else if (instruction.Operands[0] is Immediate)
+                    // A call on `this` whose target stayed a raw address: a .ctor's `call`
+                    // on `this` is only ever legal to a .ctor, so this is the init call
+                    // the lifter failed to name.
+                    unresolvedThisCalls.Add(instruction);
             }
 
             List<(Instruction Instruction, MethodAnalysisContext Callee)> distant = [];
@@ -1259,18 +1293,51 @@ public static class IlGenerator
                     distant.Add(call);
             }
 
+            // Re-anchor an unresolved `this` call to the .ctor its operand shape
+            // selects - the recovered target keeps the real arguments, unlike a
+            // synthesized prologue.
+            ThisConstructorCallPlan? RetargetUnresolvedThisCall()
+            {
+                foreach (var call in unresolvedThisCalls)
+                    if (ResolveThisConstructorCall(call, declaringType, immediateBase, context) is { } recovered)
+                    {
+                        var retargeted = new ThisConstructorCallPlan();
+                        retargeted.Retarget[call] = recovered;
+                        return retargeted;
+                    }
+
+                return null;
+            }
+
             if (calls.Count == 0)
             {
+                if (RetargetUnresolvedThisCall() is { } recoveredPlan)
+                    return recoveredPlan;
+
                 // No .ctor call on `this` survived lifting at all (IL2CPP elides the
                 // trivial Object::.ctor chain); the verifier still requires `this`
                 // initialized before ret, so synthesize the honest base-init call
                 // when the immediate base offers a parameterless .ctor.
                 var baseCtor = FindParameterlessBaseConstructor(immediateBase);
-                if (baseCtor == null || !IsAccessibleBaseConstructor(baseCtor, context))
-                    return null;
-                var synthesized = new ThisConstructorCallPlan();
-                synthesized.PrologueCalls.Add((baseCtor, []));
-                return synthesized;
+                if (baseCtor != null && IsAccessibleBaseConstructor(baseCtor, context))
+                {
+                    var synthesized = new ThisConstructorCallPlan();
+                    synthesized.PrologueCalls.Add((baseCtor, []));
+                    return synthesized;
+                }
+
+                // The base has no parameterless .ctor: when it offers exactly one
+                // reachable .ctor the init call is still pinned, and its
+                // unrecoverable arguments take defaults like any other lost operand.
+                if (FindUniqueAccessibleBaseConstructor(immediateBase, context) is { } uniqueCtor)
+                {
+                    var synthesized = new ThisConstructorCallPlan();
+                    synthesized.PrologueCalls.Add((uniqueCtor,
+                        uniqueCtor.Parameters.Select(_ => (IOperand)new Immediate(0)).ToArray()));
+                    return synthesized;
+                }
+
+                return null;
             }
 
             if (distant.Count == 0)
@@ -1293,7 +1360,7 @@ public static class IlGenerator
 
             if (resolved.Count == 0
                 || resolved.Any(r => !SameMethodIdentity(r.Replacement, resolved[0].Replacement)))
-                return null;
+                return RetargetUnresolvedThisCall();
 
             var replacement = resolved[0].Replacement;
             if (replacement.Parameters.Count == 0)
@@ -1353,6 +1420,106 @@ public static class IlGenerator
             }
 
             return match;
+        }
+
+        // The single .ctor the immediate base exposes that the derived .ctor may
+        // name, or null when the choice is not pinned to exactly one.
+        private static MethodAnalysisContext? FindUniqueAccessibleBaseConstructor(TypeAnalysisContext immediateBase,
+            MethodAnalysisContext context)
+        {
+            var genericInstance = immediateBase as GenericInstanceTypeAnalysisContext;
+            var definition = genericInstance?.GenericType ?? immediateBase;
+
+            MethodAnalysisContext? match = null;
+            foreach (var candidate in definition.Methods)
+            {
+                if (candidate is not { IsStatic: false, Name: ".ctor" })
+                    continue;
+
+                var concrete = genericInstance != null
+                    ? new ConcreteGenericMethodAnalysisContext(candidate, genericInstance.GenericArguments, [])
+                        : candidate;
+                // A .ctor the derived type cannot name was never the init call.
+                if (!IsAccessibleBaseConstructor(concrete, context))
+                    continue;
+                if (match != null)
+                    return null;
+                match = concrete;
+            }
+
+            return match;
+        }
+
+        // In a .ctor the only `call` `this` may receive is a constructor call, so an
+        // unresolved call on `this` is the init call whose target the lifter lost.
+        // Recover it by matching the operand shape against the .ctors of the
+        // immediate base and the declaring type: a unique signature match is the
+        // honest callee; ambiguity returns null and keeps the diagnostic stub.
+        private static MethodAnalysisContext? ResolveThisConstructorCall(Instruction call,
+            TypeAnalysisContext declaringType, TypeAnalysisContext immediateBase, MethodAnalysisContext context)
+        {
+            var receiver = ConstructorReceiverIndex(call);
+            var argumentCount = call.Operands.Count - receiver - 1;
+            // A trailing hidden MethodInfo argument rides along on unknown-callee calls.
+            if (argumentCount > 0
+                && call.Operands[^1] is RuntimeMethodInfoAnalysisContext
+                    or LocalVariable { IsMethodInfo: true }
+                    or LocalVariable { Type: RuntimeMethodInfoAnalysisContext })
+                argumentCount--;
+
+            MethodAnalysisContext? match = null;
+            foreach (var owner in new[] { immediateBase, declaringType })
+            {
+                var ownerInstance = owner as GenericInstanceTypeAnalysisContext;
+                var ownerDefinition = ownerInstance?.GenericType ?? owner;
+                var sibling = SameTypeIdentity(ownerDefinition,
+                    (declaringType as GenericInstanceTypeAnalysisContext)?.GenericType ?? declaringType);
+
+                foreach (var candidate in ownerDefinition.Methods)
+                {
+                    if (candidate is not { IsStatic: false, Name: ".ctor" }
+                        || candidate.Parameters.Count != argumentCount
+                        || ReferenceEquals(candidate, context)
+                        || SameMethodIdentity(candidate, context))
+                        continue;
+
+                    var concrete = ownerInstance != null
+                        ? new ConcreteGenericMethodAnalysisContext(candidate, ownerInstance.GenericArguments, [])
+                        : candidate;
+
+                    // A sibling .ctor is always nameable from its own type; a base
+                    // .ctor must be reachable from the derived constructor.
+                    if (!sibling && !IsAccessibleBaseConstructor(concrete, context))
+                        continue;
+
+                    if (!CallArgumentsSatisfy(call, receiver, concrete, context))
+                        continue;
+
+                    if (match != null)
+                        return null; // two legal targets - resolving would be a guess
+
+                    match = concrete;
+                }
+            }
+
+            return match;
+        }
+
+        // Every operand the call still carries must be able to feed the candidate's
+        // parameter in that slot; an untyped operand cannot disqualify, a mistyped
+        // one can.
+        private static bool CallArgumentsSatisfy(Instruction call, int receiver,
+            MethodAnalysisContext constructor, MethodAnalysisContext context)
+        {
+            for (var i = 0; i < constructor.Parameters.Count; i++)
+            {
+                var parameterType = constructor.Parameters[i].ParameterType;
+                var emitted = EmittedOperandType(call.Operands[receiver + 1 + i], context, parameterType);
+                if (emitted != null && !LooseAssignable(emitted, parameterType))
+                    return false;
+            }
+
+            return true;
         }
 
         // A derived .ctor may always name its direct base .ctor on `this`: family
@@ -3787,14 +3954,88 @@ public static class IlGenerator
             field.Name, new FieldSignature(field.ToTypeSignature()));
     }
 
+    // stfld on an initonly instance field only verifies when the receiver is the
+    // literal `this` pointer (ILVerify requires actualThis.IsThisPtr) - a copy of
+    // `this` parked in an ordinary local does not qualify even though it holds the
+    // same object.
+    private static bool RequiresThisPointerReceiver(FieldAnalysisContext field, MethodAnalysisContext context) =>
+        (field.Attributes & FieldAttributes.InitOnly) != 0
+        && context.Name == ".ctor"
+        && field.DeclaringType != null && context.DeclaringType != null
+        && ThisConstructorCallPlan.SameTypeIdentity(GenericDefinition(field.DeclaringType),
+            GenericDefinition(context.DeclaringType));
+
+    // Locals that provably only ever hold `this`: every one of their definitions is
+    // a move or phi whose sources are themselves this-aliases. Loading such a local
+    // as ldarg.0 is semantics-preserving and satisfies the IsThisPtr rule. Cached per
+    // method because GenerateIl runs per method body, potentially in parallel.
+    private static readonly ConditionalWeakTable<MethodAnalysisContext, HashSet<LocalVariable>> ThisAliasCache = new();
+
+    private static HashSet<LocalVariable> ThisAliasLocals(MethodAnalysisContext context) =>
+        ThisAliasCache.GetValue(context, ComputeThisAliasLocals);
+
+    private static HashSet<LocalVariable> ComputeThisAliasLocals(MethodAnalysisContext context)
+    {
+        var aliases = new HashSet<LocalVariable>();
+        var instructions = context.ControlFlowGraph?.Instructions;
+        if (instructions == null)
+            return aliases;
+
+        var definitions = new Dictionary<LocalVariable, List<Instruction>>();
+        foreach (var instruction in instructions)
+            if (instruction.Destination is LocalVariable destination)
+            {
+                if (!definitions.TryGetValue(destination, out var list))
+                    definitions[destination] = list = [];
+                list.Add(instruction);
+            }
+
+        // `this` itself is the root alias - but only while it is never written:
+        // if a this-local is ever the destination of another value, copies made
+        // earlier hold a different object than a fresh ldarg.0 would read.
+        foreach (var local in context.Locals)
+            if (local.IsThis && !definitions.ContainsKey(local))
+                aliases.Add(local);
+
+        var changed = true;
+        while (changed)
+        {
+            changed = false;
+            foreach (var pair in definitions)
+            {
+                if (aliases.Contains(pair.Key))
+                    continue;
+                if (pair.Value.All(definition => CopiesOnlyAliases(definition, aliases)))
+                {
+                    aliases.Add(pair.Key);
+                    changed = true;
+                }
+            }
+        }
+
+        return aliases;
+    }
+
+    private static bool CopiesOnlyAliases(Instruction definition, HashSet<LocalVariable> aliases) =>
+        definition.OpCode switch
+        {
+            OpCode.Move => definition.Operands[1] is LocalVariable source && aliases.Contains(source),
+            OpCode.Phi => definition.Operands.Skip(1)
+                .All(source => source is LocalVariable phi && aliases.Contains(phi)),
+            _ => false,
+        };
+
     private static bool FieldUsableFrom(FieldAnalysisContext field, MethodAnalysisContext context,
         bool writeAccess = false)
     {
         if (!CanEmitFieldToken(field))
             return false;
         var attrs = field.Attributes;
+        // The verifier splits initonly writes by storage class: stsfld belongs to
+        // the field's .cctor, stfld to the field's own .ctor (and through `this`
+        // itself - see RequiresThisPointerReceiver).
         if (writeAccess && (attrs & FieldAttributes.InitOnly) != 0
-            && !(context.Name is ".ctor" or ".cctor"
+            && !((field.IsStatic ? context.Name is ".cctor" : context.Name is ".ctor")
                 && field.DeclaringType != null && context.DeclaringType != null
                 && ThisConstructorCallPlan.SameTypeIdentity(GenericDefinition(field.DeclaringType),
                     GenericDefinition(context.DeclaringType))))
@@ -3973,8 +4214,12 @@ public static class IlGenerator
                 method.CilMethodBody!.LocalVariables.Add(scratch);
 
                 instructions.Add(CilOpCodes.Stloc, scratch);
-                LoadOperandIntoSlot(field.Local, FieldBaseContract(field.Field), context,
-                    method, locals, writeLine);
+                if (RequiresThisPointerReceiver(field.Field, context)
+                    && ThisAliasLocals(context).Contains(field.Local))
+                    instructions.Add(CilOpCodes.Ldarg_0);
+                else
+                    LoadOperandIntoSlot(field.Local, FieldBaseContract(field.Field), context,
+                        method, locals, writeLine);
                 instructions.Add(CilOpCodes.Ldloc, scratch);
                 instructions.Add(CilOpCodes.Stfld, fieldDescriptor);
                 break;

@@ -328,13 +328,16 @@ public class IlGeneratorTests
         var module = new ModuleDefinition("InvalidStack.dll");
         var type = new TypeDefinition("Tests", "InvalidStack", TypeAttributes.Public | TypeAttributes.Class);
         module.TopLevelTypes.Add(type);
-        // A non-void signature with an empty return stack must not acquire a guessed bound.
+        // A non-void signature with an empty return stack gets no recovered value.
         var method = new MethodDefinition("Invalid", MethodAttributes.Public | MethodAttributes.Static,
             MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32));
         type.Methods.Add(method);
         IlGenerator.GenerateIl(caller, method);
         Assert.That(method.CilMethodBody!.Instructions[0].OpCode, Is.EqualTo(CilOpCodes.Ret));
-        Assert.That(method.CilMethodBody.MaxStack, Is.EqualTo(0));
+        // The verifier compares pushes against the declared bound, so a failed stack
+        // analysis still declares the provable ceiling - the body's total pushes -
+        // rather than a guessed bound or a 0 nothing can satisfy.
+        Assert.That(method.CilMethodBody.MaxStack, Is.GreaterThanOrEqualTo(1));
         Assert.That(caller.AnalysisWarnings.Any(w => w.Contains("Invalid reconstructed IL stack")), Is.True);
         Assert.That(method.CilMethodBody.Instructions.Any(i => i.Operand is string s && s.Contains("Invalid reconstructed IL stack")), Is.True);
         Assert.That(method.CilMethodBody.Instructions[^1].OpCode, Is.EqualTo(CilOpCodes.Throw));
