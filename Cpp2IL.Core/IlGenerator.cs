@@ -434,7 +434,7 @@ public static class IlGenerator
                     && referent is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext or GenericParameterTypeAnalysisContext)
                     && store.AccessSize == context.AppContext.Binary.PointerSizeBytes)
                 {
-                    LoadLocal(address, method, locals);
+                    LoadLocal(address, method, locals, context);
                     LoadOperandIntoSlot(instruction.Operands[1], referent, context, method, locals, writeLine);
                     instructions.Add(CilOpCodes.Stind_Ref);
                     break;
@@ -802,6 +802,16 @@ public static class IlGenerator
                             EmittedOperandType(instruction.Operands[thisParamIndex], context))
                         ?? targetMethod;
 
+                // The rest of the shared-generic erasure is recovered the same
+                // way: the callee's open signature is matched against the types
+                // the receiver, parameter and result operands actually emit, so
+                // `PersistentMap<object,object>::op_Inequality` fed by a
+                // PersistentMap<string,AssetObject> local and a `T Get()` stored
+                // into a Dictionary both name the instantiation the native code
+                // ran with.
+                targetMethod = SolveSharedGenericArguments(targetMethod, instruction, context, thisParamIndex)
+                    ?? targetMethod;
+
                 // IL2CPP leaves direct calls to corlib members managed code could never name: the
                 // internal slow paths of inlined BCL operations (List<T>.AddWithResize, private
                 // Math.ThrowMinMaxException) or shared-generic instantiations over non-public
@@ -809,10 +819,12 @@ public static class IlGenerator
                 // leave a diagnostic stub rather than a reference the verifier rejects. The check
                 // runs after every retarget: the receiver's own instantiation is what the emitted
                 // member reference actually names.
-                if (!Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(targetMethod, context))
+                if (!Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(targetMethod, context)
+                    || !Analysis.InaccessibleCalleeRecovery.SatisfiesDeclaredConstraints(targetMethod))
                 {
                     if (Analysis.InaccessibleCalleeRecovery.TrySubstitute(targetMethod) is { } accessibleCallee
-                        && Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(accessibleCallee, context))
+                        && Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(accessibleCallee, context)
+                        && Analysis.InaccessibleCalleeRecovery.SatisfiesDeclaredConstraints(accessibleCallee))
                         targetMethod = accessibleCallee;
                     else
                     {
@@ -1230,10 +1242,25 @@ public static class IlGenerator
                         instructions.Add(CilOpCodes.Ldflda, resolvedField.ToFieldDescriptor());
                         fieldResult = fieldContract;
                     }
-                    else
+                    else if (fieldContract == null
+                        || StackContractSatisfied(resolvedField.FieldType, fieldContract, context))
                     {
                         instructions.Add(CilOpCodes.Ldfld, resolvedField.ToFieldDescriptor());
                         fieldResult = resolvedField.FieldType;
+                    }
+                    else
+                    {
+                        // `base+offset` computes the field's address; a contract that can
+                        // hold neither &F nor F itself (an object slot for a pointer
+                        // field) has no honest value. The base operand is already on
+                        // the stack, so drop it before the default.
+                        instructions.Add(CilOpCodes.Pop);
+                        instructions.Add(CilOpCodes.Ldstr,
+                            Diagnostic($"Unrepresentable field address: {resolvedField}"));
+                        instructions.Add(CilOpCodes.Call, writeLine);
+                        PushDefaultOf(fieldContract, method, instructions, context);
+                        StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
+                        break;
                     }
                     CoerceOrDefault(fieldResult, fieldContract, method, context);
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
@@ -1593,9 +1620,15 @@ public static class IlGenerator
                 // late in the body while earlier instructions read `this` as a
                 // value. When the call is the only one and its arguments are live
                 // from the first slot (immediates and parameters), hoist it to a
-                // prologue - the position managed code always runs it in.
+                // prologue - the position managed code always runs it in. The same
+                // hoist applies when the call sits behind a guard some `ret` path
+                // bypasses: arguments that are not live at entry emit their default,
+                // the recovered operand shape the call carried anyway.
                 if (calls.Count == 1 && hasLegalInitialization
-                    && PrologueArguments(calls[0].Instruction, calls[0].Callee, context) is { } initArguments)
+                    && (PrologueArguments(calls[0].Instruction, calls[0].Callee, context) is { } initArguments
+                        || (!InitCallDominatesAllReturns(calls[0].Instruction, context)
+                            && (initArguments = PrologueArguments(calls[0].Instruction, calls[0].Callee, context,
+                                allowDefaults: true)) != null)))
                 {
                     var hoisted = new ThisConstructorCallPlan();
                     hoisted.Skip.Add(calls[0].Instruction);
@@ -1691,20 +1724,43 @@ public static class IlGenerator
             return plan;
         }
 
-        private static IOperand[]? PrologueArguments(Instruction call, MethodAnalysisContext replacement,
-            MethodAnalysisContext context)
+        private static IOperand?[]? PrologueArguments(Instruction call, MethodAnalysisContext replacement,
+            MethodAnalysisContext context, bool allowDefaults = false)
         {
             var receiver = ConstructorReceiverIndex(call);
             if (call.Operands.Count < receiver + 1 + replacement.Parameters.Count)
                 return null;
 
-            var arguments = call.Operands.Skip(receiver + 1).Take(replacement.Parameters.Count).ToArray();
-            return arguments.All(a => a switch
-            {
-                Immediate or StringLiteral or FloatLiteral or DoubleLiteral or TypeAnalysisContext => true,
-                LocalVariable local => !local.IsThis && !local.IsMethodInfo && context.ParameterLocals.Contains(local),
-                _ => false,
-            }) ? arguments : null;
+            var arguments = call.Operands.Skip(receiver + 1).Take(replacement.Parameters.Count)
+                .Select(a => a switch
+                {
+                    Immediate or StringLiteral or FloatLiteral or DoubleLiteral or TypeAnalysisContext => a,
+                    LocalVariable local when !local.IsThis && !local.IsMethodInfo
+                        && context.ParameterLocals.Contains(local) => a,
+                    _ => null,
+                }).ToArray();
+            return allowDefaults || arguments.All(a => a != null) ? arguments : null;
+        }
+
+        // A base-init call the verifier honours only covers the `ret`s its block
+        // dominates; a guard can leave a path that reaches `ret` with `this` still
+        // uninitialized.
+        private static bool InitCallDominatesAllReturns(Instruction call, MethodAnalysisContext context)
+        {
+            var graph = context.ControlFlowGraph;
+            var dominators = context.DominatorInfo;
+            if (graph == null || dominators == null)
+                return true; // no basis to judge - keep the call in place
+
+            var callBlock = graph.Blocks.FirstOrDefault(block => block.Instructions.Contains(call));
+            if (callBlock == null)
+                return true;
+
+            foreach (var block in graph.Blocks)
+                if (block.Instructions.Any(instruction => instruction.OpCode == OpCode.Return)
+                    && !dominators.Dominates(callBlock, block))
+                    return false;
+            return true;
         }
 
         private static MethodAnalysisContext? FindParameterlessBaseConstructor(TypeAnalysisContext immediateBase)
@@ -1960,7 +2016,9 @@ public static class IlGenerator
             var baseConstructor = constructor is ConcreteGenericMethodAnalysisContext concrete
                 ? concrete.BaseMethodContext
                 : constructor;
-            return new ConcreteGenericMethodAnalysisContext(baseConstructor, destination.GenericArguments, []);
+            var methodArguments = (constructor as ConcreteGenericMethodAnalysisContext)?.MethodGenericParameters
+                ?? (IReadOnlyList<TypeAnalysisContext>)[];
+            return new ConcreteGenericMethodAnalysisContext(baseConstructor, destination.GenericArguments, methodArguments);
         }
 
         private static bool SameMethodIdentity(MethodAnalysisContext a, MethodAnalysisContext b)
@@ -2025,6 +2083,168 @@ public static class IlGenerator
 
         return null;
     }
+
+    // Shared generics erase the callee's instantiation arguments to System.Object at
+    // the call site, but the operand types carry the instantiation the native code
+    // actually ran: the callee's open signature is matched against the emitted
+    // types of the parameter operands and the declared type of the result slot.
+    // Only provably-erased arguments (System.Object or an open parameter) are
+    // replaced - a concrete argument from metadata is already authoritative.
+    private static MethodAnalysisContext? SolveSharedGenericArguments(
+        MethodAnalysisContext targetMethod, Instruction instruction, MethodAnalysisContext context, int thisParamIndex)
+    {
+        var open = (targetMethod as ConcreteGenericMethodAnalysisContext)?.BaseMethodContext ?? targetMethod;
+        var declaringInstance = targetMethod.DeclaringType as GenericInstanceTypeAnalysisContext;
+        var typeArguments = declaringInstance?.GenericArguments.ToArray();
+        var methodArguments = (targetMethod as ConcreteGenericMethodAnalysisContext)?.MethodGenericParameters.ToArray();
+        if (typeArguments == null && methodArguments == null)
+            return null;
+
+        var changed = false;
+        // The verifier checks `this` against the callee's constructed declaring
+        // type, so for an instance call the type arguments are pinned by what the
+        // receiver operand emits (RetargetToDestinationInstantiation already
+        // re-anchors to it). Solving them further from the result contract would
+        // retarget the callee past the receiver - List<object>::get_Item fed by
+        // a List<object> local must stay List<object>::get_Item. A static callee
+        // names no receiver, so its instantiation is free to be sharpened from
+        // any operand evidence.
+        var maySolveTypeArguments = targetMethod.IsStatic;
+        void Solve(TypeAnalysisContext? pattern, TypeAnalysisContext? concrete)
+        {
+            if (pattern == null || concrete == null)
+                return;
+            switch (pattern)
+            {
+                case GenericParameterTypeAnalysisContext { Type: Il2CppTypeEnum.IL2CPP_TYPE_VAR } typeParameter
+                    when maySolveTypeArguments && typeArguments != null && typeParameter.Index < typeArguments.Length:
+                    if (IsErasedSharedArgument(typeArguments[typeParameter.Index])
+                        && concrete is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+                            or GenericParameterTypeAnalysisContext)
+                        && !ThisConstructorCallPlan.SameTypeIdentity(typeArguments[typeParameter.Index], concrete))
+                    {
+                        typeArguments[typeParameter.Index] = concrete;
+                        changed = true;
+                    }
+                    break;
+                case GenericParameterTypeAnalysisContext { Type: Il2CppTypeEnum.IL2CPP_TYPE_MVAR } methodParameter
+                    when methodArguments != null && methodParameter.Index < methodArguments.Length:
+                    if (IsErasedSharedArgument(methodArguments[methodParameter.Index])
+                        && concrete is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+                            or GenericParameterTypeAnalysisContext)
+                        && !ThisConstructorCallPlan.SameTypeIdentity(methodArguments[methodParameter.Index], concrete))
+                    {
+                        methodArguments[methodParameter.Index] = concrete;
+                        changed = true;
+                    }
+                    break;
+                case ByRefTypeAnalysisContext byRef:
+                    Solve(byRef.ElementType,
+                        concrete is ByRefTypeAnalysisContext concreteByRef ? concreteByRef.ElementType : concrete);
+                    break;
+                case PointerTypeAnalysisContext pointer when concrete is PointerTypeAnalysisContext concretePointer:
+                    Solve(pointer.ElementType, concretePointer.ElementType);
+                    break;
+                case GenericInstanceTypeAnalysisContext patternInstance
+                    when concrete is GenericInstanceTypeAnalysisContext concreteInstance
+                        && ThisConstructorCallPlan.SameTypeIdentity(patternInstance.GenericType, concreteInstance.GenericType)
+                        && patternInstance.GenericArguments.Count == concreteInstance.GenericArguments.Count:
+                    for (var k = 0; k < patternInstance.GenericArguments.Count; k++)
+                        Solve(patternInstance.GenericArguments[k], concreteInstance.GenericArguments[k]);
+                    break;
+            }
+        }
+
+        var parameterOperandStart = thisParamIndex + (targetMethod.IsStatic ? 0 : 1);
+        for (var i = 0; i < open.Parameters.Count && parameterOperandStart + i < instruction.Operands.Count; i++)
+        {
+            var operand = instruction.Operands[parameterOperandStart + i];
+            // Hidden shared-generic channels (MethodInfo*/klass*/rgctx) can sit in a
+            // parameter slot; their emitted nint is not the argument's type.
+            if (operand is RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext
+                or RuntimeClassTypeAnalysisContext or RgctxTableTypeAnalysisContext
+                or MethodRgctxTableTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext)
+                continue;
+            Solve(open.Parameters[i].ParameterType, EmittedOperandType(operand, context));
+        }
+
+        if (instruction.OpCode == OpCode.Call && instruction.Operands.Count > 1)
+            Solve(open.ReturnType, StoreContract(instruction.Operands[1], context));
+
+        if (!changed)
+            return null;
+
+        // Every parameter the call feeds must still match once the solved
+        // arguments are substituted in: a second operand disagreeing with the
+        // instantiation the first one selected would emit a call whose own
+        // argument list the verifier rejects. Unresolved slots stay erased and
+        // impose no constraint.
+        for (var i = 0; i < open.Parameters.Count && parameterOperandStart + i < instruction.Operands.Count; i++)
+        {
+            var operand = instruction.Operands[parameterOperandStart + i];
+            if (operand is RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext
+                or RuntimeClassTypeAnalysisContext or RgctxTableTypeAnalysisContext
+                or MethodRgctxTableTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext)
+                continue;
+            if (!OperandMatchesSolvedPattern(open.Parameters[i].ParameterType,
+                    EmittedOperandType(operand, context), typeArguments, methodArguments))
+                return null;
+        }
+
+        var solvedTypeArguments = typeArguments ?? (targetMethod as ConcreteGenericMethodAnalysisContext)!.TypeGenericParameters;
+        return new ConcreteGenericMethodAnalysisContext(open, solvedTypeArguments, methodArguments ?? []);
+    }
+
+    // Whether the emitted operand type still satisfies the open parameter pattern
+    // after the shared-generic solve: every generic parameter the pattern spells
+    // out must resolve to exactly the type the operand carries.
+    private static bool OperandMatchesSolvedPattern(TypeAnalysisContext pattern,
+        TypeAnalysisContext? concrete, TypeAnalysisContext[]? typeArguments,
+        TypeAnalysisContext[]? methodArguments)
+    {
+        if (concrete == null)
+            return true;
+        switch (pattern)
+        {
+            case GenericParameterTypeAnalysisContext { Type: Il2CppTypeEnum.IL2CPP_TYPE_VAR } typeParameter
+                when typeArguments != null && typeParameter.Index < typeArguments.Length:
+                return SlotAccepts(typeArguments[typeParameter.Index]);
+            case GenericParameterTypeAnalysisContext { Type: Il2CppTypeEnum.IL2CPP_TYPE_MVAR } methodParameter
+                when methodArguments != null && methodParameter.Index < methodArguments.Length:
+                return SlotAccepts(methodArguments[methodParameter.Index]);
+            case GenericParameterTypeAnalysisContext:
+                return true;
+            case ByRefTypeAnalysisContext byRef:
+                return concrete is ByRefTypeAnalysisContext concreteByRef
+                    && OperandMatchesSolvedPattern(byRef.ElementType, concreteByRef.ElementType,
+                        typeArguments, methodArguments);
+            case PointerTypeAnalysisContext pointer:
+                return concrete is PointerTypeAnalysisContext concretePointer
+                    && OperandMatchesSolvedPattern(pointer.ElementType, concretePointer.ElementType,
+                        typeArguments, methodArguments);
+            case GenericInstanceTypeAnalysisContext patternInstance:
+                return concrete is GenericInstanceTypeAnalysisContext concreteInstance
+                    && ThisConstructorCallPlan.SameTypeIdentity(patternInstance.GenericType, concreteInstance.GenericType)
+                    && patternInstance.GenericArguments.Count == concreteInstance.GenericArguments.Count
+                    && patternInstance.GenericArguments.Zip(concreteInstance.GenericArguments,
+                        (p, c) => OperandMatchesSolvedPattern(p, c, typeArguments, methodArguments)).All(match => match);
+            default:
+                return ThisConstructorCallPlan.SameTypeIdentity(pattern, concrete)
+                    || concrete.IsAssignableTo(pattern);
+        }
+
+        // An unsolved slot still emits its erased argument (object), which any
+        // operand feeds legally; a solved one is the parameter type verbatim, so
+        // the operand must be assignable to it.
+        bool SlotAccepts(TypeAnalysisContext solved) =>
+            IsErasedSharedArgument(solved)
+            || ThisConstructorCallPlan.SameTypeIdentity(solved, concrete)
+            || concrete.IsAssignableTo(solved);
+    }
+
+    private static bool IsErasedSharedArgument(TypeAnalysisContext argument) =>
+        argument is GenericParameterTypeAnalysisContext
+        || argument.FullName is "System.Object" or "System.ValueType";
 
     // The original call site had access to the .ctor, but the re-anchored candidate sits on a
     // different (concrete) type, so its own accessibility must hold from the emitting method -
@@ -2706,10 +2926,20 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldstr, s.Value);
                 break;
             case LocalVariable local:
-                LoadLocal(local, method, locals);
+                LoadLocal(local, method, locals, callingContext);
                 break;
             case ReferenceCast referenceCast:
-                if (!TypeTokenUsableFrom(referenceCast.Type, callingContext))
+                var castTarget = referenceCast.Type;
+                var castValueType = EmittedOperandType(referenceCast.Value, callingContext);
+                // A cast to the canonical shared instantiation is the lifter
+                // mistyping the object; the instance the native code held is the
+                // value's own instantiation.
+                if (castTarget is GenericInstanceTypeAnalysisContext erasedCast
+                    && erasedCast.GenericArguments.Any(IsErasedSharedArgument)
+                    && castValueType is GenericInstanceTypeAnalysisContext valueInstance
+                    && ThisConstructorCallPlan.SameTypeIdentity(valueInstance.GenericType, erasedCast.GenericType))
+                    castTarget = valueInstance;
+                if (!TypeTokenUsableFrom(castTarget, callingContext))
                 {
                     // The target type cannot be named here (e.g. a shared-generic
                     // instantiation over a corlib-internal marker); a cast token for it
@@ -2717,11 +2947,13 @@ public static class IlGenerator
                     // target type.
                     instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Inaccessible cast target: {referenceCast.Type.FullName}"));
                     instructions.Add(CilOpCodes.Call, writeLine);
-                    PushDefaultOf(referenceCast.Type, method, instructions, callingContext);
+                    PushDefaultOf(castTarget, method, instructions, callingContext);
                     break;
                 }
-                LoadLocal(referenceCast.Value, method, locals);
-                instructions.Add(CilOpCodes.Castclass, referenceCast.Type.ToTypeSignature().ToTypeDefOrRef());
+                LoadLocal(referenceCast.Value, method, locals, callingContext);
+                // A cast to the value's own type verifies without the opcode.
+                if (!ThisConstructorCallPlan.SameTypeIdentity(castValueType, castTarget))
+                    instructions.Add(CilOpCodes.Castclass, castTarget.ToTypeSignature().ToTypeDefOrRef());
                 break;
             case ArrayLength arrayLength:
                 LoadArrayBase(arrayLength.Array, method, locals, callingContext);
@@ -2813,7 +3045,7 @@ public static class IlGenerator
                         PushDefaultOf(referent, method, instructions, callingContext);
                         break;
                     }
-                    LoadLocal((LocalVariable)memory.Base!, method, locals);
+                    LoadLocal((LocalVariable)memory.Base!, method, locals, callingContext);
                     instructions.Add(referent switch
                     {
                         PointerTypeAnalysisContext or ByRefTypeAnalysisContext => new CilInstruction(CilOpCodes.Ldind_I),
@@ -2999,7 +3231,7 @@ public static class IlGenerator
             .CreateMemberReference("GetType", MethodSignature.CreateInstance(
                 module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "Type").ToTypeSignature(false)));
 
-        LoadLocal(objLocal, method, locals);
+        LoadLocal(objLocal, method, locals, context);
         // GetType is a reference-type member: a generic or value-typed operand
         // reaches it only through box.
         CoerceOrDefault(EmittedLocalType(objLocal, context), context?.AppContext.SystemTypes.SystemObjectType, method, context);
@@ -3194,15 +3426,69 @@ public static class IlGenerator
     // recovered type the caller cannot name (e.g. a generic instantiation over a
     // corlib-internal marker) is declared object/int instead, and every contract
     // check has to see that emitted type rather than the unnameable analysis one.
-    private static TypeAnalysisContext EmittedLocalType(LocalVariable local, MethodAnalysisContext context) =>
-        EmittableLocalType(EmittedLocalTypeCore(local, context), context);
+    // A local tagged with the canonical shared instantiation
+    // (PersistentMap<object,object>) is recovered from the instantiation its
+    // definitions actually produce - a call's instantiated return, or the value
+    // a mistyped cast was applied to.
+    private static TypeAnalysisContext? SharpenedLocalInstanceType(
+        LocalVariable local, GenericInstanceTypeAnalysisContext erasedInstance,
+        MethodAnalysisContext context, HashSet<LocalVariable> visited)
+    {
+        if (!visited.Add(local) || context.ControlFlowGraph == null)
+            return null;
+        foreach (var instruction in context.ControlFlowGraph.Instructions)
+        {
+            if (!ReferenceEquals(instruction.Destination, local))
+                continue;
+            foreach (var produced in ProducedInstanceTypes(instruction, context, visited))
+                if (produced is GenericInstanceTypeAnalysisContext producedInstance
+                    && ThisConstructorCallPlan.SameTypeIdentity(producedInstance.GenericType, erasedInstance.GenericType)
+                    && !producedInstance.GenericArguments.Any(IsErasedSharedArgument))
+                    return producedInstance;
+        }
+        return null;
+    }
 
-    private static TypeAnalysisContext EmittedLocalTypeCore(LocalVariable local, MethodAnalysisContext context)
+    private static IEnumerable<TypeAnalysisContext> ProducedInstanceTypes(
+        Instruction instruction, MethodAnalysisContext context, HashSet<LocalVariable> visited)
+    {
+        if (instruction.Operands is [MethodAnalysisContext callee, ..] && !callee.IsVoid)
+            yield return callee.ReturnType;
+        foreach (var operand in instruction.Operands.Skip(1))
+        {
+            switch (operand)
+            {
+                case ReferenceCast referenceCast:
+                    yield return EmittedOperandType(referenceCast.Value, context);
+                    break;
+                case LocalVariable source:
+                    // EmittedOperandType would recurse through the same sharpening
+                    // with a fresh visited-set; keep the cycle guard instead.
+                    yield return source.Type is GenericInstanceTypeAnalysisContext sourceInstance
+                        && sourceInstance.GenericArguments.Any(IsErasedSharedArgument)
+                        ? SharpenedLocalInstanceType(source, sourceInstance, context, visited)
+                        : source.Type;
+                    break;
+                default:
+                    yield return EmittedOperandType(operand, context);
+                    break;
+            }
+        }
+    }
+
+    private static TypeAnalysisContext EmittedLocalType(LocalVariable local, MethodAnalysisContext context) =>
+        EmittableLocalType(EmittedLocalTypeCore(local, context, []), context);
+
+    private static TypeAnalysisContext EmittedLocalTypeCore(LocalVariable local, MethodAnalysisContext context, HashSet<LocalVariable> visited)
     {
         // `ldarg` always pushes the declared parameter type: when the lifter tagged the
         // parameter local with a different type (register reuse packs a Vector3 arg onto a
         // later parameter register) the declared signature is what the verifier sees.
+        // The match is by the parameter's own register local - a scratch local that
+        // merely shares a parameter's name (`v2 @ X8` vs parameter `v2 @ V3`) is not
+        // the argument and keeps its own type.
         if (!local.IsThis && !local.IsMethodInfo
+            && context.ParameterLocals.Contains(local)
             && context.Parameters.FirstOrDefault(p => p.ParameterName == local.Name) is { } parameter)
             return IsNativeHandleType(parameter.ParameterType)
                 ? context.AppContext.SystemTypes.SystemIntPtrType
@@ -3220,7 +3506,17 @@ public static class IlGenerator
             return thisType.IsValueType ? new ByRefTypeAnalysisContext(thisType) : thisType;
         }
         if (local.Type != null && local.Type != context.AppContext.SystemTypes.SystemVoidType)
+        {
+            // Shared-generic erasure can tag a local with the canonical
+            // PersistentMap<object,object> instantiation while the values that
+            // actually reach it carry the concrete one; recover the local's type
+            // from its definitions so downstream consumers stay consistent.
+            if (local.Type is GenericInstanceTypeAnalysisContext erasedInstance
+                && erasedInstance.GenericArguments.Any(IsErasedSharedArgument)
+                && SharpenedLocalInstanceType(local, erasedInstance, context, visited) is { } sharpened)
+                return sharpened;
             return IsNativeHandleType(local.Type) ? context.AppContext.SystemTypes.SystemIntPtrType : local.Type;
+        }
         if (context.DeclaringType is { } declaringType
             && !context.IsStatic && ReferenceEquals(local, context.ParameterLocals.FirstOrDefault()))
             return declaringType.IsValueType ? new ByRefTypeAnalysisContext(declaringType) : declaringType;
@@ -3565,6 +3861,21 @@ public static class IlGenerator
         var declared = destination is LocalVariable { IsThis: true }
             ? null
             : DestinationType(destination);
+        // A shared-generic erased instantiation (List<object>) is not the local
+        // the emitted body declares when sharpening recovered the concrete one;
+        // the contract must agree with the declaration or the store coerces the
+        // operand into a type the slot does not accept.
+        if (declared is GenericInstanceTypeAnalysisContext declaredInstance
+            && declaredInstance.GenericArguments.Any(IsErasedSharedArgument)
+            && destination is LocalVariable destinationLocal
+            && EmittedLocalType(destinationLocal, context) is GenericInstanceTypeAnalysisContext
+                {
+                    GenericType: { } sharpenedDefinition,
+                    GenericArguments: { } sharpenedArguments
+                } sharpenedContract
+            && ThisConstructorCallPlan.SameTypeIdentity(sharpenedDefinition, declaredInstance.GenericType)
+            && !sharpenedArguments.Any(IsErasedSharedArgument))
+            return sharpenedContract;
         if (declared != null)
             return declared;
         return destination switch
@@ -4106,6 +4417,17 @@ public static class IlGenerator
         bool convertByRef = false)
     {
         var emitted = EmittedOperandType(operand, context, contract);
+        if (operand is LocalVariable { IsThis: true }
+            && contract is { IsValueType: true }
+            && emitted is { IsValueType: false } and not PointerTypeAnalysisContext and not ByRefTypeAnalysisContext)
+        {
+            // `this` in a value slot is native pointer math on the receiver - a class
+            // `this` is never a boxed value, so even after initialization the load
+            // has no honest managed form; before the base .ctor runs it is also an
+            // uninitialized read.
+            PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context);
+            return;
+        }
         if (contract == null || StackContractSatisfied(emitted, contract, context, convertByRef))
         {
             LoadOperand(operand, method, locals, writeLine, contract, context);
@@ -4860,7 +5182,7 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldarg_0);
                 return true;
             case LocalVariable local:
-                var parameter = method.Parameters.FirstOrDefault(p => p.Name == local.Name);
+                var parameter = ParameterForLocal(local, method, context);
                 if (EmittedLocalType(local, context) is { IsValueType: false })
                 {
                     if (parameter != null)
@@ -4906,11 +5228,27 @@ public static class IlGenerator
     private static void LoadArrayBase(LocalVariable array, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, MethodAnalysisContext context)
     {
-        LoadLocal(array, method, locals);
+        LoadLocal(array, method, locals, context);
         CoerceOrDefault(EmittedLocalType(array, context), array.Type, method, context);
     }
 
-    private static void LoadLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
+    // A scratch local can share a parameter's name (register reuse: `v2 @ X8` the
+    // float[] local vs `v2 @ V3` the Single parameter). Only a local that actually
+    // is the parameter's register local loads through ldarg; anything else is ldloc.
+    private static AsmResolver.DotNet.Collections.Parameter? ParameterForLocal(LocalVariable local, MethodDefinition method, MethodAnalysisContext context)
+    {
+        if (!context.ParameterLocals.Contains(local))
+            return null;
+        return context.Parameters.FirstOrDefault(p => p.ParameterName == local.Name) is { } analysisParameter
+            ? method.Parameters.FirstOrDefault(p => p.Name == analysisParameter.ParameterName)
+            // Injected and partially-resolved contexts may not carry parameter
+            // names; the local is still the argument's register local, so fall
+            // back to the declared parameter name.
+            : method.Parameters.FirstOrDefault(p => p.Name == local.Name);
+    }
+
+    private static void LoadLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals,
+        MethodAnalysisContext context)
     {
         var instructions = method.CilMethodBody!.Instructions;
 
@@ -4920,7 +5258,7 @@ public static class IlGenerator
             return;
         }
 
-        var parameter = method.Parameters.FirstOrDefault(p => p.Name == local.Name);
+        var parameter = ParameterForLocal(local, method, context);
 
         if (parameter != null)
             instructions.Add(CilOpCodes.Ldarg, parameter);

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
 using LibCpp2IL.Metadata;
 
 namespace Cpp2IL.Core.Extensions;
@@ -106,9 +107,39 @@ internal static class AccessibilityExtensions
         var current = derivedType;
         while (current != null)
         {
-            if (current == baseType)
+            // Context objects for the same metadata type are not guaranteed
+            // identical (generic instances are rebuilt on demand), so compare
+            // the full name which carries the instantiation arguments too.
+            if (current == baseType
+                || current is not GenericParameterTypeAnalysisContext
+                && baseType is not GenericParameterTypeAnalysisContext
+                && current.FullName == baseType.FullName
+                // B<int> is-a B: an instantiation's own definition is its base
+                // even though the instantiating FullName never equals it.
+                || current is GenericInstanceTypeAnalysisContext { GenericType: { } currentDefinition }
+                && baseType is not GenericParameterTypeAnalysisContext
+                && (currentDefinition == baseType || currentDefinition.FullName == baseType.FullName))
                 return true;
-            current = current.BaseType;
+            // A generic instance's own BaseType can stay unresolved (built
+            // before the definition's base was), so continue the walk through
+            // the open definition's base. That base still mentions the
+            // definition's parameters (`ModProcessorBase<T>`), so it is bound
+            // through the instance's arguments first - same as the interface
+            // walk below.
+            var next = current.BaseType
+                ?? (current as GenericInstanceTypeAnalysisContext)?.GenericType.BaseType;
+            if (next != null && current is GenericInstanceTypeAnalysisContext instance)
+            {
+                try
+                {
+                    next = GenericInstantiation.Instantiate(next, instance.GenericArguments, []);
+                }
+                catch
+                {
+                    // malformed base instantiations keep the open form.
+                }
+            }
+            current = next;
         }
 
         return false;
@@ -116,16 +147,66 @@ internal static class AccessibilityExtensions
 
     private static bool IsAssignableToInterface(this TypeAnalysisContext derivedType, TypeAnalysisContext baseInterface)
     {
-        if (derivedType == baseInterface)
+        // Interface contexts are not reference-unique either, and an interface
+        // instance (`IEnumerable<int>`) only equals an identical instantiation -
+        // the open definition or different arguments must not match it. Generic
+        // parameters are excluded: unrelated `T`s share the same name.
+        if (derivedType == baseInterface
+            || derivedType is not GenericParameterTypeAnalysisContext
+            && baseInterface is not GenericParameterTypeAnalysisContext
+            && derivedType.FullName == baseInterface.FullName)
+            return true;
+        if (baseInterface is not GenericInstanceTypeAnalysisContext
+            && derivedType is GenericInstanceTypeAnalysisContext { GenericType: { } interfaceDefinition }
+            && interfaceDefinition.FullName == baseInterface.FullName)
             return true;
 
-        foreach (var @interface in derivedType.InterfaceContexts)
+        // Generic instances carry no interface list of their own; the set is a
+        // property of the generic definition, whose entries still mention its
+        // parameters - `List<int>` implements `IEnumerable<T>`, so the entries
+        // are instantiated with the instance's arguments.
+        var interfaces = derivedType.InterfaceContexts;
+        if (derivedType is GenericInstanceTypeAnalysisContext instance)
+        {
+            if (interfaces.Count == 0)
+                interfaces = instance.GenericType.InterfaceContexts;
+            interfaces = interfaces.Select(i =>
+            {
+                try
+                {
+                    return GenericInstantiation.Instantiate(i, instance.GenericArguments, []);
+                }
+                catch
+                {
+                    return i;
+                }
+            }).ToList();
+        }
+
+        foreach (var @interface in interfaces)
         {
             if (@interface.IsAssignableToInterface(baseInterface))
                 return true;
         }
 
-        return false;
+        // Interfaces are inherited: a type satisfies the interface its base
+        // class implements even when its own list does not repeat it. For a
+        // generic instance the base still mentions the definition's parameters,
+        // so it is instantiated with the instance's arguments first.
+        var baseType = derivedType.BaseType
+            ?? (derivedType as GenericInstanceTypeAnalysisContext)?.GenericType.BaseType;
+        if (baseType != null && derivedType is GenericInstanceTypeAnalysisContext baseInstance)
+        {
+            try
+            {
+                baseType = GenericInstantiation.Instantiate(baseType, baseInstance.GenericArguments, []);
+            }
+            catch
+            {
+                // malformed base instantiations keep the open form.
+            }
+        }
+        return baseType != null && baseType.IsAssignableToInterface(baseInterface);
     }
 
     /// <summary>

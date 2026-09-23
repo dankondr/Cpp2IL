@@ -74,6 +74,35 @@ internal static class InaccessibleCalleeRecovery
     }
 
     /// <summary>
+    /// Whether every generic argument the concrete callee carries satisfies the
+    /// constraint its open declaration declares. An erased shared-generic
+    /// argument (object) can leave an instantiation no honest type fulfils -
+    /// such a call cannot be named at all and must be stubbed.
+    /// </summary>
+    internal static bool SatisfiesDeclaredConstraints(MethodAnalysisContext callee)
+    {
+        if (callee is not ConcreteGenericMethodAnalysisContext concrete)
+            return true;
+
+        var typeArguments = concrete.TypeGenericParameters;
+        var methodArguments = concrete.MethodGenericParameters;
+        var baseDeclaring = concrete.BaseMethodContext.DeclaringType;
+        if (baseDeclaring != null)
+            for (var i = 0; i < baseDeclaring.GenericParameters.Count && i < typeArguments.Count; i++)
+                if (!Utils.AsmResolver.ContextToMethodDescriptor.SatisfiesConstraints(
+                        typeArguments[i], baseDeclaring.GenericParameters[i], typeArguments, methodArguments))
+                    return false;
+
+        var genericParameters = concrete.BaseMethodContext.GenericParameters;
+        for (var i = 0; i < genericParameters.Count && i < methodArguments.Count; i++)
+            if (!Utils.AsmResolver.ContextToMethodDescriptor.SatisfiesConstraints(
+                    methodArguments[i], genericParameters[i], typeArguments, methodArguments))
+                return false;
+
+        return true;
+    }
+
+    /// <summary>
     /// The honest public callee for a corlib-internal helper, if one performs the same operation.
     /// <c>List&lt;T&gt;.AddWithResize</c> is the slow path of <c>List&lt;T&gt;.Add</c> — IL2CPP
     /// inlines the capacity check and leaves a direct call to it, so <c>Add</c> is the faithful

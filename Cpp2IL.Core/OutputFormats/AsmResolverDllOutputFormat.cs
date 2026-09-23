@@ -50,7 +50,61 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
     private static void EnsureStubVerifiable(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
     {
         EnsureInitLocals(methodDefinition);
+        EnsureOutParameterStores(methodDefinition);
         EnsureCtorInitialized(methodDefinition, methodContext);
+    }
+
+    // The minimal-implementation stub writes `ldnull; stind.ref` through every
+    // byref parameter. That is only verifiable when the pointee is a managed
+    // reference: pointer and IntPtr slots take `stind.i`, value-type slots take
+    // `initobj`. Rewrite the stores the signature's own element type demands.
+    private static void EnsureOutParameterStores(MethodDefinition methodDefinition)
+    {
+        if (methodDefinition is not { CilMethodBody: { } body, Signature: { } signature })
+            return;
+        var instructions = body.Instructions;
+        var thisSlot = signature.HasThis ? 1 : 0;
+        for (var i = 0; i + 2 < instructions.Count; i++)
+        {
+            var argumentIndex = instructions[i].OpCode.Code switch
+            {
+                CilCode.Ldarg_0 => 0,
+                CilCode.Ldarg_1 => 1,
+                CilCode.Ldarg_2 => 2,
+                CilCode.Ldarg_3 => 3,
+                CilCode.Ldarg or CilCode.Ldarg_S => instructions[i].Operand is ushort argIndex
+                    ? argIndex
+                    : instructions[i].Operand is int wideIndex ? wideIndex : -1,
+                _ => -1,
+            };
+            var paramIndex = argumentIndex - thisSlot;
+            if (paramIndex < 0
+                || instructions[i + 1].OpCode != CilOpCodes.Ldnull
+                || instructions[i + 2].OpCode != CilOpCodes.Stind_Ref
+                || paramIndex >= signature.ParameterTypes.Count
+                || signature.ParameterTypes[paramIndex] is not ByReferenceTypeSignature { BaseType: { } elementType }
+                // Managed-reference pointees already verify as `ldnull; stind.ref`;
+                // everything else needs the store its element type demands.
+                || (!elementType.IsValueType
+                    && elementType is not (PointerTypeSignature or ByReferenceTypeSignature
+                        or FunctionPointerTypeSignature)
+                    && elementType.FullName is not ("System.IntPtr" or "System.UIntPtr")))
+                continue;
+
+            if (elementType.IsValueType && elementType.FullName is not ("System.IntPtr" or "System.UIntPtr"))
+            {
+                instructions[i + 1] = new CilInstruction(CilOpCodes.Nop);
+                instructions[i + 2] = new CilInstruction(CilOpCodes.Initobj, elementType.ToTypeDefOrRef());
+            }
+            else
+            {
+                // Native-pointer-sized zero: ldc.i4.0; conv.i; stind.i.
+                instructions[i + 1] = new CilInstruction(CilOpCodes.Ldc_I4_0);
+                instructions[i + 2] = new CilInstruction(CilOpCodes.Stind_I);
+                instructions.Insert(i + 2, new CilInstruction(CilOpCodes.Conv_I));
+                i++;
+            }
+        }
     }
 
     private static void EnsureCtorInitialized(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
