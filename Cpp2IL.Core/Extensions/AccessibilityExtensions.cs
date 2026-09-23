@@ -9,6 +9,15 @@ namespace Cpp2IL.Core.Extensions;
 
 internal static class AccessibilityExtensions
 {
+    /// <summary>
+    /// Set by the il-recovery output format while assemblies are being emitted:
+    /// every generated assembly carries InternalsVisibleTo to its siblings
+    /// (il2cpp dropped the original attributes), so emission-time access gates
+    /// answer for the friend scope that will actually exist in the output.
+    /// Analysis-time callers leave it unset and keep the raw metadata answer.
+    /// </summary>
+    internal static bool EmittedInternalsAreShared;
+
     public static bool IsAccessibleTo(this TypeAnalysisContext referenceType, TypeAnalysisContext referencingType)
     {
         if (referenceType == referencingType)
@@ -16,7 +25,8 @@ internal static class AccessibilityExtensions
 
         var declaringTypesHierarchy = referenceType.GetTypeAndDeclaringTypes().ToArray();
         var referencingNesting = referencingType.GetTypeAndDeclaringTypes().ToArray();
-        var sameAssembly = referenceType.DeclaringAssembly == referencingType.DeclaringAssembly /*or internals visible*/;
+        var sameAssembly = referenceType.DeclaringAssembly == referencingType.DeclaringAssembly
+            || SharesEmittedInternals(referenceType.DeclaringAssembly, referencingType.DeclaringAssembly);
         if (!sameAssembly
             && !referenceType.DeclaringAssembly.IsDependencyOf(referencingType.DeclaringAssembly))
         {
@@ -117,6 +127,18 @@ internal static class AccessibilityExtensions
 
         return false;
     }
+
+    /// <summary>
+    /// Whether two assemblies share internal scope in emitted output: same
+    /// assembly, or two real metadata assemblies, since every generated
+    /// assembly carries InternalsVisibleTo to its siblings (il2cpp dropped the
+    /// original attributes). Covers `internal` and the Assem half of
+    /// FamANDAssem/FamORAssem; private members never cross the boundary.
+    /// </summary>
+    internal static bool SharesEmittedInternals(AssemblyAnalysisContext? a, AssemblyAnalysisContext? b) =>
+        ReferenceEquals(a, b)
+        || (a != null && b != null && (a.Name == b.Name
+            || (EmittedInternalsAreShared && a.Definition != null && b.Definition != null)));
 
     private static bool IsDependencyOf(this AssemblyAnalysisContext referencedAssembly, AssemblyAnalysisContext referencingAssembly)
     {

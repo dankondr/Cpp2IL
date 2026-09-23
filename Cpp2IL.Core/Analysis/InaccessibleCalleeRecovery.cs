@@ -40,7 +40,8 @@ internal static class InaccessibleCalleeRecovery
             var declaring = concrete.BaseMethodContext.DeclaringType;
             if (declaring is not null)
             {
-                var sameAssembly = ReferenceEquals(callerType.DeclaringAssembly, declaring.DeclaringAssembly);
+                var sameAssembly = ReferenceEquals(callerType.DeclaringAssembly, declaring.DeclaringAssembly)
+                    || Extensions.AccessibilityExtensions.SharesEmittedInternals(callerType.DeclaringAssembly, declaring.DeclaringAssembly);
                 var memberVisible = (callee.Attributes & MethodAttributes.MemberAccessMask) switch
                 {
                     MethodAttributes.Public => true,

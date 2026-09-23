@@ -40,14 +40,79 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 
         IlGenerator.InjectHelpersType(context);
 
-        var assemblies = base.BuildAssemblies(context);
+        // The emission-time access gates must answer for the friend scope
+        // RestoreInternalsVisibleTo creates below, not for the raw metadata.
+        AccessibilityExtensions.EmittedInternalsAreShared = true;
+        try
+        {
+            var assemblies = base.BuildAssemblies(context);
+            foreach (var assembly in assemblies)
+                foreach (var module in assembly.Modules)
+                {
+                    RecoveryModuleIdentity.Assign(module, buildIdentity);
+                    RelocateLargeStrings(module);
+                }
+            RestoreInternalsVisibleTo(assemblies);
+            return assemblies;
+        }
+        finally
+        {
+            AccessibilityExtensions.EmittedInternalsAreShared = false;
+        }
+    }
+
+    // il2cpp metadata does not preserve assembly-level attributes, so recovered
+    // assemblies lose the InternalsVisibleTo grants the originals compiled
+    // against - Unity package internals cross assembly boundaries constantly
+    // (internal types in fields, methods, casts). The verifier resolves the real
+    // hierarchy and rejects those references as invisible. Restoring the grant
+    // for every sibling assembly recreates the access shape the binary actually
+    // had - the il2cpp runtime never enforced .NET visibility anyway.
+    private static void RestoreInternalsVisibleTo(List<AssemblyDefinition> assemblies)
+    {
+        // Strong-named friends must be listed with their full public key or
+        // the runtime and ILVerify treat the InternalsVisibleTo grant as not
+        // matching - il2cpp kept Unity's keypair-signed public keys.
+        var friends = assemblies
+            .Where(a => a.Name is not null)
+            .Select(FriendName)
+            .Distinct()
+            .ToList();
         foreach (var assembly in assemblies)
-            foreach (var module in assembly.Modules)
+        {
+            var module = assembly.Modules.FirstOrDefault();
+            if (module == null || assembly.Name is null)
+                continue;
+            var factory = module.CorLibTypeFactory;
+            var ivtCtor = factory.CorLibScope
+                .CreateTypeReference("System.Runtime.CompilerServices", "InternalsVisibleToAttribute")
+                .CreateMemberReference(".ctor",
+                    MethodSignature.CreateInstance(factory.Void, [factory.String]));
+            var self = assembly.Name.ToString() + ",";
+            foreach (var friend in friends)
             {
-                RecoveryModuleIdentity.Assign(module, buildIdentity);
-                RelocateLargeStrings(module);
+                if (friend.StartsWith(self, StringComparison.Ordinal))
+                    continue;
+                var signature = new CustomAttributeSignature(
+                    new CustomAttributeArgument(factory.String, friend));
+                assembly.CustomAttributes.Add(new CustomAttribute(ivtCtor, signature));
             }
-        return assemblies;
+        }
+    }
+
+    private static string FriendName(AssemblyDefinition friend)
+    {
+        var name = friend.Name!.ToString();
+        if (friend.PublicKey is not { Length: > 0 } publicKey)
+            return name;
+        var hex = new char[publicKey.Length * 2];
+        const string digits = "0123456789abcdef";
+        for (var i = 0; i < publicKey.Length; i++)
+        {
+            hex[i * 2] = digits[publicKey[i] >> 4];
+            hex[i * 2 + 1] = digits[publicKey[i] & 0xf];
+        }
+        return name + ", PublicKey=" + new string(hex);
     }
 
     private const int StringHeapSoftLimit = 14 * 1024 * 1024;

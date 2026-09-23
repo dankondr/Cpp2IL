@@ -451,8 +451,13 @@ public static class IlGenerator
                     }
                     if (!field.Field.IsStatic)
                     {
+                        // Same rule as the recovery stfld path: inside the
+                        // declaring .ctor `this` is the only legal initonly
+                        // receiver regardless of whether the local provably
+                        // aliases it.
                         if (RequiresThisPointerReceiver(field.Field, context)
-                            && ThisAliasLocals(context).Contains(field.Local))
+                            && (field.Local is null or LocalVariable
+                                || ThisAliasLocals(context).Contains(field.Local)))
                             instructions.Add(CilOpCodes.Ldarg_0);
                         else
                             LoadOperandIntoSlot(field.Local, FieldBaseContract(field.Field), context, method, locals, writeLine);
@@ -900,8 +905,20 @@ public static class IlGenerator
                                     || (isOwnThis && thisEmitted != null && thisTarget != null
                                         && !StackAssignableTo(thisEmitted, thisTarget)))
                                 {
-                                    // An unmanaged pointer to the struct is already a legal receiver.
-                                    if (thisEmitted is not PointerTypeAnalysisContext)
+                                    // An unmanaged pointer is not a legal receiver: T* is
+                                    // a native int to the verifier, never the &T or object
+                                    // reference `this` needs, and no conversion forges a
+                                    // managed pointer from a raw address. Drop it and offer
+                                    // the honest fallback - the unique local of the struct
+                                    // type, or a fresh default &T.
+                                    if (thisEmitted is PointerTypeAnalysisContext)
+                                    {
+                                        instructions.Add(CilOpCodes.Pop);
+                                        if (structCallee == null
+                                            || !EmitFallbackStructReceiver(structCallee, context, method, locals))
+                                            PushDefaultOf(thisTarget, method, instructions, context);
+                                    }
+                                    else
                                         CoerceOrDefault(thisEmitted, thisTarget, method, context);
                                 }
                             }
@@ -1065,6 +1082,7 @@ public static class IlGenerator
                     && targetMethod.DeclaringType is { IsSealed: false }
                     && !isOwnThis;
                 instructions.Add(!targetMethod.IsStatic && retargetedBaseConstructor == null
+                        && structCallee == null
                         && (instruction.IsVirtualDispatch || targetMethod.DeclaringType?.IsInterface == true
                             || directCallToVirtual)
                     ? CilOpCodes.Callvirt
@@ -1569,7 +1587,23 @@ public static class IlGenerator
             }
 
             if (distant.Count == 0)
+            {
+                // Managed source runs the base .ctor before anything else touches
+                // `this`, but the inlined chain can leave the surviving legal call
+                // late in the body while earlier instructions read `this` as a
+                // value. When the call is the only one and its arguments are live
+                // from the first slot (immediates and parameters), hoist it to a
+                // prologue - the position managed code always runs it in.
+                if (calls.Count == 1 && hasLegalInitialization
+                    && PrologueArguments(calls[0].Instruction, calls[0].Callee, context) is { } initArguments)
+                {
+                    var hoisted = new ThisConstructorCallPlan();
+                    hoisted.Skip.Add(calls[0].Instruction);
+                    hoisted.PrologueCalls.Add((calls[0].Callee, initArguments));
+                    return hoisted;
+                }
                 return null;
+            }
 
             var plan = new ThisConstructorCallPlan();
             if (hasLegalInitialization)
@@ -1604,7 +1638,27 @@ public static class IlGenerator
             }
 
             if (resolved.Count == 0)
-                return RetargetUnresolvedThisCall();
+            {
+                if (RetargetUnresolvedThisCall() is { } retargetedPlan)
+                    return retargetedPlan;
+
+                // No distant call could be re-anchored and no unresolved `this`
+                // call could be shape-matched; `this` still has to be initialized
+                // before ret, so fall back to the closest reachable base .ctor and
+                // drop the distant calls the verifier must reject.
+                var fallbackCtor = FindParameterlessBaseConstructor(immediateBase);
+                if (fallbackCtor == null
+                    || !IsAccessibleBaseConstructor(fallbackCtor, context)
+                    || !Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(fallbackCtor, context))
+                    fallbackCtor = FindAccessibleBaseConstructor(immediateBase, -1, context)
+                        ?? FindUniqueAccessibleBaseConstructor(immediateBase, context);
+                if (fallbackCtor == null)
+                    return null;
+                foreach (var (instruction, _) in distant)
+                    plan.Skip.Add(instruction);
+                plan.PrologueCalls.Add((fallbackCtor, new IOperand?[fallbackCtor.Parameters.Count]));
+                return plan;
+            }
 
             // Distant calls with no reachable base .ctor are inlined-chain remnants;
             // once `this` is initialized by the retargeted calls they only re-run
@@ -1713,11 +1767,15 @@ public static class IlGenerator
         {
             var receiver = ConstructorReceiverIndex(call);
             var argumentCount = call.Operands.Count - receiver - 1;
-            // A trailing hidden MethodInfo argument rides along on unknown-callee calls.
+            // A trailing hidden MethodInfo or rgctx-table argument rides along on
+            // unknown-callee calls (generic instantiations carry the rgctx slot
+            // after the real arguments).
             if (argumentCount > 0
                 && call.Operands[^1] is RuntimeMethodInfoAnalysisContext
                     or LocalVariable { IsMethodInfo: true }
-                    or LocalVariable { Type: RuntimeMethodInfoAnalysisContext })
+                    or LocalVariable { Type: RuntimeMethodInfoAnalysisContext }
+                    or MemoryOperand { Base: LocalVariable { Type: RgctxTableTypeAnalysisContext
+                        or MethodRgctxTableTypeAnalysisContext } })
                 argumentCount--;
 
             MethodAnalysisContext? match = null;
@@ -1790,10 +1848,15 @@ public static class IlGenerator
             var sameAssembly = constructor.DeclaringType?.DeclaringAssembly != null
                 && ReferenceEquals(caller.DeclaringType?.DeclaringAssembly,
                     constructor.DeclaringType.DeclaringAssembly);
+            // Emitted siblings share InternalsVisibleTo, so internal .ctors cross
+            // the assembly boundary; private ones still do not.
+            var assemblyScope = sameAssembly
+                || Extensions.AccessibilityExtensions.SharesEmittedInternals(
+                    caller.DeclaringType?.DeclaringAssembly, constructor.DeclaringType?.DeclaringAssembly);
             return access switch
             {
                 MethodAttributes.FamORAssem => true,
-                MethodAttributes.Assembly or MethodAttributes.FamANDAssem => sameAssembly,
+                MethodAttributes.Assembly or MethodAttributes.FamANDAssem => assemblyScope,
                 // Emission relaxes same-assembly member definitions to public; a
                 // constructed (generic) base keeps its declared access, so the
                 // IsVisibleFrom check stays the gate for those.
@@ -1975,7 +2038,8 @@ public static class IlGenerator
         if (declaring == null || caller == null)
             return true; // no metadata basis to judge the access
 
-        var sameAssembly = ReferenceEquals(caller.DeclaringAssembly, declaring.DeclaringAssembly);
+        var sameAssembly = ReferenceEquals(caller.DeclaringAssembly, declaring.DeclaringAssembly)
+            || Extensions.AccessibilityExtensions.SharesEmittedInternals(caller.DeclaringAssembly, declaring.DeclaringAssembly);
         var memberVisible = (candidate.Attributes & MethodAttributes.MemberAccessMask) switch
         {
             MethodAttributes.Public => true,
@@ -3730,6 +3794,20 @@ public static class IlGenerator
             fromWidth = -1;
         }
 
+        // `&T` into a native-int or unmanaged-pointer slot is the pinned-address
+        // idiom, but no verifiable IL converts `&` to `*`/nint - conv.* reject
+        // managed pointers outright (ECMA III.1.5 keeps the conversion
+        // unverifiable). The honest emission drops the address and defaults
+        // the slot - the same placeholder an unresolvable operand gets -
+        // instead of fabricating a value-as-pointer or leaving a raw `&`.
+        if (from is ByRefTypeAnalysisContext
+            && to is PointerTypeAnalysisContext or { FullName: "System.IntPtr" or "System.UIntPtr" })
+        {
+            instructions.Add(CilOpCodes.Pop);
+            PushDefaultOf(to, method, instructions, context);
+            return true;
+        }
+
         // A managed pointer read back as a value is an honest dereference: ldobj
         // for value elements, ldind.ref for references. Neither deref finishes
         // the job by itself - the value on the stack is still the element type,
@@ -4705,6 +4783,7 @@ public static class IlGenerator
         var declaring = field.DeclaringType;
         if (declaring == null || callerType == null)
             return true;
+
         // Member references keep declared accessibility everywhere: the field's own
         // signature type, the declaring type it names, and - when the reference is
         // emitted on the receiver's instantiation - the receiver's type arguments.
@@ -4719,8 +4798,8 @@ public static class IlGenerator
             declaring = declaringInstance.GenericType;
         if (callerType is GenericInstanceTypeAnalysisContext callerInstance)
             callerType = callerInstance.GenericType;
-        var sameAssembly = ReferenceEquals(callerType.DeclaringAssembly, declaring.DeclaringAssembly)
-            || callerType.DeclaringAssembly?.Name == declaring.DeclaringAssembly?.Name;
+        var sameAssembly = Extensions.AccessibilityExtensions.SharesEmittedInternals(
+            callerType.DeclaringAssembly, declaring.DeclaringAssembly);
         var sameType = ThisConstructorCallPlan.SameTypeIdentity(declaring, callerType);
         return (attrs & FieldAttributes.FieldAccessMask) switch
         {
@@ -4890,8 +4969,12 @@ public static class IlGenerator
                 method.CilMethodBody!.LocalVariables.Add(scratch);
 
                 instructions.Add(CilOpCodes.Stloc, scratch);
+                // Same rule as the MoveAssign stfld path: an initonly store inside the
+                // field's own .ctor only verifies through `this`, which is the receiver
+                // valid managed source could only have used.
                 if (RequiresThisPointerReceiver(field.Field, context)
-                    && ThisAliasLocals(context).Contains(field.Local))
+                    && (field.Local is null or LocalVariable
+                        || ThisAliasLocals(context).Contains(field.Local)))
                     instructions.Add(CilOpCodes.Ldarg_0);
                 else
                     LoadOperandIntoSlot(field.Local, FieldBaseContract(field.Field), context,
