@@ -494,19 +494,36 @@ public static class IlGenerator
                     constructor = Analysis.AllocationConstructorRecovery.Resolve(instruction, constructor) ?? constructor;
                     constructor = ThisConstructorCallPlan.RetargetToDestinationInstantiation(constructor, allocatedDestination)
                         ?? constructor;
-                    // The resolved .ctor can sit on an abstract declaring type when the
-                    // allocation was mistyped as a base; newobj on abstract is illegal, so
-                    // re-anchor to the concrete destination type's matching .ctor.
-                    if (constructor.DeclaringType is { IsAbstract: true }
-                        && allocatedDestination is { IsAbstract: false } concreteType)
+                    // The resolved .ctor can sit on an abstract declaring type when IL2CPP
+                    // inlined the derived .ctor's forwarding body - the paired call then names
+                    // the abstract base even though object_new was given the concrete class.
+                    // newobj on an abstract type is illegal, so re-anchor to a matching .ctor
+                    // on a concrete type: the class operand object_new was invoked with is the
+                    // honest allocated type, then the store destination. When neither proves a
+                    // concrete type the allocation cannot be reproduced honestly - emit a
+                    // diagnostic and the destination's default rather than an unverifiable
+                    // newobj.
+                    if (constructor.DeclaringType is { IsAbstract: true })
                     {
-                        var concreteCtor = concreteType.Methods.FirstOrDefault(m =>
-                            m is { IsStatic: false, Name: ".ctor" }
-                            && m.Parameters.Count == constructor.Parameters.Count
-                            && m.Parameters.Zip(constructor.Parameters,
-                                (x, y) => ThisConstructorCallPlan.SameTypeIdentity(x.ParameterType, y.ParameterType)).All(z => z));
-                        if (concreteCtor != null)
-                            constructor = concreteCtor;
+                        var concreteCtor = (AllocatedClassOperand(context, instruction) is { IsAbstract: false } allocatedClass
+                                ? MatchingConcreteConstructor(allocatedClass, constructor, context)
+                                : null)
+                            ?? (allocatedDestination is { IsAbstract: false } concreteDestination
+                                ? MatchingConcreteConstructor(concreteDestination, constructor, context)
+                                : null);
+                        if (concreteCtor == null)
+                        {
+                            instructions.Add(CilOpCodes.Ldstr, Diagnostic(
+                                $"Cannot construct abstract type {constructor.DeclaringType.FullName}: allocation's concrete type could not be recovered"));
+                            instructions.Add(CilOpCodes.Call, writeLine);
+                            EmitNullOrDefault(allocatedDestination, method, instructions);
+                            StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
+
+                            constructorCall.OpCode = OpCode.Nop;
+                            constructorCall.SetOperands();
+                            break;
+                        }
+                        constructor = concreteCtor;
                     }
                     // Operands run [ctor, newObject, arguments..., methodInfo], so take only as many as
                     // the constructor declares (i.e. drop methodInfo)
@@ -548,6 +565,24 @@ public static class IlGenerator
                     // Nothing to fuse with, so the allocation was self-contained. The type is still right, so construct it bare.
                     parameterlessCtor = ThisConstructorCallPlan.RetargetToDestinationInstantiation(parameterlessCtor, allocatedDestination)
                         ?? parameterlessCtor;
+                    // An abstract allocated type can never be constructed honestly; when a
+                    // concrete destination offers the matching .ctor re-anchor to it, else
+                    // emit the diagnostic and the destination's default.
+                    if (parameterlessCtor.DeclaringType is { IsAbstract: true })
+                    {
+                        if (allocatedDestination is { IsAbstract: false } selfContainedDestination
+                            && MatchingConcreteConstructor(selfContainedDestination, parameterlessCtor, context) is { } reanchored)
+                            parameterlessCtor = reanchored;
+                        else
+                        {
+                            instructions.Add(CilOpCodes.Ldstr, Diagnostic(
+                                $"Cannot construct abstract type {parameterlessCtor.DeclaringType.FullName}: allocation's concrete type could not be recovered"));
+                            instructions.Add(CilOpCodes.Call, writeLine);
+                            EmitNullOrDefault(allocatedDestination, method, instructions);
+                            StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
+                            break;
+                        }
+                    }
                     instructions.Add(CilOpCodes.Newobj, parameterlessCtor.ToMethodDescriptor());
                     EmitStackCoerceOrDefault(parameterlessCtor.DeclaringType ?? allocatedType,
                         StoreContract(instruction.Operands[0], context), method);
@@ -584,7 +619,17 @@ public static class IlGenerator
             case OpCode.Throw:
                 if (instruction.Operands is [TypeAnalysisContext exceptionType]
                     && exceptionType.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0) is { } exceptionCtor)
+                {
+                    if (exceptionCtor.DeclaringType is { IsAbstract: true })
+                    {
+                        // An abstract exception type cannot be constructed honestly; fail with
+                        // the diagnostic exception rather than an unverifiable newobj.
+                        EmitUnrecoverableOperation(method, writeLine,
+                            $"Cannot construct abstract exception type {exceptionType.FullName}");
+                        break;
+                    }
                     instructions.Add(CilOpCodes.Newobj, exceptionCtor.ToMethodDescriptor());
+                }
                 else if (instruction.Operands is [LocalVariable or FieldReference])
                 {
                     LoadOperand(instruction.Operands[0], method, locals, writeLine, null, context); // an already-constructed exception
@@ -770,6 +815,35 @@ public static class IlGenerator
                             ctorNoReceiver = true;
                         else if (structCallee == null || !EmitFallbackStructReceiver(structCallee, context, method, locals))
                             instructions.Add(CilOpCodes.Ldnull);
+                    }
+                }
+
+                // A re-init `call` to a .ctor on an abstract declaring type is emitted as
+                // `newobj` below, but IL2CPP leaves the inlined derived .ctor's base-init
+                // naming the abstract base - that newobj cannot verify. Re-anchor to a
+                // matching .ctor on the receiver's concrete type before any argument is
+                // pushed; when none is provable emit the diagnostic and the defaults.
+                if (ctorReinitReceiver != null && targetMethod.DeclaringType is { IsAbstract: true })
+                {
+                    if (EmittedOperandType(ctorReinitReceiver, context) is { IsAbstract: false } concreteReceiver
+                        && MatchingConcreteConstructor(concreteReceiver, targetMethod, context) is { } reanchoredCtor)
+                    {
+                        targetMethod = reanchoredCtor;
+                        importedMethod = targetMethod.ToMethodDescriptor();
+                    }
+                    else
+                    {
+                        instructions.Add(CilOpCodes.Ldstr, Diagnostic(
+                            $"Cannot construct abstract type {targetMethod.DeclaringType.FullName}: receiver's concrete type could not be recovered"));
+                        instructions.Add(CilOpCodes.Call, writeLine);
+                        EmitNullOrDefault(StoreContract(ctorReinitReceiver, context), method, instructions);
+                        StoreToOperand(ctorReinitReceiver, method, locals, writeLine, context);
+                        if (instruction.OpCode == OpCode.Call)
+                        {
+                            EmitNullOrDefault(StoreContract(instruction.Operands[1], context), method, instructions);
+                            StoreToOperand(instruction.Operands[1], method, locals, writeLine, context);
+                        }
+                        break;
                     }
                 }
 
@@ -1727,6 +1801,132 @@ public static class IlGenerator
                 && left.GenericArguments.Zip(right.GenericArguments, SameTypeIdentity).All(z => z);
         }
     }
+
+    // Finds a .ctor on `concreteType` whose signature matches `constructor`'s and which
+    // is visible from the emitting method, to re-anchor a `newobj` whose resolved .ctor
+    // sits on an abstract base. For a generic instance the definition's .ctor is
+    // re-instantiated with the instance's arguments; the definition-level signature
+    // comparison additionally tolerates shared-generic erasure where the abstract
+    // callee's parameters were recovered as their substitution (e.g. object).
+    private static MethodAnalysisContext? MatchingConcreteConstructor(TypeAnalysisContext concreteType,
+        MethodAnalysisContext constructor, MethodAnalysisContext context)
+    {
+        var instance = concreteType as GenericInstanceTypeAnalysisContext;
+        var definition = instance?.GenericType ?? concreteType;
+        var constructorBase = (constructor as ConcreteGenericMethodAnalysisContext)?.BaseMethodContext ?? constructor;
+
+        foreach (var candidate in definition.Methods)
+        {
+            if (candidate is not { IsStatic: false, Name: ".ctor" }
+                || candidate.Parameters.Count != constructor.Parameters.Count)
+                continue;
+
+            var instantiated = instance == null
+                ? candidate
+                : new ConcreteGenericMethodAnalysisContext(candidate, instance.GenericArguments, []);
+            if ((instantiated.Parameters.Zip(constructor.Parameters,
+                    (x, y) => ThisConstructorCallPlan.SameTypeIdentity(x.ParameterType, y.ParameterType)).All(z => z)
+                || candidate.Parameters.Zip(constructorBase.Parameters,
+                    (x, y) => ThisConstructorCallPlan.SameTypeIdentity(x.ParameterType, y.ParameterType)).All(z => z))
+                && ConstructorVisibleFrom(instantiated, context))
+                return instantiated;
+        }
+
+        return null;
+    }
+
+    // The original call site had access to the .ctor, but the re-anchored candidate sits on a
+    // different (concrete) type, so its own accessibility must hold from the emitting method -
+    // both the member access and the declaring type's visibility to the caller.
+    private static bool ConstructorVisibleFrom(MethodAnalysisContext candidate, MethodAnalysisContext context)
+    {
+        var declaring = candidate.DeclaringType is GenericInstanceTypeAnalysisContext instance
+            ? instance.GenericType
+            : candidate.DeclaringType;
+        var caller = context.DeclaringType;
+        if (declaring == null || caller == null)
+            return true; // no metadata basis to judge the access
+
+        var sameAssembly = ReferenceEquals(caller.DeclaringAssembly, declaring.DeclaringAssembly);
+        var memberVisible = (candidate.Attributes & MethodAttributes.MemberAccessMask) switch
+        {
+            MethodAttributes.Public => true,
+            // Private members are visible to the declaring type itself, to anything nested
+            // inside it, and to the enclosing type of a nested declaration.
+            MethodAttributes.Private => IsWithinOrSame(caller, declaring) || IsWithinOrSame(declaring, caller),
+            MethodAttributes.Assembly => sameAssembly,
+            MethodAttributes.Family => IsWithinOrSame(caller, declaring) || caller.IsAssignableTo(declaring),
+            MethodAttributes.FamANDAssem => sameAssembly && (IsWithinOrSame(caller, declaring) || caller.IsAssignableTo(declaring)),
+            MethodAttributes.FamORAssem => sameAssembly || IsWithinOrSame(caller, declaring) || caller.IsAssignableTo(declaring),
+            _ => false,
+        };
+
+        return memberVisible && declaring.IsAccessibleTo(caller);
+    }
+
+    private static bool IsWithinOrSame(TypeAnalysisContext candidate, TypeAnalysisContext declaring)
+    {
+        for (var current = candidate; current != null; current = current.DeclaringType)
+            if (ReferenceEquals(current, declaring))
+                return true;
+
+        return false;
+    }
+
+    // The Il2CppClass* the native object_new was invoked with is the allocation's
+    // honest type. It can reach the ISIL operand already resolved (a type or a
+    // class-pointer local) or still as a raw metadata-usage global address, which
+    // the same usage table ResolveMetadataUsages consults resolves here. Anything
+    // else leaves the allocated type unknown.
+    private static TypeAnalysisContext? AllocatedClassOperand(MethodAnalysisContext context, Instruction newobj) =>
+        newobj.Operands.Count > 1 ? AllocatedClassOperand(context, newobj.Operands[1]) : null;
+
+    private static TypeAnalysisContext? AllocatedClassOperand(MethodAnalysisContext context, IOperand classOperand) =>
+        classOperand switch
+        {
+            RuntimeClassTypeAnalysisContext { RepresentedType: { } represented } => represented,
+            TypeAnalysisContext type => type,
+            LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { } represented } } => represented,
+            MemoryOperand { Base: null, Index: null, Scale: 0 } memory => ResolveTypeGlobal(context, (ulong)memory.Addend),
+            Immediate immediate => ResolveTypeGlobal(context, immediate.UnsignedValue),
+            LocalVariable local => AllocatedClassFromLocal(context, local),
+            _ => null,
+        };
+
+    // A class argument carried in a local still names the allocated type when every
+    // definition of that local is a Move of the same type-metadata global. Any other
+    // definition - or two different globals - makes the contents unknowable.
+    private static TypeAnalysisContext? AllocatedClassFromLocal(MethodAnalysisContext context, LocalVariable local)
+    {
+        TypeAnalysisContext? resolved = null;
+        foreach (var instruction in context.ControlFlowGraph!.Instructions)
+        {
+            if (!ReferenceEquals(instruction.Destination, local))
+                continue;
+
+            var candidate = instruction switch
+            {
+                { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext type] }
+                    => type is RuntimeClassTypeAnalysisContext { RepresentedType: { } represented } ? represented : type,
+                { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: null, Index: null, Scale: 0 } memory] }
+                    => ResolveTypeGlobal(context, (ulong)memory.Addend),
+                { OpCode: OpCode.Move, Operands: [_, Immediate immediate] }
+                    => ResolveTypeGlobal(context, immediate.UnsignedValue),
+                _ => null,
+            };
+
+            if (candidate == null || (resolved != null && !ReferenceEquals(resolved, candidate)))
+                return null;
+            resolved = candidate;
+        }
+
+        return resolved;
+    }
+
+    private static TypeAnalysisContext? ResolveTypeGlobal(MethodAnalysisContext context, ulong address) =>
+        context.AppContext.LibCpp2IlContext.GetTypeGlobalByAddress(address) is { } typeGlobal
+            ? context.AppContext.ResolveIl2CppType(typeGlobal)
+            : null;
 
     // Try find the constructor call for an allocation. CFG traversal may place the
     // call before the allocation even though both operate on the same SSA local.
