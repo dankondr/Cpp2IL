@@ -110,11 +110,13 @@ public static class IlGenerator
                 context.Locals.Add(local);
         }
 
-        // Map ISIL locals to IL
+        // Map ISIL locals to IL. The declared type joins the method body's locals
+        // signature, so a local whose recovered type cannot be named here is
+        // declared as the closest verifier-legal placeholder instead.
         Dictionary<LocalVariable, CilLocalVariable> locals = [];
         foreach (var local in context.Locals)
         {
-            var emittedType = EmittedLocalType(local, context);
+            var emittedType = EmittableLocalType(EmittedLocalType(local, context), context);
             var ilType = emittedType == context.AppContext.SystemTypes.SystemObjectType
                 ? module.CorLibTypeFactory.Object
                 : emittedType == context.AppContext.SystemTypes.SystemBooleanType
@@ -136,6 +138,13 @@ public static class IlGenerator
         // constructor at the top of the body, where managed code runs it.
         foreach (var (constructor, arguments) in thisConstructorCalls?.PrologueCalls ?? [])
         {
+            // A base .ctor the caller cannot name cannot be invoked; the stub keeps
+            // the body honest - it throws, which the verifier permits in a .ctor.
+            if (!Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(constructor, context))
+            {
+                EmitInaccessibleCalleeStub(constructor, definition, writeLine);
+                continue;
+            }
             body.Instructions.Add(CilOpCodes.Ldarg_0);
             for (var i = 0; i < arguments.Length; i++)
                 LoadOperandIntoSlot(arguments[i], constructor.Parameters[i].ParameterType, context, definition, locals, writeLine);
@@ -398,7 +407,8 @@ public static class IlGenerator
 
                 if (instruction.Operands[0] is FieldReference field) // stfld takes instance before value so LoadOperand StoreToOperand doesn't work
                 {
-                    if (!FieldUsableFrom(field.Field, context, writeAccess: true))
+                    if (!FieldUsableFrom(field.Field, context, writeAccess: true,
+                            receiverType: field.Field.IsStatic ? null : EmittedOperandType(field.Local, context)))
                     {
                         EmitUnrecoverableOperation(method, writeLine,
                             $"Inaccessible field store: {field.Field.DeclaringType?.FullName}.{field.Field.Name}");
@@ -421,11 +431,14 @@ public static class IlGenerator
                     LoadArrayBase(target.Array, method, locals, context);
                     LoadOperandIntoSlot(target.Index, context.AppContext.SystemTypes.SystemInt32Type, context, method, locals, writeLine);
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, stored, context);
-                    CoerceOrDefault(EmittedOperandType(instruction.Operands[1], context, stored), stored, method);
+                    CoerceOrDefault(EmittedOperandType(instruction.Operands[1], context, stored), stored, method, context);
                     if (StelemOpCode(stored) is { } stelemOp)
                         instructions.Add(stelemOp);
-                    else
+                    else if (TypeTokenUsableFrom(stored, context))
                         instructions.Add(CilOpCodes.Stelem, stored.ToTypeSignature().ToTypeDefOrRef());
+                    else
+                        EmitUnrecoverableOperation(method, writeLine,
+                            $"Inaccessible array element type: {stored.FullName}");
                     break;
                 }
 
@@ -439,7 +452,7 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Conv_I4);
                 instructions.Add(CilOpCodes.Conv_I8);
                 EmitStackCoerceOrDefault(context.AppContext.SystemTypes.SystemInt64Type,
-                    StoreContract(instruction.Operands[0], context), method);
+                    StoreContract(instruction.Operands[0], context), method, context);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 break;
 
@@ -447,14 +460,26 @@ public static class IlGenerator
                 var newArrayDestination = StoreContract(instruction.Operands[0], context);
                 if (instruction.Operands is [_, SzArrayTypeAnalysisContext { ElementType: { } newArrayElement }, { } length])
                 {
-                    LoadOperandIntoSlot(length, context.AppContext.SystemTypes.SystemInt32Type, context, method, locals, writeLine);
-                    instructions.Add(CilOpCodes.Newarr, newArrayElement.ToTypeSignature().ToTypeDefOrRef());
-                    CoerceOrDefault(new SzArrayTypeAnalysisContext(newArrayElement), newArrayDestination, method);
+                    if (TypeTokenUsableFrom(newArrayElement, context))
+                    {
+                        LoadOperandIntoSlot(length, context.AppContext.SystemTypes.SystemInt32Type, context, method, locals, writeLine);
+                        instructions.Add(CilOpCodes.Newarr, newArrayElement.ToTypeSignature().ToTypeDefOrRef());
+                        CoerceOrDefault(new SzArrayTypeAnalysisContext(newArrayElement), newArrayDestination, method, context);
+                    }
+                    else
+                    {
+                        // The element type cannot be named here (e.g. a shared-generic
+                        // instantiation over a corlib-internal marker); the honest array
+                        // value is a default of the slot type.
+                        instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Inaccessible array element type: {newArrayElement.FullName}"));
+                        instructions.Add(CilOpCodes.Call, writeLine);
+                        EmitNullOrDefault(newArrayDestination, method, instructions, context);
+                    }
                 }
                 else if (newArrayDestination is { IsValueType: true } && CanEmitTypeToken(newArrayDestination))
-                    EmitDefaultValueLocal(newArrayDestination, method, instructions);
+                    EmitDefaultValueLocal(newArrayDestination, method, instructions, context);
                 else
-                    EmitNullOrDefault(StoreContract(instruction.Operands[0], context), method, instructions);
+                    EmitNullOrDefault(StoreContract(instruction.Operands[0], context), method, instructions, context);
 
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 break;
@@ -499,9 +524,20 @@ public static class IlGenerator
                     {
                         instructions.Add(CilOpCodes.Ldstr, Diagnostic(delegateFailure));
                         instructions.Add(CilOpCodes.Call, writeLine);
-                        EmitNullOrDefault(allocatedDestination, method, instructions);
+                        EmitNullOrDefault(allocatedDestination, method, instructions, context);
                         StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
 
+                        constructorCall.OpCode = OpCode.Nop;
+                        constructorCall.SetOperands();
+                        break;
+                    }
+
+                    // A constructor on a shared-generic instantiation over a type the
+                    // caller cannot see (List<System.Int32Enum>) emits a member
+                    // reference the verifier rejects - same contract as a call target.
+                    if (!Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(constructor, context))
+                    {
+                        EmitInaccessibleCalleeStub(constructor, method, writeLine);
                         constructorCall.OpCode = OpCode.Nop;
                         constructorCall.SetOperands();
                         break;
@@ -512,7 +548,7 @@ public static class IlGenerator
 
                     instructions.Add(CilOpCodes.Newobj, constructor.ToMethodDescriptor());
                     EmitStackCoerceOrDefault(constructor.DeclaringType,
-                        StoreContract(instruction.Operands[0], context), method);
+                        StoreContract(instruction.Operands[0], context), method, context);
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
 
                     constructorCall.OpCode = OpCode.Nop;
@@ -523,14 +559,19 @@ public static class IlGenerator
                     // Nothing to fuse with, so the allocation was self-contained. The type is still right, so construct it bare.
                     parameterlessCtor = ThisConstructorCallPlan.RetargetToDestinationInstantiation(parameterlessCtor, allocatedDestination)
                         ?? parameterlessCtor;
+                    if (!Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(parameterlessCtor, context))
+                    {
+                        EmitInaccessibleCalleeStub(parameterlessCtor, method, writeLine);
+                        break;
+                    }
                     instructions.Add(CilOpCodes.Newobj, parameterlessCtor.ToMethodDescriptor());
                     EmitStackCoerceOrDefault(parameterlessCtor.DeclaringType ?? allocatedType,
-                        StoreContract(instruction.Operands[0], context), method);
+                        StoreContract(instruction.Operands[0], context), method, context);
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 }
                 else
                 {
-                    EmitNullOrDefault(StoreContract(instruction.Operands[0], context), method, instructions);
+                    EmitNullOrDefault(StoreContract(instruction.Operands[0], context), method, instructions, context);
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 }
                 break;
@@ -538,33 +579,66 @@ public static class IlGenerator
             case OpCode.Box:
                 if (instruction.Operands is [_, TypeAnalysisContext boxedType, var boxedValue])
                 {
-                    // il2cpp_value_box takes the value by address, but IL boxes it by value
-                    LoadOperandIntoSlot(boxedValue is AddressOf { Target: LocalVariable byRef } ? byRef : boxedValue,
-                        boxedType, context, method, locals, writeLine);
-                    instructions.Add(CilOpCodes.Box, boxedType.ToTypeSignature().ToTypeDefOrRef());
-                    // `box` leaves a boxed-T reference; a slot that wants a narrower
-                    // reference still needs the castclass the contract requires.
-                    if (StoreContract(instruction.Operands[0], context) is { IsValueType: false } boxContract
-                        and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext
-                            or GenericParameterTypeAnalysisContext)
-                        && !IsAssignableToLoose(boxedType, boxContract) && CanEmitTypeToken(boxContract))
-                        instructions.Add(CilOpCodes.Castclass, boxContract.ToTypeSignature().ToTypeDefOrRef());
+                    if (!TypeTokenUsableFrom(boxedType, context))
+                    {
+                        // The boxed type cannot be named here (e.g. a shared-generic
+                        // instantiation over a corlib-internal marker); the honest
+                        // value is a default of the slot type.
+                        instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Inaccessible box type: {boxedType.FullName}"));
+                        instructions.Add(CilOpCodes.Call, writeLine);
+                        EmitNullOrDefault(StoreContract(instruction.Operands[0], context), method, instructions, context);
+                    }
+                    else
+                    {
+                        // il2cpp_value_box takes the value by address, but IL boxes it by value
+                        LoadOperandIntoSlot(boxedValue is AddressOf { Target: LocalVariable byRef } ? byRef : boxedValue,
+                            boxedType, context, method, locals, writeLine);
+                        instructions.Add(CilOpCodes.Box, boxedType.ToTypeSignature().ToTypeDefOrRef());
+                        // `box` leaves a boxed-T reference; a slot that wants a narrower
+                        // reference still needs the castclass the contract requires.
+                        if (StoreContract(instruction.Operands[0], context) is { IsValueType: false } boxContract
+                            and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+                                or GenericParameterTypeAnalysisContext)
+                            && !IsAssignableToLoose(boxedType, boxContract) && CanEmitTypeToken(boxContract))
+                        {
+                            if (TypeTokenUsableFrom(boxContract, context))
+                                instructions.Add(CilOpCodes.Castclass, boxContract.ToTypeSignature().ToTypeDefOrRef());
+                            else
+                            {
+                                instructions.Add(CilOpCodes.Pop);
+                                instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Inaccessible cast target: {boxContract.FullName}"));
+                                instructions.Add(CilOpCodes.Call, writeLine);
+                                PushDefaultOf(boxContract, method, instructions, context);
+                            }
+                        }
+                    }
                 }
                 else
-                    EmitNullOrDefault(StoreContract(instruction.Operands[0], context), method, instructions);
+                    EmitNullOrDefault(StoreContract(instruction.Operands[0], context), method, instructions, context);
 
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 break;
 
             case OpCode.Throw:
-                if (instruction.Operands is [TypeAnalysisContext exceptionType]
-                    && exceptionType.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0) is { } exceptionCtor)
+                var exceptionCtor = instruction.Operands is [TypeAnalysisContext exceptionType]
+                    ? exceptionType.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0)
+                    : null;
+                if (exceptionCtor != null
+                    && !Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(exceptionCtor, context))
+                {
+                    // Constructing the exception would name an inaccessible member; the
+                    // raise is still honest - the diagnostic stub ends in throw too.
+                    EmitUnrecoverableOperation(method, writeLine,
+                        $"Inaccessible exception constructor: {exceptionCtor.DeclaringType?.FullName}.{exceptionCtor.Name}");
+                    break;
+                }
+                if (exceptionCtor != null)
                     instructions.Add(CilOpCodes.Newobj, exceptionCtor.ToMethodDescriptor());
                 else if (instruction.Operands is [LocalVariable or FieldReference])
                 {
                     LoadOperand(instruction.Operands[0], method, locals, writeLine, null, context); // an already-constructed exception
                     CoerceOrDefault(EmittedOperandType(instruction.Operands[0], context),
-                        context.AppContext.SystemTypes.SystemExceptionType, method);
+                        context.AppContext.SystemTypes.SystemExceptionType, method, context);
                 }
                 else
                     instructions.Add(CilOpCodes.Ldnull);
@@ -592,6 +666,11 @@ public static class IlGenerator
 
                 if (Analysis.StringConstructorRecovery.Resolve(instruction, targetMethod) is { } stringConstructor)
                 {
+                    if (!Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(stringConstructor, context))
+                    {
+                        EmitInaccessibleCalleeStub(stringConstructor, method, writeLine);
+                        break;
+                    }
                     var firstArgument = instruction.OpCode == OpCode.Call ? 3 : 2;
                     for (var i = 0; i < stringConstructor.Parameters.Count; i++)
                         LoadOperandIntoSlot(instruction.Operands[firstArgument + i], stringConstructor.Parameters[i].ParameterType, context, method, locals, writeLine);
@@ -600,7 +679,7 @@ public static class IlGenerator
                     {
                         CoerceOrDefault(stringConstructor.DeclaringType,
                             StoreContract(instruction.Operands[1], context),
-                            method);
+                            method, context);
                         StoreToOperand(instruction.Operands[1], method, locals, writeLine, context);
                     }
                     else
@@ -615,11 +694,24 @@ public static class IlGenerator
                 if (retargetedBaseConstructor != null)
                     targetMethod = retargetedBaseConstructor;
 
+                var thisParamIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
+
+                // Shared generics erase T to object at the call site, so the resolved callee
+                // can sit on List<object> while the receiver operand emits as List<T>; when
+                // both share the generic definition, the honest callee is the receiver's
+                // instantiation (which is what the native code actually invoked).
+                if (!targetMethod.IsStatic && instruction.Operands.Count - 1 >= thisParamIndex)
+                    targetMethod = ThisConstructorCallPlan.RetargetToDestinationInstantiation(targetMethod,
+                            EmittedOperandType(instruction.Operands[thisParamIndex], context))
+                        ?? targetMethod;
+
                 // IL2CPP leaves direct calls to corlib members managed code could never name: the
                 // internal slow paths of inlined BCL operations (List<T>.AddWithResize, private
                 // Math.ThrowMinMaxException) or shared-generic instantiations over non-public
                 // marker types. Swap in the honest public equivalent when one exists; otherwise
-                // leave a diagnostic stub rather than a reference the verifier rejects.
+                // leave a diagnostic stub rather than a reference the verifier rejects. The check
+                // runs after every retarget: the receiver's own instantiation is what the emitted
+                // member reference actually names.
                 if (!Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(targetMethod, context))
                 {
                     if (Analysis.InaccessibleCalleeRecovery.TrySubstitute(targetMethod) is { } accessibleCallee
@@ -631,17 +723,6 @@ public static class IlGenerator
                         break;
                     }
                 }
-
-                var thisParamIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
-
-                // Shared generics erase T to object at the call site, so the resolved callee
-                // can sit on List<object> while the receiver operand emits as List<T>; when
-                // both share the generic definition, the honest callee is the receiver's
-                // instantiation (which is what the native code actually invoked).
-                if (!targetMethod.IsStatic && instruction.Operands.Count - 1 >= thisParamIndex)
-                    targetMethod = ThisConstructorCallPlan.RetargetToDestinationInstantiation(targetMethod,
-                            EmittedOperandType(instruction.Operands[thisParamIndex], context))
-                        ?? targetMethod;
 
                 var importedMethod = targetMethod.ToMethodDescriptor();
 
@@ -717,7 +798,7 @@ public static class IlGenerator
                                 {
                                     // An unmanaged pointer to the struct is already a legal receiver.
                                     if (thisEmitted is not PointerTypeAnalysisContext)
-                                        CoerceOrDefault(thisEmitted, thisTarget, method);
+                                        CoerceOrDefault(thisEmitted, thisTarget, method, context);
                                 }
                             }
                         }
@@ -763,13 +844,13 @@ public static class IlGenerator
                             // A hidden shared-generic argument (MethodInfo*/klass*/rgctx) landed in a
                             // real parameter slot; the actual argument was dropped upstream. Stub the
                             // slot rather than emit a wrongly-typed placeholder.
-                            PushDefaultOf(parameterType, method, instructions);
+                            PushDefaultOf(parameterType, method, instructions, context);
                         }
                         else
                             LoadOperandIntoSlot(argumentOperand, parameterType, context, method, locals, writeLine);
                     }
                     else
-                        PushDefaultOf(parameterType, method, instructions);
+                        PushDefaultOf(parameterType, method, instructions, context);
                 }
 
                 if (ctorReinitReceiver != null)
@@ -778,12 +859,12 @@ public static class IlGenerator
                     if (instruction.OpCode == OpCode.Call)
                         instructions.Add(CilOpCodes.Dup); // the constructed object is also the call result
                     EmitStackCoerceOrDefault(targetMethod.DeclaringType,
-                        StoreContract(ctorReinitReceiver, context), method);
+                        StoreContract(ctorReinitReceiver, context), method, context);
                     StoreToOperand(ctorReinitReceiver, method, locals, writeLine, context);
                     if (instruction.OpCode == OpCode.Call)
                     {
                         CoerceOrDefault(targetMethod.DeclaringType,
-                            StoreContract(instruction.Operands[1], context), method);
+                            StoreContract(instruction.Operands[1], context), method, context);
                         StoreToOperand(instruction.Operands[1], method, locals, writeLine, context);
                     }
                     break;
@@ -814,7 +895,7 @@ public static class IlGenerator
                     if (instruction.OpCode == OpCode.Call)
                     {
                         EmitStackCoerceOrDefault(targetMethod.ReturnType,
-                            StoreContract(instruction.Operands[1], context), method);
+                            StoreContract(instruction.Operands[1], context), method, context);
                         StoreToOperand(instruction.Operands[1], method, locals, writeLine, context);
                     }
                     else
@@ -845,7 +926,7 @@ public static class IlGenerator
                     if (instruction.Operands.Count == 1)
                         LoadOperandIntoSlot(instruction.Operands[0], context.ReturnType, context, method, locals, writeLine);
                     else
-                        EmitNullOrDefault(context.ReturnType, method, instructions); // ret still pops a value even if we lost track of it
+                        EmitNullOrDefault(context.ReturnType, method, instructions, context); // ret still pops a value even if we lost track of it
                 }
                 instructions.Add(CilOpCodes.Ret);
                 break;
@@ -928,7 +1009,11 @@ public static class IlGenerator
                 // field access itself instead of invalid pointer math.
                 if (instruction.OpCode is OpCode.Add or OpCode.Subtract
                     && TryResolveFieldAddressArithmetic(instruction, context) is { } fieldAddress
-                    && FieldUsableFrom(fieldAddress.Field, context, writeAccess: true))
+                    && FieldUsableFrom(fieldAddress.Field, context, writeAccess: true)
+                    // The member reference names the owner instantiation, whose type
+                    // arguments the field's own declaration does not carry.
+                    && (context.DeclaringType == null
+                        || Analysis.InaccessibleCalleeRecovery.IsVisibleType(fieldAddress.Owner, context.DeclaringType)))
                 {
                     LoadOperand(fieldAddress.Base, method, locals, writeLine, null, context);
                     // Fields found on a generic instance's definition must be
@@ -950,7 +1035,7 @@ public static class IlGenerator
                         instructions.Add(CilOpCodes.Ldfld, resolvedField.ToFieldDescriptor());
                         fieldResult = resolvedField.FieldType;
                     }
-                    CoerceOrDefault(fieldResult, fieldContract, method);
+                    CoerceOrDefault(fieldResult, fieldContract, method, context);
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                     break;
                 }
@@ -1016,8 +1101,8 @@ public static class IlGenerator
                         && !(instruction.OpCode == OpCode.Add
                             && stack1 is ByRefTypeAnalysisContext && stack2 is ByRefTypeAnalysisContext);
                 if (unrecoverableIntegerOperation
-                    || !StackContractSatisfied(emitted1, contract1, isComparison)
-                    || !StackContractSatisfied(emitted2, contract2, isComparison)
+                    || !StackContractSatisfied(emitted1, contract1, context, isComparison)
+                    || !StackContractSatisfied(emitted2, contract2, context, isComparison)
                     || !operandsUsable)
                 {
                     if (unrecoverableIntegerOperation)
@@ -1033,7 +1118,7 @@ public static class IlGenerator
                             || TryEmitReferenceEquality(instruction, context, method, locals, writeLine)))
                         EmitUnrecoverableOperation(method, writeLine, $"Unrecoverable operation: {instruction}");
                     EmitStackCoerceOrDefault(context.AppContext.SystemTypes.SystemInt32Type,
-                        StoreContract(instruction.Operands[0], context), method);
+                        StoreContract(instruction.Operands[0], context), method, context);
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                     break;
                 }
@@ -1087,7 +1172,7 @@ public static class IlGenerator
                             ? context.AppContext.SystemTypes.SystemIntPtrType // &-& is a native int
                             : resultByRef // & +/- i keeps the managed pointer
                         : operandType ?? EmittedOperandType(instruction.Operands[1], context);
-                EmitStackCoerceOrDefault(resultType, StoreContract(instruction.Operands[0], context), method, true);
+                EmitStackCoerceOrDefault(resultType, StoreContract(instruction.Operands[0], context), method, context, true);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 break;
 
@@ -1108,7 +1193,7 @@ public static class IlGenerator
                     // `not`/`neg` on `&x` really means the pointed value; the coerce
                     // dereferences an integral element or drops a lost one for zero.
                     if (unaryOperandType is ByRefTypeAnalysisContext)
-                        EmitStackCoerce(unaryOperandType, context.AppContext.SystemTypes.SystemIntPtrType, method);
+                        EmitStackCoerce(unaryOperandType, context.AppContext.SystemTypes.SystemIntPtrType, method, context);
                 }
 
                 var unaryResultType = unaryOperandType is ByRefTypeAnalysisContext or PointerTypeAnalysisContext
@@ -1153,7 +1238,7 @@ public static class IlGenerator
                 else
                     instructions.Add(CilOpCodes.Not);
 
-                EmitStackCoerceOrDefault(unaryResultType, StoreContract(instruction.Operands[0], context), method);
+                EmitStackCoerceOrDefault(unaryResultType, StoreContract(instruction.Operands[0], context), method, context);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 break;
             }
@@ -1989,10 +2074,12 @@ public static class IlGenerator
                 }
                 break;
             // ref/out/in slots need a managed pointer; a fresh local is the only
-            // honest default, same as in PushDefaultOf.
+            // honest default, same as in PushDefaultOf. The element is sanitized
+            // because the temp's declared type is a signature token too.
             case Immediate when literalType is ByRefTypeAnalysisContext byRefLiteral
                     && CanEmitTypeToken(byRefLiteral.ElementType):
-                var byRefLocal = new CilLocalVariable(byRefLiteral.ElementType.ToTypeSignature());
+                var byRefLocal = new CilLocalVariable(
+                    EmittableLocalType(byRefLiteral.ElementType, callingContext).ToTypeSignature());
                 method.CilMethodBody!.LocalVariables.Add(byRefLocal);
                 instructions.Add(CilOpCodes.Ldloca, byRefLocal);
                 break;
@@ -2009,7 +2096,7 @@ public static class IlGenerator
             // dropped operand, not a real value; default(T) is the only honest filler.
             case Immediate when literalType is { IsValueType: true } or GenericParameterTypeAnalysisContext
                     && CanEmitTypeToken(literalType):
-                EmitDefaultValueLocal(literalType, method, instructions);
+                EmitDefaultValueLocal(literalType, method, instructions, callingContext);
                 break;
             case Immediate { Value: >= int.MinValue and <= int.MaxValue } immediate:
                 instructions.Add(CilOpCodes.Ldc_I4, (int)immediate.Value);
@@ -2030,6 +2117,17 @@ public static class IlGenerator
                 LoadLocal(local, method, locals);
                 break;
             case ReferenceCast referenceCast:
+                if (!TypeTokenUsableFrom(referenceCast.Type, callingContext))
+                {
+                    // The target type cannot be named here (e.g. a shared-generic
+                    // instantiation over a corlib-internal marker); a cast token for it
+                    // would fail access checks, so the honest value is a default of the
+                    // target type.
+                    instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Inaccessible cast target: {referenceCast.Type.FullName}"));
+                    instructions.Add(CilOpCodes.Call, writeLine);
+                    PushDefaultOf(referenceCast.Type, method, instructions, callingContext);
+                    break;
+                }
                 LoadLocal(referenceCast.Value, method, locals);
                 instructions.Add(CilOpCodes.Castclass, referenceCast.Type.ToTypeSignature().ToTypeDefOrRef());
                 break;
@@ -2042,12 +2140,14 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldloca, locals[addressed]);
                 break;
             case AddressOf { Target: FieldReference addressedField }:
-                if (!FieldUsableFrom(addressedField.Field, callingContext, writeAccess: true))
+                if (!FieldUsableFrom(addressedField.Field, callingContext, writeAccess: true,
+                        receiverType: addressedField.Field.IsStatic ? null
+                            : EmittedOperandType(addressedField.Local, callingContext)))
                 {
                     // The field cannot legally be addressed here; a fresh zeroed
                     // local is the honest managed-address placeholder.
                     PushDefaultOf(new ByRefTypeAnalysisContext(addressedField.Field.FieldType),
-                        method, instructions);
+                        method, instructions, callingContext);
                     break;
                 }
                 if (!addressedField.Field.IsStatic)
@@ -2059,23 +2159,39 @@ public static class IlGenerator
                             EmittedOperandType(addressedField.Local, callingContext)));
                 break;
             case AddressOf { Target: ArrayAccess elementAddress }:
+                var elementAddressType = ((SzArrayTypeAnalysisContext)elementAddress.Array.Type!).ElementType;
+                if (!TypeTokenUsableFrom(elementAddressType, callingContext))
+                {
+                    instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Inaccessible array element type: {elementAddressType.FullName}"));
+                    instructions.Add(CilOpCodes.Call, writeLine);
+                    PushDefaultOf(new ByRefTypeAnalysisContext(elementAddressType), method, instructions, callingContext);
+                    break;
+                }
                 LoadArrayBase(elementAddress.Array, method, locals, callingContext);
                 LoadOperandIntoSlot(elementAddress.Index, callingContext.AppContext.SystemTypes.SystemInt32Type,
                     callingContext, method, locals, writeLine);
-                instructions.Add(CilOpCodes.Ldelema,
-                    ((SzArrayTypeAnalysisContext)elementAddress.Array.Type!).ElementType.ToTypeSignature().ToTypeDefOrRef());
+                instructions.Add(CilOpCodes.Ldelema, elementAddressType.ToTypeSignature().ToTypeDefOrRef());
                 break;
             case ArrayAccess arrayAccess:
+                var arrayElementType = ((SzArrayTypeAnalysisContext)arrayAccess.Array.Type!).ElementType;
+                if (!TypeTokenUsableFrom(arrayElementType, callingContext))
+                {
+                    instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Inaccessible array element type: {arrayElementType.FullName}"));
+                    instructions.Add(CilOpCodes.Call, writeLine);
+                    PushDefaultOf(arrayElementType, method, instructions, callingContext);
+                    break;
+                }
                 LoadArrayBase(arrayAccess.Array, method, locals, callingContext);
                 LoadOperandIntoSlot(arrayAccess.Index, callingContext.AppContext.SystemTypes.SystemInt32Type,
                     callingContext, method, locals, writeLine);
-                instructions.Add(CilOpCodes.Ldelem,
-                    ((SzArrayTypeAnalysisContext)arrayAccess.Array.Type!).ElementType.ToTypeSignature().ToTypeDefOrRef());
+                instructions.Add(CilOpCodes.Ldelem, arrayElementType.ToTypeSignature().ToTypeDefOrRef());
                 break;
             case FieldReference field:
-                if (!FieldUsableFrom(field.Field, callingContext))
+                if (!FieldUsableFrom(field.Field, callingContext,
+                        receiverType: field.Field.IsStatic ? null
+                            : EmittedOperandType(field.Local, callingContext)))
                 {
-                    PushDefaultOf(field.Field.FieldType, method, instructions);
+                    PushDefaultOf(field.Field.FieldType, method, instructions, callingContext);
                     break;
                 }
                 if (field.Field.IsStatic)
@@ -2092,11 +2208,17 @@ public static class IlGenerator
             case MemoryOperand memory:
                 if (TryGetDeterministicMemoryReferent(memory, expectedType, out var referent))
                 {
-                    LoadLocal((LocalVariable)memory.Base!, method, locals);
-
                     // A zero-offset load through a typed pointer/byref is an actual managed
                     // dereference. Everything else stays unresolved below: ISIL has no proof
                     // that an arbitrary native address or offset names a managed field.
+                    if (referent is { IsValueType: true } && !TypeTokenUsableFrom(referent, callingContext))
+                    {
+                        instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Inaccessible dereference type: {referent.FullName}"));
+                        instructions.Add(CilOpCodes.Call, writeLine);
+                        PushDefaultOf(referent, method, instructions, callingContext);
+                        break;
+                    }
+                    LoadLocal((LocalVariable)memory.Base!, method, locals);
                     instructions.Add(referent switch
                     {
                         PointerTypeAnalysisContext or ByRefTypeAnalysisContext => new CilInstruction(CilOpCodes.Ldind_I),
@@ -2140,14 +2262,25 @@ public static class IlGenerator
                 }
 
                 //Not fully implemented, these basically shouldn't actually ever exist in the final IL.
-                instructions.Add(CilOpCodes.Ldc_I4_0);
-                instructions.Add(CilOpCodes.Conv_I);
+                // A struct handle slot takes its default; everything else keeps the
+                // native-int zero the handle wrapper lowers to.
+                if (expectedType is { IsValueType: true }
+                    && expectedType.FullName is not "System.IntPtr" and not "System.UIntPtr")
+                    PushDefaultOf(expectedType, method, instructions, callingContext);
+                else
+                {
+                    instructions.Add(CilOpCodes.Ldc_I4_0);
+                    instructions.Add(CilOpCodes.Conv_I);
+                }
                 break;
             case RuntimeFieldInfoAnalysisContext runtimeField:
                 // fieldof(F), e.g. the handle InitializeArray takes.
                 if (expectedType?.FullName == "System.RuntimeFieldHandle")
                 {
-                    instructions.Add(CilOpCodes.Ldtoken, runtimeField.RepresentedField.ToFieldDescriptor());
+                    if (FieldUsableFrom(runtimeField.RepresentedField, callingContext))
+                        instructions.Add(CilOpCodes.Ldtoken, runtimeField.RepresentedField.ToFieldDescriptor());
+                    else
+                        PushDefaultOf(expectedType, method, instructions, callingContext);
                     break;
                 }
 
@@ -2155,10 +2288,18 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Conv_I);
                 break;
             case RuntimeClassTypeAnalysisContext runtimeClass when expectedType?.FullName == "System.RuntimeTypeHandle":
-                instructions.Add(CilOpCodes.Ldtoken, runtimeClass.RepresentedType.ToTypeSignature().ToTypeDefOrRef());
+                if (TypeTokenUsableFrom(runtimeClass.RepresentedType, callingContext))
+                    instructions.Add(CilOpCodes.Ldtoken, runtimeClass.RepresentedType.ToTypeSignature().ToTypeDefOrRef());
+                else
+                    PushDefaultOf(expectedType, method, instructions, callingContext);
                 break;
             case RuntimeClassTypeAnalysisContext runtimeClass
                 when expectedType?.FullName is "System.Type" or "System.Object":
+                if (!TypeTokenUsableFrom(runtimeClass.RepresentedType, callingContext))
+                {
+                    PushDefaultOf(expectedType, method, instructions, callingContext);
+                    break;
+                }
                 // The native arg is a klass*; the managed contract wants the Type object for it.
                 instructions.Add(CilOpCodes.Ldtoken, runtimeClass.RepresentedType.ToTypeSignature().ToTypeDefOrRef());
                 instructions.Add(CilOpCodes.Call, module.CorLibTypeFactory.CorLibScope
@@ -2179,13 +2320,23 @@ public static class IlGenerator
 
                 if (expectedType?.FullName == "System.RuntimeTypeHandle")
                 {
-                    instructions.Add(CilOpCodes.Ldtoken, type.ToTypeSignature().ToTypeDefOrRef());
+                    if (TypeTokenUsableFrom(type, callingContext))
+                        instructions.Add(CilOpCodes.Ldtoken, type.ToTypeSignature().ToTypeDefOrRef());
+                    else
+                        PushDefaultOf(expectedType, method, instructions, callingContext);
                     break;
                 }
 
                 if (expectedType?.FullName is "System.IntPtr" or "System.UIntPtr"
                     || expectedType is RuntimeClassTypeAnalysisContext)
                 {
+                    if (!TypeTokenUsableFrom(type, callingContext))
+                    {
+                        // The honest value of an unnameable handle is the null address.
+                        instructions.Add(CilOpCodes.Ldc_I4_0);
+                        instructions.Add(CilOpCodes.Conv_I);
+                        break;
+                    }
                     var handleLocal = new CilLocalVariable(runtimeTypeHandle.ToTypeSignature(true));
                     method.CilMethodBody!.LocalVariables.Add(handleLocal);
                     var getValue = runtimeTypeHandle.CreateMemberReference("get_Value",
@@ -2204,8 +2355,13 @@ public static class IlGenerator
                         corLibScope.CreateTypeReference("System", "Type").ToTypeSignature(false),
                         [runtimeTypeHandle.ToTypeSignature(true)]));
 
-                instructions.Add(CilOpCodes.Ldtoken, type.ToTypeSignature().ToTypeDefOrRef());
-                instructions.Add(CilOpCodes.Call, typeFromHandle);
+                if (TypeTokenUsableFrom(type, callingContext))
+                {
+                    instructions.Add(CilOpCodes.Ldtoken, type.ToTypeSignature().ToTypeDefOrRef());
+                    instructions.Add(CilOpCodes.Call, typeFromHandle);
+                }
+                else
+                    instructions.Add(CilOpCodes.Ldnull);
                 break;
             default:
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unknown operand: " + operand));
@@ -2233,6 +2389,14 @@ public static class IlGenerator
             return false;
 
         var module = method.DeclaringModule!;
+        if (typeOperand is TypeAnalysisContext comparedType && !TypeTokenUsableFrom(comparedType, context))
+        {
+            // The compared type cannot be named here; there is no honest constant for
+            // `obj.GetType() == typeof(T)`, so the operation is unrecoverable.
+            EmitUnrecoverableOperation(method, writeLine,
+                $"Inaccessible compared type: {comparedType.FullName}");
+            return true;
+        }
         var instructions = method.CilMethodBody!.Instructions;
 
         var getType = module.CorLibTypeFactory.CorLibScope
@@ -2252,7 +2416,7 @@ public static class IlGenerator
         }
 
         EmitStackCoerceOrDefault(context.AppContext.SystemTypes.SystemInt32Type,
-            StoreContract(instruction.Operands[0], context), method);
+            StoreContract(instruction.Operands[0], context), method, context);
         StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
         return true;
     }
@@ -2295,7 +2459,8 @@ public static class IlGenerator
                 : referent.IsAssignableTo(expectedType));
     }
 
-    private static void PushDefaultOf(TypeAnalysisContext type, MethodDefinition method, CilInstructionCollection instructions)
+    private static void PushDefaultOf(TypeAnalysisContext type, MethodDefinition method, CilInstructionCollection instructions,
+        MethodAnalysisContext? context)
     {
         //TODO Remove this, we should be handling arguments correctly in ISIL resolution, this is a hack to emit balanced stacks.
         //TODO At the *very* least we should emit a console.writeline saying that we did this.
@@ -2303,9 +2468,11 @@ public static class IlGenerator
         {
             // ref/out/in slots need a managed pointer; a fresh local is the only
             // honest default - the callee may write through it and the result is
-            // dropped, same as any other placeholder.
-            var elementType = byRefParameter.ElementType;
-            if (CanEmitTypeToken(elementType))
+            // dropped, same as any other placeholder. The element is sanitized for
+            // the same reason locals are: the temp's declared type is a signature
+            // token too.
+            var elementType = EmittableLocalType(byRefParameter.ElementType, context);
+            if (TypeTokenUsableFrom(elementType, context))
             {
                 var tempLocal = new CilLocalVariable(elementType.ToTypeSignature());
                 method.CilMethodBody!.LocalVariables.Add(tempLocal);
@@ -2329,7 +2496,7 @@ public static class IlGenerator
         // emission the compiler uses - because ldnull is only legal for reference Ts.
         if (type is GenericParameterTypeAnalysisContext && CanEmitTypeToken(type))
         {
-            EmitDefaultValueLocal(type, method, instructions);
+            EmitDefaultValueLocal(type, method, instructions, context);
             return;
         }
 
@@ -2354,7 +2521,7 @@ public static class IlGenerator
                 break;
             default:
                 if (CanEmitTypeToken(type))
-                    EmitDefaultValueLocal(type, method, instructions);
+                    EmitDefaultValueLocal(type, method, instructions, context);
                 else
                     instructions.Add(CilOpCodes.Ldc_I4_0);
                 break;
@@ -2365,14 +2532,53 @@ public static class IlGenerator
     // (the verifier will not invent the implicit struct ctor), so default(T) goes
     // through a zero-initialized temp local instead.
     private static void EmitDefaultValueLocal(TypeAnalysisContext type, MethodDefinition method,
-        CilInstructionCollection instructions)
+        CilInstructionCollection instructions, MethodAnalysisContext? context)
     {
+        if (!TypeTokenUsableFrom(type, context))
+        {
+            // initobj would name a type the caller cannot see, and the temp local
+            // would carry the same invalid signature; the sanitized placeholder
+            // keeps the same shape (int32 for marker structs, ldnull for references).
+            PushDefaultOf(EmittableLocalType(type, context), method, instructions, context);
+            return;
+        }
         var signature = type.ToTypeSignature();
         var tempLocal = new CilLocalVariable(signature);
         method.CilMethodBody!.LocalVariables.Add(tempLocal);
         instructions.Add(CilOpCodes.Ldloca, tempLocal);
         instructions.Add(CilOpCodes.Initobj, signature.ToTypeDefOrRef());
         instructions.Add(CilOpCodes.Ldloc, tempLocal);
+    }
+
+    // A local's declared type is part of the method body's locals signature, so it
+    // is subject to the same accessibility rules as an instruction token. When the
+    // recovered type cannot be named here, declare the closest verifier-legal
+    // shape instead: the same wrapper over a sanitized element for arrays and
+    // byrefs (so element and pointer ops still resolve), the enum's underlying
+    // primitive for marker structs, a native int for unmanaged pointers, and
+    // object for anything else.
+    private static TypeAnalysisContext EmittableLocalType(TypeAnalysisContext type, MethodAnalysisContext? context)
+    {
+        // Only a type that produces a token but names something the caller cannot
+        // see needs the placeholder; anything unemittable keeps the existing
+        // behavior (the corlib-signature special cases and the literal defaults).
+        if (context?.DeclaringType == null
+            || !CanEmitTypeToken(type)
+            || Analysis.InaccessibleCalleeRecovery.IsVisibleType(type, context.DeclaringType))
+            return type;
+        return type switch
+        {
+            SzArrayTypeAnalysisContext array =>
+                new SzArrayTypeAnalysisContext(EmittableLocalType(array.ElementType, context)),
+            ByRefTypeAnalysisContext byRef =>
+                new ByRefTypeAnalysisContext(EmittableLocalType(byRef.ElementType, context)),
+            PointerTypeAnalysisContext => context.AppContext.SystemTypes.SystemIntPtrType,
+            { IsValueType: true } => type is { IsEnumType: true }
+                && type.DefaultEnumUnderlyingType is { } underlying
+                    ? EmittableLocalType(underlying, context)
+                    : context.AppContext.SystemTypes.SystemInt32Type,
+            _ => context.AppContext.SystemTypes.SystemObjectType,
+        };
     }
 
     private static bool IsBoolean(IOperand operand, MethodAnalysisContext context) =>
@@ -2897,7 +3103,7 @@ public static class IlGenerator
     // when no legal conversion exists and the value still does not satisfy `to`;
     // callers then drop the unrepresentable value and fill the slot honestly.
     private static bool EmitStackCoerce(TypeAnalysisContext? from, TypeAnalysisContext? to, MethodDefinition method,
-        bool convertByRef = false)
+        MethodAnalysisContext? context, bool convertByRef = false)
     {
         // Handle contexts have no managed stack type of their own; everything below
         // reasons about the native int they emit as.
@@ -2923,8 +3129,15 @@ public static class IlGenerator
             if (!to.IsValueType && to is not PointerTypeAnalysisContext && CanEmitTypeToken(from))
             {
                 instructions.Add(CilOpCodes.Box, from.ToTypeSignature().ToTypeDefOrRef());
-                if (!IsAssignableToLoose(from, to) && CanEmitTypeToken(to))
-                    instructions.Add(CilOpCodes.Castclass, to.ToTypeSignature().ToTypeDefOrRef());
+                if (!IsAssignableToLoose(from, to))
+                {
+                    // A cast the caller cannot name is not a legal coercion; the caller
+                    // drops the box result and defaults the slot instead.
+                    if (!TypeTokenUsableFrom(to, context))
+                        return false;
+                    if (CanEmitTypeToken(to))
+                        instructions.Add(CilOpCodes.Castclass, to.ToTypeSignature().ToTypeDefOrRef());
+                }
             }
             return !to.IsValueType;
         }
@@ -2950,14 +3163,14 @@ public static class IlGenerator
         {
             var element = byRef.ElementType;
             if (element is ByRefTypeAnalysisContext or PointerTypeAnalysisContext
-                || element.IsValueType && !CanEmitTypeToken(element)
-                || !StackContractSatisfied(element, to, convertByRef))
+                || element.IsValueType && !TypeTokenUsableFrom(element, context)
+                || !StackContractSatisfied(element, to, context, convertByRef))
                 return false;
             if (element.IsValueType)
                 instructions.Add(CilOpCodes.Ldobj, element.ToTypeSignature().ToTypeDefOrRef());
             else
                 instructions.Add(CilOpCodes.Ldind_Ref);
-            return EmitStackCoerce(element, to, method, convertByRef);
+            return EmitStackCoerce(element, to, method, context, convertByRef);
         }
 
         if (fromWidth != 0 && toWidth != 0)
@@ -2996,14 +3209,19 @@ public static class IlGenerator
         {
             // Without a box token the value is left as-is: reduced fixtures retype
             // the slot to the real primitive, and dropping real data for a guessed
-            // null is no better for the verifier.
+            // null is no better for the verifier. A token that exists but is not
+            // visible here fails instead, so the caller defaults the slot honestly.
             if (!CanEmitTypeToken(from))
                 return true;
+            if (!TypeTokenUsableFrom(from, context))
+                return false;
             instructions.Add(CilOpCodes.Box, from.ToTypeSignature().ToTypeDefOrRef());
             // box yields a `from` reference; an interface/other-ref destination still
             // needs the narrowing cast the verifier requires.
             if (IsAssignableToLoose(from, to) || !CanEmitTypeToken(to))
                 return true;
+            if (!TypeTokenUsableFrom(to, context))
+                return false;
             instructions.Add(CilOpCodes.Castclass, to.ToTypeSignature().ToTypeDefOrRef());
             return true;
         }
@@ -3012,6 +3230,8 @@ public static class IlGenerator
         {
             if (!CanEmitTypeToken(to))
                 return true;
+            if (!TypeTokenUsableFrom(to, context))
+                return false;
             instructions.Add(CilOpCodes.Unbox_Any, to.ToTypeSignature().ToTypeDefOrRef());
             return true;
         }
@@ -3020,9 +3240,12 @@ public static class IlGenerator
         {
             // When the cast token cannot be emitted the value is left as-is: it may
             // still be runtime-compatible, and the verifier's complaint is no worse
-            // than dropping real data for a guessed default.
+            // than dropping real data for a guessed default. A token that exists but
+            // is not visible here fails instead, so the caller defaults the slot.
             if (IsAssignableToLoose(from, to) || !CanEmitTypeToken(to))
                 return true;
+            if (!TypeTokenUsableFrom(to, context))
+                return false;
             instructions.Add(CilOpCodes.Castclass, to.ToTypeSignature().ToTypeDefOrRef());
             return true;
         }
@@ -3036,13 +3259,13 @@ public static class IlGenerator
     // operation can bridge the types - drops it and fills the slot with the same
     // honest default PushDefaultOf uses for operands that were lost upstream.
     private static void CoerceOrDefault(TypeAnalysisContext? from, TypeAnalysisContext? to, MethodDefinition method,
-        bool convertByRef = false)
+        MethodAnalysisContext? context, bool convertByRef = false)
     {
-        if (to == null || EmitStackCoerce(from, to, method, convertByRef))
+        if (to == null || EmitStackCoerce(from, to, method, context, convertByRef))
             return;
         var instructions = method.CilMethodBody!.Instructions;
         instructions.Add(CilOpCodes.Pop);
-        PushDefaultOf(to, method, instructions);
+        PushDefaultOf(to, method, instructions, context);
     }
 
     // True when the operand's emitted stack type is already a pointer to the struct a
@@ -3105,7 +3328,7 @@ public static class IlGenerator
             : context.DeclaringType;
         method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldarg_0);
         method.CilMethodBody.Instructions.Add(CilOpCodes.Ldfld, FieldDescriptorFor(match, thisReceiver));
-        CoerceOrDefault(match.FieldType, contract, method);
+        CoerceOrDefault(match.FieldType, contract, method, context);
         return true;
     }
 
@@ -3154,7 +3377,7 @@ public static class IlGenerator
     // satisfy the slot (e.g. an int into a Vector3 argument) and the site should
     // emit default(to) rather than leave an uncoercible value on the stack.
     private static bool StackContractSatisfied(TypeAnalysisContext? from, TypeAnalysisContext? to,
-        bool convertByRef = false)
+        MethodAnalysisContext? context, bool convertByRef = false)
     {
         if (from != null && IsNativeHandleType(from))
             from = from.AppContext.SystemTypes.SystemIntPtrType;
@@ -3170,8 +3393,11 @@ public static class IlGenerator
             return StackAssignableTo(from, to);
 
         // A T source fits a managed reference through box T; nothing else is legal.
+        // Mirrors EmitStackCoerce: a reference target that needs a narrowing cast
+        // fails when the cast token is not visible to the caller.
         if (from is GenericParameterTypeAnalysisContext)
-            return !to.IsValueType && to is not PointerTypeAnalysisContext;
+            return !to.IsValueType && to is not PointerTypeAnalysisContext
+                && (IsAssignableToLoose(from, to) || !CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context));
 
         var fromWidth = IntegralStackWidth(from);
         var toWidth = IntegralStackWidth(to);
@@ -3191,8 +3417,8 @@ public static class IlGenerator
                 return toWidth != 0;
             var element = ((ByRefTypeAnalysisContext)from).ElementType;
             return element is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
-                && (!element.IsValueType || CanEmitTypeToken(element))
-                && StackContractSatisfied(element, to, convertByRef);
+                && (!element.IsValueType || TypeTokenUsableFrom(element, context))
+                && StackContractSatisfied(element, to, context, convertByRef);
         }
 
         if (fromWidth != 0 && toWidth != 0)
@@ -3202,11 +3428,16 @@ public static class IlGenerator
         if (to.FullName is "System.Single" or "System.Double")
             return from.FullName is "System.Single" or "System.Double" || fromWidth != 0;
         if (from.IsValueType && !to.IsValueType)
-            return true; // box, plus castclass when the reference target narrows
+            // box, plus castclass when the reference target narrows - both need
+            // tokens the caller can legally name
+            return !CanEmitTypeToken(from)
+                || TypeTokenUsableFrom(from, context)
+                    && (IsAssignableToLoose(from, to) || !CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context));
         if (!from.IsValueType && to.IsValueType)
-            return true; // unbox.any accepts any managed reference
+            return !CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context); // unbox.any accepts any managed reference
         if (!from.IsValueType && !to.IsValueType)
-            return true; // castclass narrows any reference pair
+            // castclass narrows any reference pair - unless the caller cannot name it
+            return IsAssignableToLoose(from, to) || !CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context);
         return StackAssignableTo(from, to);
     }
 
@@ -3220,38 +3451,38 @@ public static class IlGenerator
         bool convertByRef = false)
     {
         var emitted = EmittedOperandType(operand, context, contract);
-        if (contract == null || StackContractSatisfied(emitted, contract, convertByRef))
+        if (contract == null || StackContractSatisfied(emitted, contract, context, convertByRef))
         {
             LoadOperand(operand, method, locals, writeLine, contract, context);
-            EmitStackCoerce(emitted, contract, method, convertByRef);
+            EmitStackCoerce(emitted, contract, method, context, convertByRef);
             return;
         }
-        PushDefaultOf(contract, method, method.CilMethodBody!.Instructions);
+        PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context);
     }
 
     // Coerces an already-emitted stack value into a slot contract. When no legal
     // coercion exists the value is replaced by default(contract) - same as a
     // dropped operand - so the consuming store still sees a compatible type.
     private static void EmitStackCoerceOrDefault(TypeAnalysisContext? from, TypeAnalysisContext? contract,
-        MethodDefinition method, bool convertByRef = false)
+        MethodDefinition method, MethodAnalysisContext? context, bool convertByRef = false)
     {
         var instructions = method.CilMethodBody!.Instructions;
-        if (contract == null || StackContractSatisfied(from, contract, convertByRef))
+        if (contract == null || StackContractSatisfied(from, contract, context, convertByRef))
         {
-            EmitStackCoerce(from, contract, method, convertByRef);
+            EmitStackCoerce(from, contract, method, context, convertByRef);
             return;
         }
         instructions.Add(CilOpCodes.Pop);
-        PushDefaultOf(contract, method, instructions);
+        PushDefaultOf(contract, method, instructions, context);
     }
 
     // A missing value for a value-type or generic-parameter slot is default(T);
     // everything else gets the usual null.
     private static void EmitNullOrDefault(TypeAnalysisContext? contract, MethodDefinition method,
-        CilInstructionCollection instructions)
+        CilInstructionCollection instructions, MethodAnalysisContext? context)
     {
         if (contract is { IsValueType: true } or GenericParameterTypeAnalysisContext)
-            PushDefaultOf(contract, method, instructions);
+            PushDefaultOf(contract, method, instructions, context);
         else
             instructions.Add(CilOpCodes.Ldnull);
     }
@@ -3335,13 +3566,13 @@ public static class IlGenerator
                 return false; // a struct, float or reference side cannot lower to a native int
             // conv.* rejects managed pointers, so a `&` side only reaches native
             // int when its pointee can: `&x` lowers to the dereferenced value.
-            if (!StackContractSatisfied(emitted, nativeInt, convertByRef: true))
+            if (!StackContractSatisfied(emitted, nativeInt, context, convertByRef: true))
                 return false;
         }
         foreach (var operand in operands)
         {
             LoadOperand(operand, method, locals, writeLine, null, context);
-            EmitStackCoerce(NaturalEmittedType(operand, context), nativeInt, method, true);
+            EmitStackCoerce(NaturalEmittedType(operand, context), nativeInt, method, context, true);
         }
         instructions.Add(CilOpCodes.Ceq);
         if (instruction.OpCode == OpCode.CheckNotEqual)
@@ -3378,7 +3609,7 @@ public static class IlGenerator
                 || IsNativeHandleType(emittedType))
                 return false; // pointer and unknown emissions cannot become references
             if ((emittedType.IsValueType || emittedType is GenericParameterTypeAnalysisContext)
-                && !CanEmitTypeToken(emittedType))
+                && !TypeTokenUsableFrom(emittedType, context))
                 return false; // a value side that cannot box cannot become a reference either
             emitted.Add(emittedType);
         }
@@ -3452,6 +3683,16 @@ public static class IlGenerator
             or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext => true,
         _ => type.GetExtraData<TypeDefinition>("AsmResolverType") != null
     };
+
+    // CanEmitTypeToken answers whether a token can be produced for the type; this answers
+    // whether the caller may legally name it. Shared-generic recovery composes instances
+    // over corlib-internal marker types (List<System.Int32Enum>) that produce a token the
+    // verifier rejects, so every token-bearing op routes through here instead of
+    // CanEmitTypeToken alone.
+    private static bool TypeTokenUsableFrom(TypeAnalysisContext? type, MethodAnalysisContext? context) =>
+        CanEmitTypeToken(type)
+            && (context?.DeclaringType == null
+                || Analysis.InaccessibleCalleeRecovery.IsVisibleType(type, context.DeclaringType));
 
     private sealed record FieldAddressArithmetic(IOperand Base, TypeAnalysisContext Owner, FieldAnalysisContext Field);
 
@@ -3582,7 +3823,7 @@ public static class IlGenerator
             && IntegralStackWidth(EmittedOperandType(instruction.Operands[1], context)) <= 0)
         {
             instructions.Add(CilOpCodes.Ldc_I4_0);
-            CoerceOrDefault(context.AppContext.SystemTypes.SystemInt32Type, destinationType, method);
+            CoerceOrDefault(context.AppContext.SystemTypes.SystemInt32Type, destinationType, method, context);
             StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
             return true;
         }
@@ -3592,7 +3833,8 @@ public static class IlGenerator
         // destination, the whole operation is the field access itself.
         if (instruction.OpCode is OpCode.Or or OpCode.Add
             && FindAddressOffsetField(instruction, context, out var address, out var addressField)
-            && FieldUsableFrom(addressField, context)
+            && FieldUsableFrom(addressField, context,
+                receiverType: addressField.IsStatic ? null : EmittedOperandType(address, context))
             && (ThisConstructorCallPlan.SameTypeIdentity(addressField.FieldType, destinationType)
                 || IntegralStackWidth(addressField.FieldType) != 0
                     && destinationType is not ByRefTypeAnalysisContext and not PointerTypeAnalysisContext
@@ -3601,14 +3843,15 @@ public static class IlGenerator
         {
             instructions.Add(CilOpCodes.Ldfld,
                 FieldDescriptorFor(addressField, EmittedOperandType(address, context)));
-            CoerceOrDefault(addressField.FieldType, destinationType, method);
+            CoerceOrDefault(addressField.FieldType, destinationType, method, context);
             StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
             return true;
         }
 
         // `packed >> N`/`packed OP mask`: the surviving bytes are a field.
         if (TryGetPackedFieldAccess(instruction, context, out var packed, out var packedField, out var otherOperand)
-            && FieldUsableFrom(packedField, context)
+            && FieldUsableFrom(packedField, context,
+                receiverType: packedField.IsStatic ? null : EmittedOperandType(packed, context))
             && EmitManagedAddress(packed, method, context, locals, writeLine))
         {
             var fieldType = packedField.FieldType;
@@ -3619,7 +3862,7 @@ public static class IlGenerator
                 // The op applies to the low-word field only; that is exact for the
                 // masked range (and for wraps/shifts the field itself is the answer).
                 LoadOperand(otherOperand, method, locals, writeLine, fieldType, context);
-                CoerceOrDefault(EmittedOperandType(otherOperand, context, fieldType), fieldType, method);
+                CoerceOrDefault(EmittedOperandType(otherOperand, context, fieldType), fieldType, method, context);
                 instructions.Add(instruction.OpCode switch
                 {
                     OpCode.And => new CilInstruction(CilOpCodes.And),
@@ -3633,7 +3876,7 @@ public static class IlGenerator
                     _ => new CilInstruction(CilOpCodes.Nop),
                 });
             }
-            CoerceOrDefault(fieldType, destinationType, method);
+            CoerceOrDefault(fieldType, destinationType, method, context);
             StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
             return true;
         }
@@ -3788,7 +4031,7 @@ public static class IlGenerator
     }
 
     private static bool FieldUsableFrom(FieldAnalysisContext field, MethodAnalysisContext context,
-        bool writeAccess = false)
+        bool writeAccess = false, TypeAnalysisContext? receiverType = null)
     {
         if (!CanEmitFieldToken(field))
             return false;
@@ -3803,6 +4046,14 @@ public static class IlGenerator
         var declaring = field.DeclaringType;
         if (declaring == null || callerType == null)
             return true;
+        // Member references keep declared accessibility everywhere: the field's own
+        // signature type, the declaring type it names, and - when the reference is
+        // emitted on the receiver's instantiation - the receiver's type arguments.
+        if (!Analysis.InaccessibleCalleeRecovery.IsVisibleType(field.FieldType, callerType)
+            || !Analysis.InaccessibleCalleeRecovery.IsVisibleType(declaring, callerType)
+            || receiverType != null
+                && !Analysis.InaccessibleCalleeRecovery.IsVisibleType(receiverType, callerType))
+            return false;
         // A field on the generic definition is still the same member when reached
         // through an instantiation, so identity compares the definitions.
         if (declaring is GenericInstanceTypeAnalysisContext declaringInstance)
@@ -3890,13 +4141,16 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldsflda, staticField.Field.ToFieldDescriptor());
                 return true;
             case FieldReference field:
-                if (!FieldUsableFrom(field.Field, context, writeAccess: true)
+                if (!FieldUsableFrom(field.Field, context, writeAccess: true,
+                        receiverType: EmittedOperandType(field.Local, context))
                     || !EmitManagedAddress(field.Local, method, context, locals, writeLine))
                     return false;
                 instructions.Add(CilOpCodes.Ldflda,
                     FieldDescriptorFor(field.Field, EmittedOperandType(field.Local, context)));
                 return true;
             case ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } access:
+                if (!TypeTokenUsableFrom(array.ElementType, context))
+                    return false; // ldelema would name a type the caller cannot see
                 LoadArrayBase(access.Array, method, locals, context);
                 LoadOperandIntoSlot(access.Index, context.AppContext.SystemTypes.SystemInt32Type,
                     context, method, locals, writeLine);
@@ -3915,7 +4169,7 @@ public static class IlGenerator
         Dictionary<LocalVariable, CilLocalVariable> locals, MethodAnalysisContext context)
     {
         LoadLocal(array, method, locals);
-        CoerceOrDefault(EmittedLocalType(array, context), array.Type, method);
+        CoerceOrDefault(EmittedLocalType(array, context), array.Type, method, context);
     }
 
     private static void LoadLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
@@ -3949,7 +4203,8 @@ public static class IlGenerator
                 break;
 
             case FieldReference field:
-                if (!FieldUsableFrom(field.Field, context, writeAccess: true))
+                if (!FieldUsableFrom(field.Field, context, writeAccess: true,
+                        receiverType: field.Field.IsStatic ? null : EmittedOperandType(field.Local, context)))
                 {
                     // The value is already on the stack; the field cannot legally
                     // be referenced here, so fail honestly.
@@ -3968,8 +4223,11 @@ public static class IlGenerator
                 }
 
                 // stfld wants the object underneath the value, but the value is already on the stack, so
-                // park it in a temporary while we load the object.
-                var scratch = new CilLocalVariable(fieldDescriptor.Signature!.FieldType);
+                // park it in a temporary while we load the object. The scratch takes the
+                // instantiated field type: the descriptor's raw signature keeps the generic
+                // definition's !T, which has no meaning in this method's locals signature.
+                var scratch = new CilLocalVariable(
+                    EmittableLocalType(field.Field.FieldType, context).ToTypeSignature());
                 method.CilMethodBody!.LocalVariables.Add(scratch);
 
                 instructions.Add(CilOpCodes.Stloc, scratch);
@@ -3982,6 +4240,15 @@ public static class IlGenerator
             case ArrayAccess arrayAccess:
                 // stelem needs array and index before the value, so the same trick as stfld
                 var elementType = ((SzArrayTypeAnalysisContext)arrayAccess.Array.Type!).ElementType;
+                if (!TypeTokenUsableFrom(elementType, context))
+                {
+                    // The element type cannot be named here - not even the scratch
+                    // local's signature - so drop the stored value and fail honestly.
+                    instructions.Add(CilOpCodes.Pop);
+                    EmitUnrecoverableOperation(method, writeLine,
+                        $"Inaccessible array element type: {elementType.FullName}");
+                    break;
+                }
                 var elementScratch = new CilLocalVariable(elementType.ToTypeSignature());
                 method.CilMethodBody!.LocalVariables.Add(elementScratch);
 
