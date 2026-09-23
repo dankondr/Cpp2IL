@@ -1841,4 +1841,251 @@ public class IlGeneratorTests
             Assert.That(il[^1].OpCode, Is.EqualTo(CilOpCodes.Ret));
         });
     }
+
+    // IL2CPP's shared-generic lowering instantiates generic code over internal
+    // corlib marker types (System.Int32Enum and friends) that managed callers can
+    // never name. The fixture's own corlib carries them, so these tests assert the
+    // generator never fabricates a token that references the marker: the emitted
+    // member/type references are checked for the marker's name, and locals that
+    // carried it must be declared as a visible placeholder.
+
+    private static TypeAnalysisContext SeedInternalEnumMarker(ApplicationAnalysisContext app, ModuleDefinition module)
+    {
+        var marker = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Int32Enum");
+        Assert.That(marker, Is.Not.Null, "2022 fixture corlib should expose the shared-generic enum markers");
+        Assert.That(marker!.IsValueType && marker.IsEnumType, Is.True);
+        Assert.That(marker.Visibility, Is.EqualTo(System.Reflection.TypeAttributes.NotPublic));
+        marker.PutExtraData("AsmResolverType", new TypeDefinition(marker.Namespace, marker.Name,
+            TypeAttributes.NotPublic | TypeAttributes.Sealed | TypeAttributes.SequentialLayout,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType")));
+        return marker;
+    }
+
+    private static TypeDefinition SeedGenericListDefinition(TypeAnalysisContext listDefinition)
+    {
+        var typeDefinition = new TypeDefinition("System.Collections.Generic", "List`1",
+            TypeAttributes.Public | TypeAttributes.Class);
+        typeDefinition.GenericParameters.Add(new GenericParameter("T"));
+        listDefinition.PutExtraData("AsmResolverType", typeDefinition);
+        return typeDefinition;
+    }
+
+    private static IEnumerable<CilInstruction> TokenInstructions(MethodDefinition method) =>
+        method.CilMethodBody!.Instructions.Where(i => i.OpCode.OperandType
+            is CilOperandType.InlineMethod or CilOperandType.InlineType
+            or CilOperandType.InlineField or CilOperandType.InlineTok);
+
+    private static void AssertNoTokenNamesMarker(MethodDefinition method, string markerName = "Int32Enum")
+    {
+        Assert.That(TokenInstructions(method).All(i => i.Operand?.ToString()?.Contains(markerName) != true),
+            Is.True, () => string.Join("\n", method.CilMethodBody!.Instructions.Select(i => i.ToString())));
+        Assert.That(method.CilMethodBody!.LocalVariables.All(l => l.VariableType?.FullName?.Contains(markerName) != true),
+            Is.True, "a local must not be declared with the invisible marker type");
+    }
+
+    [Test]
+    public void CallOnSharedGenericOverInternalMarkerEmitsDiagnosticStub()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var add = listDefinition.Methods.FirstOrDefault(m => m.Name == "Add" && !m.IsStatic && m.Parameters.Count == 1);
+        Assert.That(add, Is.Not.Null);
+        var module = new ModuleDefinition("MarkerAdd.dll");
+        var markerType = SeedInternalEnumMarker(app, module);
+        SeedGenericListDefinition(listDefinition);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemVoidType, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemObjectType);
+        var callee = new ConcreteGenericMethodAnalysisContext(add!, [markerType], []);
+        var listType = new GenericInstanceTypeAnalysisContext(listDefinition, [markerType]);
+        var list = new LocalVariable("list", new Register(null, "list")) { Type = listType };
+        var item = new LocalVariable("item", new Register(null, "item")) { Type = markerType };
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.CallVoid, callee, list, item),
+            new(1, OpCode.Return)], [list, item]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Throw), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand?.ToString()?.Contains("Add") == true),
+                Is.False, "List<Int32Enum>::Add cannot be named by the caller");
+        });
+        AssertNoTokenNamesMarker(method);
+    }
+
+    [Test]
+    public void AddWithResizeOverInternalMarkerDoesNotSubstitute()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var addWithResize = listDefinition.Methods.FirstOrDefault(m => m.Name == "AddWithResize");
+        Assert.That(addWithResize, Is.Not.Null, "2022 fixture corlib should expose List<T>.AddWithResize");
+        var module = new ModuleDefinition("MarkerAddWithResize.dll");
+        var markerType = SeedInternalEnumMarker(app, module);
+        SeedGenericListDefinition(listDefinition);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemVoidType, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemObjectType);
+        var callee = new ConcreteGenericMethodAnalysisContext(addWithResize!, [markerType], []);
+        var listType = new GenericInstanceTypeAnalysisContext(listDefinition, [markerType]);
+        var list = new LocalVariable("list", new Register(null, "list")) { Type = listType };
+        var item = new LocalVariable("item", new Register(null, "item")) { Type = markerType };
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.CallVoid, callee, list, item),
+            new(1, OpCode.Return)], [list, item]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        // The honest substitute List<T>.Add exists, but over the marker it is just
+        // as unnameable - the substitution must not resurrect the same violation.
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Throw), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand?.ToString()?.Contains("Add") == true),
+                Is.False, "neither AddWithResize nor the Add substitute may be named");
+        });
+        AssertNoTokenNamesMarker(method);
+    }
+
+    [Test]
+    public void SharedGenericMethodArgumentOverInternalMarkerEmitsDiagnosticStub()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var activator = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Activator")!;
+        var createInstance = activator.Methods.FirstOrDefault(m =>
+            m.Name == "CreateInstance" && m.GenericParameters.Count == 1 && m.Parameters.Count == 0);
+        Assert.That(createInstance, Is.Not.Null, "2022 fixture corlib should expose Activator.CreateInstance<T>()");
+        var module = new ModuleDefinition("MarkerCreateInstance.dll");
+        var markerType = SeedInternalEnumMarker(app, module);
+        SeedCorLibTypes(app, module, activator, app.SystemTypes.SystemVoidType,
+            app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemObjectType);
+        var callee = new ConcreteGenericMethodAnalysisContext(createInstance!, [], [markerType]);
+        var result = new LocalVariable("result", new Register(null, "result"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Call, callee, result),
+            new(1, OpCode.Return)], [result]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Throw), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand?.ToString()?.Contains("CreateInstance") == true),
+                Is.False, "CreateInstance<Int32Enum> cannot be named by the caller");
+        });
+        AssertNoTokenNamesMarker(method);
+    }
+
+    [Test]
+    public void NewobjOnSharedGenericOverInternalMarkerEmitsDiagnosticStub()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var parameterless = listDefinition.Methods.FirstOrDefault(m =>
+            m.Name == ".ctor" && m.Parameters.Count == 0);
+        Assert.That(parameterless, Is.Not.Null);
+        var module = new ModuleDefinition("MarkerCtor.dll");
+        var markerType = SeedInternalEnumMarker(app, module);
+        SeedGenericListDefinition(listDefinition);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemVoidType, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemObjectType);
+        var ctor = new ConcreteGenericMethodAnalysisContext(parameterless!, [markerType], []);
+        var listType = new GenericInstanceTypeAnalysisContext(listDefinition, [markerType]);
+        var list = new LocalVariable("list", new Register(null, "list")) { Type = listType };
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Newobj, list),
+            new(1, OpCode.CallVoid, ctor, list),
+            new(2, OpCode.Return)], [list]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Throw), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Newobj && i.Operand?.ToString()?.Contains("List") == true),
+                Is.False, "newobj List<Int32Enum>::.ctor cannot be named by the caller");
+        });
+        AssertNoTokenNamesMarker(method);
+    }
+
+    [Test]
+    public void CastToSharedGenericOverInternalMarkerEmitsDefault()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var module = new ModuleDefinition("MarkerCast.dll");
+        var markerType = SeedInternalEnumMarker(app, module);
+        SeedGenericListDefinition(listDefinition);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemVoidType, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemObjectType);
+        var listType = new GenericInstanceTypeAnalysisContext(listDefinition, [markerType]);
+        var source = new LocalVariable("source", new Register(null, "source"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var cast = new LocalVariable("cast", new Register(null, "cast")) { Type = listType };
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, cast, new ReferenceCast(source, listType)),
+            new(1, OpCode.Return)], [source, cast]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Castclass), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldnull), Is.True,
+                "the honest value of an unnameable cast is a default of the slot");
+        });
+        AssertNoTokenNamesMarker(method);
+    }
+
+    [Test]
+    public void NewArrOverInternalMarkerEmitsDefault()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("MarkerArray.dll");
+        var markerType = SeedInternalEnumMarker(app, module);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemVoidType, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemObjectType);
+        var arrayType = new SzArrayTypeAnalysisContext(markerType);
+        var array = new LocalVariable("array", new Register(null, "array")) { Type = arrayType };
+        var length = new LocalVariable("length", new Register(null, "length"))
+            { Type = app.SystemTypes.SystemInt32Type };
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.NewArr, array, arrayType, length),
+            new(1, OpCode.Return)], [array, length]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Newarr), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldnull), Is.True,
+                "the honest value of an unnameable array is a default of the slot");
+        });
+        AssertNoTokenNamesMarker(method);
+    }
 }
