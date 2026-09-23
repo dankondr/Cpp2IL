@@ -275,6 +275,22 @@ public static class IlGenerator
             branchInstruction.Operand = new CilInstructionLabel(target);
         }
 
+        // Nothing may fall off the physical end of a body: a conditional branch
+        // (or any other fall-through-capable opcode) as the last instruction
+        // makes the verifier index a fall-through block past the code end. The
+        // ISIL successor was the synthetic exit - an edge the CFG models without
+        // a Return instruction - so the honest continuation is a plain return:
+        // default(T) on the stack when the method returns a value.
+        var lastEmitted = body.Instructions.LastOrDefault();
+        if (lastEmitted != null && lastEmitted.OpCode.Code is not (CilCode.Br or CilCode.Br_S
+                or CilCode.Ret or CilCode.Throw or CilCode.Leave or CilCode.Leave_S
+                or CilCode.Jmp or CilCode.Endfinally or CilCode.Rethrow))
+        {
+            if (!context.IsVoid)
+                PushDefaultOf(context.ReturnType, definition, body.Instructions, context);
+            body.Instructions.Add(CilOpCodes.Ret);
+        }
+
         // Add analysis warnings
         var instructions = body.Instructions;
         foreach (var warning in context.AnalysisWarnings)
@@ -822,7 +838,7 @@ public static class IlGenerator
                     if ((instruction.Operands.Count - 1) >= thisParamIndex)
                     {
                         var thisOperand = instruction.Operands[thisParamIndex];
-                        isOwnThis = thisOperand is LocalVariable thisLocal
+                        isOwnThis = !context.IsStatic && thisOperand is LocalVariable thisLocal
                             && (thisLocal.IsThis || ReferenceEquals(thisLocal, context.ParameterLocals.FirstOrDefault()));
                         // Outside a .ctor there is no `this`-initialization exemption,
                         // so a .ctor call even on the caller's own `this` is a re-init
@@ -859,8 +875,12 @@ public static class IlGenerator
                             var thisTarget = structCallee != null
                                 ? new ByRefTypeAnalysisContext(structCallee)
                                 : targetMethod.DeclaringType;
-                            var thisEmitted = EmittedOperandType(thisOperand, context);
-                            if (isOwnThis && thisEmitted != null && !StackAssignableTo(thisEmitted, thisTarget)
+                            // The receiver's stack type under its own contract: a zero
+                            // literal emits ldnull (the contract type itself), a nonzero
+                            // one keeps its natural width for the coerce below.
+                            var thisEmitted = EmittedOperandType(thisOperand, context, thisTarget);
+                            if (isOwnThis && thisEmitted != null && thisTarget != null
+                                && !StackAssignableTo(thisEmitted, thisTarget)
                                 && TryEmitThisFieldReceiver(context, thisTarget, method))
                             {
                                 // `this` cannot be the callee's receiver, but the compiler's
@@ -877,7 +897,8 @@ public static class IlGenerator
                                 // `this` must stay a bare ldarg.0 when it already satisfies the
                                 // callee - only a provable contract mismatch earns a coercion.
                                 if ((!isOwnThis && (targetMethod.Name is not ".ctor" || structCallee != null))
-                                    || (isOwnThis && thisEmitted != null && !StackAssignableTo(thisEmitted, thisTarget)))
+                                    || (isOwnThis && thisEmitted != null && thisTarget != null
+                                        && !StackAssignableTo(thisEmitted, thisTarget)))
                                 {
                                     // An unmanaged pointer to the struct is already a legal receiver.
                                     if (thisEmitted is not PointerTypeAnalysisContext)
@@ -1200,22 +1221,13 @@ public static class IlGenerator
                         && IntegralStackWidth(operandEmitted) == 0
                         && (operandEmitted.IsValueType || operandEmitted.FullName != "System.Object"));
 
-                // A managed pointer operand in add/sub carries its own stack kind: pointer
-                // arithmetic keeps the `&` rather than coercing to a shared numeric type.
-                var operand1Natural = instruction.OpCode is OpCode.Add or OpCode.Subtract
-                    ? EmittedOperandType(instruction.Operands[1], context)
-                    : null;
-                var operand2Natural = instruction.OpCode is OpCode.Add or OpCode.Subtract
-                    ? EmittedOperandType(instruction.Operands[2], context)
-                    : null;
                 // A managed pointer cannot participate in any binary op (ILVerify
-                // rejects `&` in add/sub entirely), so the operand's contract is
-                // the element it will be dereferenced to. Pointer arithmetic that
-                // names a field is recovered earlier by the address resolver.
-                var contract1 = NullComparisonType(instruction, 1, context)
-                    ?? (operand1Natural is ByRefTypeAnalysisContext byRef1 ? byRef1.ElementType : operandType);
-                var contract2 = NullComparisonType(instruction, 2, context)
-                    ?? (operand2Natural is ByRefTypeAnalysisContext byRef2 ? byRef2.ElementType : operand2Type);
+                // rejects `&` in add/sub entirely): the contract stays the shared
+                // numeric type and EmitStackCoerce dereferences `&` to it with the
+                // matching ldind width. Pointer arithmetic that names a field is
+                // recovered earlier by the address resolver.
+                var contract1 = NullComparisonType(instruction, 1, context) ?? operandType;
+                var contract2 = NullComparisonType(instruction, 2, context) ?? operand2Type;
 
                 // The stack types after loading under the contract - a missing contract
                 // leaves the operand's natural emission.
@@ -2632,7 +2644,10 @@ public static class IlGenerator
                 LoadArrayBase(arrayAccess.Array, method, locals, callingContext);
                 LoadOperandIntoSlot(arrayAccess.Index, callingContext.AppContext.SystemTypes.SystemInt32Type,
                     callingContext, method, locals, writeLine);
-                instructions.Add(CilOpCodes.Ldelem, arrayElementType.ToTypeSignature().ToTypeDefOrRef());
+                if (LdelemOpCode(arrayElementType) is { } ldelemOpCode)
+                    instructions.Add(ldelemOpCode);
+                else
+                    instructions.Add(CilOpCodes.Ldelem, arrayElementType.ToTypeSignature().ToTypeDefOrRef());
                 break;
             case FieldReference field:
                 if (!FieldUsableFrom(field.Field, callingContext,
@@ -2853,6 +2868,9 @@ public static class IlGenerator
                 module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "Type").ToTypeSignature(false)));
 
         LoadLocal(objLocal, method, locals);
+        // GetType is a reference-type member: a generic or value-typed operand
+        // reaches it only through box.
+        CoerceOrDefault(EmittedLocalType(objLocal, context), context?.AppContext.SystemTypes.SystemObjectType, method, context);
         instructions.Add(CilOpCodes.Callvirt, getType);
         LoadOperand(typeOperand, method, locals, writeLine, null, context); // emits typeof(T)
         instructions.Add(CilOpCodes.Ceq);
@@ -3010,6 +3028,10 @@ public static class IlGenerator
         // Only a type that produces a token but names something the caller cannot
         // see needs the placeholder; anything unemittable keeps the existing
         // behavior (the corlib-signature special cases and the literal defaults).
+        // A generic parameter is the method's own type variable: ldarg/stloc
+        // signatures name it directly, and no placeholder could stand in for it.
+        if (type is GenericParameterTypeAnalysisContext)
+            return type;
         if (context?.DeclaringType == null
             || !CanEmitTypeToken(type)
             || Analysis.InaccessibleCalleeRecovery.IsVisibleType(type, context.DeclaringType))
@@ -3032,7 +3054,15 @@ public static class IlGenerator
     private static bool IsBoolean(IOperand operand, MethodAnalysisContext context) =>
         DestinationType(operand) == context.AppContext.SystemTypes.SystemBooleanType;
 
-    private static TypeAnalysisContext EmittedLocalType(LocalVariable local, MethodAnalysisContext context)
+    // The stack type `ldloc`/`stloc` actually produces: the analysis type mapped
+    // through the same placeholder rules the locals signature used. A local whose
+    // recovered type the caller cannot name (e.g. a generic instantiation over a
+    // corlib-internal marker) is declared object/int instead, and every contract
+    // check has to see that emitted type rather than the unnameable analysis one.
+    private static TypeAnalysisContext EmittedLocalType(LocalVariable local, MethodAnalysisContext context) =>
+        EmittableLocalType(EmittedLocalTypeCore(local, context), context);
+
+    private static TypeAnalysisContext EmittedLocalTypeCore(LocalVariable local, MethodAnalysisContext context)
     {
         // `ldarg` always pushes the declared parameter type: when the lifter tagged the
         // parameter local with a different type (register reuse packs a Vector3 arg onto a
@@ -3047,7 +3077,9 @@ public static class IlGenerator
         // local with the bare struct type, the address is what lands on the stack.
         // On a generic type `this` verifies as the self-instantiation def<!0..!n>,
         // which is what the local analysis stored - prefer it over the bare def.
-        if (local.IsThis && context.DeclaringType is { } thisDeclaring)
+        // A static method has no `this`: an X0 local the lifter tagged IsThis there
+        // is an ordinary parameter and keeps its declared parameter type.
+        if (local.IsThis && !context.IsStatic && context.DeclaringType is { } thisDeclaring)
         {
             var thisType = local.Type as GenericInstanceTypeAnalysisContext ?? thisDeclaring;
             return thisType.IsValueType ? new ByRefTypeAnalysisContext(thisType) : thisType;
@@ -3478,6 +3510,31 @@ public static class IlGenerator
 
     // Mirrors the Immediate branch of LoadOperand: the reported stack type is whatever
     // the literal actually emits under the consumer's contract.
+    // ldelem.any pushes the element type verbatim, so narrow primitives and
+    // enums land on the stack as Byte/Short/Char - no arithmetic or store slot
+    // accepts them. The typed opcodes normalize to the evaluation-stack types.
+    private static CilOpCode? LdelemOpCode(TypeAnalysisContext elementType)
+    {
+        var type = elementType is { IsEnumType: true, DefaultEnumUnderlyingType: { } underlying }
+            ? underlying
+            : elementType;
+        return type.FullName switch
+        {
+            "System.Boolean" or "System.Byte" => CilOpCodes.Ldelem_U1,
+            "System.SByte" => CilOpCodes.Ldelem_I1,
+            "System.Int16" => CilOpCodes.Ldelem_I2,
+            "System.Char" or "System.UInt16" => CilOpCodes.Ldelem_U2,
+            "System.Int32" => CilOpCodes.Ldelem_I4,
+            "System.UInt32" => CilOpCodes.Ldelem_U4,
+            "System.Int64" or "System.UInt64" => CilOpCodes.Ldelem_I8,
+            "System.Single" => CilOpCodes.Ldelem_R4,
+            "System.Double" => CilOpCodes.Ldelem_R8,
+            "System.IntPtr" or "System.UIntPtr" => CilOpCodes.Ldelem_I,
+            _ when !type.IsValueType => CilOpCodes.Ldelem_Ref,
+            _ => null,
+        };
+    }
+
     private static TypeAnalysisContext EmittedImmediateType(Immediate immediate, TypeAnalysisContext? expectedType,
         MethodAnalysisContext context)
     {
@@ -3639,7 +3696,8 @@ public static class IlGenerator
 
         if (fromIsFloat && toWidth != 0)
         {
-            instructions.Add(toWidth == 8 ? CilOpCodes.Conv_I8 : CilOpCodes.Conv_I4);
+            instructions.Add(toWidth == 8 ? CilOpCodes.Conv_I8
+                : toWidth < 0 ? CilOpCodes.Conv_I : CilOpCodes.Conv_I4);
             return true;
         }
 
