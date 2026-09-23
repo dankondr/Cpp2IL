@@ -388,8 +388,12 @@ public class AllocationConstructorTests
     }
 
     [Test]
-    public void DistantConstructorCallWithoutBaseMatchIsPreserved()
+    public void DistantConstructorCallWithoutSignatureMatchRetargetsToAccessibleBaseCtor()
     {
+        // FeatureGroupDebugUI shape: IL2CPP inlined the whole base chain, so the
+        // surviving call is the parameterless grandparent .ctor while the immediate
+        // base only offers .ctor(int32). No signature match exists; the emitted call
+        // must still initialize `this` through the accessible immediate-base .ctor.
         var app = Cpp2IlApi.CurrentAppContext!;
         var (grandBase, immediateBase, derived, distantCtor, baseCtor, context, thisLocal) = ThisCtorFixture(app, 1, 0);
         context.ControlFlowGraph = new ISILControlFlowGraph([
@@ -399,10 +403,107 @@ public class AllocationConstructorTests
         var module = new ModuleDefinition("ThisCtorNoMatch.dll");
         var (distant, _, definition) = ThisCtorDefinitions(module, grandBase,
             immediateBase, derived, distantCtor, baseCtor, context, 0);
+        // The analysis base .ctor really takes an int32, so its AsmResolver
+        // counterpart must too (ThisCtorDefinitions gave it the distant signature).
+        var baseType = (TypeDefinition)immediateBase.GetExtraData<TypeDefinition>("AsmResolverType")!;
+        baseType.Methods.Clear();
+        var baseDefinition = new MethodDefinition(".ctor", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.Int32]));
+        baseType.Methods.Add(baseDefinition);
+        baseCtor.PutExtraData("AsmResolverMethod", baseDefinition);
 
         IlGenerator.GenerateIl(context, definition);
 
         var il = definition.CilMethodBody!.Instructions;
-        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand == distant), Is.True);
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand == distant), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            var call = il.Single(i => i.OpCode == CilOpCodes.Call && i.Operand is MethodDefinition);
+            Assert.That(call.Operand, Is.SameAs(baseDefinition));
+            // No matching parameter survived, so the slot is an honest default.
+            Assert.That(il[il.IndexOf(call) - 1].OpCode, Is.EqualTo(CilOpCodes.Ldc_I4_0));
+        });
+    }
+
+    [Test]
+    public void DistantConstructorCallWithoutSameArityBaseCtorFallsBackToParameterless()
+    {
+        // Distant .ctor(int32) on `this`, but the immediate base only offers a
+        // parameterless .ctor: same-arity keeps operand alignment, so without it the
+        // parameterless base .ctor is the honest initialization and moves to the
+        // prologue like any other parameterless replacement.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var (grandBase, immediateBase, derived, distantCtor, baseCtor, context, thisLocal) = ThisCtorFixture(app, 0, 1);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CallVoid, distantCtor, thisLocal, new Immediate(7)),
+            new(1, OpCode.Return)]);
+
+        var module = new ModuleDefinition("ThisCtorArityMismatch.dll");
+        var (distant, baseDefinition, definition) = ThisCtorDefinitions(module, grandBase,
+            immediateBase, derived, distantCtor, baseCtor, context, 0);
+        // distantCtor really takes an int32; give its definition that signature.
+        var grandBaseType = (TypeDefinition)grandBase.GetExtraData<TypeDefinition>("AsmResolverType")!;
+        grandBaseType.Methods.Clear();
+        var realDistant = new MethodDefinition(".ctor", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.Int32]));
+        grandBaseType.Methods.Add(realDistant);
+        distantCtor.PutExtraData("AsmResolverMethod", realDistant);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.Operand == realDistant), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldarg_0));
+            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Call));
+            Assert.That(il[1].Operand, Is.SameAs(baseDefinition));
+        });
+    }
+
+    [Test]
+    public void ConstructorCallOnThisOutsideConstructorBecomesNewobj()
+    {
+        // A `call` to a .ctor inside a non-.ctor method verifies on no receiver,
+        // including `this` - IL2CPP re-initialization is emitted as newobj + store.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "Tests", "Reinit", app.SystemTypes.SystemObjectType, R.TypeAttributes.Public);
+        var ctor = new NativeCtor(owner, 0x2000);
+        owner.Methods.Add(ctor);
+        var thisLocal = new LocalVariable("this", new Register(null, "this"), owner) { IsThis = true };
+        var caller = new InjectedMethodAnalysisContext(owner, "Reset",
+            app.SystemTypes.SystemVoidType, R.MethodAttributes.Public, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CallVoid, ctor, thisLocal),
+            new(1, OpCode.Return)]);
+        caller.Locals = [thisLocal];
+        caller.ParameterLocals = [thisLocal];
+        caller.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("Reinit.dll");
+        var ownerType = new TypeDefinition("Tests", "Reinit", TypeAttributes.Public,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(ownerType);
+        var ctorDefinition = new MethodDefinition(".ctor", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        ownerType.Methods.Add(ctorDefinition);
+        owner.PutExtraData("AsmResolverType", ownerType);
+        ctor.PutExtraData("AsmResolverMethod", ctorDefinition);
+        var definition = new MethodDefinition("Reset", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        ownerType.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Newobj && i.Operand == ctorDefinition), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand == ctorDefinition), Is.False);
+        });
     }
 }

@@ -137,8 +137,13 @@ public static class IlGenerator
         foreach (var (constructor, arguments) in thisConstructorCalls?.PrologueCalls ?? [])
         {
             body.Instructions.Add(CilOpCodes.Ldarg_0);
-            for (var i = 0; i < arguments.Length; i++)
-                LoadOperandIntoSlot(arguments[i], constructor.Parameters[i].ParameterType, context, definition, locals, writeLine);
+            for (var i = 0; i < constructor.Parameters.Count; i++)
+            {
+                if (i < arguments.Length && arguments[i] is { } argument)
+                    LoadOperandIntoSlot(argument, constructor.Parameters[i].ParameterType, context, definition, locals, writeLine);
+                else
+                    PushDefaultOf(constructor.Parameters[i].ParameterType, definition, body.Instructions);
+            }
             body.Instructions.Add(CilOpCodes.Call, constructor.ToMethodDescriptor());
         }
 
@@ -649,6 +654,9 @@ public static class IlGenerator
                 // is IL2CPP's re-init of an allocated object; emit newobj and store the fresh
                 // object back into the receiver slot instead.
                 IOperand? ctorReinitReceiver = null;
+                // A .ctor call lifted without any receiver operand cannot be a `call`
+                // either; it degrades to a bare newobj whose result is dropped.
+                var ctorNoReceiver = false;
                 // A struct's instance `this` is a managed pointer to that struct -
                 // `call StructType::.ctor` initializes through it in place too.
                 var structCallee = !targetMethod.IsStatic && targetMethod.DeclaringType is { IsValueType: true } structDeclaring
@@ -664,7 +672,11 @@ public static class IlGenerator
                         var thisOperand = instruction.Operands[thisParamIndex];
                         isOwnThis = thisOperand is LocalVariable thisLocal
                             && (thisLocal.IsThis || ReferenceEquals(thisLocal, context.ParameterLocals.FirstOrDefault()));
-                        if (referenceTypeConstructor && !isOwnThis)
+                        // Outside a .ctor there is no `this`-initialization exemption,
+                        // so a .ctor call even on the caller's own `this` is a re-init
+                        // of an allocated object and takes the newobj+store path too.
+                        if (referenceTypeConstructor
+                            && !(isOwnThis && context is { IsStatic: false, Name: ".ctor" }))
                             ctorReinitReceiver = thisOperand;
 
                         // A struct's instance `this` is a managed pointer: when the receiver
@@ -726,7 +738,9 @@ public static class IlGenerator
                     {
                         instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Non static method called without 'this' param ({instruction})"));
                         instructions.Add(CilOpCodes.Call, writeLine);
-                        if (structCallee == null || !EmitFallbackStructReceiver(structCallee, context, method, locals))
+                        if (referenceTypeConstructor)
+                            ctorNoReceiver = true;
+                        else if (structCallee == null || !EmitFallbackStructReceiver(structCallee, context, method, locals))
                             instructions.Add(CilOpCodes.Ldnull);
                     }
                 }
@@ -786,6 +800,20 @@ public static class IlGenerator
                             StoreContract(instruction.Operands[1], context), method);
                         StoreToOperand(instruction.Operands[1], method, locals, writeLine, context);
                     }
+                    break;
+                }
+
+                if (ctorNoReceiver)
+                {
+                    instructions.Add(CilOpCodes.Newobj, importedMethod);
+                    if (instruction.OpCode == OpCode.Call && instruction.Operands.Count > 1)
+                    {
+                        CoerceOrDefault(targetMethod.DeclaringType,
+                            StoreContract(instruction.Operands[1], context), method);
+                        StoreToOperand(instruction.Operands[1], method, locals, writeLine, context);
+                    }
+                    else
+                        instructions.Add(CilOpCodes.Pop);
                     break;
                 }
                 // ECMA III.3.19: a `call` to a non-final virtual method on a non-sealed
@@ -1226,7 +1254,7 @@ public static class IlGenerator
     {
         public readonly HashSet<Instruction> Skip = [];
         public readonly Dictionary<Instruction, MethodAnalysisContext> Retarget = [];
-        public readonly List<(MethodAnalysisContext Constructor, IOperand[] Arguments)> PrologueCalls = [];
+        public readonly List<(MethodAnalysisContext Constructor, IOperand?[] Arguments)> PrologueCalls = [];
 
         public static ThisConstructorCallPlan? Create(MethodAnalysisContext context)
         {
@@ -1235,13 +1263,17 @@ public static class IlGenerator
                 || declaringType.BaseType is not { } immediateBase)
                 return null;
 
+            var thisLocal = context.ParameterLocals.FirstOrDefault();
             List<(Instruction Instruction, MethodAnalysisContext Callee)> calls = [];
             foreach (var instruction in context.ControlFlowGraph!.Instructions)
             {
                 if (!instruction.IsCall
                     || instruction.Operands[0] is not MethodAnalysisContext { IsStatic: false, Name: ".ctor" } callee
                     || instruction.Operands.Count <= ConstructorReceiverIndex(instruction)
-                    || instruction.Operands[ConstructorReceiverIndex(instruction)] is not LocalVariable { IsThis: true })
+                    || instruction.Operands[ConstructorReceiverIndex(instruction)] is not LocalVariable receiver
+                    // Same rule as the emitter's own-this check: the flag, or the local
+                    // analysis pinned as the 'this' parameter.
+                    || !(receiver.IsThis || ReferenceEquals(receiver, thisLocal)))
                     continue;
 
                 calls.Add((instruction, callee));
@@ -1254,8 +1286,11 @@ public static class IlGenerator
                 if (SameTypeIdentity(call.Callee.DeclaringType, declaringType)
                     || SameTypeIdentity(call.Callee.DeclaringType, immediateBase))
                     hasLegalInitialization = true;
-                else if (IsDistantAncestorOf(declaringType, call.Callee.DeclaringType)
-                         || SameGenericDefinition(call.Callee.DeclaringType, immediateBase))
+                else
+                    // A `call` to a .ctor on `this` only verifies when the callee is an
+                    // overload of this .ctor or the immediate base's; anything else is a
+                    // leftover of the inlined base chain (or a broken base-type link) and
+                    // must be re-anchored or dropped.
                     distant.Add(call);
             }
 
@@ -1264,12 +1299,16 @@ public static class IlGenerator
                 // No .ctor call on `this` survived lifting at all (IL2CPP elides the
                 // trivial Object::.ctor chain); the verifier still requires `this`
                 // initialized before ret, so synthesize the honest base-init call
-                // when the immediate base offers a parameterless .ctor.
+                // when the immediate base offers a reachable .ctor.
                 var baseCtor = FindParameterlessBaseConstructor(immediateBase);
-                if (baseCtor == null || !IsAccessibleBaseConstructor(baseCtor, context))
+                if (baseCtor == null
+                    || !IsAccessibleBaseConstructor(baseCtor, context)
+                    || !Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(baseCtor, context))
+                    baseCtor = FindAccessibleBaseConstructor(immediateBase, -1, context);
+                if (baseCtor == null)
                     return null;
                 var synthesized = new ThisConstructorCallPlan();
-                synthesized.PrologueCalls.Add((baseCtor, []));
+                synthesized.PrologueCalls.Add((baseCtor, new IOperand?[baseCtor.Parameters.Count]));
                 return synthesized;
             }
 
@@ -1286,17 +1325,42 @@ public static class IlGenerator
                 return plan;
             }
 
+            // A distant-ancestor call has to be re-anchored to the immediate base to
+            // verify. Same-signature matches reproduce the original `base(...)` call;
+            // when the inlined chain leaves no matching signature, the closest
+            // accessible base .ctor still initializes `this` honestly: same arity
+            // keeps the surviving operands meaningful, a parameterless .ctor invents
+            // nothing, and any wider signature is filled with defaults.
             List<(Instruction Instruction, MethodAnalysisContext Replacement)> resolved = [];
+            List<Instruction> unresolved = [];
             foreach (var (instruction, callee) in distant)
-                if (FindImmediateBaseConstructor(immediateBase, callee) is { } match)
+            {
+                var match = FindImmediateBaseConstructor(immediateBase, callee);
+                if (match != null
+                    && (!IsAccessibleBaseConstructor(match, context)
+                        || !Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(match, context)))
+                    match = null;
+                match ??= FindAccessibleBaseConstructor(immediateBase, callee.Parameters.Count, context);
+                if (match != null)
                     resolved.Add((instruction, match));
+                else
+                    unresolved.Add(instruction);
+            }
 
-            if (resolved.Count == 0
-                || resolved.Any(r => !SameMethodIdentity(r.Replacement, resolved[0].Replacement)))
+            if (resolved.Count == 0)
                 return null;
 
+            // Distant calls with no reachable base .ctor are inlined-chain remnants;
+            // once `this` is initialized by the retargeted calls they only re-run
+            // work the inlining already emitted, so drop them rather than emit a
+            // call the verifier must reject.
+            foreach (var instruction in unresolved)
+                plan.Skip.Add(instruction);
+
             var replacement = resolved[0].Replacement;
-            if (replacement.Parameters.Count == 0)
+            if (resolved.Count == distant.Count
+                && replacement.Parameters.Count == 0
+                && resolved.All(r => SameMethodIdentity(r.Replacement, replacement)))
             {
                 foreach (var (instruction, _) in resolved)
                     plan.Skip.Add(instruction);
@@ -1357,7 +1421,9 @@ public static class IlGenerator
 
         // A derived .ctor may always name its direct base .ctor on `this`: family
         // access covers protected bases, and only truly private or cross-assembly
-        // assembly-only constructors are out of reach.
+        // assembly-only constructors are out of reach. A private .ctor on a base
+        // emitted into this same assembly stays reachable because member definitions
+        // are relaxed to public when their descriptors are emitted.
         private static bool IsAccessibleBaseConstructor(MethodAnalysisContext constructor,
             MethodAnalysisContext caller)
         {
@@ -1372,6 +1438,10 @@ public static class IlGenerator
             {
                 MethodAttributes.FamORAssem => true,
                 MethodAttributes.Assembly or MethodAttributes.FamANDAssem => sameAssembly,
+                // Emission relaxes same-assembly member definitions to public; a
+                // constructed (generic) base keeps its declared access, so the
+                // IsVisibleFrom check stays the gate for those.
+                MethodAttributes.Private => sameAssembly,
                 _ => false,
             };
         }
@@ -1403,20 +1473,46 @@ public static class IlGenerator
             return match;
         }
 
-        private static bool IsDistantAncestorOf(TypeAnalysisContext declaringType, TypeAnalysisContext? target)
+        // The inlined-away chain can leave a distant .ctor call whose signature no
+        // immediate-base .ctor repeats. `this` still has to be initialized by a legal
+        // call, so fall back to the closest accessible base .ctor: matching arity
+        // keeps the call's surviving operands aligned with real parameters, a
+        // parameterless .ctor invents nothing, and otherwise the smallest signature
+        // minimizes defaulted arguments. arity of -1 means no surviving call.
+        private static MethodAnalysisContext? FindAccessibleBaseConstructor(TypeAnalysisContext immediateBase,
+            int distantArity, MethodAnalysisContext caller)
         {
-            if (target == null)
-                return false;
-            for (var ancestor = declaringType.BaseType?.BaseType; ancestor != null; ancestor = ancestor.BaseType)
-                if (SameTypeIdentity(ancestor, target) || SameGenericDefinition(ancestor, target))
-                    return true;
-            return false;
-        }
+            var genericInstance = immediateBase as GenericInstanceTypeAnalysisContext;
+            var definition = genericInstance?.GenericType ?? immediateBase;
 
-        private static bool SameGenericDefinition(TypeAnalysisContext? a, TypeAnalysisContext? b) =>
-            a is GenericInstanceTypeAnalysisContext left
-            && b is GenericInstanceTypeAnalysisContext right
-            && left.GenericType.FullName == right.GenericType.FullName;
+            MethodAnalysisContext? best = null;
+            var bestScore = int.MaxValue;
+            foreach (var candidate in definition.Methods)
+            {
+                if (candidate is not { IsStatic: false, Name: ".ctor" })
+                    continue;
+
+                var concrete = genericInstance != null
+                    ? new ConcreteGenericMethodAnalysisContext(candidate, genericInstance.GenericArguments, [])
+                    : candidate;
+                if (!IsAccessibleBaseConstructor(concrete, caller)
+                    // A constructed base's .ctor reaches the verifier with declared
+                    // accessibility intact, so it must also survive that check.
+                    || !Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(concrete, caller))
+                    continue;
+
+                var score = candidate.Parameters.Count == distantArity ? 0
+                    : candidate.Parameters.Count == 0 ? 1
+                    : 2 + candidate.Parameters.Count;
+                if (score < bestScore)
+                {
+                    best = concrete;
+                    bestScore = score;
+                }
+            }
+
+            return best;
+        }
 
         // IL2CPP shares generic code across reference-type arguments, so the lifter may tag
         // a `newobj` with `List<object>` while every use site wants `List<string>`. When the
