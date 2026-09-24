@@ -142,8 +142,13 @@ public class AllocationConstructorTests
         IlGenerator.GenerateIl(caller, definition);
 
         var il = definition.CilMethodBody!.Instructions;
-        Assert.That(il.Count(i => i.OpCode == CilOpCodes.Newobj), Is.EqualTo(1));
-        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand == ctorDefinition), Is.True);
+        // A `call` to a reference-type .ctor on a foreign receiver is not legal IL;
+        // the re-init is emitted as newobj + store back to the receiver slot.
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Count(i => i.OpCode == CilOpCodes.Newobj), Is.EqualTo(2));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand == ctorDefinition), Is.False);
+        });
     }
 
     [Test]
@@ -383,8 +388,12 @@ public class AllocationConstructorTests
     }
 
     [Test]
-    public void DistantConstructorCallWithoutBaseMatchIsPreserved()
+    public void DistantConstructorCallWithoutSignatureMatchRetargetsToAccessibleBaseCtor()
     {
+        // FeatureGroupDebugUI shape: IL2CPP inlined the whole base chain, so the
+        // surviving call is the parameterless grandparent .ctor while the immediate
+        // base only offers .ctor(int32). No signature match exists; the emitted call
+        // must still initialize `this` through the accessible immediate-base .ctor.
         var app = Cpp2IlApi.CurrentAppContext!;
         var (grandBase, immediateBase, derived, distantCtor, baseCtor, context, thisLocal) = ThisCtorFixture(app, 1, 0);
         context.ControlFlowGraph = new ISILControlFlowGraph([
@@ -394,10 +403,317 @@ public class AllocationConstructorTests
         var module = new ModuleDefinition("ThisCtorNoMatch.dll");
         var (distant, _, definition) = ThisCtorDefinitions(module, grandBase,
             immediateBase, derived, distantCtor, baseCtor, context, 0);
+        // The analysis base .ctor really takes an int32, so its AsmResolver
+        // counterpart must too (ThisCtorDefinitions gave it the distant signature).
+        var baseType = (TypeDefinition)immediateBase.GetExtraData<TypeDefinition>("AsmResolverType")!;
+        baseType.Methods.Clear();
+        var baseDefinition = new MethodDefinition(".ctor", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.Int32]));
+        baseType.Methods.Add(baseDefinition);
+        baseCtor.PutExtraData("AsmResolverMethod", baseDefinition);
 
         IlGenerator.GenerateIl(context, definition);
 
         var il = definition.CilMethodBody!.Instructions;
-        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand == distant), Is.True);
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand == distant), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            var call = il.Single(i => i.OpCode == CilOpCodes.Call && i.Operand is MethodDefinition);
+            Assert.That(call.Operand, Is.SameAs(baseDefinition));
+            // No matching parameter survived, so the slot is an honest default.
+            Assert.That(il[il.IndexOf(call) - 1].OpCode, Is.EqualTo(CilOpCodes.Ldc_I4_0));
+        });
+    }
+
+    [Test]
+    public void DistantConstructorCallWithoutSameArityBaseCtorFallsBackToParameterless()
+    {
+        // Distant .ctor(int32) on `this`, but the immediate base only offers a
+        // parameterless .ctor: same-arity keeps operand alignment, so without it the
+        // parameterless base .ctor is the honest initialization and moves to the
+        // prologue like any other parameterless replacement.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var (grandBase, immediateBase, derived, distantCtor, baseCtor, context, thisLocal) = ThisCtorFixture(app, 0, 1);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CallVoid, distantCtor, thisLocal, new Immediate(7)),
+            new(1, OpCode.Return)]);
+
+        var module = new ModuleDefinition("ThisCtorArityMismatch.dll");
+        var (distant, baseDefinition, definition) = ThisCtorDefinitions(module, grandBase,
+            immediateBase, derived, distantCtor, baseCtor, context, 0);
+        // distantCtor really takes an int32; give its definition that signature.
+        var grandBaseType = (TypeDefinition)grandBase.GetExtraData<TypeDefinition>("AsmResolverType")!;
+        grandBaseType.Methods.Clear();
+        var realDistant = new MethodDefinition(".ctor", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.Int32]));
+        grandBaseType.Methods.Add(realDistant);
+        distantCtor.PutExtraData("AsmResolverMethod", realDistant);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.Operand == realDistant), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldarg_0));
+            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Call));
+            Assert.That(il[1].Operand, Is.SameAs(baseDefinition));
+        });
+    }
+
+    [Test]
+    public void ConstructorCallOnThisOutsideConstructorBecomesNewobj()
+    {
+        // A `call` to a .ctor inside a non-.ctor method verifies on no receiver,
+        // including `this` - IL2CPP re-initialization is emitted as newobj + store.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "Tests", "Reinit", app.SystemTypes.SystemObjectType, R.TypeAttributes.Public);
+        var ctor = new NativeCtor(owner, 0x2000);
+        owner.Methods.Add(ctor);
+        var thisLocal = new LocalVariable("this", new Register(null, "this"), owner) { IsThis = true };
+        var caller = new InjectedMethodAnalysisContext(owner, "Reset",
+            app.SystemTypes.SystemVoidType, R.MethodAttributes.Public, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CallVoid, ctor, thisLocal),
+            new(1, OpCode.Return)]);
+        caller.Locals = [thisLocal];
+        caller.ParameterLocals = [thisLocal];
+        caller.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("Reinit.dll");
+        var ownerType = new TypeDefinition("Tests", "Reinit", TypeAttributes.Public,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(ownerType);
+        var ctorDefinition = new MethodDefinition(".ctor", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        ownerType.Methods.Add(ctorDefinition);
+        owner.PutExtraData("AsmResolverType", ownerType);
+        ctor.PutExtraData("AsmResolverMethod", ctorDefinition);
+        var definition = new MethodDefinition("Reset", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        ownerType.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Newobj && i.Operand == ctorDefinition), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand == ctorDefinition), Is.False);
+        });
+    }
+
+    // An abstract base type with a matching-arity derived type, wired for AsmResolver
+    // emission. Mirrors the IL2CPP pattern where a derived .ctor's forwarding body is
+    // inlined and the paired call ends up naming the abstract base .ctor.
+    private static (InjectedTypeAnalysisContext AbstractBase, InjectedTypeAnalysisContext Derived,
+        NativeCtor AbstractCtor, NativeCtor DerivedCtor, LocalVariable Result,
+        InjectedMethodAnalysisContext Caller) AbstractAllocationFixture(ApplicationAnalysisContext app)
+    {
+        var assembly = app.SystemTypes.SystemObjectType.DeclaringAssembly;
+        var abstractBase = new InjectedTypeAnalysisContext(assembly, "Tests", "AbstractBase",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Abstract);
+        var derived = new InjectedTypeAnalysisContext(assembly, "Tests", "Derived",
+            abstractBase, R.TypeAttributes.Public);
+        var owner = new InjectedTypeAnalysisContext(assembly, "Tests", "Capture",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public);
+        var abstractCtor = new NativeCtor(abstractBase, 0x2000);
+        var derivedCtor = new NativeCtor(derived, 0x3000);
+        abstractBase.Methods.Add(abstractCtor);
+        derived.Methods.Add(derivedCtor);
+        var result = new LocalVariable("result", new Register(null, "result"), abstractBase);
+        var caller = new InjectedMethodAnalysisContext(owner, "Create", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public | R.MethodAttributes.Static, []);
+        caller.Locals = [result]; caller.ParameterLocals = []; caller.AnalysisWarnings = [];
+        return (abstractBase, derived, abstractCtor, derivedCtor, result, caller);
+    }
+
+    private static (MethodDefinition AbstractCtor, MethodDefinition DerivedCtor, MethodDefinition Caller)
+        AbstractAllocationDefinitions(ModuleDefinition module, InjectedTypeAnalysisContext abstractBase,
+            InjectedTypeAnalysisContext derived, NativeCtor abstractCtor, NativeCtor? derivedCtor,
+            InjectedMethodAnalysisContext caller)
+    {
+        var abstractType = new TypeDefinition("Tests", "AbstractBase",
+            TypeAttributes.Public | TypeAttributes.Abstract, module.CorLibTypeFactory.Object.Type);
+        var derivedType = new TypeDefinition("Tests", "Derived", TypeAttributes.Public, abstractType);
+        var captureType = new TypeDefinition("Tests", "Capture", TypeAttributes.Public,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(abstractType);
+        module.TopLevelTypes.Add(derivedType);
+        module.TopLevelTypes.Add(captureType);
+        var abstractCtorDefinition = new MethodDefinition(".ctor", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        var derivedCtorDefinition = new MethodDefinition(".ctor", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        abstractType.Methods.Add(abstractCtorDefinition);
+        derivedType.Methods.Add(derivedCtorDefinition);
+        var definition = new MethodDefinition("Create", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        captureType.Methods.Add(definition);
+        abstractBase.PutExtraData("AsmResolverType", abstractType);
+        derived.PutExtraData("AsmResolverType", derivedType);
+        abstractCtor.PutExtraData("AsmResolverMethod", abstractCtorDefinition);
+        derivedCtor?.PutExtraData("AsmResolverMethod", derivedCtorDefinition);
+        return (abstractCtorDefinition, derivedCtorDefinition, definition);
+    }
+
+    [Test]
+    public void FusedAbstractConstructorReanchorsToTheAllocatedClassOperand()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var (abstractBase, derived, abstractCtor, derivedCtor, result, caller) = AbstractAllocationFixture(app);
+        // object_new was invoked with the concrete class; the paired .ctor call resolved to
+        // the abstract base (the derived .ctor's forwarding body was inlined).
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Newobj, result, derived),
+            new(1, OpCode.CallVoid, abstractCtor, result),
+            new(2, OpCode.Return)]);
+
+        var module = new ModuleDefinition("AbstractFusedConcrete.dll");
+        var (_, derivedCtorDefinition, definition) = AbstractAllocationDefinitions(module,
+            abstractBase, derived, abstractCtor, derivedCtor, caller);
+
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        var newobj = il.Single(i => i.OpCode == CilOpCodes.Newobj);
+        Assert.That(newobj.Operand, Is.SameAs(derivedCtorDefinition));
+    }
+
+    [Test]
+    public void FusedAbstractConstructorWithoutConcreteEvidenceEmitsNull()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var (abstractBase, derived, abstractCtor, _, result, caller) = AbstractAllocationFixture(app);
+        // The class operand stayed an unresolved address and the destination local is typed
+        // by the abstract base - no concrete type is provable, so no newobj may be emitted.
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Newobj, result, new Immediate(123)),
+            new(1, OpCode.CallVoid, abstractCtor, result),
+            new(2, OpCode.Return)]);
+
+        var module = new ModuleDefinition("AbstractFusedNull.dll");
+        var (_, _, definition) = AbstractAllocationDefinitions(module,
+            abstractBase, derived, abstractCtor, null!, caller);
+
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Newobj), Is.False);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldnull), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.True);
+        });
+    }
+
+    [Test]
+    public void FusedAbstractConstructorWithoutSignatureMatchEmitsNull()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var (abstractBase, derived, abstractCtor, _, result, caller) = AbstractAllocationFixture(app);
+        // The concrete type only declares a one-parameter .ctor, so the parameterless base
+        // init cannot be re-anchored honestly (the real argument was consumed elsewhere).
+        result.Type = derived;
+        var derivedOnlyCtor = new NativeCtor(derived, 0x3000);
+        derivedOnlyCtor.Parameters.Add(new InjectedParameterAnalysisContext(null,
+            app.SystemTypes.SystemInt32Type, R.ParameterAttributes.None, 0, derivedOnlyCtor));
+        derived.Methods.Clear();
+        derived.Methods.Add(derivedOnlyCtor);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Newobj, result, derived),
+            new(1, OpCode.CallVoid, abstractCtor, result),
+            new(2, OpCode.Return)]);
+
+        var module = new ModuleDefinition("AbstractFusedNoMatch.dll");
+        var (_, _, definition) = AbstractAllocationDefinitions(module,
+            abstractBase, derived, abstractCtor, null!, caller);
+
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Newobj), Is.False);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldnull), Is.True);
+        });
+    }
+
+    [Test]
+    public void SelfContainedAbstractAllocationEmitsNull()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var (abstractBase, derived, abstractCtor, _, result, caller) = AbstractAllocationFixture(app);
+        // No paired .ctor call: the allocation is self-contained but names an abstract type.
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Newobj, result, abstractBase),
+            new(1, OpCode.Return)]);
+
+        var module = new ModuleDefinition("AbstractBare.dll");
+        var (_, _, definition) = AbstractAllocationDefinitions(module,
+            abstractBase, derived, abstractCtor, null!, caller);
+
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Newobj), Is.False);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldnull), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.True);
+        });
+    }
+
+    [Test]
+    public void AbstractConstructorCallOnConcreteReceiverReanchors()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var (abstractBase, derived, abstractCtor, derivedCtor, _, caller) = AbstractAllocationFixture(app);
+        // `call AbstractBase::.ctor(receiver)` on a non-this receiver is emitted as newobj +
+        // store; the receiver's concrete type is the honest construction type.
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver"), derived);
+        caller.Locals.Add(receiver);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CallVoid, abstractCtor, receiver),
+            new(1, OpCode.Return)]);
+
+        var module = new ModuleDefinition("AbstractReinitConcrete.dll");
+        var (_, derivedCtorDefinition, definition) = AbstractAllocationDefinitions(module,
+            abstractBase, derived, abstractCtor, derivedCtor, caller);
+
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        var newobj = il.Single(i => i.OpCode == CilOpCodes.Newobj);
+        Assert.That(newobj.Operand, Is.SameAs(derivedCtorDefinition));
+    }
+
+    [Test]
+    public void AbstractConstructorCallOnAbstractReceiverEmitsNull()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var (abstractBase, derived, abstractCtor, _, result, caller) = AbstractAllocationFixture(app);
+        // The receiver is only known as the abstract base, so the re-init cannot be
+        // reproduced as a newobj; the slot takes its default instead.
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CallVoid, abstractCtor, result),
+            new(1, OpCode.Return)]);
+
+        var module = new ModuleDefinition("AbstractReinitNull.dll");
+        var (_, _, definition) = AbstractAllocationDefinitions(module,
+            abstractBase, derived, abstractCtor, null!, caller);
+
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Newobj), Is.False);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldnull), Is.True);
+        });
     }
 }

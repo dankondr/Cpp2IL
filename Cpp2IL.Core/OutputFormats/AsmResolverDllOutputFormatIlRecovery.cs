@@ -5,9 +5,11 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading;
+using AsmResolver;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
+using AsmResolver.PE.DotNet.Metadata.Tables;
 using AssetRipper.CIL;
 using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Graphs;
@@ -38,11 +40,198 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 
         IlGenerator.InjectHelpersType(context);
 
-        var assemblies = base.BuildAssemblies(context);
+        // The emission-time access gates must answer for the friend scope
+        // RestoreInternalsVisibleTo creates below, not for the raw metadata.
+        AccessibilityExtensions.EmittedInternalsAreShared = true;
+        try
+        {
+            var assemblies = base.BuildAssemblies(context);
+            foreach (var assembly in assemblies)
+                foreach (var module in assembly.Modules)
+                {
+                    RecoveryModuleIdentity.Assign(module, buildIdentity);
+                    RelocateLargeStrings(module);
+                }
+            RestoreInternalsVisibleTo(assemblies);
+            return assemblies;
+        }
+        finally
+        {
+            AccessibilityExtensions.EmittedInternalsAreShared = false;
+        }
+    }
+
+    // il2cpp metadata does not preserve assembly-level attributes, so recovered
+    // assemblies lose the InternalsVisibleTo grants the originals compiled
+    // against - Unity package internals cross assembly boundaries constantly
+    // (internal types in fields, methods, casts). The verifier resolves the real
+    // hierarchy and rejects those references as invisible. Restoring the grant
+    // for every sibling assembly recreates the access shape the binary actually
+    // had - the il2cpp runtime never enforced .NET visibility anyway.
+    private static void RestoreInternalsVisibleTo(List<AssemblyDefinition> assemblies)
+    {
+        // Strong-named friends must be listed with their full public key or
+        // the runtime and ILVerify treat the InternalsVisibleTo grant as not
+        // matching - il2cpp kept Unity's keypair-signed public keys.
+        var friends = assemblies
+            .Where(a => a.Name is not null)
+            .Select(FriendName)
+            .Distinct()
+            .ToList();
         foreach (var assembly in assemblies)
-            foreach (var module in assembly.Modules)
-                RecoveryModuleIdentity.Assign(module, buildIdentity);
-        return assemblies;
+        {
+            var module = assembly.Modules.FirstOrDefault();
+            if (module == null || assembly.Name is null)
+                continue;
+            var factory = module.CorLibTypeFactory;
+            var ivtCtor = factory.CorLibScope
+                .CreateTypeReference("System.Runtime.CompilerServices", "InternalsVisibleToAttribute")
+                .CreateMemberReference(".ctor",
+                    MethodSignature.CreateInstance(factory.Void, [factory.String]));
+            var self = assembly.Name.ToString() + ",";
+            foreach (var friend in friends)
+            {
+                if (friend.StartsWith(self, StringComparison.Ordinal))
+                    continue;
+                var signature = new CustomAttributeSignature(
+                    new CustomAttributeArgument(factory.String, friend));
+                assembly.CustomAttributes.Add(new CustomAttribute(ivtCtor, signature));
+            }
+        }
+    }
+
+    private static string FriendName(AssemblyDefinition friend)
+    {
+        var name = friend.Name!.ToString();
+        if (friend.PublicKey is not { Length: > 0 } publicKey)
+            return name;
+        var hex = new char[publicKey.Length * 2];
+        const string digits = "0123456789abcdef";
+        for (var i = 0; i < publicKey.Length; i++)
+        {
+            hex[i * 2] = digits[publicKey[i] >> 4];
+            hex[i * 2 + 1] = digits[publicKey[i] & 0xf];
+        }
+        return name + ", PublicKey=" + new string(hex);
+    }
+
+    private const int StringHeapSoftLimit = 14 * 1024 * 1024;
+
+    // The #US heap is addressed with 24-bit offsets: a single assembly can exceed
+    // 16MB of unique strings (protobuf descriptors in HotFix.dll) and offsets past
+    // the limit produce unresolvable tokens. Move the largest strings into an RVA
+    // blob read through Encoding.UTF8.GetString until the projected heap fits.
+    private static void RelocateLargeStrings(ModuleDefinition module)
+    {
+        var unique = new Dictionary<string, int>();
+        var bodies = new List<AsmResolver.DotNet.Code.Cil.CilMethodBody>();
+        foreach (var type in module.GetAllTypes())
+        foreach (var method in type.Methods)
+        {
+            if (method.CilMethodBody is not { } body)
+                continue;
+            bodies.Add(body);
+            foreach (var instruction in body.Instructions)
+                if (instruction.OpCode == CilOpCodes.Ldstr && instruction.Operand is string s)
+                    unique[s] = s.Length;
+        }
+
+        //Entries are stored as UTF-16 bytes plus a trailing flag byte and a
+        //compressed-length prefix, so each string costs roughly 2*chars+3.
+        var heap = 1L;
+        foreach (var n in unique.Values) heap += 2L * n + 3;
+        if (heap <= StringHeapSoftLimit) return;
+
+        var helpers = module.GetAllTypes().FirstOrDefault(t => t.FullName == "Cpp2ILInjected.Cpp2ILHelpers");
+        if (helpers == null) return;
+
+        var moved = new Dictionary<string, (int Offset, int Length)>();
+        var blob = new List<byte>();
+        foreach (var kv in unique.OrderByDescending(kv => kv.Value))
+        {
+            if (heap <= StringHeapSoftLimit) break;
+            moved[kv.Key] = (blob.Count, Encoding.UTF8.GetByteCount(kv.Key));
+            blob.AddRange(Encoding.UTF8.GetBytes(kv.Key));
+            heap -= 2L * kv.Value + 3;
+        }
+
+        var factory = module.CorLibTypeFactory;
+        var byteArray = new SzArrayTypeSignature(factory.Byte);
+
+        var blobType = new TypeDefinition(null, "__StringBlob",
+            TypeAttributes.NestedPrivate | TypeAttributes.Sealed | TypeAttributes.SequentialLayout,
+            factory.CorLibScope.CreateTypeReference("System", "ValueType"));
+        blobType.ClassLayout = new ClassLayout(1, (uint)blob.Count);
+        helpers.NestedTypes.Add(blobType);
+
+        var dataField = new FieldDefinition("__StringData",
+            FieldAttributes.Assembly | FieldAttributes.Static | FieldAttributes.HasFieldRva,
+            new FieldSignature(blobType.ToTypeSignature()));
+        dataField.FieldRva = new DataSegment(blob.ToArray());
+        helpers.Fields.Add(dataField);
+
+        var stringsField = new FieldDefinition("__Strings", FieldAttributes.Assembly | FieldAttributes.Static,
+            new FieldSignature(byteArray));
+        helpers.Fields.Add(stringsField);
+
+        var arrayType = factory.CorLibScope.CreateTypeReference("System", "Array");
+        var handleType = factory.CorLibScope.CreateTypeReference("System", "RuntimeFieldHandle");
+        var initArray = factory.CorLibScope
+            .CreateTypeReference("System.Runtime.CompilerServices", "RuntimeHelpers")
+            .CreateMemberReference("InitializeArray",
+                MethodSignature.CreateStatic(factory.Void, [arrayType.ToTypeSignature(true), handleType.ToTypeSignature(true)]));
+
+        var cctor = new MethodDefinition(".cctor",
+            MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.SpecialName | MethodAttributes.RuntimeSpecialName,
+            MethodSignature.CreateStatic(factory.Void, []));
+        var cctorBody = new AsmResolver.DotNet.Code.Cil.CilMethodBody();
+        var ci = cctorBody.Instructions;
+        ci.Add(CilOpCodes.Ldc_I4, blob.Count);
+        ci.Add(CilOpCodes.Newarr, factory.Byte.ToTypeDefOrRef());
+        ci.Add(CilOpCodes.Dup);
+        ci.Add(CilOpCodes.Ldtoken, dataField);
+        ci.Add(CilOpCodes.Call, initArray);
+        ci.Add(CilOpCodes.Stsfld, stringsField);
+        ci.Add(CilOpCodes.Ret);
+        cctor.CilMethodBody = cctorBody;
+        helpers.Methods.Add(cctor);
+
+        var encodingType = factory.CorLibScope.CreateTypeReference("System.Text", "Encoding");
+        var getUtf8 = encodingType.CreateMemberReference("get_UTF8",
+            MethodSignature.CreateStatic(encodingType.ToTypeSignature(true), []));
+        var getString = encodingType.CreateMemberReference("GetString",
+            MethodSignature.CreateInstance(factory.String, [byteArray, factory.Int32, factory.Int32]));
+
+        foreach (var body in bodies)
+        {
+            var rewritten = false;
+            var instructions = body.Instructions;
+            for (var i = 0; i < instructions.Count; i++)
+            {
+                var instruction = instructions[i];
+                if (instruction.OpCode != CilOpCodes.Ldstr || instruction.Operand is not string s ||
+                    !moved.TryGetValue(s, out var entry))
+                    continue;
+                //Rewrite in place so existing branch labels stay anchored.
+                instruction.OpCode = CilOpCodes.Call;
+                instruction.Operand = getUtf8;
+                instructions.Insert(i + 1, new CilInstruction(CilOpCodes.Ldsfld, stringsField));
+                instructions.Insert(i + 2, new CilInstruction(CilOpCodes.Ldc_I4, entry.Offset));
+                instructions.Insert(i + 3, new CilInstruction(CilOpCodes.Ldc_I4, entry.Length));
+                instructions.Insert(i + 4, new CilInstruction(CilOpCodes.Callvirt, getString));
+                rewritten = true;
+                i += 4;
+            }
+
+            //The replacement sequence is deeper than ldstr; give the verifier a true peak.
+            if (rewritten)
+            {
+                try { body.MaxStack = Math.Max(body.MaxStack, body.ComputeMaxStack()); }
+                catch { body.MaxStack += 4; }
+            }
+        }
+
+        Logger.VerboseNewline($"Relocated {moved.Count} large strings ({blob.Count} bytes) to RVA blob in {module.Name}", "DllOutput");
     }
 
     protected override void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
@@ -78,7 +267,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         if (shouldSkip)
         {
             status = "intentional-stub";
-            FillMethodBodyWithStub(methodDefinition);
+            FillMethodBodyWithStub(methodDefinition, methodContext);
             return;
         }
 
@@ -91,7 +280,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             if (methodContext.ConvertedIsil.Count == 0)
             {
                 status = "unresolved";
-                FillMethodBodyWithStub(methodDefinition);
+                FillMethodBodyWithStub(methodDefinition, methodContext);
             }
             else
                 IlGenerator.GenerateIl(methodContext, methodDefinition);

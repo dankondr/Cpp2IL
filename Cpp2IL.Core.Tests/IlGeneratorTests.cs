@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using AsmResolver.DotNet;
+using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
 using AsmResolver.PE.DotNet.Metadata.Tables;
@@ -52,7 +53,9 @@ public class IlGeneratorTests
     [TestCase(7, false, OpCode.CheckEqual, true)]
     [TestCase(8, false, OpCode.CheckEqual, true)]
     [TestCase(9, false, OpCode.CheckEqual, false)]
-    [TestCase(10, false, OpCode.CheckEqual, false)]
+    // An unconstrained T tested against zero is the canonical `box T; ldnull; ceq`
+    // null check - a reference comparison, so ldnull is emitted.
+    [TestCase(10, false, OpCode.CheckEqual, true)]
     [TestCase(11, false, OpCode.CheckEqual, true)]
     [TestCase(1, false, OpCode.CheckEqual, false)]
     [TestCase(2, false, OpCode.CheckEqual, false)]
@@ -303,8 +306,12 @@ public class IlGeneratorTests
         IlGenerator.GenerateIl(context, method);
 
         var instructions = method.CilMethodBody!.Instructions;
+        // The immediate adapts to the operand width at load time (ldc.r8), so no raw
+        // int ever reaches the ceq - the conversion the name promises, just folded.
         Assert.That(instructions.Select(i => i.OpCode), Does.Contain(CilOpCodes.Ldc_R8));
-        Assert.That(instructions.Select(i => i.OpCode), Does.Contain(CilOpCodes.Conv_R8));
+        // The immediate is loaded directly at double width, so no separate
+        // conversion is needed; it must not reach ceq as an integer.
+        Assert.That(instructions.Select(i => i.OpCode), Does.Not.Contain(CilOpCodes.Ldc_I4));
         Assert.That(instructions.Select(i => i.OpCode), Does.Contain(CilOpCodes.Ceq));
     }
 
@@ -321,13 +328,16 @@ public class IlGeneratorTests
         var module = new ModuleDefinition("InvalidStack.dll");
         var type = new TypeDefinition("Tests", "InvalidStack", TypeAttributes.Public | TypeAttributes.Class);
         module.TopLevelTypes.Add(type);
-        // A non-void signature with an empty return stack must not acquire a guessed bound.
+        // A non-void signature with an empty return stack gets no recovered value.
         var method = new MethodDefinition("Invalid", MethodAttributes.Public | MethodAttributes.Static,
             MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32));
         type.Methods.Add(method);
         IlGenerator.GenerateIl(caller, method);
         Assert.That(method.CilMethodBody!.Instructions[0].OpCode, Is.EqualTo(CilOpCodes.Ret));
-        Assert.That(method.CilMethodBody.MaxStack, Is.EqualTo(0));
+        // The verifier compares pushes against the declared bound, so a failed stack
+        // analysis still declares the provable ceiling - the body's total pushes -
+        // rather than a guessed bound or a 0 nothing can satisfy.
+        Assert.That(method.CilMethodBody.MaxStack, Is.GreaterThanOrEqualTo(1));
         Assert.That(caller.AnalysisWarnings.Any(w => w.Contains("Invalid reconstructed IL stack")), Is.True);
         Assert.That(method.CilMethodBody.Instructions.Any(i => i.Operand is string s && s.Contains("Invalid reconstructed IL stack")), Is.True);
         Assert.That(method.CilMethodBody.Instructions[^1].OpCode, Is.EqualTo(CilOpCodes.Throw));
@@ -446,7 +456,7 @@ public class IlGeneratorTests
     [TestCase(false, true, false)]
     [TestCase(true, true, false)]
     [TestCase(false, false, true)]
-    [TestCase(false, false, false)] // direct base/virtual calls must remain direct
+    [TestCase(false, false, false)] // a virtual callee on a non-`this` receiver must dispatch virtually
     public void InterfaceCallPreservesRuntimeDispatch(bool isStatic, bool isInterface, bool virtualDispatch)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
@@ -473,7 +483,165 @@ public class IlGeneratorTests
             MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
         type.Methods.Add(method);
         IlGenerator.GenerateIl(caller, method);
-        Assert.That(method.CilMethodBody!.Instructions.Any(i => i.OpCode == (!isStatic && (isInterface || virtualDispatch) ? CilOpCodes.Callvirt : CilOpCodes.Call) && i.Operand == targetDefinition), Is.True);
+        // ECMA III.3.19: `call` to a non-final virtual on a non-sealed type only verifies
+        // on the caller's own `this` pointer (or a boxed value type). Every non-static row
+        // targets a non-final virtual with a placeholder receiver, so `callvirt` is the
+        // only verifiable spelling; the static target keeps `call`.
+        Assert.That(method.CilMethodBody!.Instructions.Any(i => i.OpCode == (!isStatic ? CilOpCodes.Callvirt : CilOpCodes.Call) && i.Operand == targetDefinition), Is.True);
+    }
+
+    [Test]
+    public void DirectCallToVirtualOnAddressOfObjectEmitsCallvirtAndNarrowingCast()
+    {
+        // Enum::ToString is a non-final virtual on a non-sealed reference type and the
+        // recovered receiver is the address of an object local: `call` cannot verify on
+        // a non-`this` receiver and the dereferenced object is not statically an Enum.
+        // The honest emission is ldind.ref + castclass + callvirt.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var enumType = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Enum")!;
+        var toString = enumType.GetMethod("ToString", 0);
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var result = new LocalVariable("result", new Register(null, "result"))
+            { Type = app.SystemTypes.SystemStringType };
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Call, toString, result, new AddressOf(receiver)),
+            new(1, OpCode.Return)]);
+        caller.Locals = [receiver, result];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("VirtualThis.dll");
+        var enumDefinition = new TypeDefinition("System", "Enum",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(enumDefinition);
+        enumType.PutExtraData("AsmResolverType", enumDefinition);
+        app.SystemTypes.SystemStringType.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "String", TypeAttributes.Public | TypeAttributes.Class,
+                module.CorLibTypeFactory.Object.Type));
+        var toStringDefinition = new MethodDefinition("ToString", MethodAttributes.Public | MethodAttributes.Virtual,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.String));
+        enumDefinition.Methods.Add(toStringDefinition);
+        toString.PutExtraData("AsmResolverMethod", toStringDefinition);
+        var owner = new TypeDefinition("Tests", "Host", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(method);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Callvirt && i.Operand == toStringDefinition), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand == toStringDefinition), Is.False);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldind_Ref), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Castclass), Is.True);
+        });
+    }
+
+    [Test]
+    public void DirectCallToVirtualOnEnumAddressEmitsBoxedReceiver()
+    {
+        // The same virtual callee with the address of a genuinely enum-typed local
+        // recovers the real receiver: ldobj + box leaves a boxed enum on the stack,
+        // which is assignable to System.Enum and verifiable under callvirt.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var enumType = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Enum")!;
+        var toString = enumType.GetMethod("ToString", 0);
+        var myEnum = new InjectedTypeAnalysisContext(enumType.DeclaringAssembly,
+            "Tests", "MyEnum", enumType, System.Reflection.TypeAttributes.Public);
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver")) { Type = myEnum };
+        var result = new LocalVariable("result", new Register(null, "result"))
+            { Type = app.SystemTypes.SystemStringType };
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Call, toString, result, new AddressOf(receiver)),
+            new(1, OpCode.Return)]);
+        caller.Locals = [receiver, result];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("VirtualEnum.dll");
+        var enumDefinition = new TypeDefinition("System", "Enum",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(enumDefinition);
+        enumType.PutExtraData("AsmResolverType", enumDefinition);
+        app.SystemTypes.SystemStringType.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "String", TypeAttributes.Public | TypeAttributes.Class,
+                module.CorLibTypeFactory.Object.Type));
+        var toStringDefinition = new MethodDefinition("ToString", MethodAttributes.Public | MethodAttributes.Virtual,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.String));
+        enumDefinition.Methods.Add(toStringDefinition);
+        toString.PutExtraData("AsmResolverMethod", toStringDefinition);
+        myEnum.PutExtraData("AsmResolverType", new TypeDefinition("Tests", "MyEnum",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout,
+            enumDefinition));
+        var owner = new TypeDefinition("Tests", "Host", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(method);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Callvirt && i.Operand == toStringDefinition), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldobj), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Box), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldnull), Is.False);
+        });
+    }
+
+    [Test]
+    public void DirectCallToVirtualOnOwnThisStaysCall()
+    {
+        // `call` to a non-final virtual is still the right (and only verifiable)
+        // spelling for base calls: the receiver is the caller's own `this`.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "Tests", "Base", app.SystemTypes.SystemObjectType, System.Reflection.TypeAttributes.Public);
+        var speak = owner.InjectMethodContext("Speak", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Virtual);
+        var thisLocal = new LocalVariable("this", new Register(null, "this")) { Type = owner, IsThis = true };
+        var caller = new InjectedMethodAnalysisContext(owner, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CallVoid, speak, thisLocal),
+            new(1, OpCode.Return)]);
+        caller.Locals = [thisLocal];
+        caller.ParameterLocals = [thisLocal];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("BaseCall.dll");
+        var ownerDefinition = new TypeDefinition("Tests", "Base",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(ownerDefinition);
+        owner.PutExtraData("AsmResolverType", ownerDefinition);
+        var speakDefinition = new MethodDefinition("Speak", MethodAttributes.Public | MethodAttributes.Virtual,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        ownerDefinition.Methods.Add(speakDefinition);
+        speak.PutExtraData("AsmResolverMethod", speakDefinition);
+        var method = new MethodDefinition("Run", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        ownerDefinition.Methods.Add(method);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand == speakDefinition), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Callvirt && i.Operand == speakDefinition), Is.False);
+        });
     }
 
     [Test]
@@ -730,12 +898,19 @@ public class IlGeneratorTests
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var source = new LocalVariable("source", new Register(null, "source")) { Type = app.SystemTypes.SystemInt32Type };
-        var dest = new LocalVariable("dest", new Register(null, "dest")); // untyped => object
+        var dest = new LocalVariable("dest", new Register(null, "dest")); // untyped
+        // `dest` also flows to an object-typed call arg, which is boxing-compatible
+        // and no longer disqualifies numeric inference: dest emits Int32 and the
+        // box happens at the object-typed call site instead.
+        var target = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Take",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [app.SystemTypes.SystemObjectType]);
         var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
             app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
         context.ControlFlowGraph = new ISILControlFlowGraph([
             new(0, OpCode.Move, dest, source),
-            new(1, OpCode.Return)]);
+            new(1, OpCode.CallVoid, target, dest),
+            new(2, OpCode.Return)]);
         context.Locals = [source, dest];
         context.ParameterLocals = [];
         context.AnalysisWarnings = [];
@@ -745,6 +920,10 @@ public class IlGeneratorTests
         var owner = new TypeDefinition("Tests", "Box", TypeAttributes.Public | TypeAttributes.Class,
             module.CorLibTypeFactory.Object.Type);
         module.TopLevelTypes.Add(owner);
+        var takeDef = new MethodDefinition("Take", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.Object]));
+        owner.Methods.Add(takeDef);
+        target.PutExtraData("AsmResolverMethod", takeDef);
         var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
             MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
         owner.Methods.Add(method);
@@ -755,8 +934,10 @@ public class IlGeneratorTests
         Assert.Multiple(() =>
         {
             Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
-            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Box));
-            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Stloc));
+            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Stloc));
+            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+            Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.Box));
+            Assert.That(il[4].OpCode, Is.EqualTo(CilOpCodes.Call));
         });
     }
 
@@ -1016,5 +1197,895 @@ public class IlGeneratorTests
             Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
             Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.Call));
         });
+    }
+
+    private static void SeedCorLibTypes(ApplicationAnalysisContext app, ModuleDefinition module,
+        params TypeAnalysisContext[] types)
+    {
+        foreach (var type in types)
+        {
+            var baseRef = type is { IsValueType: true }
+                ? module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType")
+                : null;
+            type.PutExtraData("AsmResolverType",
+                new TypeDefinition(type.Namespace, type.Name,
+                    TypeAttributes.Public | (type.IsValueType ? TypeAttributes.Sealed | TypeAttributes.SequentialLayout : TypeAttributes.Class),
+                    baseRef));
+        }
+    }
+
+    private (MethodAnalysisContext caller, MethodDefinition method) ForeignCaller(ApplicationAnalysisContext app,
+        ModuleDefinition module, List<Instruction> instructions, List<LocalVariable> locals)
+    {
+        var callerType = new InjectedTypeAnalysisContext(app.AssembliesByName["UnityEngine.CoreModule"],
+            "Tests", "ForeignCaller", app.SystemTypes.SystemObjectType,
+            System.Reflection.TypeAttributes.Public | System.Reflection.TypeAttributes.Class);
+        var caller = callerType.InjectMethodContext("Run", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static);
+        caller.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        caller.Locals = locals;
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var type = new TypeDefinition("Tests", "ForeignCaller", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        type.Methods.Add(method);
+        return (caller, method);
+    }
+
+    [Test]
+    public void InlinedCorlibAddWithResizeCallRetargetsToPublicAdd()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var addWithResize = listDefinition.Methods.FirstOrDefault(m => m.Name == "AddWithResize");
+        Assert.That(addWithResize, Is.Not.Null, "2022 fixture corlib should expose List<T>.AddWithResize");
+        Assert.That(addWithResize!.Attributes & ReflectionMethodAttributes.MemberAccessMask,
+            Is.Not.EqualTo(ReflectionMethodAttributes.Public));
+        var intType = app.SystemTypes.SystemInt32Type;
+        var callee = new ConcreteGenericMethodAnalysisContext(addWithResize, [intType], []);
+        var list = new LocalVariable("list", new Register(null, "list"))
+            { Type = new GenericInstanceTypeAnalysisContext(listDefinition, [intType]) };
+        var item = new LocalVariable("item", new Register(null, "item")) { Type = intType };
+        var module = new ModuleDefinition("AddWithResize.dll");
+        var listTypeDefinition = new TypeDefinition("System.Collections.Generic", "List`1",
+            TypeAttributes.Public | TypeAttributes.Class);
+        listTypeDefinition.GenericParameters.Add(new GenericParameter("T"));
+        listDefinition.PutExtraData("AsmResolverType", listTypeDefinition);
+        SeedCorLibTypes(app, module, intType, app.SystemTypes.SystemVoidType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.CallVoid, callee, list, item),
+            new(1, OpCode.Return)], [list, item]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var calls = method.CilMethodBody!.Instructions
+            .Where(i => i.OpCode == CilOpCodes.Call || i.OpCode == CilOpCodes.Callvirt).ToList();
+        Assert.That(calls.Any(c => c.Operand is MemberReference { Name: { } name } && name.ToString() == "Add"), Is.True,
+            () => string.Join("\n", method.CilMethodBody.Instructions.Select(i => i.ToString())));
+        Assert.That(calls.Any(c => c.Operand?.ToString()?.Contains("AddWithResize") == true), Is.False);
+    }
+
+    [Test]
+    public void InlinedCorlibAddWithResizeLdftnRetargetsToPublicAdd()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var addWithResize = listDefinition.Methods.FirstOrDefault(m => m.Name == "AddWithResize");
+        Assert.That(addWithResize, Is.Not.Null);
+        var intType = app.SystemTypes.SystemInt32Type;
+        var callee = new ConcreteGenericMethodAnalysisContext(addWithResize!, [intType], []);
+        var ptr = new LocalVariable("ptr", new Register(null, "ptr")) { Type = app.SystemTypes.SystemIntPtrType };
+        var methodInfo = new RuntimeMethodInfoAnalysisContext(callee, app.AssembliesByName["UnityEngine.CoreModule"]);
+        var module = new ModuleDefinition("AddWithResizeFtn.dll");
+        var listTypeDefinition = new TypeDefinition("System.Collections.Generic", "List`1",
+            TypeAttributes.Public | TypeAttributes.Class);
+        listTypeDefinition.GenericParameters.Add(new GenericParameter("T"));
+        listDefinition.PutExtraData("AsmResolverType", listTypeDefinition);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemIntPtrType,
+            app.SystemTypes.SystemVoidType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, ptr, methodInfo),
+            new(1, OpCode.Return)], [ptr]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var ldftn = method.CilMethodBody!.Instructions.Where(i => i.OpCode == CilOpCodes.Ldftn).ToList();
+        Assert.That(ldftn, Has.Count.EqualTo(1));
+        Assert.That(ldftn[0].Operand is MemberReference { Name: { } name } && name.ToString() == "Add", Is.True,
+            $"expected ldftn of List<T>.Add, got {ldftn[0].Operand}");
+    }
+
+    [Test]
+    public void PrivateCorlibThrowHelperCallEmitsDiagnosticStub()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var math = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Math")!;
+        var throwMinMax = math.Methods.FirstOrDefault(m => m.Name == "ThrowMinMaxException");
+        Assert.That(throwMinMax, Is.Not.Null);
+        Assert.That(throwMinMax!.Attributes & ReflectionMethodAttributes.MemberAccessMask,
+            Is.Not.EqualTo(ReflectionMethodAttributes.Public));
+        var intType = app.SystemTypes.SystemInt32Type;
+        var callee = new ConcreteGenericMethodAnalysisContext(throwMinMax, [], [intType]);
+        var a = new LocalVariable("a", new Register(null, "a")) { Type = intType };
+        var b = new LocalVariable("b", new Register(null, "b")) { Type = intType };
+        var module = new ModuleDefinition("ThrowHelper.dll");
+        SeedCorLibTypes(app, module, intType, app.SystemTypes.SystemVoidType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.CallVoid, callee, a, b),
+            new(1, OpCode.Return)], [a, b]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Throw), Is.True);
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Newobj), Is.True);
+        Assert.That(il.Any(i => (i.OpCode == CilOpCodes.Call || i.OpCode == CilOpCodes.Callvirt
+                || i.OpCode == CilOpCodes.Ldftn || i.OpCode == CilOpCodes.Newobj)
+            && i.Operand?.ToString()?.Contains("ThrowMinMaxException") == true), Is.False);
+    }
+
+    [Test]
+    public void PrivateCorlibThrowHelperLdftnEmitsNativeZero()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var math = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Math")!;
+        var throwMinMax = math.Methods.FirstOrDefault(m => m.Name == "ThrowMinMaxException");
+        Assert.That(throwMinMax, Is.Not.Null);
+        var callee = new ConcreteGenericMethodAnalysisContext(throwMinMax!, [], [app.SystemTypes.SystemInt32Type]);
+        var ptr = new LocalVariable("ptr", new Register(null, "ptr")) { Type = app.SystemTypes.SystemIntPtrType };
+        var methodInfo = new RuntimeMethodInfoAnalysisContext(callee, app.AssembliesByName["UnityEngine.CoreModule"]);
+        var module = new ModuleDefinition("ThrowHelperFtn.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemIntPtrType, app.SystemTypes.SystemVoidType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, ptr, methodInfo),
+            new(1, OpCode.Return)], [ptr]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldftn), Is.False);
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldc_I4_0), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Conv_I), Is.True);
+        });
+    }
+
+    private static InjectedTypeAnalysisContext InjectedVector(ApplicationAnalysisContext app) =>
+        new(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "UnityEngine", "Vector3", app.SystemTypes.SystemValueTypeType, System.Reflection.TypeAttributes.Public);
+
+    private static TypeDefinition EmitVectorDefinition(ModuleDefinition module, TypeAnalysisContext vector)
+    {
+        var vectorDef = new TypeDefinition("UnityEngine", "Vector3",
+            TypeAttributes.Public | TypeAttributes.SequentialLayout,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType"));
+        module.TopLevelTypes.Add(vectorDef);
+        vector.PutExtraData("AsmResolverType", vectorDef);
+        return vectorDef;
+    }
+
+    [Test]
+    public void IntLocalInStructArgumentSlotEmitsDefault()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = InjectedVector(app);
+        var target = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Place",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            [vector]);
+        var intLocal = new LocalVariable("i", new Register(null, "i")) { Type = app.SystemTypes.SystemInt32Type };
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, intLocal, new Immediate(3)),
+            new(1, OpCode.CallVoid, target, intLocal),
+            new(2, OpCode.Return)]);
+        caller.Locals = [intLocal];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("StructArg.dll");
+        var vectorDef = EmitVectorDefinition(module, vector);
+        app.SystemTypes.SystemInt32Type.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Int32", TypeAttributes.Public));
+        var owner = new TypeDefinition("Tests", "Place", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var targetDef = new MethodDefinition("Place", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [vectorDef.ToTypeSignature()]));
+        owner.Methods.Add(targetDef);
+        target.PutExtraData("AsmResolverMethod", targetDef);
+        var definition = new MethodDefinition("Caller", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        // The int local can never occupy the Vector3 slot; default(Vector3) is emitted instead.
+        var callIndex = il.Select((i, idx) => (i, idx)).First(t => t.i.OpCode == CilOpCodes.Call).idx;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il[callIndex - 3].OpCode, Is.EqualTo(CilOpCodes.Ldloca));
+            Assert.That(il[callIndex - 2].OpCode, Is.EqualTo(CilOpCodes.Initobj));
+            Assert.That(il[callIndex - 1].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+        });
+    }
+
+    [Test]
+    public void IntLocalStoredIntoStructLocalEmitsDefault()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = InjectedVector(app);
+        var vectorLocal = new LocalVariable("v", new Register(null, "v")) { Type = vector };
+        var intLocal = new LocalVariable("i", new Register(null, "i")) { Type = app.SystemTypes.SystemInt32Type };
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, vectorLocal, intLocal),
+            new(1, OpCode.Return)]);
+        context.Locals = [vectorLocal, intLocal];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+        var module = new ModuleDefinition("StructStore.dll");
+        EmitVectorDefinition(module, vector);
+        app.SystemTypes.SystemInt32Type.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Int32", TypeAttributes.Public));
+        var owner = new TypeDefinition("Tests", "Run", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var definition = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        // stloc of an int into a Vector3 local is invalid; the store keeps default(Vector3).
+        var stlocIndex = il.Select((i, idx) => (i, idx)).Last(t => t.i.OpCode == CilOpCodes.Stloc).idx;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il[stlocIndex - 3].OpCode, Is.EqualTo(CilOpCodes.Ldloca));
+            Assert.That(il[stlocIndex - 2].OpCode, Is.EqualTo(CilOpCodes.Initobj));
+            Assert.That(il[stlocIndex - 1].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+            Assert.That(il[^1].OpCode, Is.EqualTo(CilOpCodes.Ret));
+        });
+    }
+
+    [Test]
+    public void ImmediateStoredThroughSimpleMemoryDestinationUsesBaseLocalContract()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = InjectedVector(app);
+        var vectorLocal = new LocalVariable("v", new Register(null, "v")) { Type = vector };
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, new MemoryOperand(vectorLocal), new Immediate(0)),
+            new(1, OpCode.Return)]);
+        context.Locals = [vectorLocal];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+        var module = new ModuleDefinition("StructMemoryStore.dll");
+        EmitVectorDefinition(module, vector);
+        var owner = new TypeDefinition("Tests", "Run", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var definition = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        // [v] is a plain stloc into the Vector3 local, so the immediate must be default(Vector3).
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Initobj), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldc_I4 || i.OpCode == CilOpCodes.Ldc_I4_0), Is.False);
+            Assert.That(il[^2].OpCode, Is.EqualTo(CilOpCodes.Stloc));
+            Assert.That(il[^1].OpCode, Is.EqualTo(CilOpCodes.Ret));
+        });
+    }
+
+    [Test]
+    public void StructComparedToZeroEmitsBoxedNullCheck()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = InjectedVector(app);
+        var vectorLocal = new LocalVariable("v", new Register(null, "v")) { Type = vector };
+        var result = new LocalVariable("r", new Register(null, "r")) { Type = app.SystemTypes.SystemBooleanType };
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CheckEqual, result, vectorLocal, new Immediate(0)),
+            new(1, OpCode.Return)]);
+        context.Locals = [vectorLocal, result];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+        var module = new ModuleDefinition("StructEq.dll");
+        EmitVectorDefinition(module, vector);
+        app.SystemTypes.SystemBooleanType.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Boolean", TypeAttributes.Public));
+        var owner = new TypeDefinition("Tests", "Run", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var definition = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        // ceq cannot pair a Vector3 with an int; the honest form is the null test: box; ldnull; ceq.
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Box), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldnull), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ceq), Is.True);
+        });
+    }
+
+    [Test]
+    public void PublicGenericCalleeOnVisibleInstantiationStaysDirect()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var intType = app.SystemTypes.SystemInt32Type;
+        var add = listDefinition.Methods.First(m => m.Name == "Add" && m.Parameters.Count == 1);
+        var callee = new ConcreteGenericMethodAnalysisContext(add, [intType], []);
+        var list = new LocalVariable("list", new Register(null, "list"))
+            { Type = new GenericInstanceTypeAnalysisContext(listDefinition, [intType]) };
+        var item = new LocalVariable("item", new Register(null, "item")) { Type = intType };
+        var module = new ModuleDefinition("VisibleAdd.dll");
+        var listTypeDefinition = new TypeDefinition("System.Collections.Generic", "List`1",
+            TypeAttributes.Public | TypeAttributes.Class);
+        listTypeDefinition.GenericParameters.Add(new GenericParameter("T"));
+        listDefinition.PutExtraData("AsmResolverType", listTypeDefinition);
+        SeedCorLibTypes(app, module, intType, app.SystemTypes.SystemVoidType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.CallVoid, callee, list, item),
+            new(1, OpCode.Return)], [list, item]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var calls = method.CilMethodBody!.Instructions
+            .Where(i => i.OpCode == CilOpCodes.Call || i.OpCode == CilOpCodes.Callvirt).ToList();
+        Assert.That(calls.Any(c => c.Operand is MemberReference { Name: { } name } && name.ToString() == "Add"), Is.True,
+            () => string.Join("\n", method.CilMethodBody.Instructions.Select(i => i.ToString())));
+        Assert.That(method.CilMethodBody.Instructions.Any(i => i.Operand is string s && s.Contains("Inaccessible callee")), Is.False);
+    }
+
+    [Test]
+    public void PrivateGenericCalleeOnOwnTypeStaysDirect()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var addWithResize = listDefinition.Methods.FirstOrDefault(m => m.Name == "AddWithResize");
+        Assert.That(addWithResize, Is.Not.Null);
+        var intType = app.SystemTypes.SystemInt32Type;
+        var callee = new ConcreteGenericMethodAnalysisContext(addWithResize!, [intType], []);
+        // A method declared on List<T> itself may name its own private member.
+        var caller = new InjectedMethodAnalysisContext(listDefinition, "Run", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        var list = new LocalVariable("list", new Register(null, "list"))
+            { Type = new GenericInstanceTypeAnalysisContext(listDefinition, [intType]) };
+        var item = new LocalVariable("item", new Register(null, "item")) { Type = intType };
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CallVoid, callee, list, item),
+            new(1, OpCode.Return)]);
+        caller.Locals = [list, item];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("OwnPrivate.dll");
+        var listTypeDefinition = new TypeDefinition("System.Collections.Generic", "List`1",
+            TypeAttributes.Public | TypeAttributes.Class);
+        listTypeDefinition.GenericParameters.Add(new GenericParameter("T"));
+        listDefinition.PutExtraData("AsmResolverType", listTypeDefinition);
+        SeedCorLibTypes(app, module, intType, app.SystemTypes.SystemVoidType);
+        var type = new TypeDefinition("Tests", "OwnCaller", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        type.Methods.Add(method);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var calls = method.CilMethodBody!.Instructions
+            .Where(i => i.OpCode == CilOpCodes.Call || i.OpCode == CilOpCodes.Callvirt).ToList();
+        Assert.That(calls.Any(c => c.Operand?.ToString()?.Contains("AddWithResize") == true), Is.True,
+            () => string.Join("\n", method.CilMethodBody.Instructions.Select(i => i.ToString())));
+    }
+
+    [Test]
+    public void MistypedStructReceiverLoadsMatchingEnumeratorAddress()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var enumerator = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "Tests", "Enumerator", app.SystemTypes.SystemValueTypeType, System.Reflection.TypeAttributes.Public);
+        var dispose = enumerator.InjectMethodContext("Dispose", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public);
+        var enumeratorLocal = new LocalVariable("enumerator", new Register(null, "enumerator")) { Type = enumerator };
+        var lostReceiver = new LocalVariable("lostReceiver", new Register(null, "lostReceiver"))
+            { Type = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.NullReferenceException")! };
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CallVoid, dispose, lostReceiver),
+            new(1, OpCode.Return)]);
+        caller.Locals = [enumeratorLocal, lostReceiver];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("StructReceiver.dll");
+        var enumeratorDefinition = new TypeDefinition("Tests", "Enumerator",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType"));
+        module.TopLevelTypes.Add(enumeratorDefinition);
+        enumerator.PutExtraData("AsmResolverType", enumeratorDefinition);
+        var disposeDefinition = new MethodDefinition("Dispose", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        enumeratorDefinition.Methods.Add(disposeDefinition);
+        dispose.PutExtraData("AsmResolverMethod", disposeDefinition);
+        lostReceiver.Type!.PutExtraData("AsmResolverType", new TypeDefinition("System", "NullReferenceException",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type));
+        var owner = new TypeDefinition("Tests", "Host", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(method);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        var ldloca = il.Where(i => i.OpCode == CilOpCodes.Ldloca).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(ldloca, Has.Count.EqualTo(1));
+            Assert.That(ldloca[0].Operand, Is.SameAs(method.CilMethodBody.LocalVariables[0]));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldloc), Is.False);
+        });
+    }
+
+    [Test]
+    public void MistypedStructReceiverWithoutMatchingLocalGetsFreshDefaultSlot()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var enumerator = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "Tests", "Enumerator", app.SystemTypes.SystemValueTypeType, System.Reflection.TypeAttributes.Public);
+        var moveNext = enumerator.InjectMethodContext("MoveNext", app.SystemTypes.SystemBooleanType,
+            ReflectionMethodAttributes.Public);
+        var lostReceiver = new LocalVariable("lostReceiver", new Register(null, "lostReceiver"))
+            { Type = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.NullReferenceException")! };
+        var result = new LocalVariable("result", new Register(null, "result"))
+            { Type = app.SystemTypes.SystemBooleanType };
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Call, moveNext, result, lostReceiver),
+            new(1, OpCode.Return)]);
+        caller.Locals = [lostReceiver, result];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("StructReceiverDefault.dll");
+        var enumeratorDefinition = new TypeDefinition("Tests", "Enumerator",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType"));
+        module.TopLevelTypes.Add(enumeratorDefinition);
+        enumerator.PutExtraData("AsmResolverType", enumeratorDefinition);
+        var moveNextDefinition = new MethodDefinition("MoveNext", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Boolean));
+        enumeratorDefinition.Methods.Add(moveNextDefinition);
+        moveNext.PutExtraData("AsmResolverMethod", moveNextDefinition);
+        lostReceiver.Type!.PutExtraData("AsmResolverType", new TypeDefinition("System", "NullReferenceException",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type));
+        var owner = new TypeDefinition("Tests", "Host", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(method);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        var ldloca = il.Where(i => i.OpCode == CilOpCodes.Ldloca).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(method.CilMethodBody.LocalVariables, Has.Count.EqualTo(3));
+            Assert.That(ldloca, Has.Count.EqualTo(1));
+            Assert.That(ldloca[0].Operand, Is.SameAs(method.CilMethodBody.LocalVariables[2]));
+            Assert.That(method.CilMethodBody.LocalVariables[2].VariableType.FullName, Is.EqualTo("Tests.Enumerator"));
+        });
+    }
+
+    [Test]
+    public void OrderingCompareOnStructEmitsDefaultBool()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = InjectedVector(app);
+        var vectorLocal = new LocalVariable("v", new Register(null, "v")) { Type = vector };
+        var result = new LocalVariable("r", new Register(null, "r")) { Type = app.SystemTypes.SystemBooleanType };
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CheckLess, result, vectorLocal, new Immediate(1)),
+            new(1, OpCode.Return)]);
+        context.Locals = [vectorLocal, result];
+        context.ParameterLocals = [];
+        context.AnalysisWarnings = [];
+        var module = new ModuleDefinition("StructLt.dll");
+        EmitVectorDefinition(module, vector);
+        app.SystemTypes.SystemBooleanType.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Boolean", TypeAttributes.Public));
+        var owner = new TypeDefinition("Tests", "Run", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var definition = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(context, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        // Ordering on a struct has no answer; emit the honest diagnostic throw,
+        // never a clt on Vector3.
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Clt), Is.False);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Throw), Is.True);
+        });
+    }
+
+    [Test]
+    public void MoveFromUnbridgeableTypeToStructSlotEmitsDefaultValue()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "UnityEngine", "Vector3", app.SystemTypes.SystemValueTypeType, System.Reflection.TypeAttributes.Public);
+        var destination = new LocalVariable("destination", new Register(null, "destination")) { Type = vector };
+        var source = new LocalVariable("source", new Register(null, "source"))
+            { Type = app.SystemTypes.SystemInt32Type };
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, destination, source),
+            new(1, OpCode.Return)]);
+        caller.Locals = [destination, source];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("UnbridgeableMove.dll");
+        var vectorDefinition = new TypeDefinition("UnityEngine", "Vector3",
+            TypeAttributes.Public | TypeAttributes.SequentialLayout,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType"));
+        module.TopLevelTypes.Add(vectorDefinition);
+        vector.PutExtraData("AsmResolverType", vectorDefinition);
+        app.SystemTypes.SystemInt32Type.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Int32", TypeAttributes.Public));
+        var owner = new TypeDefinition("Tests", "Host", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(method);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(method.CilMethodBody.LocalVariables, Has.Count.EqualTo(3));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldloca), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Initobj), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stloc), Is.True);
+        });
+    }
+
+    [Test]
+    public void CallResultIntoStructLocalEmitsDefault()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = InjectedVector(app);
+        var target = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Count",
+            app.SystemTypes.SystemInt32Type, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
+            []);
+        var vectorLocal = new LocalVariable("v", new Register(null, "v")) { Type = vector };
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Call, target, vectorLocal),
+            new(1, OpCode.Return)]);
+        caller.Locals = [vectorLocal];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("StructResult.dll");
+        EmitVectorDefinition(module, vector);
+        var owner = new TypeDefinition("Tests", "Place", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(owner);
+        var targetDef = new MethodDefinition("Count", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32));
+        owner.Methods.Add(targetDef);
+        target.PutExtraData("AsmResolverMethod", targetDef);
+        var definition = new MethodDefinition("Caller", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        // The int return value cannot land in a Vector3 local: it is popped and the
+        // store keeps default(Vector3).
+        var stlocIndex = il.Select((i, idx) => (i, idx)).Last(t => t.i.OpCode == CilOpCodes.Stloc).idx;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il[stlocIndex - 4].OpCode, Is.EqualTo(CilOpCodes.Pop));
+            Assert.That(il[stlocIndex - 3].OpCode, Is.EqualTo(CilOpCodes.Ldloca));
+            Assert.That(il[stlocIndex - 2].OpCode, Is.EqualTo(CilOpCodes.Initobj));
+            Assert.That(il[stlocIndex - 1].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+            Assert.That(il[^1].OpCode, Is.EqualTo(CilOpCodes.Ret));
+        });
+    }
+
+    // IL2CPP's shared-generic lowering instantiates generic code over internal
+    // corlib marker types (System.Int32Enum and friends) that managed callers can
+    // never name. The fixture's own corlib carries them, so these tests assert the
+    // generator never fabricates a token that references the marker: the emitted
+    // member/type references are checked for the marker's name, and locals that
+    // carried it must be declared as a visible placeholder.
+
+    private static TypeAnalysisContext SeedInternalEnumMarker(ApplicationAnalysisContext app, ModuleDefinition module)
+    {
+        var marker = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Int32Enum");
+        Assert.That(marker, Is.Not.Null, "2022 fixture corlib should expose the shared-generic enum markers");
+        Assert.That(marker!.IsValueType && marker.IsEnumType, Is.True);
+        Assert.That(marker.Visibility, Is.EqualTo(System.Reflection.TypeAttributes.NotPublic));
+        marker.PutExtraData("AsmResolverType", new TypeDefinition(marker.Namespace, marker.Name,
+            TypeAttributes.NotPublic | TypeAttributes.Sealed | TypeAttributes.SequentialLayout,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType")));
+        return marker;
+    }
+
+    private static TypeDefinition SeedGenericListDefinition(TypeAnalysisContext listDefinition)
+    {
+        var typeDefinition = new TypeDefinition("System.Collections.Generic", "List`1",
+            TypeAttributes.Public | TypeAttributes.Class);
+        typeDefinition.GenericParameters.Add(new GenericParameter("T"));
+        listDefinition.PutExtraData("AsmResolverType", typeDefinition);
+        return typeDefinition;
+    }
+
+    private static IEnumerable<CilInstruction> TokenInstructions(MethodDefinition method) =>
+        method.CilMethodBody!.Instructions.Where(i => i.OpCode.OperandType
+            is CilOperandType.InlineMethod or CilOperandType.InlineType
+            or CilOperandType.InlineField or CilOperandType.InlineTok);
+
+    private static void AssertNoTokenNamesMarker(MethodDefinition method, string markerName = "Int32Enum")
+    {
+        Assert.That(TokenInstructions(method).All(i => i.Operand?.ToString()?.Contains(markerName) != true),
+            Is.True, () => string.Join("\n", method.CilMethodBody!.Instructions.Select(i => i.ToString())));
+        Assert.That(method.CilMethodBody!.LocalVariables.All(l => l.VariableType?.FullName?.Contains(markerName) != true),
+            Is.True, "a local must not be declared with the invisible marker type");
+    }
+
+    [Test]
+    public void CallOnSharedGenericOverInternalMarkerEmitsDiagnosticStub()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var add = listDefinition.Methods.FirstOrDefault(m => m.Name == "Add" && !m.IsStatic && m.Parameters.Count == 1);
+        Assert.That(add, Is.Not.Null);
+        var module = new ModuleDefinition("MarkerAdd.dll");
+        var markerType = SeedInternalEnumMarker(app, module);
+        SeedGenericListDefinition(listDefinition);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemVoidType, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemObjectType);
+        var callee = new ConcreteGenericMethodAnalysisContext(add!, [markerType], []);
+        var listType = new GenericInstanceTypeAnalysisContext(listDefinition, [markerType]);
+        var list = new LocalVariable("list", new Register(null, "list")) { Type = listType };
+        var item = new LocalVariable("item", new Register(null, "item")) { Type = markerType };
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.CallVoid, callee, list, item),
+            new(1, OpCode.Return)], [list, item]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Throw), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand?.ToString()?.Contains("Add") == true),
+                Is.False, "List<Int32Enum>::Add cannot be named by the caller");
+        });
+        AssertNoTokenNamesMarker(method);
+    }
+
+    [Test]
+    public void AddWithResizeOverInternalMarkerDoesNotSubstitute()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var addWithResize = listDefinition.Methods.FirstOrDefault(m => m.Name == "AddWithResize");
+        Assert.That(addWithResize, Is.Not.Null, "2022 fixture corlib should expose List<T>.AddWithResize");
+        var module = new ModuleDefinition("MarkerAddWithResize.dll");
+        var markerType = SeedInternalEnumMarker(app, module);
+        SeedGenericListDefinition(listDefinition);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemVoidType, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemObjectType);
+        var callee = new ConcreteGenericMethodAnalysisContext(addWithResize!, [markerType], []);
+        var listType = new GenericInstanceTypeAnalysisContext(listDefinition, [markerType]);
+        var list = new LocalVariable("list", new Register(null, "list")) { Type = listType };
+        var item = new LocalVariable("item", new Register(null, "item")) { Type = markerType };
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.CallVoid, callee, list, item),
+            new(1, OpCode.Return)], [list, item]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        // The honest substitute List<T>.Add exists, but over the marker it is just
+        // as unnameable - the substitution must not resurrect the same violation.
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Throw), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand?.ToString()?.Contains("Add") == true),
+                Is.False, "neither AddWithResize nor the Add substitute may be named");
+        });
+        AssertNoTokenNamesMarker(method);
+    }
+
+    [Test]
+    public void SharedGenericMethodArgumentOverInternalMarkerEmitsDiagnosticStub()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var activator = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Activator")!;
+        var createInstance = activator.Methods.FirstOrDefault(m =>
+            m.Name == "CreateInstance" && m.GenericParameters.Count == 1 && m.Parameters.Count == 0);
+        Assert.That(createInstance, Is.Not.Null, "2022 fixture corlib should expose Activator.CreateInstance<T>()");
+        var module = new ModuleDefinition("MarkerCreateInstance.dll");
+        var markerType = SeedInternalEnumMarker(app, module);
+        SeedCorLibTypes(app, module, activator, app.SystemTypes.SystemVoidType,
+            app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemObjectType);
+        var callee = new ConcreteGenericMethodAnalysisContext(createInstance!, [], [markerType]);
+        var result = new LocalVariable("result", new Register(null, "result"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Call, callee, result),
+            new(1, OpCode.Return)], [result]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Throw), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand?.ToString()?.Contains("CreateInstance") == true),
+                Is.False, "CreateInstance<Int32Enum> cannot be named by the caller");
+        });
+        AssertNoTokenNamesMarker(method);
+    }
+
+    [Test]
+    public void NewobjOnSharedGenericOverInternalMarkerEmitsDiagnosticStub()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var parameterless = listDefinition.Methods.FirstOrDefault(m =>
+            m.Name == ".ctor" && m.Parameters.Count == 0);
+        Assert.That(parameterless, Is.Not.Null);
+        var module = new ModuleDefinition("MarkerCtor.dll");
+        var markerType = SeedInternalEnumMarker(app, module);
+        SeedGenericListDefinition(listDefinition);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemVoidType, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemObjectType);
+        var ctor = new ConcreteGenericMethodAnalysisContext(parameterless!, [markerType], []);
+        var listType = new GenericInstanceTypeAnalysisContext(listDefinition, [markerType]);
+        var list = new LocalVariable("list", new Register(null, "list")) { Type = listType };
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Newobj, list),
+            new(1, OpCode.CallVoid, ctor, list),
+            new(2, OpCode.Return)], [list]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Throw), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Newobj && i.Operand?.ToString()?.Contains("List") == true),
+                Is.False, "newobj List<Int32Enum>::.ctor cannot be named by the caller");
+        });
+        AssertNoTokenNamesMarker(method);
+    }
+
+    [Test]
+    public void CastToSharedGenericOverInternalMarkerEmitsDefault()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var listDefinition = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var module = new ModuleDefinition("MarkerCast.dll");
+        var markerType = SeedInternalEnumMarker(app, module);
+        SeedGenericListDefinition(listDefinition);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemVoidType, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemObjectType);
+        var listType = new GenericInstanceTypeAnalysisContext(listDefinition, [markerType]);
+        var source = new LocalVariable("source", new Register(null, "source"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var cast = new LocalVariable("cast", new Register(null, "cast")) { Type = listType };
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, cast, new ReferenceCast(source, listType)),
+            new(1, OpCode.Return)], [source, cast]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Castclass), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldnull), Is.True,
+                "the honest value of an unnameable cast is a default of the slot");
+        });
+        AssertNoTokenNamesMarker(method);
+    }
+
+    [Test]
+    public void NewArrOverInternalMarkerEmitsDefault()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("MarkerArray.dll");
+        var markerType = SeedInternalEnumMarker(app, module);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemVoidType, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemObjectType);
+        var arrayType = new SzArrayTypeAnalysisContext(markerType);
+        var array = new LocalVariable("array", new Register(null, "array")) { Type = arrayType };
+        var length = new LocalVariable("length", new Register(null, "length"))
+            { Type = app.SystemTypes.SystemInt32Type };
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.NewArr, array, arrayType, length),
+            new(1, OpCode.Return)], [array, length]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Newarr), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldnull), Is.True,
+                "the honest value of an unnameable array is a default of the slot");
+        });
+        AssertNoTokenNamesMarker(method);
     }
 }

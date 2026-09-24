@@ -274,7 +274,7 @@ public static class MetadataResolver
 
     // Mirrors the owner selection in ResolveFieldOffsets: generic definitions have
     // all-0 metadata offsets, so their layout is recomputed instead.
-    private static FieldAnalysisContext? FindInstanceFieldAtOffset(TypeAnalysisContext owner, long offset)
+    internal static FieldAnalysisContext? FindInstanceFieldAtOffset(TypeAnalysisContext owner, long offset)
     {
         if (owner is GenericInstanceTypeAnalysisContext genericOwner)
             return genericOwner.GenericArguments.Any(a => a.IsValueType)

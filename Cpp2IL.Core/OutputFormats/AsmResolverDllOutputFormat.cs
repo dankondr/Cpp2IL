@@ -8,7 +8,9 @@ using System.Linq;
 using System.Threading.Tasks;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Builder;
+using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.Builder;
+using AsmResolver.PE.DotNet.Cil;
 using AsmResolver.PE.DotNet.Metadata.Tables;
 using AssetRipper.CIL;
 using Cpp2IL.Core.Api;
@@ -29,16 +31,148 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
     private readonly ConcurrentDictionary<ModuleDefinition, object> _stubLocks = new();
 
     //TODO revert this once AsmResolver.CIL stops calling AsmResolver's Importer
-    protected void FillMethodBodyWithStub(MethodDefinition methodDefinition)
+    protected void FillMethodBodyWithStub(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
     {
         if (methodDefinition.DeclaringModule is not { } module)
         {
             methodDefinition.ReplaceMethodBodyWithMinimalImplementation();
+            EnsureStubVerifiable(methodDefinition, methodContext);
             return;
         }
 
         lock (_stubLocks.GetOrAdd(module, _ => new object()))
+        {
             methodDefinition.ReplaceMethodBodyWithMinimalImplementation();
+            EnsureStubVerifiable(methodDefinition, methodContext);
+        }
+    }
+
+    private static void EnsureStubVerifiable(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
+    {
+        EnsureInitLocals(methodDefinition);
+        EnsureOutParameterStores(methodDefinition);
+        EnsureCtorInitialized(methodDefinition, methodContext);
+    }
+
+    // The minimal-implementation stub writes `ldnull; stind.ref` through every
+    // byref parameter. That is only verifiable when the pointee is a managed
+    // reference: pointer and IntPtr slots take `stind.i`, value-type slots take
+    // `initobj`. Rewrite the stores the signature's own element type demands.
+    private static void EnsureOutParameterStores(MethodDefinition methodDefinition)
+    {
+        if (methodDefinition is not { CilMethodBody: { } body, Signature: { } signature })
+            return;
+        var instructions = body.Instructions;
+        var thisSlot = signature.HasThis ? 1 : 0;
+        for (var i = 0; i + 2 < instructions.Count; i++)
+        {
+            var argumentIndex = instructions[i].OpCode.Code switch
+            {
+                CilCode.Ldarg_0 => 0,
+                CilCode.Ldarg_1 => 1,
+                CilCode.Ldarg_2 => 2,
+                CilCode.Ldarg_3 => 3,
+                CilCode.Ldarg or CilCode.Ldarg_S => instructions[i].Operand is ushort argIndex
+                    ? argIndex
+                    : instructions[i].Operand is int wideIndex ? wideIndex : -1,
+                _ => -1,
+            };
+            var paramIndex = argumentIndex - thisSlot;
+            if (paramIndex < 0
+                || instructions[i + 1].OpCode != CilOpCodes.Ldnull
+                || instructions[i + 2].OpCode != CilOpCodes.Stind_Ref
+                || paramIndex >= signature.ParameterTypes.Count
+                || signature.ParameterTypes[paramIndex] is not ByReferenceTypeSignature { BaseType: { } elementType }
+                // Managed-reference pointees already verify as `ldnull; stind.ref`;
+                // everything else needs the store its element type demands.
+                || (!elementType.IsValueType
+                    && elementType is not (PointerTypeSignature or ByReferenceTypeSignature
+                        or FunctionPointerTypeSignature)
+                    && elementType.FullName is not ("System.IntPtr" or "System.UIntPtr")))
+                continue;
+
+            if (elementType.IsValueType && elementType.FullName is not ("System.IntPtr" or "System.UIntPtr"))
+            {
+                instructions[i + 1] = new CilInstruction(CilOpCodes.Nop);
+                instructions[i + 2] = new CilInstruction(CilOpCodes.Initobj, elementType.ToTypeDefOrRef());
+            }
+            else
+            {
+                // Native-pointer-sized zero: ldc.i4.0; conv.i; stind.i.
+                instructions[i + 1] = new CilInstruction(CilOpCodes.Ldc_I4_0);
+                instructions[i + 2] = new CilInstruction(CilOpCodes.Stind_I);
+                instructions.Insert(i + 2, new CilInstruction(CilOpCodes.Conv_I));
+                i++;
+            }
+        }
+    }
+
+    private static void EnsureCtorInitialized(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
+    {
+        //A bare-ret stub for an instance .ctor leaves this uninitialized; initialize it honestly.
+        if (methodDefinition is not { IsConstructor: true, IsStatic: false, CilMethodBody: { } body })
+            return;
+        var module = methodDefinition.DeclaringModule;
+        var declaringType = methodDefinition.DeclaringType;
+        if (module == null || declaringType == null)
+            return;
+        var instructions = body.Instructions;
+        if (declaringType.IsValueType)
+        {
+            ITypeDefOrRef initTarget = declaringType;
+            var genericArity = methodContext.DeclaringType?.GenericParameters.Count ?? 0;
+            if (genericArity > 0)
+            {
+                //this on a generic struct's .ctor is address-of the instantiated type.
+                var git = new GenericInstanceTypeSignature(declaringType, true,
+                    Enumerable.Range(0, genericArity)
+                        .Select(i => (TypeSignature)new GenericParameterSignature(GenericParameterType.Type, i))
+                        .ToArray());
+                initTarget = new TypeSpecification(git);
+            }
+            instructions.Insert(0, CilOpCodes.Ldarg_0);
+            instructions.Insert(1, CilOpCodes.Initobj, initTarget);
+            return;
+        }
+        var declaringCtx = methodContext.DeclaringType;
+        var baseTypeCtx = declaringCtx?.BaseType;
+        var accessibleCtor = baseTypeCtx?.Methods.FirstOrDefault(m =>
+            m is { IsStatic: false, Name: ".ctor" } && m.Parameters.Count == 0 &&
+            IsCtorAccessibleFrom(m, declaringCtx!));
+        if (declaringType.BaseType is { } baseTypeRef && (baseTypeCtx == null || accessibleCtor != null))
+        {
+            var baseCtor = baseTypeRef.CreateMemberReference(".ctor",
+                MethodSignature.CreateInstance(module.CorLibTypeFactory.Void, []));
+            instructions.Insert(0, CilOpCodes.Ldarg_0);
+            instructions.Insert(1, CilOpCodes.Call, baseCtor);
+            return;
+        }
+        //No honest base .ctor is callable (unresolved stub, e.g. base only has non-default
+        //ctors): the method must not return with this uninitialized, so make it a diagnostic
+        //throw instead.
+        instructions.Clear();
+        instructions.Add(CilOpCodes.Ldnull);
+        instructions.Add(CilOpCodes.Throw);
+    }
+
+    private static bool IsCtorAccessibleFrom(MethodAnalysisContext ctor, TypeAnalysisContext caller)
+    {
+        var visibility = ctor.Visibility;
+        if (visibility is System.Reflection.MethodAttributes.Public or System.Reflection.MethodAttributes.Family
+            or System.Reflection.MethodAttributes.FamORAssem)
+            return true;
+        if (visibility == System.Reflection.MethodAttributes.Private)
+            return false;
+        //Assembly and FamANDAssem are only usable within the same assembly.
+        return ReferenceEquals(ctor.DeclaringType?.DeclaringAssembly, caller.DeclaringAssembly);
+    }
+
+    private static void EnsureInitLocals(MethodDefinition methodDefinition)
+    {
+        //The minimal-implementation stub uses a temp local for value-type defaults; verifiable
+        //code requires initlocals whenever a method has locals.
+        if (methodDefinition.CilMethodBody is { LocalVariables.Count: > 0 } body)
+            body.InitializeLocals = true;
     }
 
     public sealed override void DoOutput(ApplicationAnalysisContext context, string outputRoot)
