@@ -55,6 +55,18 @@ public class LocalLifetimeSplitTests
         return vector;
     }
 
+    // A public-field value type shaped like an enum: one Int32 field `value__` at
+    // offset 0, so an I4 operand position on it resolves to the lane field.
+    private static TypeAnalysisContext Enum32(ApplicationAnalysisContext app)
+    {
+        var kind = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Lane", "Enum32",
+            app.AssembliesByName["mscorlib"].GetTypeByFullName("System.ValueType")!,
+            ReflectionTypeAttributes.Public | ReflectionTypeAttributes.Sealed | ReflectionTypeAttributes.SequentialLayout);
+        kind.Fields.Add(new InjectedFieldAnalysisContext("value__", app.SystemTypes.SystemInt32Type,
+            ReflectionFieldAttributes.Public, kind, 0));
+        return kind;
+    }
+
     private static InjectedMethodAnalysisContext Method(ApplicationAnalysisContext app, string name,
         TypeAnalysisContext returnType, TypeAnalysisContext[] parameterTypes, params string[] parameterNames)
         => new(app.SystemTypes.SystemObjectType, name, returnType,
@@ -72,7 +84,9 @@ public class LocalLifetimeSplitTests
     }
 
     private static TypeSignature CorLibSignature(ModuleDefinition module, TypeAnalysisContext type)
-        => type.FullName switch
+        => type is SzArrayTypeAnalysisContext szArray
+            ? CorLibSignature(module, szArray.ElementType).MakeSzArrayType()
+            : type.FullName switch
         {
             "System.Single" => module.CorLibTypeFactory.Single,
             "System.Double" => module.CorLibTypeFactory.Double,
@@ -581,5 +595,41 @@ public class LocalLifetimeSplitTests
 
         var result = loaded.GetType("Tests.Runner")!.GetMethod("Run")!.Invoke(null, [3]);
         Assert.That(result, Is.EqualTo(10));
+    }
+
+    [Test]
+    public void NestedFieldLaneInsideArrayIndexKeepsReceiverLocalRegistered()
+    {
+        // A lane FieldReference propagated into an ArrayAccess index can be the enum
+        // local's only remaining use. A pruning pass that drops that receiver leaves
+        // the emitted locals table without it, and the field load's ldloca hits
+        // KeyNotFoundException - the corpus crash this test guards.
+        var app = App;
+        var kind = Enum32(app);
+        var strings = new SzArrayTypeAnalysisContext(app.SystemTypes.SystemStringType);
+        var arr = new LocalVariable("arg0", new Register(8, "X8"), strings);
+        var kindLocal = new LocalVariable("kind", new Register(9, "X9", 6), kind);
+        var dst = new LocalVariable("dst", new Register(0, "X0", 1), app.SystemTypes.SystemStringType);
+        var context = Method(app, "Run", app.SystemTypes.SystemStringType, [strings], ["arg0"]);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, dst, new ArrayAccess(arr, new FieldReference(kind.Fields[0], kindLocal, 0))),
+            new Instruction(1, OpCode.Return, dst)]);
+        context.Locals = [arr, kindLocal, dst];
+        context.ParameterLocals = [arr];
+        context.AnalysisWarnings = [];
+
+        LocalVariables.RemoveUnused(context);
+
+        Assert.That(context.Locals, Does.Contain(kindLocal),
+            "lane receiver pruned: the emitted locals table loses it and emission throws");
+
+        var (module, signatures) = EmitModule(app, kind, app.SystemTypes.SystemStringType,
+            app.SystemTypes.SystemVoidType);
+        var definition = Runner(module, signatures, app.SystemTypes.SystemStringType, [strings], ["arg0"]);
+        var loaded = EmitAssembly(context, definition, module);
+
+        var result = loaded.GetType("Tests.Runner")!.GetMethod("Run")!
+            .Invoke(null, [new[] { "hit", "other" }]);
+        Assert.That(result, Is.EqualTo("hit"));
     }
 }

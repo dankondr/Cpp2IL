@@ -171,9 +171,67 @@ public static class LocalVariables
 
             foreach (var definedVar in block.Def.OfType<LocalVariable>())
                 usedLocals.Add(definedVar);
+
+            // Use/def only sees top-level LocalVariable operands, but a local can be
+            // referenced only through a nested operand - a field lane inside an array
+            // index, an addressed field's receiver, a selected field's owner.
+            // Emission resolves any of those through the locals table, so a local
+            // reachable through any operand shape stays registered.
+            foreach (var instruction in block.Instructions)
+                foreach (var operand in instruction.Operands)
+                    foreach (var nested in OperandLocals(operand))
+                        usedLocals.Add(nested);
         }
 
         method.Locals.RemoveAll(x => !usedLocals.Contains(x));
+    }
+
+    // Every local an operand can reach, through any nesting the emitter walks:
+    // field receivers, array bases and indices, addressed targets, casts.
+    private static IEnumerable<LocalVariable> OperandLocals(IOperand operand)
+    {
+        switch (operand)
+        {
+            case LocalVariable local:
+                yield return local;
+                break;
+            case FieldReference field:
+                yield return field.Local;
+                break;
+            case SelectedFieldReference selected:
+                yield return selected.Selector;
+                foreach (var (_, choiceField) in selected.Choices)
+                    yield return choiceField.Local;
+                break;
+            case AddressOf { Target: { } target }:
+                foreach (var nested in OperandLocals(target))
+                    yield return nested;
+                break;
+            case ArrayAccess access:
+                yield return access.Array;
+                foreach (var nested in OperandLocals(access.Index))
+                    yield return nested;
+                break;
+            case ArrayElementFieldReference elementField:
+                yield return elementField.Array;
+                foreach (var nested in OperandLocals(elementField.Index))
+                    yield return nested;
+                break;
+            case ArrayLength arrayLength:
+                yield return arrayLength.Array;
+                break;
+            case MemoryOperand memory:
+                if (memory.Base is { } memoryBase)
+                    foreach (var nested in OperandLocals(memoryBase))
+                        yield return nested;
+                if (memory.Index is { } memoryIndex)
+                    foreach (var nested in OperandLocals(memoryIndex))
+                        yield return nested;
+                break;
+            case ReferenceCast cast:
+                yield return cast.Value;
+                break;
+        }
     }
 
     private static List<Register> GetRegisters(Instruction instruction)
