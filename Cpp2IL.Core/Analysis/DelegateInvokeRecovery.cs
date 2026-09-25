@@ -67,7 +67,7 @@ public static class DelegateInvokeRecovery
 
         var target = call.Operands[0];
         if (target is LocalVariable targetLocal)
-            target = InterfaceDispatchRecovery.Definition(definitions, targetLocal) is
+            target = InterfaceDispatchRecovery.ChaseCopies(definitions, targetLocal) is
                 { OpCode: OpCode.Move, Operands: [_, var loaded] } ? loaded : target;
 
         return target switch
@@ -102,7 +102,7 @@ public static class DelegateInvokeRecovery
             var argument = call.Operands[3 + i];
             var address = argument is AddressOf
                           || argument is LocalVariable local
-                              && InterfaceDispatchRecovery.Definition(definitions, local) is
+                              && InterfaceDispatchRecovery.ChaseCopies(definitions, local) is
                                   { OpCode: OpCode.Move, Operands: [_, AddressOf] };
             if (!address)
                 return false;
@@ -115,7 +115,7 @@ public static class DelegateInvokeRecovery
         Dictionary<LocalVariable, Instruction> definitions, int invokeImplOffset)
     {
         var loaded = operand is LocalVariable local
-                     && InterfaceDispatchRecovery.Definition(definitions, local) is
+                     && InterfaceDispatchRecovery.ChaseCopies(definitions, local) is
                          { OpCode: OpCode.Move, Operands: [_, var source] }
             ? source
             : operand;

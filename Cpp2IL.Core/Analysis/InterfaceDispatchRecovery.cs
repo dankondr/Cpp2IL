@@ -88,18 +88,18 @@ public static class InterfaceDispatchRecovery
         var targetLoad = dispatch.Operands[0] switch
         {
             MemoryOperand folded => folded,
-            LocalVariable target when Definition(definitions, target) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand loaded] } => loaded,
+            LocalVariable target when ChaseCopies(definitions, target) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand loaded] } => loaded,
             _ => default(MemoryOperand?)
         };
 
         if (targetLoad is not { Index: null, Scale: 0, Addend: 0, Base: LocalVariable invokeData })
             return null;
 
-        if (Definition(definitions, invokeData) is not { OpCode: OpCode.Phi, Operands: [_, LocalVariable first, LocalVariable second] } phi)
+        if (ChaseCopies(definitions, invokeData) is not { OpCode: OpCode.Phi, Operands: [_, LocalVariable first, LocalVariable second] } phi)
             return null;
 
-        var firstDefinition = Definition(definitions, first);
-        var secondDefinition = Definition(definitions, second);
+        var firstDefinition = ChaseCopies(definitions, first);
+        var secondDefinition = ChaseCopies(definitions, second);
 
         var slowCall = firstDefinition is { OpCode: OpCode.Call } 
             ? firstDefinition
@@ -147,11 +147,11 @@ public static class InterfaceDispatchRecovery
         if (vtableEntry is not { OpCode: OpCode.Add, Operands: [_, LocalVariable addLeft, LocalVariable addRight] })
             return null;
 
-        var (klassCandidate, sum) = Definition(definitions, addRight) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0 }] }
+        var (klassCandidate, sum) = ChaseCopies(definitions, addRight) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0 }] }
             ? (addRight, addLeft)
             : (addLeft, addRight);
 
-        if (Definition(definitions, klassCandidate) is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable }] })
+        if (ChaseCopies(definitions, klassCandidate) is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable }] })
             return null;
 
         var shifted = sum;
@@ -255,8 +255,8 @@ public static class InterfaceDispatchRecovery
         for (var i = 1; i < dispatch.Operands.Count; i++)
         {
             if (dispatch.Operands[i] is not LocalVariable argument
-                || Definition(definitions, argument) is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable loadBase } load] }
-                || !ReferenceEquals(Definition(definitions, loadBase), match.InvokeDataPhi))
+                || ChaseCopies(definitions, argument) is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable loadBase } load] }
+                || !ReferenceEquals(ChaseCopies(definitions, loadBase), match.InvokeDataPhi))
                 continue;
 
             if (load.Addend == 8 && assembly != null)
@@ -299,7 +299,7 @@ public static class InterfaceDispatchRecovery
             ? dispatch.Operands[0] switch
             {
                 MemoryOperand folded => folded,
-                LocalVariable target when Definition(definitions, target) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand loaded] } => loaded,
+                LocalVariable target when ChaseCopies(definitions, target) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand loaded] } => loaded,
                 _ => default(MemoryOperand?)
             }
             : null;
@@ -313,7 +313,7 @@ public static class InterfaceDispatchRecovery
         var slot = (int)(relative / invokeDataSize);
 
         // klass must be a straight [receiver] load
-        if (Definition(definitions, klassLocal) is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable receiver }] })
+        if (ChaseCopies(definitions, klassLocal) is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable receiver }] })
             return null;
 
         // the this argument must trace back to the same object the klass was loaded off
@@ -520,7 +520,7 @@ public static class InterfaceDispatchRecovery
             var address = argument switch
             {
                 AddressOf => true,
-                LocalVariable l when Definition(definitions, l) is { OpCode: OpCode.Move, Operands: [_, AddressOf] } => true,
+                LocalVariable l when ChaseCopies(definitions, l) is { OpCode: OpCode.Move, Operands: [_, AddressOf] } => true,
                 _ => false,
             };
             if (!address)
@@ -532,7 +532,7 @@ public static class InterfaceDispatchRecovery
             RuntimeMethodInfoAnalysisContext => true,
             MemoryOperand { Index: null, Scale: 0, Base: LocalVariable operandBase, Addend: var addend }
                 => ReferenceEquals(operandBase, klassLocal) && addend == targetAddend + pointerSize,
-            LocalVariable local when Definition(definitions, local) is
+            LocalVariable local when ChaseCopies(definitions, local) is
                 { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable loadBase, Addend: var addend }] }
                 => ReferenceEquals(loadBase, klassLocal) && addend == targetAddend + pointerSize,
             _ => false,
@@ -573,7 +573,7 @@ public static class InterfaceDispatchRecovery
         for (var i = 1; i < dispatch.Operands.Count; i++)
         {
             if (dispatch.Operands[i] is not LocalVariable argument
-                || Definition(definitions, argument) is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable loadBase } load] }
+                || ChaseCopies(definitions, argument) is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable loadBase } load] }
                 || !ReferenceEquals(loadBase, match.KlassLocal))
                 continue;
 
