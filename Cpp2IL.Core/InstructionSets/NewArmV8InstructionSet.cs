@@ -171,8 +171,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         var instructions = new List<Instruction>();
         var addresses = new List<ulong>();
 
-        foreach (var instruction in insns)
-            ConvertInstructionStatement(instruction, instructions, addresses, context);
+        var instructionList = insns as IReadOnlyList<Arm64Instruction> ?? insns.ToList();
+        var scalarizer = new Arm64VectorScalarizer();
+        scalarizer.Begin(instructionList);
+
+        foreach (var instruction in instructionList)
+            ConvertInstructionStatement(instruction, instructions, addresses, context, scalarizer);
 
         // Add return if the function doesn't end with one already
         if (instructions.Count > 0 && instructions[^1].OpCode != OpCode.Return)
@@ -212,7 +216,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return instructions;
     }
 
-    private void ConvertInstructionStatement(Arm64Instruction instruction, List<Instruction> instructions, List<ulong> addresses, MethodAnalysisContext context)
+    private void ConvertInstructionStatement(Arm64Instruction instruction, List<Instruction> instructions, List<ulong> addresses, MethodAnalysisContext context, Arm64VectorScalarizer scalarizer)
     {
         var address = instruction.Address;
 
@@ -470,7 +474,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         }
 
         var preserveAdrpOffset = false;
-        switch (instruction.Mnemonic)
+        scalarizer.BeginInstruction(address);
+        // lane-wise SIMD chains (DUP broadcast + following integer lanes) are
+        // scalarized by the helper when lane provenance is fully proven; it
+        // returns false for anything it cannot prove, leaving the normal path
+        if (!scalarizer.TryConvert(instruction, Add, ConvertOperand))
+            switch (instruction.Mnemonic)
         {
             case Arm64Mnemonic.FRINTM:
             case Arm64Mnemonic.FRINTP:
@@ -519,7 +528,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     if (!EmitVector4Call("op_Multiply", ConvertOperand(instruction, 0), one, ConvertOperand(instruction, 1)))
                         Add(address, OpCode.NotImplemented, new StringLiteral("UnityEngine.Vector4.op_Multiply is unavailable."));
                 }
-                else
+                else if (!scalarizer.TryBroadcastDup(instruction, Add, ConvertOperand))
                     Add(address, OpCode.NotImplemented, new StringLiteral("Instruction DUP vector broadcast is not supported."));
                 break;
             case Arm64Mnemonic.FCMGT:
@@ -1173,6 +1182,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction {instruction.Mnemonic} not yet implemented."));
                 break;
         }
+
+        scalarizer.NoteUnhandled(instruction);
 
         // any register write invalidates a tracked ADRP page address (ADRP itself just set one)
         if (!preserveAdrpOffset && instruction.Mnemonic != Arm64Mnemonic.ADRP && instruction.Op0Kind == Arm64OperandKind.Register)
