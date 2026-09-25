@@ -361,6 +361,83 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             Add(address, OpCode.Move, flagV, Imm(0));
         }
 
+        // Evaluates the "Rm {<shift> #imm}" operand of a logical shifted-register
+        // encoding into ISIL. The produced operand carries the register width: a
+        // word form is a real 32-bit value (zero-extended/truncated), an x form
+        // keeps the full 64 bits. Returns null when the encoding carries a shift
+        // combination that cannot be represented honestly.
+        IOperand? EmitLogicalShiftedOperand()
+        {
+            var source = ConvertOperand(instruction, 2);
+
+            // Logical immediate encodings carry no shift triple, and a zero
+            // amount passes the operand through untouched - no temporary is
+            // created for either case.
+            if (instruction.Op2Kind != Arm64OperandKind.Register || instruction.Op3Imm == 0)
+                return source;
+
+            var shift = instruction.Op3ShiftType;
+            var amount = (int)instruction.Op3Imm;
+            var is32 = IsWordRegister(instruction.Op0Reg);
+            var width = is32 ? 32 : 64;
+
+            // Disarm rejects out-of-range shift encodings during decode; refuse
+            // to guess if one ever slips through.
+            if (amount < 0 || amount >= width || shift == Arm64ShiftType.NONE)
+                return null;
+
+            // OpCode.ShiftRight is an arithmetic shift, so a logical right shift
+            // is the shift followed by a mask clearing the sign-filled bits.
+            IOperand EmitLogicalShiftRight(IOperand input)
+            {
+                var raw = new Register(null, "TEMP_LOGICAL_SHIFT_RAW");
+                Add(address, OpCode.ShiftRight, raw, input, Imm(amount));
+                var masked = new Register(null, "TEMP_LOGICAL_SHIFT");
+                AddInteger(address, OpCode.And, masked, raw, Imm((1L << (width - amount)) - 1));
+                return masked;
+            }
+
+            switch (shift)
+            {
+                case Arm64ShiftType.LSL:
+                {
+                    var shifted = new Register(null, "TEMP_LOGICAL_SHIFT");
+                    AddInteger(address, OpCode.ShiftLeft, shifted, source, Imm(amount));
+                    return shifted;
+                }
+                case Arm64ShiftType.LSR:
+                    return EmitLogicalShiftRight(source);
+                case Arm64ShiftType.ASR:
+                {
+                    // a word arithmetic shift takes its sign from bit 31, not bit 63
+                    var input = source;
+                    if (is32)
+                    {
+                        input = new Register(null, "TEMP_LOGICAL_SHIFT_SRC");
+                        Add(address, OpCode.SignExtend32, input, source);
+                    }
+
+                    var shifted = new Register(null, "TEMP_LOGICAL_SHIFT");
+                    AddInteger(address, OpCode.ShiftRight, shifted, input, Imm(amount));
+                    return shifted;
+                }
+                case Arm64ShiftType.ROR:
+                {
+                    // ror(x, n) = lsr(x, n) | lsl(x, width - n)
+                    var rightPart = EmitLogicalShiftRight(source);
+
+                    var leftPart = new Register(null, "TEMP_LOGICAL_SHIFT_LEFT");
+                    AddInteger(address, OpCode.ShiftLeft, leftPart, source, Imm(width - amount));
+
+                    var rotated = new Register(null, "TEMP_LOGICAL_SHIFT_ROT");
+                    AddInteger(address, OpCode.Or, rotated, rightPart, leftPart);
+                    return rotated;
+                }
+                default:
+                    return null;
+            }
+        }
+
         // emits any instructions needed to evaluate the condition, returning an operand that is nonzero when it holds
         IOperand EmitCondition(Arm64ConditionCode condition)
         {
@@ -833,18 +910,11 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     };
 
                     var dest = IsReg31(instruction.Op0Reg) ? new Register(null, "TEMP") : ConvertOperand(instruction, 0);
-                    var right = ConvertOperand(instruction, 2);
-                    if (instruction.Op3Imm != 0 && instruction.Op3ShiftType is not (Arm64ShiftType.LSL or Arm64ShiftType.ASR))
+                    var right = EmitLogicalShiftedOperand();
+                    if (right == null)
                     {
                         Add(address, OpCode.NotImplemented, new StringLiteral($"{instruction.Mnemonic} shift {instruction.Op3ShiftType} is not supported."));
                         break;
-                    }
-                    if (instruction.Op3Imm != 0)
-                    {
-                        var shifted = new Register(null, "TEMP_LOGICAL_SHIFT");
-                        Add(address, instruction.Op3ShiftType == Arm64ShiftType.LSL ? OpCode.ShiftLeft : OpCode.ShiftRight,
-                            shifted, right, Imm(instruction.Op3Imm));
-                        right = shifted;
                     }
                     AddInteger(address, opCode, dest, ConvertOperand(instruction, 1), right);
 
@@ -881,19 +951,11 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         break;
                     }
                     var temp = new Register(null, "TEMP");
-                    var shiftedOperand = ConvertOperand(instruction, 2);
-                    if (instruction.Op3Imm != 0 && instruction.Op3ShiftType is not (Arm64ShiftType.LSL or Arm64ShiftType.ASR))
+                    var shiftedOperand = EmitLogicalShiftedOperand();
+                    if (shiftedOperand == null)
                     {
                         Add(address, OpCode.NotImplemented, new StringLiteral($"{instruction.Mnemonic} shift {instruction.Op3ShiftType} is not supported."));
                         break;
-                    }
-
-                    if (instruction.Op3Imm != 0)
-                    {
-                        var shifted = new Register(null, "TEMP_BIC_SHIFT");
-                        Add(address, instruction.Op3ShiftType == Arm64ShiftType.LSL ? OpCode.ShiftLeft : OpCode.ShiftRight,
-                            shifted, shiftedOperand, Imm(instruction.Op3Imm));
-                        shiftedOperand = shifted;
                     }
 
                     Add(address, OpCode.Not, temp, shiftedOperand);
@@ -904,7 +966,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         _ => OpCode.And
                     };
                     var dest = IsReg31(instruction.Op0Reg) ? new Register(null, "TEMP") : ConvertOperand(instruction, 0);
-                    Add(address, opCode, dest, ConvertOperand(instruction, 1), temp);
+                    AddInteger(address, opCode, dest, ConvertOperand(instruction, 1), temp);
 
                     if (instruction.Mnemonic == Arm64Mnemonic.BICS)
                         EmitResultFlags(dest);
