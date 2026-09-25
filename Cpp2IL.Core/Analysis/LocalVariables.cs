@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
@@ -280,6 +281,10 @@ public static class LocalVariables
             }
         }
 
+        // With every local's stack kind resolved, operand positions whose kind is
+        // incompatible with the whole-register local they read can be split off to
+        // the register's lane-0 view - the slot the scalar operation actually sees.
+        SplitScalarOperandViews(method);
     }
 
     private static bool ResolveStackAggregateFields(MethodAnalysisContext method)
@@ -863,6 +868,10 @@ public static class LocalVariables
                 }
             }
         }
+
+        // Same kind-splitting as in ResolveTypesAndFields, applied to the copies
+        // SSA teardown and copy coalescing leave behind.
+        SplitScalarOperandViews(method);
     }
 
     private static bool PropagateBooleanResult(Instruction instruction, MethodAnalysisContext method)
@@ -1285,4 +1294,119 @@ public static class LocalVariables
                 local.Type = method.ReturnType;
         }
     }
+
+    // A lifted register is a bag of bytes the lifter tracks as one whole, but each
+    // scalar use of it only touches the low lane: `fneg s8, s0` reads 32 bits of v0
+    // and `mov w8, w0` copies 32 bits of x0, never the whole vector register. Once
+    // locals are typed, an operand position whose required stack kind is a scalar
+    // (I4/I8/F/native-int) cannot honestly read a local whose type is a different
+    // stack kind (a value-type aggregate). Split that use off the register's
+    // whole-value local: the slot the operation sees is the aggregate's lane-0
+    // field. The same applies to a scalar store into an aggregate-typed register:
+    // `fmov s0, s8` defines the low lane alone, so the store's slot is that field.
+    private static void SplitScalarOperandViews(MethodAnalysisContext method)
+    {
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            switch (instruction.OpCode)
+            {
+                case OpCode.Move:
+                    SplitMoveOperandViews(instruction);
+                    break;
+                case OpCode.Negate or OpCode.Not
+                    or OpCode.Add or OpCode.Subtract or OpCode.Multiply
+                    or OpCode.Divide or OpCode.Modulo
+                    or OpCode.And or OpCode.Or or OpCode.Xor
+                    or OpCode.ShiftLeft or OpCode.ShiftRight:
+                    SplitScalarSources(instruction);
+                    break;
+                case OpCode.CheckEqual or OpCode.CheckNotEqual
+                    or OpCode.CheckGreater or OpCode.CheckGreaterOrEqual
+                    or OpCode.CheckLess or OpCode.CheckLessOrEqual:
+                    SplitScalarComparisonSources(instruction);
+                    break;
+            }
+        }
+    }
+
+    private static void SplitMoveOperandViews(Instruction instruction)
+    {
+        if (instruction.Operands.Count < 2 || instruction.Operands[0] is not LocalVariable destination)
+            return;
+
+        if (IsScalarLaneType(destination.Type))
+        {
+            SplitScalarSources(instruction);
+            return;
+        }
+
+        // The destination is an aggregate while the source is a scalar: only the low
+        // lane is being defined, so the slot written is that lane's field, emitted
+        // as a field store on the local.
+        if (destination.Type is { IsValueType: true } destinationType
+            && instruction.Operands[1] is LocalVariable { Type: { } sourceType }
+            && IsScalarLaneType(sourceType)
+            && LaneZeroField(destinationType, sourceType) is { } lane)
+            instruction.SetOperand(0, new FieldReference(lane, destination, 0));
+    }
+
+    private static void SplitScalarSources(Instruction instruction)
+    {
+        if (instruction.Operands[0] is not LocalVariable destination
+            || !IsScalarLaneType(destination.Type))
+            return;
+
+        for (var i = 1; i < instruction.Operands.Count; i++)
+            if (LaneOperand(instruction.Operands[i], destination.Type!) is { } lane)
+                instruction.SetOperand(i, lane);
+    }
+
+    private static void SplitScalarComparisonSources(Instruction instruction)
+    {
+        // A comparison's operand pair shares one stack kind, which the flag-typed
+        // destination does not reveal; take it from whichever side is already scalar.
+        if (instruction.Operands.Count < 3
+            || instruction.Operands[1] is not LocalVariable left
+            || instruction.Operands[2] is not LocalVariable right)
+            return;
+
+        var laneType = IsScalarLaneType(left.Type) ? left.Type
+            : IsScalarLaneType(right.Type) ? right.Type
+            : null;
+        if (laneType == null)
+            return;
+
+        if (LaneOperand(right, laneType) is { } rightLane)
+            instruction.SetOperand(2, rightLane);
+        if (LaneOperand(left, laneType) is { } leftLane)
+            instruction.SetOperand(1, leftLane);
+    }
+
+    private static IOperand? LaneOperand(IOperand operand, TypeAnalysisContext laneType)
+    {
+        if (operand is not LocalVariable { Type: { } aggregateType } local
+            || !aggregateType.IsValueType || IsScalarLaneType(aggregateType)
+            || LaneZeroField(aggregateType, laneType) is not { } lane)
+            return null;
+
+        return new FieldReference(lane, local, 0);
+    }
+
+    // The low lane of an aggregate local is its publicly visible offset-0 field of
+    // the scalar's exact type - `Vector3.x` for a Single view, a leading int for an
+    // I4 view. A private or mismatched field is no lane the operand could honestly
+    // name, so the operand stays whole and the emitter keeps its diagnostic.
+    private static FieldAnalysisContext? LaneZeroField(TypeAnalysisContext aggregateType,
+        TypeAnalysisContext laneType)
+        => aggregateType.Fields.FirstOrDefault(field => !field.IsStatic
+            && field.Offset == 0
+            && field.Visibility == FieldAttributes.Public
+            && (ReferenceEquals(field.FieldType, laneType) || field.FieldType.FullName == laneType.FullName));
+
+    // The CLR stack kinds a scalar register lane can carry: a `w`/`s` lane-0 view
+    // sees 4 bytes, a `d`/`x` view sees 8.
+    private static bool IsScalarLaneType(TypeAnalysisContext? type)
+        => type is { IsValueType: true } && type.FullName is "System.Int32" or "System.UInt32"
+            or "System.Int64" or "System.UInt64" or "System.IntPtr" or "System.UIntPtr"
+            or "System.Single" or "System.Double";
 }
