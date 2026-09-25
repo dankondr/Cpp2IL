@@ -29,9 +29,22 @@ Definition of done: positive fixtures разрешаются без erased-objec
 negative fixtures остаются unresolved; targeted tests и net10 build проходят;
 commit запушен, PR открыт в baseline, в описании указано какие RGCTX kinds покрыты.
 
+Обязательный semantic-reference gate: используй
+`cpp2il-arm64-paired-reference-v1.tar.zst`, SHA-256
+`16444de84e8d43ec08a2579bf1bfca4d5383dfa58711189b29c24b585bfb4535`.
+Один и тот же fixture дан как C#, IL2CPP C++, ARM64 binary/metadata и исполняемые
+result vectors. Baseline обязан
+воспроизвести failures `GenericCases.TaggedString` и `GenericCases.Nested`; controls
+`TaggedInt`, `EchoInt` и `EchoString` уже проходят. После фикса все generic vectors
+должны совпасть с source results, а recovered constructed types/layout — с
+generated C++ и metadata. Запусти `run-cpp2il.sh`/`verify-recovered.sh` до и после.
+Нельзя принимать erased `object`, валидный JIT или уменьшение unresolved-count как
+замену семантическому совпадению. Reference files не меняй.
+
 Обязательный corpus gate: приложен архив
 `castle-busters-il2cpp-r241-evidence.tar.zst`. Распакуй, проверь hashes, не коммить
 raw. После фикса выполни полный replay через `run-cpp2il.sh` в новый каталог и
 сравни RGCTX-related unmanaged loads, unresolved generics, field-layout и indirect
 call diagnostics с baseline. В PR приложи exact before/after counts, exit code и
-список регрессий. Без архива результат только unit-validated.
+список регрессий, а отдельным блоком — paired semantic before/after. Оба gate
+обязательны и не заменяют друг друга.

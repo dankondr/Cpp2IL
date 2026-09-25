@@ -31,9 +31,24 @@ Definition of done: discovery детерминирован и position-independe
 отклоняются; targeted tests и net10 build проходят; commit запушен и PR открыт в
 baseline с перечислением новых structural patterns.
 
+Обязательный paired-reference gate: используй
+`cpp2il-arm64-paired-reference-v1.tar.zst`, SHA-256
+`16444de84e8d43ec08a2579bf1bfca4d5383dfa58711189b29c24b585bfb4535`.
+В нём есть известный C#, точный generated IL2CPP C++, CodeGen registration,
+настоящий ARM64 binary и metadata.
+Выбери только те helper/thunk call sites, для которых target независимо доказан
+generated C++/CodeGen registration и окружающими ARM64 instructions. Зафиксируй
+RVA и disassembly только в PR evidence, не в production/tests. Сначала покажи, что
+baseline discovery пропускает либо неверно классифицирует выбранную форму; затем
+production-rule должен разрешить её одинаково в оригинальном image и в двух
+синтетически relocated blobs. Near-match обязан отклоняться. Векторный runner тут
+служит downstream non-regression, но сам по себе не доказывает корректность helper
+identity. Снижение `Method not found` без доказанного target запрещено принимать.
+
 Обязательный corpus gate: приложен
 `castle-busters-il2cpp-r241-evidence.tar.zst`. После SHA-256 verification запусти
 полный corpus новым `run-cpp2il.sh` output. В PR приложи before/after frequency
 table для всех `Method not found @...`, число полностью устранённых повторяющихся
 targets, общий exit code и false-positive/regression audit. Нельзя добавлять сами
-Castle addresses в production logic или tests. Raw evidence не коммить.
+Castle addresses в production logic или tests. Raw evidence не коммить. В PR
+раздельно покажи paired structural evidence и точный Castle corpus delta.

@@ -20,6 +20,12 @@ signature, outcome, exception type/message. Любая ошибка preparation 
 exit. Abstract/PInvoke/runtime/internal-call методы классифицируются как skipped с
 причиной. Порядок output стабильный.
 
+Добавь отдельный явно включаемый режим `--vectors FILE`: он вызывает только
+allowlisted public static методы, перечисленные в JSON, только с поддержанными
+primitive/string arguments, и сравнивает exact result. Никакого поиска и исполнения
+«похожих» методов, constructors или произвольной игровой логики. JSON record также
+содержит expected/actual либо exception. Prepare-only остаётся default.
+
 Сделай две крошечные fixture assemblies: valid control и намеренно runtime-invalid
 body с несовместимым `stloc`, максимально похожий на обнаруженный класс ошибки.
 Тест доказывает, что valid проходит, invalid ловится и процесс не падает целиком.
@@ -34,7 +40,18 @@ Definition of done: CLI имеет `--help`, deterministic JSON и exit codes; t
 net10 build проходят; нет зависимости от Castle binaries; commit запушен, PR открыт
 в baseline, URL возвращён.
 
-Для этой задачи тяжёлый Castle evidence archive не нужен: oracle сначала должен
-быть доказан полностью синтетическими valid/invalid fixtures. Не проси архив и не
-делай его наличие условием PR. Интеграционный запуск на Castle выполнит владелец
-baseline после merge.
+Обязательный integration gate: приложен
+`cpp2il-arm64-paired-reference-v1.tar.zst`, SHA-256
+`16444de84e8d43ec08a2579bf1bfca4d5383dfa58711189b29c24b585bfb4535`.
+Сначала проверь его hashes. Его standalone `verify-recovered.sh` — независимый
+контроль ожидаемых результатов.
+Новый tool в `--vectors` mode должен дать те же per-method outcomes на baseline
+recovered `RecoveryReference.dll`: обнаружить FP-carrier, virtual/delegate и
+generic semantic failures, которые prepare-only не обязан видеть. На исходной
+managed fixture assembly все vectors должны проходить; на намеренно испорченной —
+детерминированно падать. Не меняй vectors ради зелёного результата.
+
+Castle archive для этой задачи используется только в prepare-only mode после
+merge: нельзя исполнять arbitrary Castle methods. Если он доступен, приложи число
+prepared/failed/skipped assemblies/methods; его отсутствие не блокирует PR, но
+paired reference gate обязателен.
