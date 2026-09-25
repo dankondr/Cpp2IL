@@ -1575,6 +1575,11 @@ public static class IlGenerator
             {
                 if (TryEmitUnityVectorOperation(instruction, context, method, locals, writeLine))
                     break;
+                // `mvn` on `fmov` bits is the same reinterpretation idiom as the
+                // binary bitwise ops.
+                if (instruction.OpCode == OpCode.Not
+                    && TryEmitFloatCarrierIntegerOperation(instruction, context, method, locals, writeLine))
+                    break;
                 var unaryOperandType = EmittedOperandType(instruction.Operands[1], context);
                 if (unaryOperandType is PointerTypeAnalysisContext)
                 {
@@ -6020,6 +6025,9 @@ public static class IlGenerator
             return true;
         }
 
+        if (TryEmitFloatCarrierIntegerOperation(instruction, context, method, locals, writeLine))
+            return true;
+
         // `&local OP const` computes the address of a field inside the local's
         // value type; when a field sits at exactly that offset and can feed the
         // destination, the whole operation is the field access itself.
@@ -6074,6 +6082,162 @@ public static class IlGenerator
         }
 
         return false;
+    }
+
+    // ARM64 `fmov` transfers identical bits between the FP and integer register
+    // banks — `BitConverter.*To*Bits` in managed terms, never a `conv.*` numeric
+    // conversion. A float-typed operand inside an integer-domain bitwise op is
+    // therefore a proven bit reinterpretation: the operation is legal on the
+    // same-width integer carrier. Reinterpret each float operand through
+    // BitConverter, run the op on the carrier, and produce a float back only at
+    // a proven FP consumer — a destination of the carrier's float type. Any
+    // width disagreement, or a non-integral operand, has no honest carrier and
+    // leaves the operation unrecoverable.
+    private static bool TryEmitFloatCarrierIntegerOperation(Instruction instruction, MethodAnalysisContext context,
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        if (instruction.OpCode is not (OpCode.And or OpCode.Or or OpCode.Xor
+                or OpCode.Not or OpCode.ShiftLeft or OpCode.ShiftRight))
+            return false;
+
+        var systemTypes = context.AppContext.SystemTypes;
+        var isShift = instruction.OpCode is OpCode.ShiftLeft or OpCode.ShiftRight;
+        var operands = instruction.Operands.Skip(1).ToArray();
+
+        // The carrier width is the single width the op's value operands provably
+        // share: a float operand contributes the width of its bit pattern, an
+        // integral operand its stack width, a native int or pointer its register
+        // width. Literals adapt to the carrier but one that does not fit it is a
+        // width disagreement of its own. A shift's amount joins no consensus —
+        // the CIL ops take an i32/n-int count regardless.
+        var carrierWidth = 0;
+        var sawFloat = false;
+        for (var i = 0; i < operands.Length; i++)
+        {
+            var joinsCarrier = !(isShift && i == 1);
+            if (operands[i] is Immediate immediate)
+            {
+                if (joinsCarrier && carrierWidth == 4
+                    && unchecked((long)(int)immediate.Value) != immediate.Value
+                    && unchecked((long)(uint)immediate.Value) != immediate.Value)
+                    return false;
+                continue;
+            }
+            var emitted = EmittedOperandType(operands[i], context);
+            int width;
+            if (emitted?.FullName is "System.Single" or "System.Double")
+            {
+                sawFloat = true;
+                width = emitted.FullName == "System.Single" ? 4 : 8;
+            }
+            else if (emitted is ByRefTypeAnalysisContext)
+                return false; // `&x` is a managed pointer, not bits a carrier can hold
+            else
+            {
+                var integral = IntegralStackWidth(emitted);
+                if (integral == 0)
+                    return false;
+                width = integral < 0 ? 8 : integral;
+            }
+            if (joinsCarrier && carrierWidth != 0 && carrierWidth != width)
+                return false;
+            if (joinsCarrier)
+                carrierWidth = width;
+        }
+        if (!sawFloat || carrierWidth == 0)
+            return false;
+
+        // A float result comes back only at a proven FP consumer — a destination
+        // of the carrier's own float type (`fmov` into a V register after the
+        // integer op). An integral destination of any width is an honest
+        // consumer: a narrower slot truncates exactly like a W-register read of
+        // the X result, a wider one sees the zero-extension every ARM64 W-write
+        // performs. Everything else — a `&` slot the carrier cannot enter, a
+        // struct/reference destination no stack coercion can satisfy, or a float
+        // of the wrong width — has no honest store and stays unrecoverable.
+        // These checks run before any instruction is emitted.
+        var storeContract = StoreContract(instruction.Operands[0], context);
+        TypeAnalysisContext? fpConsumer = null;
+        if (storeContract != null)
+        {
+            if (storeContract is ByRefTypeAnalysisContext)
+                return false;
+            var destinationWidth = storeContract.FullName == "System.Single" ? 4
+                : storeContract.FullName == "System.Double" ? 8
+                : IntegralStackWidth(storeContract);
+            if (destinationWidth == 0)
+                return false;
+            if (storeContract.FullName is "System.Single" or "System.Double")
+            {
+                if (destinationWidth != carrierWidth)
+                    return false;
+                fpConsumer = storeContract;
+            }
+        }
+
+        var instructions = method.CilMethodBody!.Instructions;
+        var module = method.DeclaringModule!;
+        var factory = module.CorLibTypeFactory;
+        var bitConverter = factory.CorLibScope.CreateTypeReference("System", "BitConverter");
+        var carrierType = carrierWidth == 4 ? systemTypes.SystemInt32Type : systemTypes.SystemInt64Type;
+
+        for (var i = 0; i < operands.Length; i++)
+        {
+            var operand = operands[i];
+            var emitted = operand is Immediate ? null : EmittedOperandType(operand, context);
+            if (emitted?.FullName is "System.Single" or "System.Double")
+            {
+                // `fmov` between the banks: the float's own bits at its own
+                // width, reinterpreted through BitConverter — the only legal
+                // float → integer sequence.
+                LoadOperand(operand, method, locals, writeLine, emitted, context);
+                var single = emitted.FullName == "System.Single";
+                instructions.Add(CilOpCodes.Call, bitConverter.CreateMemberReference(
+                    single ? "SingleToInt32Bits" : "DoubleToInt64Bits",
+                    MethodSignature.CreateStatic(single ? factory.Int32 : factory.Int64,
+                        [single ? factory.Single : factory.Double])));
+                if (isShift && i == 1 && !single)
+                    // the count is i32-shaped: keep the carrier's low bits
+                    EmitStackCoerceOrDefault(systemTypes.SystemInt64Type, systemTypes.SystemInt32Type, method, context);
+            }
+            else if (isShift && i == 1)
+                LoadOperandIntoSlot(operand, systemTypes.SystemInt32Type, context, method, locals, writeLine);
+            else
+                LoadOperandIntoSlot(operand, carrierType, context, method, locals, writeLine);
+        }
+
+        instructions.Add(instruction.OpCode switch
+        {
+            OpCode.And => new CilInstruction(CilOpCodes.And),
+            OpCode.Or => new CilInstruction(CilOpCodes.Or),
+            OpCode.Xor => new CilInstruction(CilOpCodes.Xor),
+            OpCode.Not => new CilInstruction(CilOpCodes.Not),
+            OpCode.ShiftLeft => new CilInstruction(CilOpCodes.Shl),
+            OpCode.ShiftRight => new CilInstruction(CilOpCodes.Shr),
+            _ => new CilInstruction(CilOpCodes.Nop),
+        });
+
+        // The carrier's unsigned twin as the result type: a wider integral
+        // destination then coerces with conv.u*, reproducing the zero-extension
+        // an ARM64 W-register write always performs on the X register.
+        TypeAnalysisContext resultType = carrierWidth == 4
+            ? systemTypes.SystemUInt32Type
+            : systemTypes.SystemUInt64Type;
+        if (fpConsumer != null)
+        {
+            // The store is a V-register float again: reinterpret the carrier
+            // result back through the matching `fmov`.
+            var single = fpConsumer.FullName == "System.Single";
+            instructions.Add(CilOpCodes.Call, bitConverter.CreateMemberReference(
+                single ? "Int32BitsToSingle" : "Int64BitsToDouble",
+                MethodSignature.CreateStatic(single ? factory.Single : factory.Double,
+                    [single ? factory.Int32 : factory.Int64])));
+            resultType = fpConsumer;
+        }
+
+        CoerceOrDefault(resultType, storeContract, method, context);
+        StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
+        return true;
     }
 
     private static bool TryEmitUnityVectorOperation(Instruction instruction, MethodAnalysisContext context,
