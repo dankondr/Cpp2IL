@@ -34,3 +34,7 @@ Definition of done: CLI имеет `--help`, deterministic JSON и exit codes; t
 net10 build проходят; нет зависимости от Castle binaries; commit запушен, PR открыт
 в baseline, URL возвращён.
 
+Для этой задачи тяжёлый Castle evidence archive не нужен: oracle сначала должен
+быть доказан полностью синтетическими valid/invalid fixtures. Не проси архив и не
+делай его наличие условием PR. Интеграционный запуск на Castle выполнит владелец
+baseline после merge.

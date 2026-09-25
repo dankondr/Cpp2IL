@@ -37,3 +37,12 @@ Definition of done:
 
 Не заявляй, что Castle corpus исправлен: в облаке его нет. Твоя единица истины —
 raw instruction fixture и ARM64 specification/LLVM decoding.
+
+Обязательный corpus gate: вместе с этим промптом приложен архив
+`castle-busters-il2cpp-r241-evidence.tar.zst`. Распакуй его, прочитай `README.md`,
+проверь SHA-256 обоих raw inputs и не коммить содержимое архива. После Disarm
+commit и обновления submodule pointer собери Cpp2IL, запусти `run-cpp2il.sh` в
+новый output directory и сравни target `UNIMPLEMENTED`/instruction diagnostics со
+всеми baseline manifests из архива. В PR приложи exact before/after counts, exit
+code и список изменившихся diagnostic families. Если архив недоступен, можно
+закончить unit fix, но нельзя объявлять Castle validation успешной.

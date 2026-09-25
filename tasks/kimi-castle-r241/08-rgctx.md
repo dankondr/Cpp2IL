@@ -29,3 +29,9 @@ Definition of done: positive fixtures разрешаются без erased-objec
 negative fixtures остаются unresolved; targeted tests и net10 build проходят;
 commit запушен, PR открыт в baseline, в описании указано какие RGCTX kinds покрыты.
 
+Обязательный corpus gate: приложен архив
+`castle-busters-il2cpp-r241-evidence.tar.zst`. Распакуй, проверь hashes, не коммить
+raw. После фикса выполни полный replay через `run-cpp2il.sh` в новый каталог и
+сравни RGCTX-related unmanaged loads, unresolved generics, field-layout и indirect
+call diagnostics с baseline. В PR приложи exact before/after counts, exit code и
+список регрессий. Без архива результат только unit-validated.

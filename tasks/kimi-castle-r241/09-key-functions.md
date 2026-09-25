@@ -31,3 +31,9 @@ Definition of done: discovery детерминирован и position-independe
 отклоняются; targeted tests и net10 build проходят; commit запушен и PR открыт в
 baseline с перечислением новых structural patterns.
 
+Обязательный corpus gate: приложен
+`castle-busters-il2cpp-r241-evidence.tar.zst`. После SHA-256 verification запусти
+полный corpus новым `run-cpp2il.sh` output. В PR приложи before/after frequency
+table для всех `Method not found @...`, число полностью устранённых повторяющихся
+targets, общий exit code и false-positive/regression audit. Нельзя добавлять сами
+Castle addresses в production logic или tests. Raw evidence не коммить.

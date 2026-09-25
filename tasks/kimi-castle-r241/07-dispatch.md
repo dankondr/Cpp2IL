@@ -30,3 +30,9 @@ Definition of done: positive fixtures больше не indirect; negatives не
 targeted tests и net10 build проходят; нет Castle names/addresses/tokens; commit
 запушен и PR открыт в baseline.
 
+Обязательный corpus gate: приложен
+`castle-busters-il2cpp-r241-evidence.tar.zst`. Проверь SHA-256, прочитай README и
+не добавляй raw в git. После фикса запусти весь corpus через `run-cpp2il.sh`.
+В PR укажи before/after counts `Indirect call`, `Indirect jump`, unknown call target
+и unverifiable delegate construction, плюс exit code и regression summary. Без
+corpus evidence не заявляй, что Castle dispatch улучшен.

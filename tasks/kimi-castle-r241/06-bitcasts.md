@@ -32,3 +32,10 @@ width. Проверяй exact bits и успешный runtime JIT, не тол�
 Definition of done: tests падают до фикса, после сохраняют exact bits; targeted tests
 и net10 build проходят; commit запушен, PR открыт в baseline, URL возвращён.
 
+Обязательный corpus gate: используй приложенный
+`castle-busters-il2cpp-r241-evidence.tar.zst`, сначала проверив hashes из README.
+После unit tests перегенерируй полный corpus в новый каталог. В PR приложи
+before/after counts `Unrecoverable integer operation` с float operands,
+`InvalidCastException`-связанных recovered paths насколько их можно статически
+проверить, общий exit code и отсутствие существенных regressions. Evidence не
+коммить. Без corpus run пометь работу `NOT CASTLE-VALIDATED`.

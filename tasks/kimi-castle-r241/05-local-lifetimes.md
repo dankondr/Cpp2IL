@@ -32,3 +32,9 @@ Definition of done: regression fixture раньше генерирует invalid
 разные корректные locals; JIT prepare проходит; targeted tests и net10 build
 проходят; нет method-specific repair; commit запушен и PR открыт в baseline.
 
+Обязательный corpus gate: приложен архив
+`castle-busters-il2cpp-r241-evidence.tar.zst`. Распакуй и проверь его по README,
+не коммить raw inputs. После фикса перегенерируй весь corpus. Помимо diagnostic
+counts, проверь recovered token `0x0600152d` в `CastleClashers.Game.dll`: его тело
+должно JIT/prepare без incompatible `stloc`. В PR приложи before/after evidence и
+exit code. Unit test без corpus run не считается Castle validation.

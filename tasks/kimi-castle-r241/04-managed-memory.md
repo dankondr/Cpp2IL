@@ -39,3 +39,9 @@ Definition of done: positive fixture не содержит unmanaged-load diagno
 net10 build проходят; production code не содержит названий Castle/ACTk, адресов или
 tokens; branch запушен и PR открыт в baseline.
 
+Обязательный corpus gate: используй приложенный
+`castle-busters-il2cpp-r241-evidence.tar.zst`. После проверки hashes сохрани
+baseline summary, затем после фикса запусти весь corpus через `run-cpp2il.sh` в
+новый output. В PR укажи before/after `Unmanaged memory load` counts в целом и
+отдельно для `ACTk.Runtime`, `CastleClashers.Game`, `Assembly-CSharp`; проверь,
+что другие diagnostics не выросли существенно. Raw inputs в git не добавлять.

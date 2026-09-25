@@ -33,3 +33,9 @@ Definition of done: до фикса positive fixture остаётся unsupporte
 targeted tests и net10 build проходят; нет Castle-specific идентификаторов;
 commit запушен и PR открыт в baseline.
 
+Обязательный corpus gate: вместе с промптом приложен архив
+`castle-busters-il2cpp-r241-evidence.tar.zst`. Прочитай его `README.md`, проверь
+SHA-256, не коммить evidence. После фикса перегенерируй весь corpus отдельным
+`run-cpp2il.sh` output и сравни `DUP vector broadcast`, `UNIMPLEMENTED` и
+unrecoverable-operation counts с baseline manifests. В PR приложи exact counts и
+exit code. Без corpus run не утверждай, что Castle исправлен.

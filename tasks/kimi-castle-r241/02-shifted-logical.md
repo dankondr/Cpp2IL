@@ -39,3 +39,9 @@ Definition of done:
 5. Нет assembly/method/address/token hardcodes.
 6. Commit запушен, PR открыт в baseline-ветку, URL возвращён в финальном ответе.
 
+Обязательный corpus gate: тебе приложен
+`castle-busters-il2cpp-r241-evidence.tar.zst`. Распакуй, прочитай `README.md`,
+проверь hashes и не коммить raw inputs. После unit tests запусти полный corpus
+через `run-cpp2il.sh` в новый каталог. В PR укажи before/after count diagnostics
+для shifted logical/EOR, общий exit code и любые регрессии соседних families.
+Без этого архива пометь результат `NOT CASTLE-VALIDATED`, даже если tests проходят.
