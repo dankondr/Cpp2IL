@@ -16,6 +16,8 @@
   </Folder>
   <Project Path="Cpp2IL.Core.Tests/Cpp2IL.Core.Tests.csproj" />
   <Project Path="Cpp2IL.Core/Cpp2IL.Core.csproj" />
+  <Project Path="Cpp2IL.JitOracle/Cpp2IL.JitOracle.csproj" />
+  <Project Path="Cpp2IL.JitOracle.Tests/Cpp2IL.JitOracle.Tests.csproj" />
   <Project Path="Cpp2IL.Plugin.BuildReport/Cpp2IL.Plugin.BuildReport.csproj" />
   <Project Path="Cpp2IL.Plugin.ControlFlowGraph/Cpp2IL.Plugin.ControlFlowGraph.csproj" />
   <Project Path="Cpp2IL.Plugin.Mfuscator/Cpp2IL.Plugin.Mfuscator.csproj" />
