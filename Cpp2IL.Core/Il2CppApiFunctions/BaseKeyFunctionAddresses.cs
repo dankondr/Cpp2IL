@@ -56,7 +56,7 @@ public abstract class BaseKeyFunctionAddresses
 
     public ulong AddrPInvokeLookup; //TODO Re-find this and fix name
 
-    public IEnumerable<KeyValuePair<string, ulong>> Pairs => resolvedAddressMap;
+    public IEnumerable<KeyValuePair<string, ulong>> Pairs => resolvedAddressMap.Concat(_resolvedAliases);
 
     public HashSet<ulong> WriteBarrierAliases { get; } = [];
     public HashSet<ulong> BoxAliases { get; } = [];
@@ -69,9 +69,58 @@ public abstract class BaseKeyFunctionAddresses
     private readonly Dictionary<string, ulong> resolvedAddressMap = [];
     private readonly HashSet<ulong> resolvedAddressSet = [];
 
+    // Call targets proven by structural analysis to forward to a resolved function
+    // (e.g. a veneer consisting of a single unconditional branch). They resolve to
+    // the forwarded function's name through Pairs.
+    private readonly List<KeyValuePair<string, ulong>> _resolvedAliases = [];
+    private readonly HashSet<ulong> _aliasAddressSet = [];
+    private readonly object _aliasLock = new();
+    private bool _veneerAliasesReady;
+
+    protected IReadOnlyDictionary<string, ulong> ResolvedAddresses => resolvedAddressMap;
+
     public bool IsKeyFunctionAddress(ulong address)
     {
-        return address != 0 && (resolvedAddressSet.Contains(address) || WriteBarrierAliases.Contains(address) || BoxAliases.Contains(address));
+        return address != 0 && (resolvedAddressSet.Contains(address) || WriteBarrierAliases.Contains(address) || BoxAliases.Contains(address) || IsVeneerAliasAddress(address));
+    }
+
+    private bool IsVeneerAliasAddress(ulong address)
+    {
+        if (_aliasAddressSet.Contains(address))
+            return true;
+        if (!_veneerAliasesReady)
+            return false;
+        lock (_aliasLock)
+        {
+            return _aliasAddressSet.Contains(address) || TryResolveVeneerAlias(address);
+        }
+    }
+
+    /// <summary>
+    /// Last-chance structural resolution for a call target not in the resolved set,
+    /// invoked once per distinct address on analysis threads. Implementations should
+    /// call <see cref="AddResolvedAlias"/> and return true only when the target
+    /// provably forwards to an already-resolved function.
+    /// </summary>
+    protected virtual bool TryResolveVeneerAlias(ulong address) => false;
+
+    protected void AddResolvedAlias(string name, ulong address)
+    {
+        if (address == 0 || resolvedAddressSet.Contains(address))
+            return;
+        lock (_aliasLock)
+        {
+            if (!_aliasAddressSet.Add(address))
+                return;
+            _resolvedAliases.Add(new(name, address));
+        }
+    }
+
+    /// <summary>
+    /// Eagerly registers veneer aliases after the resolved map is initialized.
+    /// </summary>
+    protected virtual void ResolveVeneerAliases()
+    {
     }
 
     private void FindExport(string name, out ulong ptr)
@@ -130,6 +179,8 @@ public abstract class BaseKeyFunctionAddresses
 
         FindThunks();
         InitializeResolvedAddresses();
+        ResolveVeneerAliases();
+        _veneerAliasesReady = true;
     }
 
     protected void TryGetInitMetadataFromException()
@@ -270,8 +321,27 @@ public abstract class BaseKeyFunctionAddresses
 
         if (il2cpp_codegen_initialize_runtime_metadata != 0)
         {
-            Logger.Verbose("\tLooking for il2cpp_codegen_initialize_runtime_metadata_inline as a thunk of the metadata init...");
-            il2cpp_codegen_initialize_runtime_metadata_inline = FindAllThunkFunctions(il2cpp_codegen_initialize_runtime_metadata).FirstOrDefault();
+            Logger.Verbose("\tLooking for il2cpp_codegen_initialize_runtime_metadata_inline as a tail-call veneer of the metadata init leaf...");
+            // The resolved entry point is a small wrapper that saves x30, calls a
+            // shared worker, issues a memory barrier and returns. The *_inline
+            // companion is a bare tail-call veneer (`b <worker>`) sharing that
+            // worker, so the thunk search must target the worker the wrapper calls,
+            // not the wrapper itself. Fall back to thunks of the wrapper when the
+            // leaf is unavailable.
+            var initLeaf = FindFirstCallTargetInMethod(il2cpp_codegen_initialize_runtime_metadata);
+            var potentialThunks = (initLeaf != 0
+                    ? FindAllThunkFunctions(initLeaf, 0, il2cpp_codegen_initialize_runtime_metadata)
+                    : FindAllThunkFunctions(il2cpp_codegen_initialize_runtime_metadata))
+                .Select(ptr => (ptr, count: GetCallerCount(ptr)))
+                .ToList();
+            potentialThunks.SortByExtractedKey(pair => pair.count);
+            potentialThunks.Reverse();
+
+            il2cpp_codegen_initialize_runtime_metadata_inline = potentialThunks.FirstOrDefault().ptr;
+
+            if (il2cpp_codegen_initialize_runtime_metadata_inline == 0 && initLeaf != 0)
+                il2cpp_codegen_initialize_runtime_metadata_inline = FindAllThunkFunctions(il2cpp_codegen_initialize_runtime_metadata).FirstOrDefault();
+
             Logger.VerboseNewline($"Found at 0x{il2cpp_codegen_initialize_runtime_metadata_inline:X}");
         }
 
