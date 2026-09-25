@@ -137,13 +137,40 @@ public static class RgctxResolver
         {
             switch (entry.type)
             {
-                case Il2CppRGCTXDataType.IL2CPP_RGCTX_DATA_CLASS or Il2CppRGCTXDataType.IL2CPP_RGCTX_DATA_TYPE:
+                case Il2CppRGCTXDataType.IL2CPP_RGCTX_DATA_CLASS or Il2CppRGCTXDataType.IL2CPP_RGCTX_DATA_TYPE
+                    // v108+: the declaring type of a field-offset pair is a class handle
+                    or Il2CppRGCTXDataType.IL2CPP_RGCTX_DATA_FIELD_OFFSET_TYPE:
                 {
                     var inflated = GenericInstantiation.Instantiate(appContext.ResolveIl2CppType(entry.Type), typeArguments, methodArguments);
                     return new RuntimeClassTypeAnalysisContext(inflated, inflated.DeclaringAssembly);
                 }
 
-                case Il2CppRGCTXDataType.IL2CPP_RGCTX_DATA_METHOD:
+                case Il2CppRGCTXDataType.IL2CPP_RGCTX_DATA_CONSTRAINED when appContext.MetadataVersion >= 108:
+                {
+                    // v108 renames this entry to CONSTRAINED_CALL_TYPE: the type half of a
+                    // constrained-call pair, a class handle
+                    var inflated = GenericInstantiation.Instantiate(appContext.ResolveIl2CppType(entry.Type), typeArguments, methodArguments);
+                    return new RuntimeClassTypeAnalysisContext(inflated, inflated.DeclaringAssembly);
+                }
+
+                case Il2CppRGCTXDataType.IL2CPP_RGCTX_DATA_ARRAY:
+                {
+                    // the runtime slot is the Il2CppClass* for the szarray of the indexed type
+                    var element = GenericInstantiation.Instantiate(appContext.ResolveIl2CppType(entry.Type), typeArguments, methodArguments);
+                    var array = new SzArrayTypeAnalysisContext(element);
+                    return new RuntimeClassTypeAnalysisContext(array, element.DeclaringAssembly);
+                }
+
+                case Il2CppRGCTXDataType.IL2CPP_RGCTX_DATA_CONSTRAINED:
+                {
+                    // a pre-v108 constrained entry's slot is a ConstrainedCall* ({MethodInfo*, Il2CppClass*}),
+                    // an opaque helper handle rather than either managed descriptor itself
+                    return new PointerTypeAnalysisContext(appContext.SystemTypes.SystemVoidType);
+                }
+
+                case Il2CppRGCTXDataType.IL2CPP_RGCTX_DATA_METHOD
+                    // v108+: the method half of a constrained-call pair is a method handle
+                    or Il2CppRGCTXDataType.IL2CPP_RGCTX_DATA_CONSTRAINED_CALL_METHOD:
                 {
                     var spec = entry.MethodSpec;
 
@@ -161,6 +188,9 @@ public static class RgctxResolver
                     return new RuntimeMethodInfoAnalysisContext(inflatedMethod, declaringType.DeclaringAssembly);
                 }
 
+                // anything else (INVALID, FIELD_OFFSET_FIELD, unknown kinds) stays unresolved:
+                // the operand is left as the raw [table + offset] load, which the IL stage reports
+                // as an explicit unmanaged-load diagnostic naming the owning table and slot.
                 default:
                     return null;
             }

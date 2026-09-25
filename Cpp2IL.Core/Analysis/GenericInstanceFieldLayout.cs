@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
@@ -15,16 +16,58 @@ public static class GenericInstanceFieldLayout
         foreach (var definition in instance.GenericType.Fields.Where(field => !field.IsStatic))
         {
             var field = new ConcreteGenericFieldAnalysisContext(definition, instance);
-            var size = TypeSizes.MinimumUnboxedSize(field.FieldType, pointerSize);
-            if (size == 0)
+            if (FieldLayout(field.FieldType, pointerSize) is not var (size, alignment))
                 return null;
-            var alignment = System.Math.Min(size, pointerSize);
             offset = (offset + alignment - 1) & ~(alignment - 1);
             if (targetOffset >= offset && targetOffset < offset + size)
                 return (field, offset, size);
             offset += size;
         }
         return null;
+    }
+
+    // The instance-aware counterparts of FindFieldAtOffset/FindStaticFieldAtOffset: the layout is
+    // computed on the instantiated field types, so value-type arguments land at the offsets the
+    // runtime produced rather than the erased sizes the generic definition's field types suggest.
+    public static FieldAnalysisContext? FindFieldAtOffset(
+        GenericInstanceTypeAnalysisContext instance, long targetOffset)
+        => FindInstanceFieldAtOffset(instance, targetOffset, false);
+
+    public static FieldAnalysisContext? FindStaticFieldAtOffset(
+        GenericInstanceTypeAnalysisContext instance, long targetOffset)
+        => FindInstanceFieldAtOffset(instance, targetOffset, true);
+
+    private static FieldAnalysisContext? FindInstanceFieldAtOffset(
+        GenericInstanceTypeAnalysisContext instance, long targetOffset, bool isStatic)
+    {
+        var pointerSize = instance.AppContext.Binary.PointerSizeBytes;
+        var offset = isStatic || instance.IsValueType ? 0 : InstanceSize(instance.BaseType, pointerSize);
+        foreach (var definition in instance.GenericType.Fields)
+        {
+            if (definition.IsStatic != isStatic)
+                continue;
+
+            var field = new ConcreteGenericFieldAnalysisContext(definition, instance);
+            if (FieldLayout(field.FieldType, pointerSize) is not var (size, alignment))
+                return null;
+
+            offset = (offset + alignment - 1) & ~(alignment - 1);
+            if (offset == targetOffset)
+                return field;
+
+            offset += size;
+        }
+        return null;
+    }
+
+    // A field's (size, alignment): value types get the computed struct layout (member alignment
+    // and trailing padding included); everything else uses the minimum unboxed size.
+    private static (long Size, long Alignment)? FieldLayout(TypeAnalysisContext fieldType, int pointerSize)
+    {
+        if (fieldType.IsValueType && GetSizeAndAlignment(fieldType, pointerSize) is { } layout)
+            return layout;
+        var fallback = TypeSizes.MinimumUnboxedSize(fieldType, pointerSize);
+        return fallback > 0 ? (fallback, System.Math.Min(fallback, (long)pointerSize)) : null;
     }
 
     public static FieldAnalysisContext? FindFieldAtOffset(TypeAnalysisContext definition, long targetOffset)
@@ -86,11 +129,14 @@ public static class GenericInstanceFieldLayout
     }
 
     private static (long Size, long Alignment)? GetSizeAndAlignment(TypeAnalysisContext fieldType, int pointerSize)
+        => GetSizeAndAlignment(fieldType, pointerSize, []);
+
+    private static (long Size, long Alignment)? GetSizeAndAlignment(
+        TypeAnalysisContext fieldType, int pointerSize, HashSet<TypeAnalysisContext> activeStructs)
     {
         if (fieldType is GenericInstanceTypeAnalysisContext { GenericType.IsEnumType: true } genericEnum)
             fieldType = genericEnum.GenericType;
 
-        // TODO support user-defined value types
         if (fieldType is GenericParameterTypeAnalysisContext genericParameter)
             return genericParameter.IsValueType ? null : (pointerSize, pointerSize);
 
@@ -101,16 +147,52 @@ public static class GenericInstanceFieldLayout
             return GetSizeAndAlignment(fieldType.EnumUnderlyingType
                                        ?? fieldType.Fields.FirstOrDefault(f => !f.IsStatic)?.FieldType
                                        ?? fieldType.AppContext.SystemTypes.SystemInt32Type,
-                pointerSize);
+                pointerSize, activeStructs);
 
         return fieldType.FullName switch
         {
-            "System.Boolean" or "System.Byte" or "System.SByte" => (1, 1),
-            "System.Int16" or "System.UInt16" or "System.Char" => (2, 2),
-            "System.Int32" or "System.UInt32" or "System.Single" => (4, 4),
-            "System.Int64" or "System.UInt64" or "System.Double" => (8, 8),
-            "System.IntPtr" or "System.UIntPtr" => (pointerSize, pointerSize),
-            _ => null // an arbitrary struct needs its own layout computed, bail rather than guess
+            "System.Boolean" or "System.Byte" or "System.SByte" => (1L, 1L),
+            "System.Int16" or "System.UInt16" or "System.Char" => (2L, 2L),
+            "System.Int32" or "System.UInt32" or "System.Single" => (4L, 4L),
+            "System.Int64" or "System.UInt64" or "System.Double" => (8L, 8L),
+            "System.IntPtr" or "System.UIntPtr" => ((long)pointerSize, (long)pointerSize),
+            // an arbitrary struct: compute the layout from its instance fields
+            _ => GetStructSizeAndAlignment(fieldType, pointerSize, activeStructs),
         };
+    }
+
+    // Sequential-layout value type: sum its instance fields with each aligned to min(size, pointer
+    // size) and pad the total to the largest member alignment. Generic instances lay out the
+    // instantiated field types. Returns null when any member's layout can't be computed.
+    private static (long Size, long Alignment)? GetStructSizeAndAlignment(
+        TypeAnalysisContext structType, int pointerSize, HashSet<TypeAnalysisContext> activeStructs)
+    {
+        if (!activeStructs.Add(structType))
+            return null;
+
+        var fields = structType is GenericInstanceTypeAnalysisContext instance
+            ? instance.GenericType.Fields
+                .Where(field => !field.IsStatic)
+                .Select(field => (FieldAnalysisContext)new ConcreteGenericFieldAnalysisContext(field, instance))
+            : structType.Fields.Where(field => !field.IsStatic);
+
+        long offset = 0;
+        long maxAlignment = 1;
+        foreach (var field in fields)
+        {
+            if (GetSizeAndAlignment(field.FieldType, pointerSize, activeStructs) is not var (size, alignment))
+            {
+                activeStructs.Remove(structType);
+                return null;
+            }
+
+            offset = (offset + alignment - 1) & ~(alignment - 1);
+            offset += size;
+            maxAlignment = System.Math.Max(maxAlignment, alignment);
+        }
+
+        activeStructs.Remove(structType);
+        var structAlignment = System.Math.Min(maxAlignment, pointerSize);
+        return ((offset + structAlignment - 1) & ~(structAlignment - 1), structAlignment);
     }
 }

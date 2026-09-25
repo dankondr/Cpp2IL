@@ -256,6 +256,17 @@ public static class MetadataResolver
                 instruction.SetOperand(i, new FieldReference(field, local, (int)memory.Addend,
                     resolved!.Value.Containers, memory.AccessSize));
                 changed = true;
+
+                // A private cross-assembly field read is an inlined accessor (e.g.
+                // String._stringLength behind get_Length) and cannot be named from the caller -
+                // emit the public accessor call the inline came from instead.
+                if (i == 1 && instruction.OpCode == OpCode.Move
+                    && instruction.Operands[0] is LocalVariable destination
+                    && TryRecoverFieldAccessor(method, field, local) is { } accessor)
+                {
+                    instruction.OpCode = OpCode.Call;
+                    instruction.SetOperands(accessor, destination, local);
+                }
             }
         }
 
@@ -275,6 +286,64 @@ public static class MetadataResolver
         }
 
         return FindInstanceFieldPathAtOffset(owner, offset, accessSize);
+    }
+
+    // The honest public equivalent of a cross-assembly private field read: IL2CPP inlines managed
+    // accessors (String.get_Length => _stringLength, List<T>.get_Count => _size), leaving a direct
+    // read of a field the emitted assembly cannot name. When the declaring type exposes exactly one
+    // public parameterless instance getter of the field's type, that accessor is what the inline
+    // came from.
+    private static MethodAnalysisContext? TryRecoverFieldAccessor(
+        MethodAnalysisContext caller, FieldAnalysisContext field, LocalVariable receiver)
+    {
+        if (!NeedsAccessor(field, caller) || receiver.Type is { IsValueType: true })
+            return null;
+
+        var genericInstance = field.DeclaringType as GenericInstanceTypeAnalysisContext;
+        var lookup = genericInstance?.GenericType ?? field.DeclaringType;
+        if (lookup == null)
+            return null;
+
+        var candidates = lookup.Methods
+            .Where(m => !m.IsStatic && m.Parameters.Count == 0
+                && m.Name.StartsWith("get_", StringComparison.Ordinal)
+                && (m.Attributes & MethodAttributes.MemberAccessMask) == MethodAttributes.Public
+                && m.ReturnType.FullName == field.FieldType.FullName)
+            .ToList();
+        if (candidates.Count != 1)
+            return null;
+
+        var accessor = genericInstance != null
+            ? (MethodAnalysisContext)new ConcreteGenericMethodAnalysisContext(candidates[0],
+                genericInstance.GenericArguments, [])
+            : candidates[0];
+        return InaccessibleCalleeRecovery.IsVisibleFrom(accessor, caller) ? accessor : null;
+    }
+
+    private static bool NeedsAccessor(FieldAnalysisContext field, MethodAnalysisContext caller)
+    {
+        var access = field.Attributes & FieldAttributes.FieldAccessMask;
+        if (access is FieldAttributes.Public or FieldAttributes.Family or FieldAttributes.FamORAssem)
+            return false;
+
+        var declaring = field.DeclaringType;
+        var callerType = caller.DeclaringType;
+        if (declaring == null || callerType == null)
+            return false;
+
+        if (declaring is GenericInstanceTypeAnalysisContext instance)
+            declaring = instance.GenericType;
+        if (callerType is GenericInstanceTypeAnalysisContext callerInstance)
+            callerType = callerInstance.GenericType;
+        if (ReferenceEquals(declaring, callerType))
+            return false; // private access within the same type stays a direct read
+
+        var declaringAssembly = declaring?.DeclaringAssembly;
+        var callerAssembly = callerType.DeclaringAssembly;
+        return declaringAssembly == null || callerAssembly == null
+            || !(ReferenceEquals(declaringAssembly, callerAssembly)
+                || (declaringAssembly.Name != null && declaringAssembly.Name == callerAssembly.Name)
+                || Extensions.AccessibilityExtensions.SharesEmittedInternals(declaringAssembly, callerAssembly));
     }
 
     internal static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)?
@@ -346,9 +415,7 @@ public static class MetadataResolver
     internal static FieldAnalysisContext? FindStaticFieldAtOffset(TypeAnalysisContext owner, long offset)
     {
         if (owner is GenericInstanceTypeAnalysisContext genericOwner)
-            return GenericLayoutDependsOnValueArgument(genericOwner)
-                ? null
-                : GenericInstanceFieldLayout.FindStaticFieldAtOffset(genericOwner.GenericType, offset);
+            return GenericInstanceFieldLayout.FindStaticFieldAtOffset(genericOwner, offset);
 
         if (owner.GenericParameters.Count > 0)
             return GenericInstanceFieldLayout.FindStaticFieldAtOffset(owner, offset);
@@ -517,11 +584,10 @@ public static class MetadataResolver
     {
         if (owner is GenericInstanceTypeAnalysisContext genericOwner)
         {
-            // Own-field layout is recomputed; a value-type argument affecting field
-            // placement makes it untrustworthy, but inherited fields on the chain
+            // Own-field layout is recomputed on the instantiated field types, so value-type
+            // arguments land at the offsets the runtime produced; inherited fields on the chain
             // keep their real metadata offsets, so fall through to the walk.
-            if (!GenericLayoutDependsOnValueArgument(genericOwner)
-                && GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner.GenericType, offset) is { } ownField)
+            if (GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner, offset) is { } ownField)
                 return ownField;
         }
         else if (owner.GenericParameters.Count > 0
@@ -534,9 +600,8 @@ public static class MetadataResolver
         {
             if (candidate is GenericInstanceTypeAnalysisContext genericCandidate)
             {
-                if (!GenericLayoutDependsOnValueArgument(genericCandidate)
-                    && GenericInstanceFieldLayout.FindFieldAtOffset(genericCandidate.GenericType, offset) is { } genericField)
-                    return new ConcreteGenericFieldAnalysisContext(genericField, genericCandidate);
+                if (GenericInstanceFieldLayout.FindFieldAtOffset(genericCandidate, offset) is { } genericField)
+                    return genericField;
                 continue; // a generic instance's metadata offsets are layout placeholders, never real
             }
             if (candidate.GenericParameters.Count > 0)
@@ -553,10 +618,6 @@ public static class MetadataResolver
 
         return null;
     }
-
-    private static bool GenericLayoutDependsOnValueArgument(GenericInstanceTypeAnalysisContext instance)
-        => instance.GenericArguments.Any(a => a.IsValueType)
-           && instance.GenericType.Fields.Any(f => f.FieldType is GenericParameterTypeAnalysisContext);
 
     private static void ResolveCalls(MethodAnalysisContext method)
     {
