@@ -11,6 +11,22 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class StatusBaseRecoveryTests
 {
+    [Test]
+    public void Arm64IsInstVeneerFollowsRuntimeClassInitVeneer()
+    {
+        var words = new Dictionary<ulong, uint>
+        {
+            [0x1000] = 0x14000001,
+            [0x1004] = 0x14000002,
+        };
+
+        Assert.That(NewArm64KeyFunctionAddresses.AdjacentIsInstVeneer(0x1000, address => words[address]),
+            Is.EqualTo(0x1004));
+        words[0x1004] = 0xd65f03c0;
+        Assert.That(NewArm64KeyFunctionAddresses.AdjacentIsInstVeneer(0x1000, address => words[address]),
+            Is.Zero);
+    }
+
     [TestCase(false)]
     [TestCase(true)]
     public void WriteBarrierMatcherRequiresExactStoreWrapper(bool wrongStore)
@@ -43,6 +59,32 @@ public class StatusBaseRecoveryTests
         MetadataResolver.ResolveFieldOffsets(method);
         if(kind==0) Assert.That(((FieldReference)load.Operands[1]).Field,Is.SameAs(field));
         else Assert.That(load.Operands[1],Is.EqualTo(original));
+    }
+
+    [Test]
+    public void AddressAliasUsesConcreteNewobjTypeWhenLocalIsErasedObject()
+    {
+        var app=Cpp2IlApi.CurrentAppContext!;
+        var owner=new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"],"Tests","Closure",app.SystemTypes.SystemObjectType,TypeAttributes.Public);
+        var field=new InjectedFieldAnalysisContext("id",app.SystemTypes.SystemStringType,FieldAttributes.Public,owner,16);
+        owner.Fields.Add(field);
+        var method=new InjectedMethodAnalysisContext(owner,"Store",app.SystemTypes.SystemVoidType,MethodAttributes.Static,[]);
+        var closure=new LocalVariable("closure",new Register(null,"closure"),app.SystemTypes.SystemObjectType);
+        var alias=new LocalVariable("alias",new Register(null,"alias"),app.SystemTypes.SystemObjectType);
+        var address=new LocalVariable("address",new Register(null,"address"));
+        var value=new LocalVariable("value",new Register(null,"value"),app.SystemTypes.SystemStringType);
+        var store=new Instruction(2,OpCode.Move,new MemoryOperand(address),value);
+        method.ControlFlowGraph=new ISILControlFlowGraph([
+            new(0,OpCode.Newobj,closure,owner),
+            new(1,OpCode.Move,alias,closure),
+            new(2,OpCode.Add,address,alias,new Immediate(16)),
+            store,
+            new(4,OpCode.Return)]);
+
+        MetadataResolver.ResolveFieldOffsets(method);
+
+        Assert.That(store.Operands[0],Is.TypeOf<FieldReference>());
+        Assert.That(((FieldReference)store.Operands[0]).Field,Is.SameAs(field));
     }
 
     [TestCase(false)]

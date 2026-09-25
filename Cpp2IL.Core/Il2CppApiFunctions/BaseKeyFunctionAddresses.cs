@@ -52,11 +52,14 @@ public abstract class BaseKeyFunctionAddresses
 
     public ulong il2cpp_codegen_write_barrier; //Not exported, not thunked. Located via corlib methods which store a reference into a field. Zero if the build has write barriers disabled.
 
+    public ulong il2cpp_codegen_get_thread_static_data; //Generated ARM64 thunk: class -> current thread's static storage.
+
     public ulong AddrPInvokeLookup; //TODO Re-find this and fix name
 
     public IEnumerable<KeyValuePair<string, ulong>> Pairs => resolvedAddressMap;
 
     public HashSet<ulong> WriteBarrierAliases { get; } = [];
+    public HashSet<ulong> BoxAliases { get; } = [];
 
     protected ApplicationAnalysisContext _appContext = null!; //Always initialized before used
 
@@ -68,7 +71,7 @@ public abstract class BaseKeyFunctionAddresses
 
     public bool IsKeyFunctionAddress(ulong address)
     {
-        return address != 0 && (resolvedAddressSet.Contains(address) || WriteBarrierAliases.Contains(address));
+        return address != 0 && (resolvedAddressSet.Contains(address) || WriteBarrierAliases.Contains(address) || BoxAliases.Contains(address));
     }
 
     private void FindExport(string name, out ulong ptr)
@@ -237,6 +240,11 @@ public abstract class BaseKeyFunctionAddresses
             Logger.Verbose("\tMapping il2cpp_value_box to Object::Box...");
             il2cpp_vm_object_box = FindFunctionThisIsAThunkOf(il2cpp_value_box);
             Logger.VerboseNewline($"Found at 0x{il2cpp_vm_object_box:X}");
+
+            BoxAliases.Clear();
+            if (il2cpp_vm_object_box != 0)
+                foreach (var alias in FindAllThunkFunctions(il2cpp_vm_object_box, 0, il2cpp_value_box))
+                    BoxAliases.Add(alias);
         }
 
         if (il2cpp_object_unbox != 0)
@@ -291,6 +299,18 @@ public abstract class BaseKeyFunctionAddresses
             Logger.VerboseNewline($"Found at 0x{il2cpp_codegen_runtime_class_init:X}");
         }
 
+        // Unity's ARM64 codegen veneer table places IsInst immediately after
+        // Runtime::ClassInit. Type.IsInstanceOfType became an indirect icall in
+        // Unity 6, so the old "last BL" probe can accidentally return the class
+        // init veneer itself. Only use the adjacent candidate when that collision
+        // happened (or the old probe found nothing).
+        if (il2cpp_codegen_runtime_class_init != 0
+            && (il2cpp_vm_object_is_inst == 0
+                || il2cpp_vm_object_is_inst == il2cpp_codegen_runtime_class_init)
+            && FindCodegenIsInstAfterRuntimeClassInit(il2cpp_codegen_runtime_class_init) is var isInst
+            && isInst != 0)
+            il2cpp_vm_object_is_inst = isInst;
+
         if (il2cpp_array_new_specific != 0)
         {
             Logger.Verbose("\tMapping il2cpp_array_new_specific to vm::Array::NewSpecific...");
@@ -307,6 +327,8 @@ public abstract class BaseKeyFunctionAddresses
     }
 
     protected abstract ulong GetObjectIsInstFromSystemType();
+
+    protected virtual ulong FindCodegenIsInstAfterRuntimeClassInit(ulong classInitVeneer) => 0;
 
     /// <summary>
     /// Locates Il2CppCodeGenWriteBarrier, the GC write barrier emitted after every reference store into a

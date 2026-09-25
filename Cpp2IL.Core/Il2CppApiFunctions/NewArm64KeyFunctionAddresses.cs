@@ -8,6 +8,22 @@ namespace Cpp2IL.Core.Il2CppApiFunctions;
 
 public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
 {
+    protected override ulong FindCodegenIsInstAfterRuntimeClassInit(ulong classInitVeneer)
+    {
+        var binary = _appContext.Binary;
+        uint Read(ulong address) => System.BitConverter.ToUInt32(binary.GetRawBinaryContent()
+            .Slice((int)binary.MapVirtualAddressToRaw(address), 4).ToArray(), 0);
+        return AdjacentIsInstVeneer(classInitVeneer, Read);
+    }
+
+    internal static ulong AdjacentIsInstVeneer(ulong classInitVeneer, System.Func<ulong, uint> read)
+        => IsUnconditionalBranch(read(classInitVeneer))
+            && IsUnconditionalBranch(read(classInitVeneer + 4))
+                ? classInitVeneer + 4
+                : 0;
+
+    private static bool IsUnconditionalBranch(uint word) => (word & 0xfc000000) == 0x14000000;
+
     protected override ulong GetWriteBarrier()
     {
         var binary = _appContext.Binary;

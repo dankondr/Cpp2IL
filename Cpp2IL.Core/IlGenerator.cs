@@ -27,7 +27,7 @@ public static class IlGenerator
         var helpersType = appContext.InjectTypeIntoAllAssemblies(
             HelpersNamespace,
             HelpersTypeName,
-            null,
+            appContext.SystemTypes.SystemObjectType,
             TypeAttributes.Public | TypeAttributes.Class | TypeAttributes.Abstract | TypeAttributes.Sealed);
 
         helpersType.InjectMethodToAllAssemblies(
@@ -76,8 +76,30 @@ public static class IlGenerator
         {
             LocalVariable? local = null;
 
+            if (operand is SelectedFieldReference selected)
+            {
+                if (!context.Locals.Contains(selected.Selector))
+                    context.Locals.Add(selected.Selector);
+                foreach (var receiver in selected.Choices.Select(c => c.Field.Local).Distinct())
+                    if (!context.Locals.Contains(receiver))
+                        context.Locals.Add(receiver);
+            }
+
             if (operand is FieldReference field)
                 local = field.Local;
+
+            var elementField = operand switch
+            {
+                ArrayElementFieldReference direct => direct,
+                AddressOf { Target: ArrayElementFieldReference addressedElementField } => addressedElementField,
+                _ => null
+            };
+            if (elementField != null)
+            {
+                local = elementField.Array;
+                if (elementField.Index is LocalVariable index && !context.Locals.Contains(index))
+                    context.Locals.Add(index);
+            }
 
             if (operand is LocalVariable local2)
                 local = local2;
@@ -141,7 +163,7 @@ public static class IlGenerator
         {
             // A base .ctor the caller cannot name cannot be invoked; the stub keeps
             // the body honest - it throws, which the verifier permits in a .ctor.
-            if (!Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(constructor, context))
+            if (!CalleeUsableFrom(constructor, context))
             {
                 EmitInaccessibleCalleeStub(constructor, definition, writeLine);
                 continue;
@@ -337,6 +359,7 @@ public static class IlGenerator
         }
     }
 
+
     // Limit so we don't run into the 16mb limit (see AsmResolver issue #775)
     private static string Diagnostic(string message) 
         => message.Length <= 250 ? message : message[..250] + "…";
@@ -428,6 +451,19 @@ public static class IlGenerator
                 break;
 
             case OpCode.Move:
+                // Il2CppClass::static_fields is a native implementation pointer, not a
+                // managed value. Field accesses rooted in this local are emitted as
+                // ldsfld/stsfld, so materializing the pointer only creates a bogus
+                // unmanaged load before otherwise valid static-field IL.
+                if (instruction.Operands is
+                    [LocalVariable { Type: StaticFieldStorageTypeAnalysisContext },
+                     MemoryOperand { Index: null, Scale: 0,
+                         Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext } }])
+                {
+                    instructions.Add(CilOpCodes.Nop);
+                    break;
+                }
+
                 if (instruction.Operands[0] is MemoryOperand
                     { Index: null, Addend: 0, Scale: 0, Base: LocalVariable
                         { Type: ByRefTypeAnalysisContext { ElementType: { IsValueType: false } referent } } address } store
@@ -442,8 +478,47 @@ public static class IlGenerator
 
                 if (instruction.Operands[0] is FieldReference field) // stfld takes instance before value so LoadOperand StoreToOperand doesn't work
                 {
-                    if (!FieldUsableFrom(field.Field, context, writeAccess: true,
-                            receiverType: field.Field.IsStatic ? null : EmittedOperandType(field.Local, context)))
+                    if (WholeValueContainerReference(field,
+                            EmittedOperandType(instruction.Operands[1], context)) is { } wholeValue
+                        && FieldReferenceUsableFrom(wholeValue, context, writeAccess: true))
+                    {
+                        if (!wholeValue.Field.IsStatic)
+                            LoadFieldReceiver(wholeValue, context, method, locals, writeLine);
+                        LoadOperandIntoSlot(instruction.Operands[1], wholeValue.Field.FieldType,
+                            context, method, locals, writeLine);
+                        instructions.Add(wholeValue.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
+                            wholeValue.Field.IsStatic ? wholeValue.Field.ToFieldDescriptor()
+                                : FieldDescriptorFor(wholeValue.Field, FieldReceiverType(wholeValue, context)));
+                        break;
+                    }
+                    if (BackingFieldConversion(field, context) is { } conversion)
+                    {
+                        if (field.Containers.Count == 0)
+                        {
+                            LoadOperandIntoSlot(instruction.Operands[1], conversion.Parameters[0].ParameterType,
+                                context, method, locals, writeLine);
+                            instructions.Add(CilOpCodes.Call, conversion.ToMethodDescriptor());
+                            StoreToOperand(field.Local, method, locals, writeLine, context);
+                            break;
+                        }
+
+                        var outerField = field.Containers[^1];
+                        var outer = new FieldReference(outerField, field.Local, outerField.Offset,
+                            field.Containers.Take(field.Containers.Count - 1).ToArray());
+                        if (FieldReferenceUsableFrom(outer, context, writeAccess: true))
+                        {
+                            if (!outerField.IsStatic)
+                                LoadFieldReceiver(outer, context, method, locals, writeLine);
+                            LoadOperandIntoSlot(instruction.Operands[1], conversion.Parameters[0].ParameterType,
+                                context, method, locals, writeLine);
+                            instructions.Add(CilOpCodes.Call, conversion.ToMethodDescriptor());
+                            instructions.Add(outerField.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
+                                outerField.IsStatic ? outerField.ToFieldDescriptor()
+                                    : FieldDescriptorFor(outerField, FieldReceiverType(outer, context)));
+                            break;
+                        }
+                    }
+                    if (!FieldReferenceUsableFrom(field, context, writeAccess: true))
                     {
                         EmitUnrecoverableOperation(method, writeLine,
                             $"Inaccessible field store: {field.Field.DeclaringType?.FullName}.{field.Field.Name}");
@@ -455,18 +530,18 @@ public static class IlGenerator
                         // declaring .ctor `this` is the only legal initonly
                         // receiver regardless of whether the local provably
                         // aliases it.
-                        if (RequiresThisPointerReceiver(field.Field, context)
+                        if (field.Containers.Count == 0 && RequiresThisPointerReceiver(field.Field, context)
                             && (field.Local is null or LocalVariable
                                 || ThisAliasLocals(context).Contains(field.Local)))
                             instructions.Add(CilOpCodes.Ldarg_0);
                         else
-                            LoadOperandIntoSlot(field.Local, FieldBaseContract(field.Field), context, method, locals, writeLine);
+                            LoadFieldReceiver(field, context, method, locals, writeLine);
                     }
 
                     LoadOperandIntoSlot(instruction.Operands[1], field.Field.FieldType, context, method, locals, writeLine);
                     instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
                         field.Field.IsStatic ? field.Field.ToFieldDescriptor()
-                            : FieldDescriptorFor(field.Field, EmittedOperandType(field.Local, context)));
+                            : FieldDescriptorFor(field.Field, FieldReceiverType(field, context)));
                     break;
                 }
 
@@ -537,9 +612,40 @@ public static class IlGenerator
                 if (constructorPairs.TryGetValue(instruction, out var constructorCall)
                     && constructorCall.Operands is [MethodAnalysisContext constructor, _, ..])
                 {
-                    constructor = Analysis.AllocationConstructorRecovery.Resolve(instruction, constructor) ?? constructor;
+                    List<IOperand>? inlinedDefaultArgs = null;
+                    var allocationType = AllocatedClassOperand(context, instruction) ?? allocatedDestination;
+                    if (constructor.DeclaringType?.FullName == "System.Object"
+                        && allocationType != null
+                        && TryGetOptionalInlinedConstructor(allocationType, context,
+                            out var optionalConstructor, out inlinedDefaultArgs))
+                    {
+                        constructor = optionalConstructor;
+                        RemoveInlinedConstructorStores(context, instruction, constructorCall,
+                            (LocalVariable)instruction.Operands[0]);
+                    }
+                    else
+                        constructor = Analysis.AllocationConstructorRecovery.Resolve(instruction, constructor) ?? constructor;
                     constructor = ThisConstructorCallPlan.RetargetToDestinationInstantiation(constructor, allocatedDestination)
                         ?? constructor;
+                    IMethodDescriptor? bareAllocationConstructor = null;
+                    if (constructor.DeclaringType?.FullName == "System.Object"
+                        && allocatedDestination is { IsAbstract: false, IsValueType: false } castDestination
+                        && castDestination.FullName != "System.Object")
+                    {
+                        if (MatchingConcreteConstructor(castDestination, constructor, context) is { } concreteConstructor)
+                            constructor = concreteConstructor;
+                        else if (AllocatedClassOperand(context, instruction) is { } allocatedClass
+                            && ThisConstructorCallPlan.SameTypeIdentity(allocatedClass, castDestination))
+                            bareAllocationConstructor = EnsureBareAllocationConstructor(allocatedClass, constructor, method);
+                    }
+                    if (bareAllocationConstructor != null)
+                    {
+                        instructions.Add(CilOpCodes.Newobj, bareAllocationConstructor);
+                        StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
+                        constructorCall.OpCode = OpCode.Nop;
+                        constructorCall.SetOperands();
+                        break;
+                    }
                     // The resolved .ctor can sit on an abstract declaring type when IL2CPP
                     // inlined the derived .ctor's forwarding body - the paired call then names
                     // the abstract base even though object_new was given the concrete class.
@@ -573,7 +679,9 @@ public static class IlGenerator
                     }
                     // Operands run [ctor, newObject, arguments..., methodInfo], so take only as many as
                     // the constructor declares (i.e. drop methodInfo)
-                    var constructorArgs = constructorCall.Operands.Skip(ConstructorReceiverIndex(constructorCall) + 1).Take(constructor.Parameters.Count).ToList();
+                    var constructorArgs = inlinedDefaultArgs
+                        ?? constructorCall.Operands.Skip(ConstructorReceiverIndex(constructorCall) + 1)
+                            .Take(constructor.Parameters.Count).ToList();
 
                     // A delegate .ctor verifies only against a function pointer whose
                     // signature matches the delegate's Invoke. Shared generics erase the
@@ -598,7 +706,7 @@ public static class IlGenerator
                     // A constructor on a shared-generic instantiation over a type the
                     // caller cannot see (List<System.Int32Enum>) emits a member
                     // reference the verifier rejects - same contract as a call target.
-                    if (!Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(constructor, context))
+                    if (!CalleeUsableFrom(constructor, context))
                     {
                         EmitInaccessibleCalleeStub(constructor, method, writeLine);
                         constructorCall.OpCode = OpCode.Nop;
@@ -622,6 +730,11 @@ public static class IlGenerator
                     // Nothing to fuse with, so the allocation was self-contained. The type is still right, so construct it bare.
                     parameterlessCtor = ThisConstructorCallPlan.RetargetToDestinationInstantiation(parameterlessCtor, allocatedDestination)
                         ?? parameterlessCtor;
+                    if (parameterlessCtor.DeclaringType?.FullName == "System.Object"
+                        && allocatedDestination is { IsAbstract: false, IsValueType: false } concreteDestination
+                        && concreteDestination.FullName != "System.Object"
+                        && MatchingConcreteConstructor(concreteDestination, parameterlessCtor, context) is { } concreteConstructor)
+                        parameterlessCtor = concreteConstructor;
                     // An abstract allocated type can never be constructed honestly; when a
                     // concrete destination offers the matching .ctor re-anchor to it, else
                     // emit the diagnostic and the destination's default.
@@ -640,7 +753,7 @@ public static class IlGenerator
                             break;
                         }
                     }
-                    if (!Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(parameterlessCtor, context))
+                    if (!CalleeUsableFrom(parameterlessCtor, context))
                     {
                         EmitInaccessibleCalleeStub(parameterlessCtor, method, writeLine);
                         break;
@@ -675,9 +788,16 @@ public static class IlGenerator
                         LoadOperandIntoSlot(boxedValue is AddressOf { Target: LocalVariable byRef } ? byRef : boxedValue,
                             boxedType, context, method, locals, writeLine);
                         instructions.Add(CilOpCodes.Box, boxedType.ToTypeSignature().ToTypeDefOrRef());
+                        var boxContract = StoreContract(instruction.Operands[0], context);
+                        if (boxContract is { IsValueType: true } or ByRefTypeAnalysisContext
+                            or PointerTypeAnalysisContext or GenericParameterTypeAnalysisContext)
+                        {
+                            instructions.Add(CilOpCodes.Pop);
+                            PushDefaultOf(boxContract, method, instructions, context);
+                        }
                         // `box` leaves a boxed-T reference; a slot that wants a narrower
                         // reference still needs the castclass the contract requires.
-                        if (StoreContract(instruction.Operands[0], context) is { IsValueType: false } boxContract
+                        else if (boxContract is { IsValueType: false }
                             and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext
                                 or GenericParameterTypeAnalysisContext)
                             && !IsAssignableToLoose(boxedType, boxContract) && CanEmitTypeToken(boxContract))
@@ -705,7 +825,7 @@ public static class IlGenerator
                     ? exceptionType.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0)
                     : null;
                 if (exceptionCtor != null
-                    && !Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(exceptionCtor, context))
+                    && !CalleeUsableFrom(exceptionCtor, context))
                 {
                     // Constructing the exception would name an inaccessible member; the
                     // raise is still honest - the diagnostic stub ends in throw too.
@@ -723,7 +843,7 @@ public static class IlGenerator
                 }
                 if (exceptionCtor != null)
                     instructions.Add(CilOpCodes.Newobj, exceptionCtor.ToMethodDescriptor());
-                else if (instruction.Operands is [LocalVariable or FieldReference])
+                else if (instruction.Operands is [LocalVariable or FieldReference or SelectedFieldReference])
                 {
                     LoadOperand(instruction.Operands[0], method, locals, writeLine, null, context); // an already-constructed exception
                     CoerceOrDefault(EmittedOperandType(instruction.Operands[0], context),
@@ -767,7 +887,7 @@ public static class IlGenerator
 
                 if (Analysis.StringConstructorRecovery.Resolve(instruction, targetMethod) is { } stringConstructor)
                 {
-                    if (!Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(stringConstructor, context))
+                    if (!CalleeUsableFrom(stringConstructor, context))
                     {
                         EmitInaccessibleCalleeStub(stringConstructor, method, writeLine);
                         break;
@@ -799,7 +919,7 @@ public static class IlGenerator
                 // instantiation (which is what the native code actually invoked).
                 if (!targetMethod.IsStatic && instruction.Operands.Count - 1 >= thisParamIndex)
                     targetMethod = ThisConstructorCallPlan.RetargetToDestinationInstantiation(targetMethod,
-                            EmittedOperandType(instruction.Operands[thisParamIndex], context))
+                            SharedGenericEvidenceType(instruction.Operands[thisParamIndex], context))
                         ?? targetMethod;
 
                 // The rest of the shared-generic erasure is recovered the same
@@ -812,6 +932,9 @@ public static class IlGenerator
                 targetMethod = SolveSharedGenericArguments(targetMethod, instruction, context, thisParamIndex)
                     ?? targetMethod;
 
+                if (TryEmitUnityQuaternionInternal(instruction, targetMethod, context, method, locals, writeLine))
+                    break;
+
                 // IL2CPP leaves direct calls to corlib members managed code could never name: the
                 // internal slow paths of inlined BCL operations (List<T>.AddWithResize, private
                 // Math.ThrowMinMaxException) or shared-generic instantiations over non-public
@@ -819,11 +942,11 @@ public static class IlGenerator
                 // leave a diagnostic stub rather than a reference the verifier rejects. The check
                 // runs after every retarget: the receiver's own instantiation is what the emitted
                 // member reference actually names.
-                if (!Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(targetMethod, context)
+                if (!CalleeUsableFrom(targetMethod, context)
                     || !Analysis.InaccessibleCalleeRecovery.SatisfiesDeclaredConstraints(targetMethod))
                 {
                     if (Analysis.InaccessibleCalleeRecovery.TrySubstitute(targetMethod) is { } accessibleCallee
-                        && Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(accessibleCallee, context)
+                        && CalleeUsableFrom(accessibleCallee, context)
                         && Analysis.InaccessibleCalleeRecovery.SatisfiesDeclaredConstraints(accessibleCallee))
                         targetMethod = accessibleCallee;
                     else
@@ -855,6 +978,13 @@ public static class IlGenerator
                     if ((instruction.Operands.Count - 1) >= thisParamIndex)
                     {
                         var thisOperand = instruction.Operands[thisParamIndex];
+                        var receiverType = EmittedOperandType(thisOperand, context, targetMethod.DeclaringType);
+                        if (targetMethod.Name != ".ctor" && !context.IsStatic
+                            && context.DeclaringType != null && targetMethod.DeclaringType != null
+                            && LooseAssignable(context.DeclaringType, targetMethod.DeclaringType)
+                            && (receiverType == null || !StackAssignableTo(receiverType, targetMethod.DeclaringType))
+                            && context.ParameterLocals.FirstOrDefault(local => local.IsThis) is { } actualThis)
+                            thisOperand = actualThis;
                         isOwnThis = !context.IsStatic && thisOperand is LocalVariable thisLocal
                             && (thisLocal.IsThis || ReferenceEquals(thisLocal, context.ParameterLocals.FirstOrDefault()));
                         // Outside a .ctor there is no `this`-initialization exemption,
@@ -1106,8 +1236,18 @@ public static class IlGenerator
                 {
                     if (instruction.OpCode == OpCode.Call)
                     {
-                        EmitStackCoerceOrDefault(targetMethod.ReturnType,
-                            StoreContract(instruction.Operands[1], context), method, context);
+                        var resultContract = StoreContract(instruction.Operands[1], context);
+                        // The member reference, not a possibly stale analysis override,
+                        // determines the value the CIL call leaves on the stack.
+                        // A value-type result stored in object must be boxed even when
+                        // analysis mislabeled the call as returning object.
+                        if (instruction.Operands[1] is LocalVariable resultLocal
+                            && locals[resultLocal].VariableType.FullName == "System.Object"
+                            && importedMethod.Signature?.ReturnType is { IsValueType: true } actualReturn)
+                            instructions.Add(CilOpCodes.Box, actualReturn.ToTypeDefOrRef());
+                        else
+                            EmitStackCoerceOrDefault(EffectiveCallReturnType(targetMethod),
+                                resultContract, method, context);
                         StoreToOperand(instruction.Operands[1], method, locals, writeLine, context);
                     }
                     else
@@ -1178,6 +1318,12 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Call, writeLine);
                 break;
 
+            case OpCode.VectorMin:
+            case OpCode.VectorMax:
+                if (!TryEmitUnityVectorMinMax(instruction, context, method, locals, writeLine))
+                    EmitUnrecoverableOperation(method, writeLine, $"Unrecoverable vector min/max: {instruction}");
+                break;
+
             case OpCode.CheckEqual:
             case OpCode.CheckGreater:
             case OpCode.CheckLess:
@@ -1200,6 +1346,9 @@ public static class IlGenerator
                 // klass pointer read => GetType
                 if (instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual
                     && TryEmitExactTypeComparison(instruction, method, locals, writeLine, context))
+                    break;
+
+                if (TryEmitUnityVectorOperation(instruction, context, method, locals, writeLine))
                     break;
 
                 // Integer ops on operands that cannot legally sit in an integer slot are
@@ -1227,11 +1376,15 @@ public static class IlGenerator
                     && (context.DeclaringType == null
                         || Analysis.InaccessibleCalleeRecovery.IsVisibleType(fieldAddress.Owner, context.DeclaringType)))
                 {
-                    LoadOperand(fieldAddress.Base, method, locals, writeLine, null, context);
+                    if (!fieldAddress.Field.IsStatic)
+                        LoadOperand(fieldAddress.Base, method, locals, writeLine, null, context);
                     // Fields found on a generic instance's definition must be
                     // referenced on the instantiation, or the verifier sees an
                     // instance type mismatch against the base operand.
-                    var resolvedField = fieldAddress.Owner is GenericInstanceTypeAnalysisContext fieldGit
+                    var fieldGit = GenericFieldOwnerInstance(fieldAddress.Owner, fieldAddress.Field);
+                    var resolvedField = fieldAddress.Field is ConcreteGenericFieldAnalysisContext
+                        ? fieldAddress.Field
+                        : fieldGit != null
                         ? new ConcreteGenericFieldAnalysisContext(fieldAddress.Field, fieldGit)
                         : fieldAddress.Field;
                     var fieldContract = StoreContract(instruction.Operands[0], context);
@@ -1239,13 +1392,15 @@ public static class IlGenerator
                     if (fieldContract is ByRefTypeAnalysisContext fieldByRef
                         && fieldByRef.ElementType.FullName == resolvedField.FieldType.FullName)
                     {
-                        instructions.Add(CilOpCodes.Ldflda, resolvedField.ToFieldDescriptor());
+                        instructions.Add(resolvedField.IsStatic ? CilOpCodes.Ldsflda : CilOpCodes.Ldflda,
+                            resolvedField.ToFieldDescriptor());
                         fieldResult = fieldContract;
                     }
                     else if (fieldContract == null
                         || StackContractSatisfied(resolvedField.FieldType, fieldContract, context))
                     {
-                        instructions.Add(CilOpCodes.Ldfld, resolvedField.ToFieldDescriptor());
+                        instructions.Add(resolvedField.IsStatic ? CilOpCodes.Ldsfld : CilOpCodes.Ldfld,
+                            resolvedField.ToFieldDescriptor());
                         fieldResult = resolvedField.FieldType;
                     }
                     else
@@ -1254,7 +1409,8 @@ public static class IlGenerator
                         // hold neither &F nor F itself (an object slot for a pointer
                         // field) has no honest value. The base operand is already on
                         // the stack, so drop it before the default.
-                        instructions.Add(CilOpCodes.Pop);
+                        if (!resolvedField.IsStatic)
+                            instructions.Add(CilOpCodes.Pop);
                         instructions.Add(CilOpCodes.Ldstr,
                             Diagnostic($"Unrepresentable field address: {resolvedField}"));
                         instructions.Add(CilOpCodes.Call, writeLine);
@@ -1287,6 +1443,26 @@ public static class IlGenerator
                 var operand2Type = instruction.OpCode is OpCode.ShiftLeft or OpCode.ShiftRight
                     ? context.AppContext.SystemTypes.SystemInt32Type
                     : operandType;
+
+                // Numeric inference can sharpen an object-typed analysis local to a
+                // floating CIL local. The locals table is the verifier's authority;
+                // if either compared slot is declared float, load both sides at that
+                // width (notably `0 > recoveredDouble`).
+                if (isComparison)
+                {
+                    var declaredFloat = instruction.Operands.Skip(1).Take(2)
+                        .OfType<LocalVariable>()
+                        .Select(local => locals.TryGetValue(local, out var emitted)
+                            ? emitted.VariableType.FullName : null)
+                        .FirstOrDefault(name => name is "System.Single" or "System.Double");
+                    if (declaredFloat != null)
+                    {
+                        operandType = declaredFloat == "System.Double"
+                            ? context.AppContext.SystemTypes.SystemDoubleType
+                            : context.AppContext.SystemTypes.SystemSingleType;
+                        operand2Type = operandType;
+                    }
+                }
 
                 // Bitwise/shift ops are integer-only in IL. An operand that provably emits
                 // a non-integer (float, struct or concrete reference — unlike an untyped
@@ -1397,6 +1573,8 @@ public static class IlGenerator
             case OpCode.Not:
             case OpCode.Negate:
             {
+                if (TryEmitUnityVectorOperation(instruction, context, method, locals, writeLine))
+                    break;
                 var unaryOperandType = EmittedOperandType(instruction.Operands[1], context);
                 if (unaryOperandType is PointerTypeAnalysisContext)
                 {
@@ -1476,6 +1654,7 @@ public static class IlGenerator
         {
             LocalVariable { Type: { } type } => type,
             FieldReference { Field.FieldType: { } type } => type,
+            SelectedFieldReference { FieldType: { } type } => type,
             _ => null
         };
 
@@ -1500,7 +1679,11 @@ public static class IlGenerator
         foreach (var allocation in instructions.Where(i => i.OpCode == OpCode.Newobj))
         {
             if (FindConstructorCall(context, allocation) is { } constructorCall)
+            {
+                Analysis.AllocationConstructorRecovery.RewriteInlinedFieldInitializer(context, allocation,
+                    constructorCall);
                 pairs[allocation] = constructorCall;
+            }
         }
 
         return pairs;
@@ -1603,7 +1786,7 @@ public static class IlGenerator
                 var baseCtor = FindParameterlessBaseConstructor(immediateBase);
                 if (baseCtor == null
                     || !IsAccessibleBaseConstructor(baseCtor, context)
-                    || !Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(baseCtor, context))
+                    || !CalleeUsableFrom(baseCtor, context))
                     baseCtor = FindAccessibleBaseConstructor(immediateBase, -1, context)
                         ?? FindUniqueAccessibleBaseConstructor(immediateBase, context);
                 if (baseCtor == null)
@@ -1661,7 +1844,7 @@ public static class IlGenerator
                 var match = FindImmediateBaseConstructor(immediateBase, callee);
                 if (match != null
                     && (!IsAccessibleBaseConstructor(match, context)
-                        || !Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(match, context)))
+                        || !CalleeUsableFrom(match, context)))
                     match = null;
                 match ??= FindAccessibleBaseConstructor(immediateBase, callee.Parameters.Count, context);
                 if (match != null)
@@ -1682,7 +1865,7 @@ public static class IlGenerator
                 var fallbackCtor = FindParameterlessBaseConstructor(immediateBase);
                 if (fallbackCtor == null
                     || !IsAccessibleBaseConstructor(fallbackCtor, context)
-                    || !Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(fallbackCtor, context))
+                    || !CalleeUsableFrom(fallbackCtor, context))
                     fallbackCtor = FindAccessibleBaseConstructor(immediateBase, -1, context)
                         ?? FindUniqueAccessibleBaseConstructor(immediateBase, context);
                 if (fallbackCtor == null)
@@ -1973,7 +2156,7 @@ public static class IlGenerator
                 if (!IsAccessibleBaseConstructor(concrete, caller)
                     // A constructed base's .ctor reaches the verifier with declared
                     // accessibility intact, so it must also survive that check.
-                    || !Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(concrete, caller))
+                    || !CalleeUsableFrom(concrete, caller))
                     continue;
 
                 var score = candidate.Parameters.Count == distantArity ? 0
@@ -2084,6 +2267,103 @@ public static class IlGenerator
         return null;
     }
 
+    private static bool TryGetOptionalInlinedConstructor(TypeAnalysisContext allocated,
+        MethodAnalysisContext caller, out MethodAnalysisContext constructor, out List<IOperand> arguments)
+    {
+        constructor = null!;
+        arguments = null!;
+        var candidates = allocated.Methods.Where(method => method is { IsStatic: false, Name: ".ctor" }
+            && method.Parameters.Count > 0
+            && method.Parameters.All(parameter => parameter.Attributes.HasFlag(ParameterAttributes.HasDefault))
+            && ConstructorVisibleFrom(method, caller)).ToArray();
+        if (candidates is not [{ } candidate])
+            return false;
+
+        var defaults = candidate.Parameters.Select(parameter => DefaultValueOperand(parameter.DefaultValue)).ToList();
+        if (defaults.Any(value => value == null))
+            return false;
+        constructor = candidate;
+        arguments = defaults.Select(value => value!).ToList();
+        return true;
+    }
+
+    private static IOperand? DefaultValueOperand(object? value) => value switch
+    {
+        null => new Immediate(0),
+        bool boolean => new Immediate(boolean ? 1 : 0),
+        char character => new Immediate(character),
+        byte number => new Immediate(number),
+        sbyte number => new Immediate(number),
+        short number => new Immediate(number),
+        ushort number => new Immediate(number),
+        int number => new Immediate(number),
+        uint number => new Immediate(number),
+        long number => new Immediate(number),
+        ulong number when number <= long.MaxValue => new Immediate((long)number),
+        float number => new FloatLiteral(number),
+        double number => new DoubleLiteral(number),
+        string text => new StringLiteral(text),
+        _ => null,
+    };
+
+    private static void RemoveInlinedConstructorStores(MethodAnalysisContext caller, Instruction allocation,
+        Instruction constructorCall, LocalVariable instance)
+    {
+        var instructions = caller.ControlFlowGraph!.Instructions;
+        var start = instructions.IndexOf(allocation);
+        var constructorIndex = instructions.IndexOf(constructorCall);
+        for (var i = start + 1; i < instructions.Count; i++)
+        {
+            var current = instructions[i];
+            if (current is { OpCode: OpCode.Move,
+                    Operands: [FieldReference { Local: var receiver, Containers.Count: 0 }, _] }
+                && ReferenceEquals(receiver, instance))
+            {
+                current.OpCode = OpCode.Nop;
+                current.SetOperands();
+                continue;
+            }
+            if (i <= constructorIndex || current.OpCode == OpCode.Nop
+                || current.Operands.Any(operand => ReferenceEquals(operand, instance)))
+                continue;
+            break;
+        }
+    }
+
+    // IL2CPP can inline a concrete constructor into the caller, leaving object_new
+    // followed by Object::.ctor and direct field stores. If the concrete class has
+    // no managed parameterless constructor, add the minimal allocation shell that
+    // represents those two native operations; the following recovered stores still
+    // perform the real initialization.
+    private static IMethodDescriptor? EnsureBareAllocationConstructor(TypeAnalysisContext concreteType,
+        MethodAnalysisContext objectConstructor, MethodDefinition caller)
+    {
+        if (concreteType.BaseType?.FullName != "System.Object"
+            || concreteType.GetExtraData<TypeDefinition>("AsmResolverType") is not { } typeDefinition
+            || !ReferenceEquals(typeDefinition.DeclaringModule, caller.DeclaringModule))
+            return null;
+
+        var factory = caller.DeclaringModule!.CorLibTypeFactory;
+        var signature = MethodSignature.CreateInstance(factory.Void, []);
+        if (typeDefinition.Methods.FirstOrDefault(method =>
+                method.Name == ".ctor" && method.Signature?.ParameterTypes.Count == 0) is { } existing)
+            return existing;
+
+        var constructor = new MethodDefinition(".ctor",
+            AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Public
+            | AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.HideBySig
+            | AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.SpecialName
+            | AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.RuntimeSpecialName,
+            signature);
+        var body = new CilMethodBody();
+        body.Instructions.Add(CilOpCodes.Ldarg_0);
+        body.Instructions.Add(CilOpCodes.Call, objectConstructor.ToMethodDescriptor());
+        body.Instructions.Add(CilOpCodes.Ret);
+        constructor.CilMethodBody = body;
+        typeDefinition.Methods.Add(constructor);
+        return constructor;
+    }
+
     // Shared generics erase the callee's instantiation arguments to System.Object at
     // the call site, but the operand types carry the instantiation the native code
     // actually ran: the callee's open signature is matched against the emitted
@@ -2091,12 +2371,15 @@ public static class IlGenerator
     // Only provably-erased arguments (System.Object or an open parameter) are
     // replaced - a concrete argument from metadata is already authoritative.
     private static MethodAnalysisContext? SolveSharedGenericArguments(
-        MethodAnalysisContext targetMethod, Instruction instruction, MethodAnalysisContext context, int thisParamIndex)
+        MethodAnalysisContext targetMethod, Instruction instruction, MethodAnalysisContext context, int thisParamIndex,
+        bool includeResultContract = true)
     {
         var open = (targetMethod as ConcreteGenericMethodAnalysisContext)?.BaseMethodContext ?? targetMethod;
         var declaringInstance = targetMethod.DeclaringType as GenericInstanceTypeAnalysisContext;
         var typeArguments = declaringInstance?.GenericArguments.ToArray();
         var methodArguments = (targetMethod as ConcreteGenericMethodAnalysisContext)?.MethodGenericParameters.ToArray();
+        if ((methodArguments == null || methodArguments.Length == 0) && open.GenericParameters.Count > 0)
+            methodArguments = open.GenericParameters.Cast<TypeAnalysisContext>().ToArray();
         if (typeArguments == null && methodArguments == null)
             return null;
 
@@ -2121,6 +2404,7 @@ public static class IlGenerator
                     if (IsErasedSharedArgument(typeArguments[typeParameter.Index])
                         && concrete is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext
                             or GenericParameterTypeAnalysisContext)
+                        && !IsErasedSharedArgument(concrete)
                         && !ThisConstructorCallPlan.SameTypeIdentity(typeArguments[typeParameter.Index], concrete))
                     {
                         typeArguments[typeParameter.Index] = concrete;
@@ -2132,6 +2416,7 @@ public static class IlGenerator
                     if (IsErasedSharedArgument(methodArguments[methodParameter.Index])
                         && concrete is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext
                             or GenericParameterTypeAnalysisContext)
+                        && !IsErasedSharedArgument(concrete)
                         && !ThisConstructorCallPlan.SameTypeIdentity(methodArguments[methodParameter.Index], concrete))
                     {
                         methodArguments[methodParameter.Index] = concrete;
@@ -2146,8 +2431,15 @@ public static class IlGenerator
                     Solve(pointer.ElementType, concretePointer.ElementType);
                     break;
                 case GenericInstanceTypeAnalysisContext patternInstance
+                    when concrete is SzArrayTypeAnalysisContext array
+                        && patternInstance.GenericArguments.Count == 1
+                        && IsArrayGenericInterface(patternInstance.GenericType):
+                    Solve(patternInstance.GenericArguments[0], array.ElementType);
+                    break;
+                case GenericInstanceTypeAnalysisContext patternInstance
                     when concrete is GenericInstanceTypeAnalysisContext concreteInstance
-                        && ThisConstructorCallPlan.SameTypeIdentity(patternInstance.GenericType, concreteInstance.GenericType)
+                        && (ThisConstructorCallPlan.SameTypeIdentity(patternInstance.GenericType, concreteInstance.GenericType)
+                            || concreteInstance.IsAssignableTo(patternInstance.GenericType))
                         && patternInstance.GenericArguments.Count == concreteInstance.GenericArguments.Count:
                     for (var k = 0; k < patternInstance.GenericArguments.Count; k++)
                         Solve(patternInstance.GenericArguments[k], concreteInstance.GenericArguments[k]);
@@ -2165,10 +2457,10 @@ public static class IlGenerator
                 or RuntimeClassTypeAnalysisContext or RgctxTableTypeAnalysisContext
                 or MethodRgctxTableTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext)
                 continue;
-            Solve(open.Parameters[i].ParameterType, EmittedOperandType(operand, context));
+            Solve(open.Parameters[i].ParameterType, SharedGenericEvidenceType(operand, context));
         }
 
-        if (instruction.OpCode == OpCode.Call && instruction.Operands.Count > 1)
+        if (includeResultContract && instruction.OpCode == OpCode.Call && instruction.Operands.Count > 1)
             Solve(open.ReturnType, StoreContract(instruction.Operands[1], context));
 
         if (!changed)
@@ -2187,11 +2479,13 @@ public static class IlGenerator
                 or MethodRgctxTableTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext)
                 continue;
             if (!OperandMatchesSolvedPattern(open.Parameters[i].ParameterType,
-                    EmittedOperandType(operand, context), typeArguments, methodArguments))
+                    SharedGenericEvidenceType(operand, context), typeArguments, methodArguments))
                 return null;
         }
 
-        var solvedTypeArguments = typeArguments ?? (targetMethod as ConcreteGenericMethodAnalysisContext)!.TypeGenericParameters;
+        var solvedTypeArguments = typeArguments
+            ?? (targetMethod as ConcreteGenericMethodAnalysisContext)?.TypeGenericParameters
+            ?? [];
         return new ConcreteGenericMethodAnalysisContext(open, solvedTypeArguments, methodArguments ?? []);
     }
 
@@ -2223,11 +2517,27 @@ public static class IlGenerator
                     && OperandMatchesSolvedPattern(pointer.ElementType, concretePointer.ElementType,
                         typeArguments, methodArguments);
             case GenericInstanceTypeAnalysisContext patternInstance:
-                return concrete is GenericInstanceTypeAnalysisContext concreteInstance
-                    && ThisConstructorCallPlan.SameTypeIdentity(patternInstance.GenericType, concreteInstance.GenericType)
-                    && patternInstance.GenericArguments.Count == concreteInstance.GenericArguments.Count
-                    && patternInstance.GenericArguments.Zip(concreteInstance.GenericArguments,
-                        (p, c) => OperandMatchesSolvedPattern(p, c, typeArguments, methodArguments)).All(match => match);
+                if (concrete is SzArrayTypeAnalysisContext array
+                    && patternInstance.GenericArguments.Count == 1
+                    && IsArrayGenericInterface(patternInstance.GenericType))
+                    return OperandMatchesSolvedPattern(patternInstance.GenericArguments[0], array.ElementType,
+                        typeArguments, methodArguments);
+                if (concrete is not GenericInstanceTypeAnalysisContext concreteInstance)
+                    return false;
+                if (ThisConstructorCallPlan.SameTypeIdentity(patternInstance.GenericType, concreteInstance.GenericType))
+                    return patternInstance.GenericArguments.Count == concreteInstance.GenericArguments.Count
+                        && patternInstance.GenericArguments.Zip(concreteInstance.GenericArguments,
+                            (p, c) => OperandMatchesSolvedPattern(p, c, typeArguments, methodArguments)).All(match => match);
+                try
+                {
+                    var instantiatedPattern = GenericInstantiation.Instantiate(patternInstance,
+                        typeArguments ?? [], methodArguments ?? []);
+                    return concreteInstance.IsAssignableTo(instantiatedPattern);
+                }
+                catch
+                {
+                    return false;
+                }
             default:
                 return ThisConstructorCallPlan.SameTypeIdentity(pattern, concrete)
                     || concrete.IsAssignableTo(pattern);
@@ -2242,9 +2552,35 @@ public static class IlGenerator
             || concrete.IsAssignableTo(solved);
     }
 
+    private static bool IsArrayGenericInterface(TypeAnalysisContext type) => type.FullName is
+        "System.Collections.Generic.IEnumerable`1"
+        or "System.Collections.Generic.ICollection`1"
+        or "System.Collections.Generic.IList`1"
+        or "System.Collections.Generic.IReadOnlyCollection`1"
+        or "System.Collections.Generic.IReadOnlyList`1";
+
     private static bool IsErasedSharedArgument(TypeAnalysisContext argument) =>
         argument is GenericParameterTypeAnalysisContext
-        || argument.FullName is "System.Object" or "System.ValueType";
+        || argument.FullName is "System.Object" or "System.ValueType"
+        || IsSharedEnumMarker(argument);
+
+    private static bool IsSharedEnumMarker(TypeAnalysisContext argument) =>
+        argument.FullName is "System.SByteEnum" or "System.ByteEnum"
+            or "System.Int16Enum" or "System.UInt16Enum"
+            or "System.Int32Enum" or "System.UInt32Enum"
+            or "System.Int64Enum" or "System.UInt64Enum";
+
+    private static bool ContainsSharedEnumMarker(TypeAnalysisContext argument) =>
+        IsSharedEnumMarker(argument)
+        || argument is WrappedTypeAnalysisContext wrapped
+            && ContainsSharedEnumMarker(wrapped.ElementType)
+        || argument is GenericInstanceTypeAnalysisContext instance
+            && instance.GenericArguments.Any(ContainsSharedEnumMarker);
+
+    private static bool ContainsErasedSharedArgument(TypeAnalysisContext argument) =>
+        IsErasedSharedArgument(argument)
+        || argument is GenericInstanceTypeAnalysisContext instance
+        && instance.GenericArguments.Any(ContainsErasedSharedArgument);
 
     // The original call site had access to the .ctor, but the re-anchored candidate sits on a
     // different (concrete) type, so its own accessibility must hold from the emitting method -
@@ -2450,10 +2786,10 @@ public static class IlGenerator
         // The method actually emitted is the visible substitute, exactly as
         // LoadOperand resolves it for the IntPtr contract.
         var target = represented;
-        if (!Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(target, context))
+        if (!CalleeUsableFrom(target, context))
         {
             if (Analysis.InaccessibleCalleeRecovery.TrySubstitute(target) is { } substitute
-                && Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(substitute, context))
+                && CalleeUsableFrom(substitute, context))
                 target = substitute;
             else
             {
@@ -2816,6 +3152,7 @@ public static class IlGenerator
         DoubleLiteral => "System.Double",
         LocalVariable { Type.FullName: var type } when type is "System.Single" or "System.Double" => type,
         FieldReference { Field.FieldType.FullName: var type } when type is "System.Single" or "System.Double" => type,
+        SelectedFieldReference { FieldType.FullName: var type } when type is "System.Single" or "System.Double" => type,
         _ => null,
     };
 
@@ -2922,6 +3259,34 @@ public static class IlGenerator
             case DoubleLiteral d:
                 instructions.Add(CilOpCodes.Ldc_R8, d.Value);
                 break;
+            case Vector128Literal vector:
+                var componentCount = literalType?.DefaultFullName switch
+                {
+                    "UnityEngine.Vector2" => 2,
+                    "UnityEngine.Vector3" => 3,
+                    _ => 4,
+                };
+                var vectorConstructor = literalType?.Methods.FirstOrDefault(candidate =>
+                    candidate is { IsStatic: false, Name: ".ctor" }
+                    && candidate.Parameters.Count == componentCount
+                    && candidate.Parameters.All(parameter => parameter.ParameterType.FullName == "System.Single"));
+                if (vectorConstructor == null)
+                {
+                    instructions.Add(CilOpCodes.Ldstr, Diagnostic(
+                        $"Cannot construct 128-bit constant as {literalType?.FullName ?? "unknown type"}"));
+                    instructions.Add(CilOpCodes.Call, writeLine);
+                    PushDefaultOf(literalType ?? callingContext.AppContext.SystemTypes.SystemObjectType,
+                        method, instructions, callingContext);
+                    break;
+                }
+                instructions.Add(CilOpCodes.Ldc_R4, vector.X);
+                instructions.Add(CilOpCodes.Ldc_R4, vector.Y);
+                if (componentCount >= 3)
+                    instructions.Add(CilOpCodes.Ldc_R4, vector.Z);
+                if (componentCount >= 4)
+                    instructions.Add(CilOpCodes.Ldc_R4, vector.W);
+                instructions.Add(CilOpCodes.Newobj, vectorConstructor.ToMethodDescriptor());
+                break;
             case StringLiteral s:
                 instructions.Add(CilOpCodes.Ldstr, s.Value);
                 break;
@@ -2935,7 +3300,7 @@ public static class IlGenerator
                 // mistyping the object; the instance the native code held is the
                 // value's own instantiation.
                 if (castTarget is GenericInstanceTypeAnalysisContext erasedCast
-                    && erasedCast.GenericArguments.Any(IsErasedSharedArgument)
+                    && erasedCast.GenericArguments.Any(ContainsErasedSharedArgument)
                     && castValueType is GenericInstanceTypeAnalysisContext valueInstance
                     && ThisConstructorCallPlan.SameTypeIdentity(valueInstance.GenericType, erasedCast.GenericType))
                     castTarget = valueInstance;
@@ -2964,9 +3329,7 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldloca, locals[addressed]);
                 break;
             case AddressOf { Target: FieldReference addressedField }:
-                if (!FieldUsableFrom(addressedField.Field, callingContext, writeAccess: true,
-                        receiverType: addressedField.Field.IsStatic ? null
-                            : EmittedOperandType(addressedField.Local, callingContext)))
+                if (!FieldReferenceUsableFrom(addressedField, callingContext, writeAccess: true))
                 {
                     // The field cannot legally be addressed here; a fresh zeroed
                     // local is the honest managed-address placeholder.
@@ -2975,12 +3338,11 @@ public static class IlGenerator
                     break;
                 }
                 if (!addressedField.Field.IsStatic)
-                    LoadOperandIntoSlot(addressedField.Local, FieldBaseContract(addressedField.Field),
-                        callingContext, method, locals, writeLine);
+                    LoadFieldReceiver(addressedField, callingContext, method, locals, writeLine);
                 instructions.Add(addressedField.Field.IsStatic ? CilOpCodes.Ldsflda : CilOpCodes.Ldflda,
                     addressedField.Field.IsStatic ? addressedField.Field.ToFieldDescriptor()
                         : FieldDescriptorFor(addressedField.Field,
-                            EmittedOperandType(addressedField.Local, callingContext)));
+                            FieldReceiverType(addressedField, callingContext)));
                 break;
             case AddressOf { Target: ArrayAccess elementAddress }:
                 var elementAddressType = ((SzArrayTypeAnalysisContext)elementAddress.Array.Type!).ElementType;
@@ -2995,6 +3357,23 @@ public static class IlGenerator
                 LoadOperandIntoSlot(elementAddress.Index, callingContext.AppContext.SystemTypes.SystemInt32Type,
                     callingContext, method, locals, writeLine);
                 instructions.Add(CilOpCodes.Ldelema, elementAddressType.ToTypeSignature().ToTypeDefOrRef());
+                break;
+            case AddressOf { Target: ArrayElementFieldReference elementFieldAddress }:
+                var addressedArrayElementType = ((SzArrayTypeAnalysisContext)elementFieldAddress.Array.Type!).ElementType;
+                if (!TypeTokenUsableFrom(addressedArrayElementType, callingContext)
+                    || !FieldUsableFrom(elementFieldAddress.Field, callingContext, writeAccess: true,
+                        receiverType: addressedArrayElementType))
+                {
+                    PushDefaultOf(new ByRefTypeAnalysisContext(elementFieldAddress.Field.FieldType),
+                        method, instructions, callingContext);
+                    break;
+                }
+                LoadArrayBase(elementFieldAddress.Array, method, locals, callingContext);
+                LoadOperandIntoSlot(elementFieldAddress.Index, callingContext.AppContext.SystemTypes.SystemInt32Type,
+                    callingContext, method, locals, writeLine);
+                instructions.Add(CilOpCodes.Ldelema, addressedArrayElementType.ToTypeSignature().ToTypeDefOrRef());
+                instructions.Add(CilOpCodes.Ldflda,
+                    FieldDescriptorFor(elementFieldAddress.Field, addressedArrayElementType));
                 break;
             case ArrayAccess arrayAccess:
                 var arrayElementType = ((SzArrayTypeAnalysisContext)arrayAccess.Array.Type!).ElementType;
@@ -3013,10 +3392,40 @@ public static class IlGenerator
                 else
                     instructions.Add(CilOpCodes.Ldelem, arrayElementType.ToTypeSignature().ToTypeDefOrRef());
                 break;
+            case ArrayElementFieldReference elementField:
+                var containingElementType = ((SzArrayTypeAnalysisContext)elementField.Array.Type!).ElementType;
+                if (!TypeTokenUsableFrom(containingElementType, callingContext)
+                    || !FieldUsableFrom(elementField.Field, callingContext, receiverType: containingElementType))
+                {
+                    PushDefaultOf(elementField.Field.FieldType, method, instructions, callingContext);
+                    break;
+                }
+                LoadArrayBase(elementField.Array, method, locals, callingContext);
+                LoadOperandIntoSlot(elementField.Index, callingContext.AppContext.SystemTypes.SystemInt32Type,
+                    callingContext, method, locals, writeLine);
+                instructions.Add(CilOpCodes.Ldelema, containingElementType.ToTypeSignature().ToTypeDefOrRef());
+                instructions.Add(CilOpCodes.Ldfld, FieldDescriptorFor(elementField.Field, containingElementType));
+                break;
             case FieldReference field:
-                if (!FieldUsableFrom(field.Field, callingContext,
-                        receiverType: field.Field.IsStatic ? null
-                            : EmittedOperandType(field.Local, callingContext)))
+                if (TryEmitInlinedEnumeratorCurrent(field, callingContext, method, locals, writeLine))
+                    break;
+                if (TryEmitInlinedListCount(field, callingContext, method, locals))
+                    break;
+                if (WholeValueContainerReference(field, expectedType) is { } wholeValue
+                    && FieldReferenceUsableFrom(wholeValue, callingContext))
+                {
+                    if (wholeValue.Field.IsStatic)
+                        instructions.Add(CilOpCodes.Ldsfld, wholeValue.Field.ToFieldDescriptor());
+                    else
+                    {
+                        LoadFieldReceiver(wholeValue, callingContext, method, locals, writeLine);
+                        instructions.Add(CilOpCodes.Ldfld,
+                            FieldDescriptorFor(wholeValue.Field,
+                                FieldReceiverType(wholeValue, callingContext)));
+                    }
+                    break;
+                }
+                if (!FieldReferenceUsableFrom(field, callingContext))
                 {
                     PushDefaultOf(field.Field.FieldType, method, instructions, callingContext);
                     break;
@@ -3027,12 +3436,21 @@ public static class IlGenerator
                     break;
                 }
 
-                LoadOperandIntoSlot(field.Local, FieldBaseContract(field.Field), callingContext,
-                    method, locals, writeLine);
+                LoadFieldReceiver(field, callingContext, method, locals, writeLine);
                 instructions.Add(CilOpCodes.Ldfld,
-                    FieldDescriptorFor(field.Field, EmittedOperandType(field.Local, callingContext)));
+                    FieldDescriptorFor(field.Field, FieldReceiverType(field, callingContext)));
+                break;
+            case SelectedFieldReference selected:
+                EmitSelectedFieldLoad(selected, method, locals, writeLine, expectedType, callingContext);
                 break;
             case MemoryOperand memory:
+                if (TryRecoverLateFieldReference(memory, callingContext, out var lateField))
+                {
+                    if (TryEmitInlinedListCount(lateField, callingContext, method, locals))
+                        break;
+                    LoadOperand(lateField, method, locals, writeLine, expectedType, callingContext);
+                    break;
+                }
                 if (TryGetDeterministicMemoryReferent(memory, expectedType, out var referent))
                 {
                     // A zero-offset load through a typed pointer/byref is an actual managed
@@ -3068,14 +3486,17 @@ public static class IlGenerator
                 // ldftn cannot name a .ctor though; the unresolved placeholder below stays
                 // verifier-legal (a native-int zero) instead of fabricating a function pointer.
                 var represented = runtimeMethod.RepresentedMethod;
-                var representedVisible = callingContext == null
-                    || Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(represented, callingContext);
+                var representedVisible = !CalleeUsesSharedEnumMarker(represented)
+                    && (callingContext == null
+                        || Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(represented, callingContext));
                 if (!representedVisible)
                 {
                     // The same invisible corlib helpers show up as function pointers; the honest
                     // substitutes are the ones a direct call would use.
                     represented = Analysis.InaccessibleCalleeRecovery.TrySubstitute(represented) ?? represented;
-                    representedVisible = Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(represented, callingContext!);
+                    representedVisible = !CalleeUsesSharedEnumMarker(represented)
+                        && (callingContext == null
+                            || Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(represented, callingContext));
                 }
                 if (expectedType?.FullName == "System.IntPtr" && represented.Name is not ".ctor" && representedVisible)
                 {
@@ -3104,7 +3525,7 @@ public static class IlGenerator
                 // fieldof(F), e.g. the handle InitializeArray takes.
                 if (expectedType?.FullName == "System.RuntimeFieldHandle")
                 {
-                    if (FieldUsableFrom(runtimeField.RepresentedField, callingContext))
+                    if (RuntimeFieldTokenUsableFrom(runtimeField.RepresentedField, callingContext))
                         instructions.Add(CilOpCodes.Ldtoken, runtimeField.RepresentedField.ToFieldDescriptor());
                     else
                         PushDefaultOf(expectedType, method, instructions, callingContext);
@@ -3197,6 +3618,108 @@ public static class IlGenerator
                 break;
         }
     }
+
+    private static TypeAnalysisContext? FieldReceiverType(FieldReference field, MethodAnalysisContext context) =>
+        field.Containers.Count == 0 ? EmittedOperandType(field.Local, context) : field.Containers[^1].FieldType;
+
+    private static bool FieldReferenceUsableFrom(FieldReference field, MethodAnalysisContext context,
+        bool writeAccess = false)
+    {
+        var receiverType = EmittedOperandType(field.Local, context);
+        foreach (var container in field.Containers)
+        {
+            if (!FieldUsableFrom(container, context, receiverType: receiverType))
+                return false;
+            receiverType = container.FieldType;
+        }
+        return FieldUsableFrom(field.Field, context, writeAccess,
+            receiverType: field.Field.IsStatic ? null : receiverType);
+    }
+
+    private static void EmitSelectedFieldLoad(SelectedFieldReference selected, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
+        TypeAnalysisContext? expectedType, MethodAnalysisContext context)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        var end = new CilInstruction(CilOpCodes.Nop);
+        var branches = new List<((long Value, FieldReference Field) Choice, CilInstruction Target)>();
+        for (var i = 0; i < selected.Choices.Count - 1; i++)
+            branches.Add((selected.Choices[i], new CilInstruction(CilOpCodes.Nop)));
+
+        foreach (var (choice, target) in branches)
+        {
+            LoadOperandIntoSlot(selected.Selector, context.AppContext.SystemTypes.SystemInt64Type,
+                context, method, locals, writeLine);
+            instructions.Add(CilOpCodes.Ldc_I8, choice.Value);
+            instructions.Add(CilOpCodes.Beq, new CilInstructionLabel(target));
+        }
+
+        LoadOperand(selected.Choices[^1].Field, method, locals, writeLine, expectedType, context);
+        instructions.Add(CilOpCodes.Br, new CilInstructionLabel(end));
+        foreach (var (choice, target) in branches)
+        {
+            instructions.Add(target);
+            LoadOperand(choice.Field, method, locals, writeLine, expectedType, context);
+            instructions.Add(CilOpCodes.Br, new CilInstructionLabel(end));
+        }
+        instructions.Add(end);
+    }
+
+    private static void LoadFieldReceiver(FieldReference field, MethodAnalysisContext context, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        void LoadBase(FieldAnalysisContext target)
+        {
+            var contract = FieldBaseContract(target);
+            if (!context.IsStatic && target.DeclaringType != null && context.DeclaringType != null
+                && ThisConstructorCallPlan.SameTypeIdentity(GenericDefinition(target.DeclaringType),
+                    GenericDefinition(context.DeclaringType))
+                && (!StackContractSatisfied(EmittedOperandType(field.Local, context), contract, context)
+                    || IsUndefinedOwnTypeReceiver(field.Local, context)))
+            {
+                method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldarg_0);
+                return;
+            }
+            if (contract is ByRefTypeAnalysisContext)
+            {
+                if (!EmitManagedAddress(field.Local, method, context, locals, writeLine))
+                    PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context);
+            }
+            else
+                LoadOperandIntoSlot(field.Local, contract, context, method, locals, writeLine);
+        }
+
+        if (field.Containers.Count == 0)
+        {
+            LoadBase(field.Field);
+            return;
+        }
+
+        var receiverType = EmittedOperandType(field.Local, context);
+        var first = field.Containers[0];
+        var start = 0;
+        if (first.IsStatic)
+        {
+            method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldsflda, first.ToFieldDescriptor());
+            receiverType = first.FieldType;
+            start = 1;
+        }
+        else
+            LoadBase(first);
+        foreach (var container in field.Containers.Skip(start))
+        {
+            method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldflda,
+                FieldDescriptorFor(container, receiverType));
+            receiverType = container.FieldType;
+        }
+    }
+
+    private static bool IsUndefinedOwnTypeReceiver(IOperand receiver, MethodAnalysisContext context) =>
+        receiver is LocalVariable local
+        && !local.IsThis
+        && !context.ParameterLocals.Contains(local)
+        && context.ControlFlowGraph?.Instructions.All(instruction =>
+            !ReferenceEquals(instruction.Destination, local)) == true;
     
     private static bool TryEmitExactTypeComparison(Instruction instruction, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
@@ -3236,7 +3759,8 @@ public static class IlGenerator
         // reaches it only through box.
         CoerceOrDefault(EmittedLocalType(objLocal, context), context?.AppContext.SystemTypes.SystemObjectType, method, context);
         instructions.Add(CilOpCodes.Callvirt, getType);
-        LoadOperand(typeOperand, method, locals, writeLine, null, context); // emits typeof(T)
+        LoadOperand(typeOperand, method, locals, writeLine,
+            ResolveSystemType(context, "System.Type"), context); // emits typeof(T)
         instructions.Add(CilOpCodes.Ceq);
 
         if (instruction.OpCode == OpCode.CheckNotEqual)
@@ -3287,6 +3811,115 @@ public static class IlGenerator
             && (referent.IsValueType
                 ? referent.FullName == expectedType.FullName
                 : referent.IsAssignableTo(expectedType));
+    }
+
+    private static bool TryRecoverLateFieldReference(MemoryOperand memory, MethodAnalysisContext context,
+        out FieldReference fieldReference)
+    {
+        fieldReference = null!;
+        if (memory.Index != null || memory.Scale != 0 || memory.Base is not LocalVariable local)
+            return false;
+
+        if (local.Type != context.AppContext.SystemTypes.SystemObjectType
+            || (CallDefinedLocalType(local, context) ?? ObjectDefinitionType(local, context)) is not { } owner
+            || owner == context.AppContext.SystemTypes.SystemObjectType)
+            return false;
+        var field = Analysis.MetadataResolver.FindInstanceFieldAtOffset(owner, memory.Addend);
+        if (field == null)
+            return false;
+        if (owner is GenericInstanceTypeAnalysisContext genericOwner)
+            field = new ConcreteGenericFieldAnalysisContext(field, genericOwner);
+        fieldReference = new FieldReference(field, local, (int)memory.Addend);
+        return true;
+    }
+
+    private static bool TryEmitInlinedListCount(FieldReference field, MethodAnalysisContext context,
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
+    {
+        if (field is not { Field.Name: "_size", Local: LocalVariable receiver }
+            || EmittedLocalType(receiver, context) is not GenericInstanceTypeAnalysisContext list
+            || list.GenericType.FullName != "System.Collections.Generic.List`1"
+            || list.GenericType.Methods.FirstOrDefault(candidate => candidate.Name == "get_Count"
+                && !candidate.IsStatic && candidate.Parameters.Count == 0) is not { } getter)
+            return false;
+
+        LoadLocal(receiver, method, locals, context);
+        method.CilMethodBody!.Instructions.Add(CilOpCodes.Call,
+            new ConcreteGenericMethodAnalysisContext(getter, list.GenericArguments, []).ToMethodDescriptor());
+        return true;
+    }
+
+    private static bool TryEmitInlinedEnumeratorCurrent(FieldReference field, MethodAnalysisContext context,
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals,
+        IMethodDescriptor writeLine)
+    {
+        var current = field.Field.Name == "_current" && field.Containers.Count == 0
+            ? field.Field
+            : field.Containers.FirstOrDefault();
+        if (current?.Name != "_current"
+            || EmittedLocalType(field.Local, context) is not GenericInstanceTypeAnalysisContext enumerator
+            || enumerator.GenericType.Methods.FirstOrDefault(candidate => candidate.Name == "get_Current"
+                && !candidate.IsStatic && candidate.Parameters.Count == 0) is not { } getter)
+            return false;
+
+        var currentType = current.FieldType;
+        var nestedReceiverType = field.Containers.Count == 1
+            ? currentType
+            : field.Containers.LastOrDefault()?.FieldType;
+        var nestedGetter = field.Containers.Count > 0 && nestedReceiverType != null
+            ? PublicFieldGetter(nestedReceiverType, field.Field)
+            : null;
+        if (field.Containers.Count > 0
+            && (!TypeTokenUsableFrom(currentType, context)
+                || field.Containers.Skip(1).Any(container => !FieldUsableFrom(container, context))
+                || !FieldUsableFrom(field.Field, context, receiverType: nestedReceiverType)
+                && nestedGetter == null))
+            return false;
+        if (!EmitManagedAddress(field.Local, method, context, locals, writeLine))
+            return false;
+
+        var concreteGetter = new ConcreteGenericMethodAnalysisContext(getter, enumerator.GenericArguments, []);
+        var instructions = method.CilMethodBody!.Instructions;
+        instructions.Add(CilOpCodes.Call, concreteGetter.ToMethodDescriptor());
+        if (field.Containers.Count == 0)
+            return true;
+
+        var temp = new CilLocalVariable(currentType.ToTypeSignature());
+        method.CilMethodBody.LocalVariables.Add(temp);
+        instructions.Add(CilOpCodes.Stloc, temp);
+        instructions.Add(CilOpCodes.Ldloca, temp);
+        var receiverType = currentType;
+        foreach (var container in field.Containers.Skip(1))
+        {
+            instructions.Add(CilOpCodes.Ldflda, FieldDescriptorFor(container, receiverType));
+            receiverType = container.FieldType;
+        }
+        if (nestedGetter != null)
+            instructions.Add(CilOpCodes.Call, nestedGetter.ToMethodDescriptor());
+        else
+            instructions.Add(CilOpCodes.Ldfld, FieldDescriptorFor(field.Field, receiverType));
+        return true;
+    }
+
+    private static MethodAnalysisContext? PublicFieldGetter(TypeAnalysisContext receiver,
+        FieldAnalysisContext field)
+    {
+        var name = field.Name;
+        if (name.StartsWith("<", System.StringComparison.Ordinal)
+            && name.IndexOf('>') is var end && end > 1)
+            name = name[1..end];
+        else if (name.Length > 0)
+            name = char.ToUpperInvariant(name[0]) + name[1..];
+        var definition = receiver is GenericInstanceTypeAnalysisContext generic
+            ? generic.GenericType
+            : receiver;
+        var getter = definition.Methods.FirstOrDefault(candidate => candidate.Name == $"get_{name}"
+            && !candidate.IsStatic && candidate.Parameters.Count == 0
+            && (candidate.Attributes & MethodAttributes.MemberAccessMask) == MethodAttributes.Public);
+        return getter == null ? null
+            : receiver is GenericInstanceTypeAnalysisContext instance
+                ? new ConcreteGenericMethodAnalysisContext(getter, instance.GenericArguments, [])
+                : getter;
     }
 
     private static void PushDefaultOf(TypeAnalysisContext type, MethodDefinition method, CilInstructionCollection instructions,
@@ -3350,7 +3983,7 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldc_I4_0);
                 break;
             default:
-                if (CanEmitTypeToken(type))
+                if (CanEmitTypeToken(type) || HasEmittedLocalOfType(type, method))
                     EmitDefaultValueLocal(type, method, instructions, context);
                 else
                     instructions.Add(CilOpCodes.Ldc_I4_0);
@@ -3364,7 +3997,7 @@ public static class IlGenerator
     private static void EmitDefaultValueLocal(TypeAnalysisContext type, MethodDefinition method,
         CilInstructionCollection instructions, MethodAnalysisContext? context)
     {
-        if (!TypeTokenUsableFrom(type, context))
+        if (!TypeTokenUsableFrom(type, context) && !HasEmittedLocalOfType(type, method))
         {
             // initobj would name a type the caller cannot see, and the temp local
             // would carry the same invalid signature; the sanitized placeholder
@@ -3380,6 +4013,23 @@ public static class IlGenerator
         instructions.Add(CilOpCodes.Ldloc, tempLocal);
     }
 
+    private static bool HasEmittedLocalOfType(TypeAnalysisContext type, MethodDefinition method)
+    {
+        if (method.CilMethodBody == null)
+            return false;
+        TypeSignature signature;
+        try
+        {
+            signature = type.ToTypeSignature();
+        }
+        catch
+        {
+            return false;
+        }
+        return method.CilMethodBody.LocalVariables.Any(local =>
+            local.VariableType.FullName == signature.FullName);
+    }
+
     // A local's declared type is part of the method body's locals signature, so it
     // is subject to the same accessibility rules as an instruction token. When the
     // recovered type cannot be named here, declare the closest verifier-legal
@@ -3389,6 +4039,24 @@ public static class IlGenerator
     // object for anything else.
     private static TypeAnalysisContext EmittableLocalType(TypeAnalysisContext type, MethodAnalysisContext? context)
     {
+        // IL2CPP's shared-generic enum markers are absent from Unity's managed
+        // runtime. Concrete evidence is sharpened before this point; unresolved
+        // occurrences keep their wrapper shape over the underlying primitive.
+        if (IsSharedEnumMarker(type))
+            return type.DefaultEnumUnderlyingType ?? type.AppContext.SystemTypes.SystemInt32Type;
+        if (type is SzArrayTypeAnalysisContext markerArray
+            && ContainsSharedEnumMarker(markerArray.ElementType))
+            return new SzArrayTypeAnalysisContext(EmittableLocalType(markerArray.ElementType, context));
+        if (type is ByRefTypeAnalysisContext markerByRef
+            && ContainsSharedEnumMarker(markerByRef.ElementType))
+            return new ByRefTypeAnalysisContext(EmittableLocalType(markerByRef.ElementType, context));
+        if (type is PointerTypeAnalysisContext markerPointer
+            && ContainsSharedEnumMarker(markerPointer.ElementType))
+            return new PointerTypeAnalysisContext(EmittableLocalType(markerPointer.ElementType, context));
+        if (type is GenericInstanceTypeAnalysisContext markerInstance
+            && markerInstance.GenericArguments.Any(ContainsSharedEnumMarker))
+            return new GenericInstanceTypeAnalysisContext(markerInstance.GenericType,
+                markerInstance.GenericArguments.Select(argument => EmittableLocalType(argument, context)).ToArray());
         // Only a type that produces a token but names something the caller cannot
         // see needs the placeholder; anything unemittable keeps the existing
         // behavior (the corlib-signature special cases and the literal defaults).
@@ -3441,13 +4109,63 @@ public static class IlGenerator
             if (!ReferenceEquals(instruction.Destination, local))
                 continue;
             foreach (var produced in ProducedInstanceTypes(instruction, context, visited))
+            {
+                if (produced is SzArrayTypeAnalysisContext array
+                    && erasedInstance.GenericType.FullName == "System.Collections.Generic.IEnumerable`1"
+                    && !ContainsUnusableSharpenedArgument(array.ElementType, context))
+                    return new GenericInstanceTypeAnalysisContext(erasedInstance.GenericType, [array.ElementType]);
                 if (produced is GenericInstanceTypeAnalysisContext producedInstance
                     && ThisConstructorCallPlan.SameTypeIdentity(producedInstance.GenericType, erasedInstance.GenericType)
-                    && !producedInstance.GenericArguments.Any(IsErasedSharedArgument))
+                    && !ThisConstructorCallPlan.SameTypeIdentity(producedInstance, erasedInstance)
+                    && !producedInstance.GenericArguments.Any(argument =>
+                        ContainsUnusableSharpenedArgument(argument, context)))
                     return producedInstance;
+            }
         }
+
+        // An allocation can be lifted through an erased temporary (`List<object>`)
+        // even though its next managed store proves the concrete instantiation.
+        // Use that slot contract only when every concrete use agrees.
+        GenericInstanceTypeAnalysisContext? useContract = null;
+        bool AcceptUseContract(GenericInstanceTypeAnalysisContext candidate)
+        {
+            if (!ThisConstructorCallPlan.SameTypeIdentity(candidate.GenericType, erasedInstance.GenericType)
+                || candidate.GenericArguments.Any(argument =>
+                    ContainsUnusableSharpenedArgument(argument, context)))
+                return true;
+            if (useContract != null && !ThisConstructorCallPlan.SameTypeIdentity(useContract, candidate))
+                return false;
+            useContract = candidate;
+            return true;
+        }
+
+        foreach (var instruction in context.ControlFlowGraph.Instructions)
+        {
+            if (instruction is not { OpCode: OpCode.Move, Operands: [var destination, var source, ..] }
+                || !ReferenceEquals(source, local)
+                || DestinationType(destination) is not GenericInstanceTypeAnalysisContext candidate)
+                continue;
+            if (!AcceptUseContract(candidate))
+                return null;
+        }
+        foreach (var cast in context.ControlFlowGraph.Instructions.SelectMany(instruction => instruction.Operands)
+                     .OfType<ReferenceCast>().Where(cast => ReferenceEquals(cast.Value, local)))
+            if (cast.Type is GenericInstanceTypeAnalysisContext candidate && !AcceptUseContract(candidate))
+                return null;
+        if (useContract != null)
+            return useContract;
         return null;
     }
+
+    private static bool ContainsUnusableSharpenedArgument(TypeAnalysisContext argument,
+        MethodAnalysisContext context) =>
+        IsSharedEnumMarker(argument)
+        || argument is GenericParameterTypeAnalysisContext
+            && !DelegateArgumentsCallerOwned(argument, context)
+        || argument is WrappedTypeAnalysisContext wrapped
+            && ContainsUnusableSharpenedArgument(wrapped.ElementType, context)
+        || argument is GenericInstanceTypeAnalysisContext instance
+            && instance.GenericArguments.Any(nested => ContainsUnusableSharpenedArgument(nested, context));
 
     private static IEnumerable<TypeAnalysisContext> ProducedInstanceTypes(
         Instruction instruction, MethodAnalysisContext context, HashSet<LocalVariable> visited)
@@ -3458,16 +4176,20 @@ public static class IlGenerator
         {
             switch (operand)
             {
+                case TypeAnalysisContext producedType when instruction.OpCode == OpCode.Newobj:
+                    yield return producedType;
+                    break;
                 case ReferenceCast referenceCast:
                     yield return EmittedOperandType(referenceCast.Value, context);
                     break;
                 case LocalVariable source:
                     // EmittedOperandType would recurse through the same sharpening
                     // with a fresh visited-set; keep the cycle guard instead.
-                    yield return source.Type is GenericInstanceTypeAnalysisContext sourceInstance
-                        && sourceInstance.GenericArguments.Any(IsErasedSharedArgument)
+                    yield return DirectCallDefinedLocalType(source, context)
+                        ?? (source.Type is GenericInstanceTypeAnalysisContext sourceInstance
+                        && sourceInstance.GenericArguments.Any(ContainsErasedSharedArgument)
                         ? SharpenedLocalInstanceType(source, sourceInstance, context, visited)
-                        : source.Type;
+                        : source.Type);
                     break;
                 default:
                     yield return EmittedOperandType(operand, context);
@@ -3478,6 +4200,27 @@ public static class IlGenerator
 
     private static TypeAnalysisContext EmittedLocalType(LocalVariable local, MethodAnalysisContext context) =>
         EmittableLocalType(EmittedLocalTypeCore(local, context, []), context);
+
+    private static TypeAnalysisContext? SharpenedFieldAddressType(LocalVariable local,
+        MethodAnalysisContext context)
+    {
+        TypeAnalysisContext? fieldType = null;
+        var found = false;
+        foreach (var instruction in context.ControlFlowGraph!.Instructions)
+        {
+            if (!ReferenceEquals(instruction.Destination, local))
+                continue;
+            var address = instruction.OpCode is OpCode.Add or OpCode.Subtract
+                ? TryResolveFieldAddressArithmetic(instruction, context)
+                : null;
+            if (address == null || fieldType != null
+                && !ThisConstructorCallPlan.SameTypeIdentity(fieldType, address.Field.FieldType))
+                return null;
+            fieldType = address.Field.FieldType;
+            found = true;
+        }
+        return found && fieldType != null ? new ByRefTypeAnalysisContext(fieldType) : null;
+    }
 
     private static TypeAnalysisContext EmittedLocalTypeCore(LocalVariable local, MethodAnalysisContext context, HashSet<LocalVariable> visited)
     {
@@ -3505,16 +4248,38 @@ public static class IlGenerator
             var thisType = local.Type as GenericInstanceTypeAnalysisContext ?? thisDeclaring;
             return thisType.IsValueType ? new ByRefTypeAnalysisContext(thisType) : thisType;
         }
+        // System.Object is also the lifter's fallback for a register whose real
+        // numeric type was lost. Do not guess from arithmetic alone; a concrete
+        // numeric mate (array length, typed field/parameter, etc.) must prove it.
+        if (local.Type == context.AppContext.SystemTypes.SystemObjectType
+            && NumericLocalTypes(context).TryGetValue(local, out var recoveredNumericType))
+            return recoveredNumericType;
         if (local.Type != null && local.Type != context.AppContext.SystemTypes.SystemVoidType)
         {
+            if (CallDefinedLocalType(local, context) is { } callType)
+                return callType;
+            // IL2CPP represents `ref enumField` through a native pointer local whose
+            // shared-generic metadata type is an internal *Enum marker. The defining
+            // base+offset operation still proves the exact managed field address.
+            if ((IsErasedSharedArgument(local.Type)
+                    || local.Type is ByRefTypeAnalysisContext byRef
+                    && IsErasedSharedArgument(byRef.ElementType))
+                && SharpenedFieldAddressType(local, context) is { } fieldAddress)
+                return fieldAddress;
             // Shared-generic erasure can tag a local with the canonical
             // PersistentMap<object,object> instantiation while the values that
             // actually reach it carry the concrete one; recover the local's type
             // from its definitions so downstream consumers stay consistent.
             if (local.Type is GenericInstanceTypeAnalysisContext erasedInstance
-                && erasedInstance.GenericArguments.Any(IsErasedSharedArgument)
+                && erasedInstance.GenericArguments.Any(ContainsErasedSharedArgument)
                 && SharpenedLocalInstanceType(local, erasedInstance, context, visited) is { } sharpened)
                 return sharpened;
+            if (local.Type == context.AppContext.SystemTypes.SystemObjectType
+                && ObjectDefinitionType(local, context) is { } sourceType)
+                return sourceType;
+            if (local.Type == context.AppContext.SystemTypes.SystemObjectType
+                && SharpenedObjectAllocationType(local, context) is { } allocatedType)
+                return allocatedType;
             return IsNativeHandleType(local.Type) ? context.AppContext.SystemTypes.SystemIntPtrType : local.Type;
         }
         if (context.DeclaringType is { } declaringType
@@ -3527,6 +4292,200 @@ public static class IlGenerator
         if (NumericLocalTypes(context).TryGetValue(local, out var numericType) && CanEmitTypeToken(numericType))
             return numericType;
         return context.AppContext.SystemTypes.SystemObjectType;
+    }
+
+    private static TypeAnalysisContext? CallDefinedLocalType(LocalVariable local,
+        MethodAnalysisContext context)
+    {
+        TypeAnalysisContext? produced = null;
+        var found = false;
+        var inferredFromArguments = false;
+        foreach (var definition in context.ControlFlowGraph!.Instructions
+                     .Where(instruction => ReferenceEquals(instruction.Destination, local)))
+        {
+            if (definition is not { OpCode: OpCode.Call,
+                    Operands: [MethodAnalysisContext { IsVoid: false } callee, ..] })
+                return null;
+            var resolved = !callee.IsStatic && definition.Operands.Count > 2
+                ? ThisConstructorCallPlan.RetargetToDestinationInstantiation(callee,
+                      DirectSharedGenericEvidenceType(definition.Operands[2], context)) ?? callee
+                : callee;
+            var solved = SolveSharedGenericArguments(resolved, definition, context, 2, false);
+            var returnType = EffectiveCallReturnType(solved ?? resolved);
+            if (!CanEmitTypeToken(returnType)
+                || produced != null && !ThisConstructorCallPlan.SameTypeIdentity(produced, returnType))
+                return null;
+            inferredFromArguments |= !ReferenceEquals(resolved, callee) || solved != null;
+            produced = returnType;
+            found = true;
+        }
+        if (!found || produced == null)
+            return null;
+
+        var matchingStore = false;
+        foreach (var use in context.ControlFlowGraph.Instructions)
+        {
+            if (use is not { OpCode: OpCode.Move, Operands: [var destination, var source, ..] }
+                || !ReferenceEquals(source, local)
+                || DestinationType(destination) is not { } contract
+                || contract.FullName == "System.Object")
+                continue;
+            if (!produced.IsValueType && contract.FullName == "System.Boolean")
+                continue;
+            if (!ThisConstructorCallPlan.SameTypeIdentity(produced, contract))
+            {
+                // Hidden struct returns from shared generic code are initially typed
+                // from the erased callee (Enumerator<object>).  The receiver can later
+                // prove the concrete result (Enumerator<EmoteData>); do not let the
+                // stale move destination erase that stronger call-site evidence.
+                if (!inferredFromArguments
+                    || produced is not GenericInstanceTypeAnalysisContext producedInstance
+                    || contract is not GenericInstanceTypeAnalysisContext contractInstance
+                    || !contractInstance.GenericArguments.Any(ContainsErasedSharedArgument)
+                    || !ThisConstructorCallPlan.SameTypeIdentity(
+                        producedInstance.GenericType, contractInstance.GenericType))
+                    return null;
+            }
+            matchingStore = true;
+        }
+        return matchingStore || inferredFromArguments || produced.FullName != "System.Object"
+            ? produced
+            : null;
+    }
+
+    private static TypeAnalysisContext? DirectCallDefinedLocalType(LocalVariable local,
+        MethodAnalysisContext context)
+    {
+        TypeAnalysisContext? produced = null;
+        foreach (var definition in context.ControlFlowGraph!.Instructions
+                     .Where(instruction => ReferenceEquals(instruction.Destination, local)))
+        {
+            if (definition is not { OpCode: OpCode.Call,
+                    Operands: [MethodAnalysisContext { IsVoid: false } callee, ..] })
+                return null;
+            var resolved = !callee.IsStatic && definition.Operands.Count > 2
+                ? ThisConstructorCallPlan.RetargetToDestinationInstantiation(callee,
+                      DirectSharedGenericEvidenceType(definition.Operands[2], context)) ?? callee
+                : callee;
+            var returnType = EffectiveCallReturnType(resolved);
+            if (!CanEmitTypeToken(returnType)
+                || produced != null && !ThisConstructorCallPlan.SameTypeIdentity(produced, returnType))
+                return null;
+            produced = returnType;
+        }
+        return produced;
+    }
+
+    private static TypeAnalysisContext? ObjectDefinitionType(LocalVariable local,
+        MethodAnalysisContext context)
+    {
+        TypeAnalysisContext? inferred = null;
+        foreach (var definition in context.ControlFlowGraph!.Instructions
+                     .Where(instruction => ReferenceEquals(instruction.Destination, local)))
+        {
+            if (definition is not { OpCode: OpCode.Move, Operands.Count: > 1 })
+                return null;
+            var sourceType = definition.Operands[1] switch
+            {
+                ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } => array.ElementType,
+                FieldReference field => field.Field.FieldType,
+                SelectedFieldReference selected => selected.FieldType,
+                ReferenceCast cast => cast.Type,
+                _ => null
+            };
+            if (sourceType == null || sourceType.IsValueType
+                || sourceType == context.AppContext.SystemTypes.SystemObjectType
+                || inferred != null && !ThisConstructorCallPlan.SameTypeIdentity(inferred, sourceType))
+                return null;
+            inferred = sourceType;
+        }
+        return inferred;
+    }
+
+    internal static TypeAnalysisContext EffectiveCallReturnType(MethodAnalysisContext method)
+    {
+        var result = method.ReturnType;
+        if (method is not ConcreteGenericMethodAnalysisContext concrete
+            || result is not GenericInstanceTypeAnalysisContext instance
+            || instance.GenericArguments.Count != concrete.TypeGenericParameters.Count
+            || !instance.GenericArguments.All(IsErasedSharedArgument))
+            return result;
+
+        return new GenericInstanceTypeAnalysisContext(instance.GenericType,
+            concrete.TypeGenericParameters);
+    }
+
+    internal static MethodAnalysisContext RetargetToReceiverInstantiation(MethodAnalysisContext method,
+        TypeAnalysisContext? receiverType) =>
+        ThisConstructorCallPlan.RetargetToDestinationInstantiation(method, receiverType) ?? method;
+
+    // object_new can lose its class operand and collapse to System.Object while the
+    // immediately following managed cast still proves the allocated reference type.
+    private static TypeAnalysisContext? SharpenedObjectAllocationType(LocalVariable local,
+        MethodAnalysisContext context)
+    {
+        var definitions = context.ControlFlowGraph!.Instructions
+            .Where(instruction => ReferenceEquals(instruction.Destination, local))
+            .ToList();
+        if (definitions.Count == 0 || definitions.Any(instruction => instruction.OpCode != OpCode.Newobj))
+            return null;
+
+        TypeAnalysisContext? contract = null;
+        foreach (var definition in definitions)
+        {
+            var allocated = AllocatedClassOperand(context, definition);
+            if (allocated == null || allocated.IsValueType)
+                return null;
+            // System.Object is the lifter's unknown-class fallback, not contrary
+            // evidence against the concrete managed cast/return contract below.
+            if (allocated.FullName == "System.Object")
+                continue;
+            if (contract != null && !ThisConstructorCallPlan.SameTypeIdentity(contract, allocated))
+                return null;
+            contract = allocated;
+        }
+
+        var aliases = new HashSet<LocalVariable> { local };
+        var changed = true;
+        while (changed)
+        {
+            changed = false;
+            foreach (var instruction in context.ControlFlowGraph.Instructions
+                         .Where(instruction => instruction.OpCode is OpCode.Move or OpCode.Phi))
+            {
+                var linked = instruction.Operands.OfType<LocalVariable>().ToList();
+                if (!linked.Any(aliases.Contains))
+                    continue;
+                foreach (var alias in linked)
+                    changed |= aliases.Add(alias);
+            }
+        }
+
+        foreach (var cast in context.ControlFlowGraph.Instructions
+                     .SelectMany(instruction => instruction.Operands)
+                     .OfType<ReferenceCast>()
+                     .Where(cast => aliases.Contains(cast.Value)))
+        {
+            if (cast.Type is { IsValueType: true } || cast.Type.FullName == "System.Object"
+                || (contract != null && !ThisConstructorCallPlan.SameTypeIdentity(contract, cast.Type)))
+                return null;
+            contract = cast.Type;
+        }
+
+        // A native object_new result is often copied through an object-typed SSA
+        // temporary and only constrained by the managed method's return slot.
+        // That return signature is the same hard contract as an explicit cast.
+        if (context.ReturnType is { IsValueType: false } returnType
+            && returnType.FullName != "System.Object"
+            && context.ControlFlowGraph.Instructions.Any(instruction =>
+                instruction.OpCode == OpCode.Return
+                && instruction.Operands.OfType<LocalVariable>().Any(aliases.Contains)))
+        {
+            if (contract != null && !ThisConstructorCallPlan.SameTypeIdentity(contract, returnType))
+                return null;
+            contract = returnType;
+        }
+        return contract;
     }
 
     private static bool IsNativePointerEmissionLocal(LocalVariable local, MethodAnalysisContext context)
@@ -3658,7 +4617,9 @@ public static class IlGenerator
             {
                 LocalVariable local => local.Type,
                 FieldReference field => field.Field.FieldType,
+                SelectedFieldReference selected => selected.FieldType,
                 ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } => array.ElementType,
+                ArrayElementFieldReference elementField => elementField.Field.FieldType,
                 ArrayLength => context.AppContext.SystemTypes.SystemInt32Type,
                 AddressOf { Target: LocalVariable addressed }
                     => new ByRefTypeAnalysisContext(addressed.Type ?? context.AppContext.SystemTypes.SystemObjectType),
@@ -3666,6 +4627,8 @@ public static class IlGenerator
                     => new ByRefTypeAnalysisContext(addressedField.Field.FieldType),
                 AddressOf { Target: ArrayAccess { Array.Type: SzArrayTypeAnalysisContext addressedArray } }
                     => new ByRefTypeAnalysisContext(addressedArray.ElementType),
+                AddressOf { Target: ArrayElementFieldReference addressedElementField }
+                    => new ByRefTypeAnalysisContext(addressedElementField.Field.FieldType),
                 AddressOf => context.AppContext.SystemTypes.SystemIntPtrType,
                 ReferenceCast cast => cast.Type,
                 StringLiteral => context.AppContext.SystemTypes.SystemStringType,
@@ -3697,6 +4660,11 @@ public static class IlGenerator
                 switch (operand)
                 {
                     case FieldReference { Local: LocalVariable host }: Disqualify(host); break;
+                    case SelectedFieldReference selected:
+                        foreach (var receiver in selected.Choices.Select(c => c.Field.Local).Distinct())
+                            Disqualify(receiver);
+                        AddOperandConstraint(selected.Selector, context.AppContext.SystemTypes.SystemInt64Type);
+                        break;
                     case ArrayAccess { Array: LocalVariable array }:
                         Disqualify(array);
                         AddOperandConstraint(((ArrayAccess)operand).Index, context.AppContext.SystemTypes.SystemInt32Type);
@@ -3714,6 +4682,7 @@ public static class IlGenerator
                 UnionLocalOperands(instruction.Operands.Skip(1));
                 foreach (var operand in instruction.Operands.Skip(1))
                     AddOperandConstraint(operand, DestinationType(operand));
+                SeedMateConstraints(instruction.Operands.Skip(1));
             }
             else if (op is OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
                 or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate or OpCode.SignExtend32)
@@ -3770,7 +4739,15 @@ public static class IlGenerator
             else if (op == OpCode.ConditionalJump && instruction.Operands.Count > 1)
                 // brtrue accepts refs and ints alike; too ambiguous to seed a type.
                 Disqualify(instruction.Operands[1]);
-            else if (op is OpCode.Newobj or OpCode.NewArr or OpCode.Throw or OpCode.IndirectJump)
+            else if (op == OpCode.NewArr)
+            {
+                Disqualify(instruction.Operands[0]);
+                if (instruction.Operands.Count > 2)
+                    AddOperandConstraint(instruction.Operands[2], context.AppContext.SystemTypes.SystemInt32Type);
+            }
+            else if (op == OpCode.Newobj)
+                Disqualify(instruction.Operands[0]);
+            else if (op is OpCode.Throw or OpCode.IndirectJump)
                 foreach (var operand in instruction.Operands)
                     Disqualify(operand);
         }
@@ -3804,7 +4781,8 @@ public static class IlGenerator
                     ?? types[0]
                 : systemTypes.SystemInt32Type;
             foreach (var member in group)
-                if (member.Type == null)
+                if (member.Type == null
+                    || member.Type == systemTypes.SystemObjectType && hasTypes)
                     result[member] = picked;
         }
         return result;
@@ -3842,7 +4820,9 @@ public static class IlGenerator
         {
             LocalVariable local => local.Type,
             FieldReference field => field.Field.FieldType,
+            SelectedFieldReference selected => selected.FieldType,
             ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } => array.ElementType,
+            ArrayElementFieldReference elementField => elementField.Field.FieldType,
             _ => null
         };
         // Handle contexts are emitted as System.IntPtr, so that is the real contract
@@ -3866,16 +4846,31 @@ public static class IlGenerator
         // the contract must agree with the declaration or the store coerces the
         // operand into a type the slot does not accept.
         if (declared is GenericInstanceTypeAnalysisContext declaredInstance
-            && declaredInstance.GenericArguments.Any(IsErasedSharedArgument)
+            && declaredInstance.GenericArguments.Any(ContainsErasedSharedArgument)
             && destination is LocalVariable destinationLocal
-            && EmittedLocalType(destinationLocal, context) is GenericInstanceTypeAnalysisContext
+            && EmittedLocalTypeCore(destinationLocal, context, []) is GenericInstanceTypeAnalysisContext
                 {
                     GenericType: { } sharpenedDefinition,
                     GenericArguments: { } sharpenedArguments
                 } sharpenedContract
             && ThisConstructorCallPlan.SameTypeIdentity(sharpenedDefinition, declaredInstance.GenericType)
-            && !sharpenedArguments.Any(IsErasedSharedArgument))
+            && !sharpenedArguments.Any(argument =>
+                ContainsUnusableSharpenedArgument(argument, context)))
             return sharpenedContract;
+        if (declared is ByRefTypeAnalysisContext declaredByRef
+            && IsErasedSharedArgument(declaredByRef.ElementType)
+            && destination is LocalVariable byRefLocal
+            && EmittedLocalType(byRefLocal, context) is ByRefTypeAnalysisContext sharpenedByRef
+            && !IsErasedSharedArgument(sharpenedByRef.ElementType))
+            return sharpenedByRef;
+        if (declared == context.AppContext.SystemTypes.SystemObjectType
+            && destination is LocalVariable objectLocal
+            && EmittedLocalType(objectLocal, context) is { } concreteContract
+            && concreteContract != context.AppContext.SystemTypes.SystemObjectType)
+            return concreteContract;
+        if (destination is LocalVariable callLocal
+            && CallDefinedLocalType(callLocal, context) is { } callContract)
+            return callContract;
         if (declared != null)
             return declared;
         return destination switch
@@ -3886,6 +4881,34 @@ public static class IlGenerator
             _ => null
         };
     }
+
+    // Type evidence used to solve shared generics. Unlike the final emitted stack
+    // type, this must not mistake a runtime-safe marker fallback (Int32Enum -> int)
+    // for a proven concrete instantiation.
+    private static TypeAnalysisContext? DirectSharedGenericEvidenceType(IOperand operand,
+        MethodAnalysisContext context) => operand switch
+    {
+        FieldReference field => field.Field.FieldType,
+        SelectedFieldReference selected => selected.FieldType,
+        ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } => array.ElementType,
+        ReferenceCast cast when !ContainsErasedSharedArgument(cast.Type) => cast.Type,
+        LocalVariable { Type: { } type } when type != context.AppContext.SystemTypes.SystemObjectType
+            && type != context.AppContext.SystemTypes.SystemVoidType
+            && !ContainsErasedSharedArgument(type) => type,
+        _ => null
+    };
+
+    internal static TypeAnalysisContext? SharedGenericEvidenceType(IOperand operand,
+        MethodAnalysisContext context) => operand switch
+    {
+        LocalVariable local => EmittedLocalTypeCore(local, context, []),
+        AddressOf { Target: LocalVariable addressedLocal }
+            => new ByRefTypeAnalysisContext(EmittedLocalTypeCore(addressedLocal, context, [])),
+        ReferenceCast { Value: var value, Type: GenericInstanceTypeAnalysisContext target }
+            when target.GenericArguments.Any(ContainsErasedSharedArgument)
+            => SharedGenericEvidenceType(value, context),
+        _ => EmittedOperandType(operand, context)
+    };
 
     // The stack type an operand produces once emitted, before any coercion. `expectedType`
     // is the consumer's contract where the emission site knows it: literal immediates adapt
@@ -3905,6 +4928,8 @@ public static class IlGenerator
                     : EmittedImmediateType(immediate, expectedType, context),
             LocalVariable local => EmittedLocalType(local, context),
             FieldReference field => field.Field.FieldType,
+            SelectedFieldReference selected => selected.FieldType,
+            ArrayElementFieldReference elementField => elementField.Field.FieldType,
             ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } => array.ElementType,
             ArrayLength => context.AppContext.SystemTypes.SystemInt32Type,
             // ldloca/ldflda/ldelema push a managed pointer, not a native int.
@@ -3914,11 +4939,14 @@ public static class IlGenerator
                 => new ByRefTypeAnalysisContext(addressedField.Field.FieldType),
             AddressOf { Target: ArrayAccess { Array.Type: SzArrayTypeAnalysisContext addressedArray } }
                 => new ByRefTypeAnalysisContext(addressedArray.ElementType),
+            AddressOf { Target: ArrayElementFieldReference addressedElementField }
+                => new ByRefTypeAnalysisContext(addressedElementField.Field.FieldType),
             AddressOf => context.AppContext.SystemTypes.SystemIntPtrType,
-            ReferenceCast cast => cast.Type,
+            ReferenceCast cast => EmittableLocalType(cast.Type, context),
             StringLiteral => context.AppContext.SystemTypes.SystemStringType,
             FloatLiteral => context.AppContext.SystemTypes.SystemSingleType,
             DoubleLiteral => context.AppContext.SystemTypes.SystemDoubleType,
+            Vector128Literal => expectedType,
             RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext
                 => expectedType?.FullName is "System.RuntimeMethodHandle" or "System.RuntimeFieldHandle"
                     ? ResolveSystemType(context, expectedType.FullName)
@@ -3932,11 +4960,13 @@ public static class IlGenerator
                 => context.AppContext.SystemTypes.SystemIntPtrType,
             // A deterministic memory dereference pushes whatever LoadOperand emits:
             // ldind.i for pointer referents, ldobj/ldind.ref for managed ones.
-            MemoryOperand memory => TryGetDeterministicMemoryReferent(memory, expectedType, out var referent)
-                ? referent is PointerTypeAnalysisContext or ByRefTypeAnalysisContext
-                    ? context.AppContext.SystemTypes.SystemIntPtrType
-                    : referent
-                : null,
+            MemoryOperand memory => TryRecoverLateFieldReference(memory, context, out var lateField)
+                ? lateField.Field.FieldType
+                : TryGetDeterministicMemoryReferent(memory, expectedType, out var referent)
+                    ? referent is PointerTypeAnalysisContext or ByRefTypeAnalysisContext
+                        ? context.AppContext.SystemTypes.SystemIntPtrType
+                        : referent
+                    : null,
             // A bare type operand (ldtoken): LoadOperand emits ldtoken + GetTypeFromHandle
             // for ordinary contracts, the bare handle for RuntimeTypeHandle, or a native
             // pointer for handle contracts — report what is actually pushed.
@@ -3994,13 +5024,6 @@ public static class IlGenerator
             ByRefTypeAnalysisContext => literalType,
             // Unmanaged pointers take the literal as a native-int address.
             PointerTypeAnalysisContext => systemTypes.SystemIntPtrType,
-            // default(T) on a struct or generic parameter produces T itself.
-            { IsValueType: true } or GenericParameterTypeAnalysisContext
-                when literalType!.FullName is not ("System.IntPtr" or "System.UIntPtr" or "System.Single"
-                    or "System.Double" or "System.Int64" or "System.UInt64" or "System.Int32" or "System.UInt32"
-                    or "System.Boolean" or "System.Byte" or "System.SByte" or "System.Int16" or "System.UInt16"
-                    or "System.Char")
-                && CanEmitTypeToken(literalType) => literalType,
             _ => literalType?.FullName switch
             {
                 "System.IntPtr" or "System.UIntPtr" => literalType,
@@ -4032,6 +5055,10 @@ public static class IlGenerator
             return 0;
         if (type is PointerTypeAnalysisContext or ByRefTypeAnalysisContext || IsNativeHandleType(type))
             return -1;
+
+        if (type is GenericInstanceTypeAnalysisContext { GenericType.IsEnumType: true } enumInstance)
+            return IntegralStackWidth(enumInstance.GenericType.DefaultEnumUnderlyingType
+                ?? type.AppContext.SystemTypes.SystemInt32Type);
 
         return type.FullName switch
         {
@@ -4171,12 +5198,44 @@ public static class IlGenerator
             return false;
         }
 
+        // Some recovered corlib contexts lose their value-type flag even though
+        // their stack kind and name remain exact. A primitive entering any managed
+        // reference slot still must be boxed; key this off the canonical name, not
+        // the unreliable flag.
+        var factory = method.DeclaringModule!.CorLibTypeFactory;
+        TypeSignature? primitive = from.FullName switch
+        {
+            "System.Boolean" => factory.Boolean,
+            "System.Byte" => factory.Byte,
+            "System.SByte" => factory.SByte,
+            "System.Char" => factory.Char,
+            "System.Int16" => factory.Int16,
+            "System.UInt16" => factory.UInt16,
+            "System.Int32" => factory.Int32,
+            "System.UInt32" => factory.UInt32,
+            "System.Int64" => factory.Int64,
+            "System.UInt64" => factory.UInt64,
+            "System.Single" => factory.Single,
+            "System.Double" => factory.Double,
+            _ => null
+        };
+        if (primitive != null && !to.IsValueType
+            && to is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext))
+        {
+            instructions.Add(CilOpCodes.Box, primitive.ToTypeDefOrRef());
+            if (to.FullName == "System.Object" || !CanEmitTypeToken(to))
+                return true;
+            if (!TypeTokenUsableFrom(to, context))
+                return false;
+            instructions.Add(CilOpCodes.Castclass, to.ToTypeSignature().ToTypeDefOrRef());
+            return true;
+        }
+
         if (from.IsValueType && !to.IsValueType)
         {
-            // Without a box token the value is left as-is: reduced fixtures retype
-            // the slot to the real primitive, and dropping real data for a guessed
-            // null is no better for the verifier. A token that exists but is not
-            // visible here fails instead, so the caller defaults the slot honestly.
+            // Primitive corlib values always have a usable signature token even when
+            // a reduced analysis fixture has no AsmResolver type mapping for them.
+            // Leaving their I4/I8/R value unboxed in an object slot is invalid IL.
             if (!CanEmitTypeToken(from))
                 return true;
             if (!TypeTokenUsableFrom(from, context))
@@ -4399,6 +5458,8 @@ public static class IlGenerator
             return !CanEmitTypeToken(from)
                 || TypeTokenUsableFrom(from, context)
                     && (IsAssignableToLoose(from, to) || !CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context));
+        if (!from.IsValueType && to.FullName == "System.Boolean")
+            return false;
         if (!from.IsValueType && to.IsValueType)
             return !CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context); // unbox.any accepts any managed reference
         if (!from.IsValueType && !to.IsValueType)
@@ -4416,7 +5477,23 @@ public static class IlGenerator
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
         bool convertByRef = false)
     {
-        var emitted = EmittedOperandType(operand, context, contract);
+        operand = RuntimeFieldHandleSource(operand, contract, context);
+        if (operand is FieldReference container
+            && NestedValueFieldForContract(container, contract) is { } nested)
+            operand = nested;
+        if (operand is FieldReference nestedField
+            && WholeValueContainerReference(nestedField, contract) is { } wholeValue)
+            operand = wholeValue;
+        if (operand is TypeAnalysisContext && contract is { IsValueType: true }
+            && contract.FullName is not ("System.RuntimeTypeHandle" or "System.RuntimeMethodHandle" or "System.RuntimeFieldHandle"))
+        {
+            PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context);
+            return;
+        }
+        var emitted = operand is MemoryOperand memory
+            && TryRecoverLateFieldReference(memory, context, out var lateField)
+                ? lateField.Field.FieldType
+                : EmittedOperandType(operand, context, contract);
         if (operand is LocalVariable { IsThis: true }
             && contract is { IsValueType: true }
             && emitted is { IsValueType: false } and not PointerTypeAnalysisContext and not ByRefTypeAnalysisContext)
@@ -4435,6 +5512,44 @@ public static class IlGenerator
             return;
         }
         PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context);
+    }
+
+    private static FieldReference? NestedValueFieldForContract(FieldReference field,
+        TypeAnalysisContext? contract)
+    {
+        if (contract == null || !field.Field.FieldType.IsValueType)
+            return null;
+        var matches = InstanceFields(field.Field.FieldType)
+            .Where(candidate => !candidate.IsStatic
+                && ThisConstructorCallPlan.SameTypeIdentity(candidate.FieldType, contract))
+            .ToList();
+        if (matches.Count != 1)
+            return null;
+        var nested = matches[0];
+        return new FieldReference(nested, field.Local, field.Offset + nested.Offset,
+            field.Containers.Append(field.Field).ToArray(), field.AccessSize);
+    }
+
+    internal static IOperand RuntimeFieldHandleSource(IOperand operand, TypeAnalysisContext? contract,
+        MethodAnalysisContext context)
+    {
+        if (contract?.FullName != "System.RuntimeFieldHandle" || operand is not LocalVariable local)
+            return operand;
+
+        var visited = new HashSet<LocalVariable>();
+        while (visited.Add(local))
+        {
+            var definitions = context.ControlFlowGraph!.Instructions
+                .Where(instruction => ReferenceEquals(instruction.Destination, local)).ToList();
+            if (definitions is not [{ OpCode: OpCode.Move, Operands: [_, var source, ..] }])
+                break;
+            if (source is RuntimeFieldInfoAnalysisContext)
+                return source;
+            if (source is not LocalVariable alias)
+                break;
+            local = alias;
+        }
+        return operand;
     }
 
     // Coerces an already-emitted stack value into a slot contract. When no legal
@@ -4667,12 +5782,27 @@ public static class IlGenerator
     // verifier rejects, so every token-bearing op routes through here instead of
     // CanEmitTypeToken alone.
     private static bool TypeTokenUsableFrom(TypeAnalysisContext? type, MethodAnalysisContext? context) =>
-        CanEmitTypeToken(type)
+        type != null
+            && !ContainsSharedEnumMarker(type)
+            && CanEmitTypeToken(type)
             && (context?.DeclaringType == null
                 || (Analysis.InaccessibleCalleeRecovery.IsVisibleType(type, context.DeclaringType)
                     && DelegateArgumentsCallerOwned(type, context)));
 
+    private static bool CalleeUsesSharedEnumMarker(MethodAnalysisContext method) =>
+        method.DeclaringType != null && ContainsSharedEnumMarker(method.DeclaringType)
+        || ContainsSharedEnumMarker(method.ReturnType)
+        || method.Parameters.Any(parameter => ContainsSharedEnumMarker(parameter.ParameterType))
+        || method is ConcreteGenericMethodAnalysisContext generic
+            && (generic.TypeGenericParameters.Any(ContainsSharedEnumMarker)
+                || generic.MethodGenericParameters.Any(ContainsSharedEnumMarker));
+
+    private static bool CalleeUsableFrom(MethodAnalysisContext method, MethodAnalysisContext context) =>
+        !CalleeUsesSharedEnumMarker(method)
+        && Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(method, context);
+
     private sealed record FieldAddressArithmetic(IOperand Base, TypeAnalysisContext Owner, FieldAnalysisContext Field);
+    private sealed record NativeAddressRoot(IOperand Base, TypeAnalysisContext Owner, long Offset, bool IsStatic = false);
 
     // `&T`/`ref T` +|- a byte-offset literal is the address of the instance field at
     // that offset, not integer math. The base is whichever operand emits as a managed
@@ -4689,24 +5819,87 @@ public static class IlGenerator
             // `literal - pointer` has no meaning; only the pointer-on-the-left form.
             if (instruction.OpCode == OpCode.Subtract && i == 2)
                 continue;
-            var owner = EmittedOperandType(baseOperand, context) switch
-            {
-                ByRefTypeAnalysisContext byRef => byRef.ElementType,
-                PointerTypeAnalysisContext => null,
-                { IsValueType: false } reference => reference,
-                // ldarg.0 of a struct method's own `this` pushes &T even though the
-                // local is declared T, so the addend still reaches a field.
-                { IsValueType: true } valueType when baseOperand is LocalVariable { IsThis: true }
-                    => valueType,
-                _ => null
-            };
-            if (owner == null)
+            var root = TryResolveNativeAddressRoot(baseOperand, context, []);
+            if (root == null)
                 continue;
-            if (Analysis.MetadataResolver.FindInstanceFieldAtOffset(owner, offset.Value) is { } field
+            var totalOffset = root.Offset + (instruction.OpCode == OpCode.Subtract ? -offset.Value : offset.Value);
+            if (totalOffset < 0)
+                continue;
+            var field = root.IsStatic
+                ? Analysis.MetadataResolver.FindStaticFieldAtOffset(root.Owner, totalOffset)
+                : Analysis.MetadataResolver.FindInstanceFieldAtOffset(root.Owner, totalOffset);
+            if (field is not null
                 && CanEmitTypeToken(field.FieldType))
-                return new FieldAddressArithmetic(baseOperand, owner, field);
+                return new FieldAddressArithmetic(root.Base, root.Owner, field);
         }
         return null;
+    }
+
+    // Native code commonly keeps `this + A` in a register, then adds B before
+    // storing. The first add may already look like a managed field value, but the
+    // second still operates on its address. Flatten that unique add chain back to
+    // the managed root so A+B resolves to the actual field instead of `field + B`.
+    private static NativeAddressRoot? TryResolveNativeAddressRoot(IOperand operand,
+        MethodAnalysisContext context, HashSet<LocalVariable> visited)
+    {
+        var staticFieldsOffset = context.AppContext.Binary.is32Bit ? 0x5C : 0xB8;
+        if (operand is AddressOf { Target: FieldReference addressed }
+            && !addressed.Field.IsStatic
+            && EmittedOperandType(addressed.Local, context) is { IsValueType: false } rootOwner
+            // FieldReference.Offset is the original absolute native offset from
+            // the object, including any value-type container path.
+            && addressed.Offset >= 0)
+            return new NativeAddressRoot(addressed.Local, rootOwner, addressed.Offset);
+
+        if (operand is MemoryOperand
+            {
+                Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: var staticOwner } },
+                Index: null, Scale: 0, Addend: var staticOffset
+            } && staticOffset == staticFieldsOffset)
+            return new NativeAddressRoot(operand, staticOwner, 0, true);
+
+        if (operand is LocalVariable local && visited.Add(local))
+        {
+            Instruction? definition = null;
+            foreach (var candidate in context.ControlFlowGraph!.Instructions)
+            {
+                if (!ReferenceEquals(candidate.Destination, local))
+                    continue;
+                if (definition != null)
+                    return null;
+                definition = candidate;
+            }
+
+            if (definition is { OpCode: OpCode.Add or OpCode.Subtract, Operands.Count: >= 3 })
+            {
+                for (var i = 1; i <= 2; i++)
+                {
+                    if (definition.Operands[3 - i] is not Immediate { Value: >= 0 } displacement
+                        || definition.OpCode == OpCode.Subtract && i == 2)
+                        continue;
+                    var root = TryResolveNativeAddressRoot(definition.Operands[i], context, visited);
+                    if (root == null)
+                        continue;
+                    var offset = root.Offset
+                        + (definition.OpCode == OpCode.Subtract ? -displacement.Value : displacement.Value);
+                    return offset >= 0 ? root with { Offset = offset } : null;
+                }
+                return null;
+            }
+        }
+
+        var owner = EmittedOperandType(operand, context) switch
+        {
+            ByRefTypeAnalysisContext byRef => byRef.ElementType,
+            PointerTypeAnalysisContext => null,
+            { IsValueType: false } reference => reference,
+            // ldarg.0 of a struct method's own `this` pushes &T even though the
+            // local is declared T, so the addend still reaches a field.
+            { IsValueType: true } valueType when operand is LocalVariable { IsThis: true }
+                => valueType,
+            _ => null
+        };
+        return owner == null ? null : new NativeAddressRoot(operand, owner, 0);
     }
 
     // The shared operand type for a binary instruction: the widest non-literal
@@ -4716,6 +5909,7 @@ public static class IlGenerator
         bool allowDestination)
     {
         TypeAnalysisContext? picked = null;
+        TypeAnalysisContext? pickedFloat = null;
         var pickedWidth = 0;
         foreach (var operand in instruction.Operands.Skip(1))
         {
@@ -4723,9 +5917,17 @@ public static class IlGenerator
             // A managed pointer operand participates through its dereferenced
             // element (conv/binary ops reject `&`), so the element's width - not
             // the pointer kind - decides the shared numeric contract.
-            var width = IntegralStackWidth(emitted is ByRefTypeAnalysisContext byRefOperand
+            var stackType = emitted is ByRefTypeAnalysisContext byRefOperand
                 ? byRefOperand.ElementType
-                : emitted);
+                : emitted;
+            stackType = EnumStackType(stackType);
+            if (stackType?.FullName is "System.Single" or "System.Double")
+            {
+                if (pickedFloat == null || stackType.FullName == "System.Double")
+                    pickedFloat = stackType;
+                continue;
+            }
+            var width = IntegralStackWidth(stackType);
             if (width == 0)
                 continue;
             if (width < 0)
@@ -4735,15 +5937,17 @@ public static class IlGenerator
                 return context.AppContext.SystemTypes.SystemIntPtrType;
             if (width > pickedWidth)
             {
-                picked = EmittedOperandType(operand, context);
+                picked = stackType;
                 pickedWidth = width;
             }
         }
 
+        if (pickedFloat != null)
+            return pickedFloat;
         if (picked != null || !allowDestination)
             return picked;
 
-        var destination = EmittedOperandType(instruction.Operands[0], context);
+        var destination = EnumStackType(EmittedOperandType(instruction.Operands[0], context));
         if (IntegralStackWidth(destination) != 0)
             return destination;
 
@@ -4761,6 +5965,16 @@ public static class IlGenerator
                 }
             }
         return picked;
+    }
+
+    private static TypeAnalysisContext? EnumStackType(TypeAnalysisContext? type)
+    {
+        var genericDefinition = (type as GenericInstanceTypeAnalysisContext)?.GenericType;
+        if (type is not { IsEnumType: true } && genericDefinition is not { IsEnumType: true })
+            return type;
+        return type!.DefaultEnumUnderlyingType
+            ?? genericDefinition?.DefaultEnumUnderlyingType
+            ?? type.AppContext.SystemTypes.SystemInt32Type;
     }
 
     // The operation cannot be represented as legal IL (e.g. a bitwise op on a
@@ -4860,6 +6074,171 @@ public static class IlGenerator
         }
 
         return false;
+    }
+
+    private static bool TryEmitUnityVectorOperation(Instruction instruction, MethodAnalysisContext context,
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        if (instruction.OpCode is not (OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Negate))
+            return false;
+
+        var resultType = StoreContract(instruction.Operands[0], context);
+        if (!IsUnityVector(resultType) && instruction.Operands[0] is LocalVariable result)
+        {
+            var useTypes = context.ControlFlowGraph!.Instructions
+                .Where(use => use is { OpCode: OpCode.Move, Operands.Count: >= 2 }
+                    && ReferenceEquals(use.Operands[1], result))
+                .Select(use => DestinationType(use.Operands[0]))
+                .Where(IsUnityVector)
+                .DistinctBy(type => type!.FullName)
+                .ToList();
+            if (useTypes.Count == 1)
+                resultType = useTypes[0];
+        }
+        if (!IsUnityVector(resultType))
+            resultType = instruction.Operands.Skip(1)
+                .Select(operand => EmittedOperandType(operand, context))
+                .FirstOrDefault(IsUnityVector);
+        if (!IsUnityVector(resultType))
+            return false;
+
+        var operatorName = instruction.OpCode switch
+        {
+            OpCode.Add => "op_Addition",
+            OpCode.Subtract => "op_Subtraction",
+            OpCode.Multiply => "op_Multiply",
+            OpCode.Divide => "op_Division",
+            OpCode.Negate => "op_UnaryNegation",
+            _ => null,
+        };
+        var @operator = resultType!.Methods.FirstOrDefault(candidate => candidate is
+            { IsStatic: true }
+            && candidate.Name == operatorName
+            && ThisConstructorCallPlan.SameTypeIdentity(candidate.ReturnType, resultType)
+            && candidate.Parameters.Count == (instruction.OpCode == OpCode.Negate ? 1 : 2)
+            && CanLoadVectorOperand(instruction.Operands[1], candidate.Parameters[0].ParameterType, context)
+            && (instruction.OpCode == OpCode.Negate
+                || CanLoadVectorOperand(instruction.Operands[2], candidate.Parameters[1].ParameterType, context)));
+        if (@operator == null)
+            return false;
+
+        LoadVectorOperand(instruction.Operands[1], @operator.Parameters[0].ParameterType,
+            context, method, locals, writeLine);
+        if (instruction.OpCode != OpCode.Negate)
+            LoadVectorOperand(instruction.Operands[2], @operator.Parameters[1].ParameterType,
+                context, method, locals, writeLine);
+        method.CilMethodBody!.Instructions.Add(CilOpCodes.Call, @operator.ToMethodDescriptor());
+        StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
+        return true;
+    }
+
+    private static bool TryEmitUnityVectorMinMax(Instruction instruction, MethodAnalysisContext context,
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        var vector = StoreContract(instruction.Operands[0], context);
+        if (!IsUnityVector(vector))
+            vector = instruction.Operands.Skip(1)
+                .Select(operand => EmittedOperandType(operand, context))
+                .FirstOrDefault(IsUnityVector);
+        if (!IsUnityVector(vector))
+            return false;
+
+        LoadVectorOperand(instruction.Operands[1], vector!, context, method, locals, writeLine);
+        LoadVectorOperand(instruction.Operands[2], vector!, context, method, locals, writeLine);
+        var signature = vector!.ToTypeSignature();
+        var target = new MemberReference(signature.ToTypeDefOrRef(),
+            instruction.OpCode == OpCode.VectorMin ? "Min" : "Max",
+            MethodSignature.CreateStatic(signature, [signature, signature]));
+        method.CilMethodBody!.Instructions.Add(CilOpCodes.Call, target);
+        StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
+        return true;
+    }
+
+    private static bool TryEmitUnityQuaternionInternal(Instruction instruction, MethodAnalysisContext target,
+        MethodAnalysisContext context, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        if (instruction.OpCode != OpCode.Call || instruction.Operands.Count < 3 || !target.IsStatic
+            || target.Parameters.Count != 1 || target.DeclaringType?.DefaultFullName != "UnityEngine.Quaternion"
+            || target.Name is not ("Internal_FromEulerRad" or "Internal_ToEulerRad"))
+            return false;
+
+        var quaternion = target.DeclaringType;
+        var vector = target.Name == "Internal_FromEulerRad" ? target.Parameters[0].ParameterType : target.ReturnType;
+        var multiply = vector.Methods.FirstOrDefault(candidate => candidate is
+            { Name: "op_Multiply", IsStatic: true, Parameters.Count: 2 }
+            && ThisConstructorCallPlan.SameTypeIdentity(candidate.ReturnType, vector)
+            && ThisConstructorCallPlan.SameTypeIdentity(candidate.Parameters[0].ParameterType, vector)
+            && candidate.Parameters[1].ParameterType.DefaultFullName == "System.Single");
+        if (multiply == null)
+            return false;
+
+        var publicMethod = target.Name == "Internal_FromEulerRad"
+            ? quaternion.Methods.FirstOrDefault(candidate => candidate is
+                { Name: "Euler", IsStatic: true, Parameters.Count: 1 }
+                && ThisConstructorCallPlan.SameTypeIdentity(candidate.Parameters[0].ParameterType, vector))
+            : quaternion.Methods.FirstOrDefault(candidate => candidate is
+                { Name: "get_eulerAngles", IsStatic: false, Parameters.Count: 0 });
+        if (publicMethod == null)
+            return false;
+
+        LoadOperandIntoSlot(instruction.Operands[2], target.Parameters[0].ParameterType,
+            context, method, locals, writeLine);
+        if (target.Name == "Internal_FromEulerRad")
+        {
+            method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldc_R4, 57.29578f);
+            method.CilMethodBody.Instructions.Add(CilOpCodes.Call, multiply.ToMethodDescriptor());
+            method.CilMethodBody.Instructions.Add(CilOpCodes.Call, publicMethod.ToMethodDescriptor());
+        }
+        else
+        {
+            method.CilMethodBody!.Instructions.Add(CilOpCodes.Call, publicMethod.ToMethodDescriptor());
+            method.CilMethodBody.Instructions.Add(CilOpCodes.Ldc_R4, 0.017453292f);
+            method.CilMethodBody.Instructions.Add(CilOpCodes.Call, multiply.ToMethodDescriptor());
+        }
+
+        EmitStackCoerceOrDefault(target.ReturnType, StoreContract(instruction.Operands[1], context), method, context);
+        StoreToOperand(instruction.Operands[1], method, locals, writeLine, context);
+        return true;
+    }
+
+    private static bool IsUnityVector(TypeAnalysisContext? type) =>
+        type?.DefaultFullName is "UnityEngine.Vector2" or "UnityEngine.Vector3" or "UnityEngine.Vector4";
+
+    private static bool CanLoadVectorOperand(IOperand operand, TypeAnalysisContext parameter,
+        MethodAnalysisContext context)
+    {
+        if (operand is Vector128Literal)
+            return IsUnityVector(parameter);
+        var source = EmittedOperandType(operand, context, parameter);
+        return StackContractSatisfied(source, parameter, context)
+            || FindUnityVectorConversion(source, parameter) != null;
+    }
+
+    private static void LoadVectorOperand(IOperand operand, TypeAnalysisContext parameter,
+        MethodAnalysisContext context, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        var source = EmittedOperandType(operand, context, parameter);
+        if (FindUnityVectorConversion(source, parameter) is { } conversion)
+        {
+            LoadOperandIntoSlot(operand, source, context, method, locals, writeLine);
+            method.CilMethodBody!.Instructions.Add(CilOpCodes.Call, conversion.ToMethodDescriptor());
+            return;
+        }
+        LoadOperandIntoSlot(operand, parameter, context, method, locals, writeLine);
+    }
+
+    private static MethodAnalysisContext? FindUnityVectorConversion(TypeAnalysisContext? source,
+        TypeAnalysisContext target)
+    {
+        if (!IsUnityVector(source) || !IsUnityVector(target)
+            || ThisConstructorCallPlan.SameTypeIdentity(source, target))
+            return null;
+        return source!.Methods.Concat(target.Methods).FirstOrDefault(candidate => candidate is
+            { Name: "op_Implicit", IsStatic: true, Parameters.Count: 1 }
+            && ThisConstructorCallPlan.SameTypeIdentity(candidate.Parameters[0].ParameterType, source)
+            && ThisConstructorCallPlan.SameTypeIdentity(candidate.ReturnType, target));
     }
 
     private static bool IsSameStorage(IOperand left, IOperand right) => (left, right) switch
@@ -4969,6 +6348,55 @@ public static class IlGenerator
         (field is ConcreteGenericFieldAnalysisContext concrete ? concrete.BaseFieldContext : field)
             .GetExtraData<FieldDefinition>("AsmResolverField") != null;
 
+    internal static MethodAnalysisContext? BackingFieldConversion(FieldReference field,
+        MethodAnalysisContext context)
+    {
+        if (field.Field.IsStatic || field.Field.DeclaringType is not { IsValueType: true } owner)
+            return null;
+        var receiverType = field.Containers.Count == 0
+            ? EmittedLocalType(field.Local, context)
+            : field.Containers[^1].FieldType;
+        if (receiverType.FullName != owner.FullName)
+            return null;
+        return owner.Methods.FirstOrDefault(method => method.Name == "op_Implicit" && method.IsStatic
+            && method.Parameters.Count == 1
+            && method.Parameters[0].ParameterType.FullName == field.Field.FieldType.FullName
+            && method.ReturnType.FullName == owner.FullName
+            && (method.Attributes & MethodAttributes.MemberAccessMask) == MethodAttributes.Public);
+    }
+
+    internal static FieldReference? WholeValueContainerReference(FieldReference field,
+        TypeAnalysisContext? valueType)
+    {
+        if (valueType == null || field.Containers.Count == 0 || field.Field.Offset != 0)
+            return null;
+        for (var i = field.Containers.Count - 1; i >= 0; i--)
+        {
+            var container = field.Containers[i];
+            if (container.FieldType.FullName != valueType.FullName
+                || field.Containers.Skip(i + 1).Any(inner => inner.Offset != 0))
+                continue;
+            return new FieldReference(container, field.Local, container.Offset,
+                field.Containers.Take(i).ToArray());
+        }
+        return null;
+    }
+
+    internal static bool RuntimeFieldTokenUsableFrom(FieldAnalysisContext field,
+        MethodAnalysisContext context)
+    {
+        if (!CanEmitFieldToken(field))
+            return false;
+        if (FieldUsableFrom(field, context))
+            return true;
+        if ((field.Attributes & FieldAttributes.FieldAccessMask) != FieldAttributes.Assembly
+            || field.DeclaringType?.DeclaringAssembly is not { } declaringAssembly
+            || context.DeclaringType?.DeclaringAssembly is not { } callerAssembly)
+            return false;
+        return ReferenceEquals(declaringAssembly, callerAssembly)
+            || declaringAssembly.Name != null && declaringAssembly.Name == callerAssembly.Name;
+    }
+
     // ldfld/ldflda need the field visible from the emitting method; writing or
     // taking the address additionally requires that initonly fields only be
     // touched from the declaring type's own constructor.
@@ -4983,6 +6411,19 @@ public static class IlGenerator
     private static TypeAnalysisContext? GenericDefinition(TypeAnalysisContext? type)
         => type is GenericInstanceTypeAnalysisContext instance ? instance.GenericType : type;
 
+    internal static GenericInstanceTypeAnalysisContext? GenericFieldOwnerInstance(
+        TypeAnalysisContext owner, FieldAnalysisContext field)
+    {
+        var declaring = GenericDefinition(field.DeclaringType);
+        for (TypeAnalysisContext? current = owner; current != null;
+             current = current.BaseType ?? (current as GenericInstanceTypeAnalysisContext)?.GenericType.BaseType)
+            if (current is GenericInstanceTypeAnalysisContext instance
+                && declaring != null
+                && ThisConstructorCallPlan.SameTypeIdentity(declaring, instance.GenericType))
+                return instance;
+        return null;
+    }
+
     // A field reference declared on a generic definition must be emitted on the
     // receiver's own instantiation: `ldfld !0 C`1::f` expects a `ref C`1` (the
     // unbound definition), which no stack value can be, while `C`1<!0>::f` is the
@@ -4990,8 +6431,18 @@ public static class IlGenerator
     private static IFieldDescriptor FieldDescriptorFor(FieldAnalysisContext field,
         TypeAnalysisContext? receiverType)
     {
-        if (field is ConcreteGenericFieldAnalysisContext)
+        if (field is ConcreteGenericFieldAnalysisContext concrete)
+        {
+            // Metadata recovery can accidentally carry an outer generic owner's
+            // instantiation onto an inner value-type field (for example
+            // ValueTuple<Vector3,...>::Item1.y). The field still belongs to Vector3;
+            // emitting it on ValueTuple produces a non-existent member reference.
+            if (GenericDefinition(concrete.BaseFieldContext.DeclaringType) is { } baseDeclaring
+                && GenericDefinition(concrete.DeclaringType) is { } concreteDeclaring
+                && !ThisConstructorCallPlan.SameTypeIdentity(baseDeclaring, concreteDeclaring))
+                return FieldDescriptorFor(concrete.BaseFieldContext, receiverType);
             return field.ToFieldDescriptor();
+        }
         var receiverInstance = receiverType switch
         {
             GenericInstanceTypeAnalysisContext instance => instance,
@@ -5105,7 +6556,6 @@ public static class IlGenerator
         var declaring = field.DeclaringType;
         if (declaring == null || callerType == null)
             return true;
-
         // Member references keep declared accessibility everywhere: the field's own
         // signature type, the declaring type it names, and - when the reference is
         // emitted on the receiver's instantiation - the receiver's type arguments.
@@ -5114,8 +6564,18 @@ public static class IlGenerator
             || receiverType != null
                 && !Analysis.InaccessibleCalleeRecovery.IsVisibleType(receiverType, callerType))
             return false;
-        // A field on the generic definition is still the same member when reached
-        // through an instantiation, so identity compares the definitions.
+        // A direct native access proves that an inlined managed member reached a
+        // same-assembly field. ToFieldDescriptor widens exactly that copied
+        // definition, so private storage remains faithfully usable. Dependency
+        // assemblies (UnityEngine/mscorlib) are not replaced in the recovered
+        // project and therefore keep their real accessibility.
+        var callerAssembly = callerType.DeclaringAssembly;
+        var declaringAssembly = declaring.DeclaringAssembly;
+        if (callerAssembly != null && declaringAssembly != null
+            && (ReferenceEquals(callerAssembly, declaringAssembly)
+                || callerAssembly.Name != null && callerAssembly.Name == declaringAssembly.Name))
+            return true;
+
         if (declaring is GenericInstanceTypeAnalysisContext declaringInstance)
             declaring = declaringInstance.GenericType;
         if (callerType is GenericInstanceTypeAnalysisContext callerInstance)
@@ -5201,12 +6661,17 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldsflda, staticField.Field.ToFieldDescriptor());
                 return true;
             case FieldReference field:
-                if (!FieldUsableFrom(field.Field, context, writeAccess: true,
-                        receiverType: EmittedOperandType(field.Local, context))
-                    || !EmitManagedAddress(field.Local, method, context, locals, writeLine))
+                if (!FieldReferenceUsableFrom(field, context, writeAccess: true))
                     return false;
+                if (field.Containers.Count == 0)
+                {
+                    if (!EmitManagedAddress(field.Local, method, context, locals, writeLine))
+                        return false;
+                }
+                else
+                    LoadFieldReceiver(field, context, method, locals, writeLine);
                 instructions.Add(CilOpCodes.Ldflda,
-                    FieldDescriptorFor(field.Field, EmittedOperandType(field.Local, context)));
+                    FieldDescriptorFor(field.Field, FieldReceiverType(field, context)));
                 return true;
             case ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } access:
                 if (!TypeTokenUsableFrom(array.ElementType, context))
@@ -5237,14 +6702,30 @@ public static class IlGenerator
     // is the parameter's register local loads through ldarg; anything else is ldloc.
     private static AsmResolver.DotNet.Collections.Parameter? ParameterForLocal(LocalVariable local, MethodDefinition method, MethodAnalysisContext context)
     {
-        if (!context.ParameterLocals.Contains(local))
-            return null;
-        return context.Parameters.FirstOrDefault(p => p.ParameterName == local.Name) is { } analysisParameter
-            ? method.Parameters.FirstOrDefault(p => p.Name == analysisParameter.ParameterName)
-            // Injected and partially-resolved contexts may not carry parameter
-            // names; the local is still the argument's register local, so fall
-            // back to the declared parameter name.
-            : method.Parameters.FirstOrDefault(p => p.Name == local.Name);
+        if (context.ParameterLocals.Contains(local))
+            return context.Parameters.FirstOrDefault(p => p.ParameterName == local.Name) is { } analysisParameter
+                ? method.Parameters.FirstOrDefault(p => p.Name == analysisParameter.ParameterName)
+                : method.Parameters.FirstOrDefault(p => p.Name == local.Name);
+
+        // Copy propagation can erase `MOV XcalleeSaved, Xarg` and leave only a
+        // later argument-register SSA local. If that local has no definition and
+        // exactly one declared parameter has its type, the parameter is its only
+        // possible managed value.
+        if (local is { IsThis: false, IsReturn: false, IsMethodInfo: false, Type: { } localType }
+            && context.ControlFlowGraph?.Instructions.All(instruction =>
+                !ReferenceEquals(instruction.Destination, local)) == true)
+        {
+            var matches = context.Parameters.Where(parameter =>
+                ThisConstructorCallPlan.SameTypeIdentity(parameter.ParameterType, localType)
+                || (ContainsErasedSharedArgument(parameter.ParameterType)
+                    || ContainsErasedSharedArgument(localType))
+                && ThisConstructorCallPlan.SameTypeIdentity(GenericDefinition(parameter.ParameterType),
+                    GenericDefinition(localType))).ToList();
+            if (matches.Count == 1)
+                return method.Parameters.FirstOrDefault(p => p.Name == matches[0].ParameterName);
+        }
+
+        return null;
     }
 
     private static void LoadLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals,
@@ -5279,8 +6760,7 @@ public static class IlGenerator
                 break;
 
             case FieldReference field:
-                if (!FieldUsableFrom(field.Field, context, writeAccess: true,
-                        receiverType: field.Field.IsStatic ? null : EmittedOperandType(field.Local, context)))
+                if (!FieldReferenceUsableFrom(field, context, writeAccess: true))
                 {
                     // The value is already on the stack; the field cannot legally
                     // be referenced here, so fail honestly.
@@ -5290,7 +6770,7 @@ public static class IlGenerator
                 }
                 var fieldDescriptor = field.Field.IsStatic
                     ? field.Field.ToFieldDescriptor()
-                    : FieldDescriptorFor(field.Field, EmittedOperandType(field.Local, context));
+                    : FieldDescriptorFor(field.Field, FieldReceiverType(field, context));
 
                 if (field.Field.IsStatic)
                 {
@@ -5310,13 +6790,12 @@ public static class IlGenerator
                 // Same rule as the MoveAssign stfld path: an initonly store inside the
                 // field's own .ctor only verifies through `this`, which is the receiver
                 // valid managed source could only have used.
-                if (RequiresThisPointerReceiver(field.Field, context)
+                if (field.Containers.Count == 0 && RequiresThisPointerReceiver(field.Field, context)
                     && (field.Local is null or LocalVariable
                         || ThisAliasLocals(context).Contains(field.Local)))
                     instructions.Add(CilOpCodes.Ldarg_0);
                 else
-                    LoadOperandIntoSlot(field.Local, FieldBaseContract(field.Field), context,
-                        method, locals, writeLine);
+                    LoadFieldReceiver(field, context, method, locals, writeLine);
                 instructions.Add(CilOpCodes.Ldloc, scratch);
                 instructions.Add(CilOpCodes.Stfld, fieldDescriptor);
                 break;

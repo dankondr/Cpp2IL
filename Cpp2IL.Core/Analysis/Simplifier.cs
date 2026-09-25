@@ -100,6 +100,14 @@ public static class Simplifier
                         if (instruction.Operands[1] is FieldReference field
                             && MustPreserveFieldSnapshot(block, i + 1, local, field.Local))
                             continue;
+                        if (instruction.Operands[1] is SelectedFieldReference selected)
+                        {
+                            var preserve = false;
+                            foreach (var choice in selected.Choices)
+                                preserve |= MustPreserveFieldSnapshot(block, i + 1, local, choice.Field.Local);
+                            if (preserve)
+                                continue;
+                        }
 
                         if (IsLocalUsedAfterInstruction(block, i + 1, local, out var usedByMemory))
                         {
@@ -309,6 +317,14 @@ public static class Simplifier
                         {
                             field.Local = fieldReplacement;
                         }
+                        else if (operand is SelectedFieldReference selected && replacement is LocalVariable selectedReplacement)
+                        {
+                            if (selected.Selector == local)
+                                selected.Selector = selectedReplacement;
+                            foreach (var choice in selected.Choices)
+                                if (choice.Field.Local == local)
+                                    choice.Field.Local = selectedReplacement;
+                        }
                     }
                 }
 
@@ -361,6 +377,13 @@ public static class Simplifier
                     foreach (var operand in instruction.Operands)
                     {
                         if (operand is FieldReference field && field.Local == local)
+                        {
+                            usedByMemory = true;
+                            return true;
+                        }
+
+                        if (operand is SelectedFieldReference selected
+                            && (selected.Selector == local || selected.Choices.Any(c => c.Field.Local == local)))
                         {
                             usedByMemory = true;
                             return true;

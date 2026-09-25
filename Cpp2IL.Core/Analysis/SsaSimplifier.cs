@@ -97,6 +97,13 @@ public static class SsaSimplifier
                 case FieldReference { Local: { } fieldLocal } field when resolved.TryGetValue(fieldLocal, out var fieldValue) && fieldValue is LocalVariable fieldReplacement:
                     field.Local = fieldReplacement;
                     break;
+                case SelectedFieldReference selected:
+                    if (resolved.TryGetValue(selected.Selector, out var selectorValue) && selectorValue is LocalVariable selectorReplacement)
+                        selected.Selector = selectorReplacement;
+                    foreach (var choice in selected.Choices)
+                        if (resolved.TryGetValue(choice.Field.Local, out var receiverValue) && receiverValue is LocalVariable receiverReplacement)
+                            choice.Field.Local = receiverReplacement;
+                    break;
             }
         }
     }
@@ -119,6 +126,9 @@ public static class SsaSimplifier
                         case LocalVariable local when !ReferenceEquals(local, destination):
                             reads.Add(local);
                             break;
+                        case AddressOf { Target: LocalVariable addressed }:
+                            reads.Add(addressed);
+                            break;
                         case MemoryOperand memory:
                             if (memory.Base is LocalVariable baseLocal)
                                 reads.Add(baseLocal);
@@ -127,6 +137,11 @@ public static class SsaSimplifier
                             break;
                         case FieldReference field when field.Local is { } fieldLocal:
                             reads.Add(fieldLocal);
+                            break;
+                        case SelectedFieldReference selected:
+                            reads.Add(selected.Selector);
+                            foreach (var choice in selected.Choices)
+                                reads.Add(choice.Field.Local);
                             break;
                     }
                 }
@@ -143,6 +158,7 @@ public static class SsaSimplifier
             LocalVariable => true,
             MemoryOperand => false,
             FieldReference => false,
+            SelectedFieldReference => false,
             _ => true
         };
 }

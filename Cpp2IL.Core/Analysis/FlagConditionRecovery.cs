@@ -34,10 +34,13 @@ public static class FlagConditionRecovery
         {
             foreach (var instruction in block.Instructions)
             {
-                if (instruction.OpCode != OpCode.ConditionalJump)
-                    continue;
-
-                if (instruction.Operands[1] is not LocalVariable condition)
+                var condition = instruction switch
+                {
+                    { OpCode: OpCode.ConditionalJump, Operands: [_, LocalVariable branchCondition] } => branchCondition,
+                    { OpCode: OpCode.Move, Operands: [_, LocalVariable movedCondition] } => movedCondition,
+                    _ => null
+                };
+                if (condition == null)
                     continue;
 
                 if (!TryClassify(condition, defOf, out var relop, out var op0, out var op1))
@@ -85,6 +88,10 @@ public static class FlagConditionRecovery
                 if (IsZeroFlag(inner, defOf, out op0, out op1)) { relop = OpCode.CheckNotEqual; return true; }          // !ZF        => !=  (jne)
                 if (IsSignFlag(inner, defOf, out op0, out op1)) { relop = OpCode.CheckGreaterOrEqual; return true; }    // !SF        => >=  (jns)
                 if (IsSignEqualsOverflow(inner, defOf, out op0, out op1)) { relop = OpCode.CheckLess; return true; }    // !(SF==OF)  => <   (jl/jb)
+                if (Def(inner, defOf) is { OpCode: OpCode.And } greater
+                    && IsSignGreater(greater, defOf, out op0, out op1)) { relop = OpCode.CheckLessOrEqual; return true; }
+                if (Def(inner, defOf) is { OpCode: OpCode.Or } lessOrEqual
+                    && IsSignLessOrEqual(lessOrEqual, defOf, out op0, out op1)) { relop = OpCode.CheckGreater; return true; }
                 return false;
 
             case OpCode.CheckEqual:

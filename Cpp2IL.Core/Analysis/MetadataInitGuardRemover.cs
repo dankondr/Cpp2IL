@@ -90,13 +90,82 @@ public static class MetadataInitGuardRemover
     {
         var removedAny = false;
 
-        foreach (var guard in cfg.Blocks.ToList())
-            removedAny |= TryRemoveGuard(cfg, guard, initialisedFlagOffset);
+        // Nested metadata guards are common in constructors. Removing an inner guard can make its
+        // outer guard a pure init region, so keep scanning until a pass no longer changes the CFG.
+        bool removedInPass;
+        do
+        {
+            removedInPass = false;
+            foreach (var guard in cfg.Blocks.ToList())
+            {
+                if (!cfg.Blocks.Contains(guard))
+                    continue;
+                removedInPass |= TryRemoveGuard(cfg, guard, initialisedFlagOffset);
+            }
 
+            removedAny |= removedInPass;
+        } while (removedInPass);
+
+        removedAny |= FoldKnownMetadataFlags(cfg);
         removedAny |= RemoveBareClassInitCalls(cfg);
 
         if (removedAny)
             DeadCodeEliminator.Run(cfg);
+    }
+
+    private static bool FoldKnownMetadataFlags(ISILControlFlowGraph cfg)
+    {
+        if (!cfg.Instructions.Any(instruction => instruction.IsCall
+                && instruction.Operands is [StringLiteral { Value: InitializeRuntimeMetadata or InitializeMethod }, ..]))
+            return false;
+
+        var comparedAddresses = cfg.Instructions
+            .Where(instruction => instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual)
+            .SelectMany(instruction => new[]
+            {
+                IsZero(instruction.Operands[2]) ? GetLoadedMemory(cfg, instruction.Operands[1]) : null,
+                IsZero(instruction.Operands[1]) ? GetLoadedMemory(cfg, instruction.Operands[2]) : null,
+            })
+            .Where(memory => memory is { IsConstant: true })
+            .Select(memory => ConstantMemoryAddress(cfg, memory!.Value))
+            .OfType<long>()
+            .ToHashSet();
+        var flags = cfg.Instructions
+            .Where(instruction => instruction.OpCode == OpCode.Move
+                && instruction.Operands is [MemoryOperand destination, var value]
+                && IsKnownOne(cfg, value))
+            .Select(instruction => ConstantMemoryAddress(cfg, (MemoryOperand)instruction.Operands[0]))
+            .OfType<long>()
+            .Where(comparedAddresses.Contains)
+            .ToHashSet();
+        if (flags.Count == 0)
+            return false;
+
+        var changed = false;
+        foreach (var instruction in cfg.Instructions)
+        {
+            if (instruction.OpCode == OpCode.Move
+                && instruction.Operands is [MemoryOperand destination, var value]
+                && ConstantMemoryAddress(cfg, destination) is { } storedAddress
+                && flags.Contains(storedAddress) && IsKnownOne(cfg, value))
+            {
+                instruction.OpCode = OpCode.Nop;
+                instruction.SetOperands();
+                changed = true;
+                continue;
+            }
+
+            for (var i = 1; i < instruction.Operands.Count; i++)
+                if (instruction.Operands[i] is MemoryOperand memory
+                    && ConstantMemoryAddress(cfg, memory) is { } loadedAddress
+                    && flags.Contains(loadedAddress))
+                {
+                    instruction.SetOperand(i, new Immediate(1));
+                    changed = true;
+                }
+        }
+
+        return changed;
     }
 
     // wasm keeps the initialized-flag check inside the class-init function, so callers make bare unguarded
@@ -130,26 +199,190 @@ public static class MetadataInitGuardRemover
 
         // see if we're checking Il2CppClass::initialized_and_no_error
         // that means this is runtime_init boilerplate and we can drop the block
-        var initialisedFlagTest = guard.Instructions.Any(i => i.OpCode == OpCode.And
-            && i.Operands is [_, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable } flag, { } mask]
-            && flag.Addend == initialisedFlagOffset && IsOne(mask));
+        var initialisedFlagTest = guard.Instructions.Any(i =>
+            IsInitialisedFlagTest(cfg, i, initialisedFlagOffset));
 
         // Either successor could be the init entry; the other is then the merge.
         var first = guard.Successors[0];
         var second = guard.Successors[1];
+        var metadataFlag = GetComparedMemory(guard);
 
-        return TryExcise(cfg, guard, first, second, initialisedFlagTest)
-            || TryExcise(cfg, guard, second, first, initialisedFlagTest);
+        return TryExcise(cfg, guard, first, second, initialisedFlagTest, metadataFlag)
+            || TryExcise(cfg, guard, second, first, initialisedFlagTest, metadataFlag)
+            || TryExciseThroughSibling(cfg, guard, first, second, initialisedFlagTest, metadataFlag)
+            || TryExciseThroughSibling(cfg, guard, second, first, initialisedFlagTest, metadataFlag)
+            || TryFoldMetadataFlag(cfg, guard, metadataFlag);
+    }
+
+    // Some value-producing guards repeat a real field assignment in both arms, so excising the init
+    // arm is deliberately rejected above. In recovered managed code metadata is already materialized;
+    // fold only absolute one-byte flags that this method also sets after a metadata-init call.
+    private static bool TryFoldMetadataFlag(ISILControlFlowGraph cfg, Block guard, MemoryOperand? metadataFlag)
+    {
+        if (metadataFlag is not { IsConstant: true } flag
+            || ConstantMemoryAddress(cfg, flag) is not { } flagAddress
+            || !cfg.Instructions.Any(i => i.IsCall
+                && i.Operands is [StringLiteral { Value: InitializeRuntimeMetadata or InitializeMethod }, ..])
+            || !cfg.Instructions.Any(i => i.OpCode == OpCode.Move
+                && i.Operands is [MemoryOperand destination, var value]
+                && ConstantMemoryAddress(cfg, destination) == flagAddress && IsKnownOne(cfg, value)))
+            return false;
+
+        var changed = false;
+        // The load feeding the guard is often in its predecessor after block splitting. Rewrite the
+        // matching flag everywhere before deleting its initializing store, otherwise a later pass
+        // is left with a read of unmanaged process memory and no proof that it is metadata state.
+        foreach (var instruction in cfg.Instructions)
+        {
+            for (var i = 1; i < instruction.Operands.Count; i++)
+            {
+                if (instruction.Operands[i] is not MemoryOperand memory
+                    || ConstantMemoryAddress(cfg, memory) != flagAddress)
+                    continue;
+                instruction.SetOperand(i, new Immediate(1));
+                changed = true;
+                }
+        }
+
+        if (!changed)
+            return false;
+
+        foreach (var store in cfg.Instructions.Where(i => i.OpCode == OpCode.Move
+                     && i.Operands is [MemoryOperand destination, var value]
+                     && ConstantMemoryAddress(cfg, destination) == flagAddress && IsKnownOne(cfg, value)))
+        {
+            store.OpCode = OpCode.Nop;
+            store.SetOperands();
+        }
+
+        return changed;
+    }
+
+    private static long? ConstantMemoryAddress(ISILControlFlowGraph cfg, MemoryOperand memory)
+    {
+        if (memory.Index != null || memory.Scale != 0)
+            return null;
+        if (memory.Base == null)
+            return memory.Addend;
+        if (memory.Base is not LocalVariable local)
+            return null;
+
+        var definitions = cfg.Instructions.Where(instruction => ReferenceEquals(instruction.Destination, local))
+            .Select(instruction => instruction.Operands is [_, Immediate immediate] ? (long?)immediate.Value : null)
+            .Distinct()
+            .ToArray();
+        return definitions is [long baseAddress] ? baseAddress + memory.Addend : null;
+    }
+
+    private static bool IsKnownOne(ISILControlFlowGraph cfg, IOperand operand) =>
+        IsOne(operand) || operand is LocalVariable local && cfg.Instructions.Any(i =>
+            i.OpCode == OpCode.Move && ReferenceEquals(i.Destination, local)
+                                     && i.Operands is [_, Immediate { Value: 1 }]);
+
+    private static bool TryExciseThroughSibling(ISILControlFlowGraph cfg, Block guard, Block initEntry,
+        Block retainedEntry, bool initialisedFlagTest, MemoryOperand? metadataFlag)
+    {
+        if (retainedEntry.Successors.Count != 1)
+            return false;
+
+        var merge = retainedEntry.Successors[0];
+        if (merge == cfg.EntryBlock || merge == cfg.ExitBlock
+            || !TryCollectRegion(cfg, guard, initEntry, merge, initialisedFlagTest, out var region, metadataFlag))
+            return false;
+
+        Excise(cfg, guard, initEntry, merge, region, retainedEntry);
+        return true;
+    }
+
+    private static MemoryOperand? GetComparedMemory(Block guard)
+    {
+        foreach (var comparison in guard.Instructions.Where(i => i.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual))
+        {
+            for (var i = 1; i <= 2; i++)
+            {
+                if (!IsZero(comparison.Operands[3 - i]))
+                    continue;
+                if (GetLoadedMemory(guard, comparison.Operands[i]) is { } memory)
+                    return memory;
+            }
+        }
+
+        foreach (var mask in guard.Instructions.Where(i => i.OpCode == OpCode.And))
+        {
+            if (mask.Operands is [_, var value, Immediate { Value: 1 }]
+                && GetLoadedMemory(guard, value) is { } memory)
+                return memory;
+            if (mask.Operands is [_, Immediate { Value: 1 }, var reversedValue]
+                && GetLoadedMemory(guard, reversedValue) is { } reversedMemory)
+                return reversedMemory;
+        }
+
+        return null;
+    }
+
+    private static MemoryOperand? GetLoadedMemory(Block guard, IOperand operand)
+    {
+        if (operand is MemoryOperand memory)
+            return memory;
+        if (operand is not LocalVariable local)
+            return null;
+
+        var load = guard.Instructions.LastOrDefault(candidate =>
+            candidate.OpCode == OpCode.Move && ReferenceEquals(candidate.Destination, local));
+        return load?.Operands[1] is MemoryOperand loadedMemory ? loadedMemory : null;
+    }
+
+    private static MemoryOperand? GetLoadedMemory(ISILControlFlowGraph cfg, IOperand operand)
+    {
+        if (operand is MemoryOperand memory)
+            return memory;
+        if (operand is not LocalVariable local)
+            return null;
+
+        return cfg.Instructions.LastOrDefault(candidate => candidate.OpCode == OpCode.Move
+            && ReferenceEquals(candidate.Destination, local))?.Operands[1] is MemoryOperand loaded ? loaded : null;
     }
 
     private static bool IsOne(IOperand operand) => operand is Immediate { Value: 1 };
 
-    private static bool TryExcise(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge, bool initialisedFlagTest)
+    internal static bool IsInitialisedFlagTest(ISILControlFlowGraph cfg, Instruction instruction,
+        long initialisedFlagOffset)
+    {
+        if (instruction.OpCode != OpCode.And || instruction.Operands is not [_, var flag, var mask]
+            || !IsOne(mask))
+            return false;
+
+        if (flag is MemoryOperand { Index: null, Scale: 0, Base: LocalVariable directAddress } direct)
+            return direct.Addend == initialisedFlagOffset
+                || direct.Addend == 0 && IsClassFlagAddress(cfg, directAddress, initialisedFlagOffset);
+
+        if (flag is not LocalVariable flagLocal)
+            return false;
+        var load = cfg.Instructions.FirstOrDefault(candidate =>
+            candidate.OpCode == OpCode.Move
+            && ReferenceEquals(candidate.Destination, flagLocal)
+            && candidate.Operands is [_, MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable }]);
+        if (load?.Operands[1] is not MemoryOperand { Base: LocalVariable address })
+            return false;
+
+        return IsClassFlagAddress(cfg, address, initialisedFlagOffset);
+    }
+
+    private static bool IsClassFlagAddress(ISILControlFlowGraph cfg, LocalVariable address,
+        long initialisedFlagOffset) =>
+        cfg.Instructions.Any(candidate =>
+            candidate.OpCode == OpCode.Add
+            && ReferenceEquals(candidate.Destination, address)
+            && candidate.Operands.Skip(1).Any(operand => operand is Immediate { Value: var value }
+                && value == initialisedFlagOffset));
+
+    private static bool TryExcise(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge,
+        bool initialisedFlagTest, MemoryOperand? metadataFlag = null)
     {
         if (merge == cfg.EntryBlock || merge == cfg.ExitBlock)
             return false;
 
-        if (!TryCollectRegion(cfg, guard, initEntry, merge, initialisedFlagTest, out var region))
+        if (!TryCollectRegion(cfg, guard, initEntry, merge, initialisedFlagTest, out var region, metadataFlag))
             return false;
 
         Excise(cfg, guard, initEntry, merge, region);
@@ -157,7 +390,7 @@ public static class MetadataInitGuardRemover
     }
 
     private static bool TryCollectRegion(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge,
-        bool initialisedFlagTest, out HashSet<Block> region)
+        bool initialisedFlagTest, out HashSet<Block> region, MemoryOperand? metadataFlag = null)
     {
         region = [];
 
@@ -189,7 +422,8 @@ public static class MetadataInitGuardRemover
             if (!region.Add(block))
                 continue;
 
-            if (!ClassifyBlock(block, initialisedFlagTest, ref sawMetadataInit, ref sawClassInit, ref sawFlagStore))
+            if (!ClassifyBlock(block, initialisedFlagTest, metadataFlag,
+                    ref sawMetadataInit, ref sawClassInit, ref sawFlagStore))
                 return false;
 
             foreach (var successor in block.Successors)
@@ -214,7 +448,8 @@ public static class MetadataInitGuardRemover
     // A region block is acceptable only if every instruction is intra-region control flow, an init
     // call, the flag store, or otherwise side-effect-free (writes a local, not memory). A managed call
     // or any other store would have an effect we cannot silently drop, so it disqualifies the region.
-    private static bool ClassifyBlock(Block block, bool initialisedFlagTest, ref bool sawMetadataInit, ref bool sawClassInit, ref bool sawFlagStore)
+    private static bool ClassifyBlock(Block block, bool initialisedFlagTest, MemoryOperand? metadataFlag,
+        ref bool sawMetadataInit, ref bool sawClassInit, ref bool sawFlagStore)
     {
         foreach (var instruction in block.Instructions)
         {
@@ -242,7 +477,8 @@ public static class MetadataInitGuardRemover
 
                     break;
 
-                case OpCode.Move when instruction.Operands is [MemoryOperand { IsConstant: true }, _]:
+                case OpCode.Move when instruction.Operands is [MemoryOperand destination, _]
+                                          && metadataFlag is { } flag && destination.Equals(flag):
                     sawFlagStore = true;
                     break;
 
@@ -271,7 +507,8 @@ public static class MetadataInitGuardRemover
             _ => false,
         };
 
-    internal static void Excise(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge, HashSet<Block> region)
+    internal static void Excise(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge,
+        HashSet<Block> region, Block? retainedEntry = null)
     {
         // 1. Repair the merge's phis: drop the inputs from the region's back-edges.
         for (var i = merge.Predecessors.Count - 1; i >= 0; i--)
@@ -292,7 +529,7 @@ public static class MetadataInitGuardRemover
 
         var terminator = guard.Instructions[^1];
         terminator.OpCode = OpCode.Jump;
-        terminator.SetOperands(merge);
+        terminator.SetOperands(retainedEntry ?? merge);
         guard.CalculateBlockType();
 
         // 3. Delete the region. 

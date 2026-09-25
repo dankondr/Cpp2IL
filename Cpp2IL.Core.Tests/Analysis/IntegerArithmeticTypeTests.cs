@@ -152,6 +152,27 @@ public class IntegerArithmeticTypeTests
         });
     }
 
+    [Test]
+    public void LateArithmeticRecoveryPreservesInt32LoopCounter()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, []);
+        var counter = new LocalVariable("counter", new Register(null, "counter"))
+            { Type = app.SystemTypes.SystemInt32Type };
+        var next = new LocalVariable("next", new Register(null, "next"));
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Add, next, counter, new Immediate(1)),
+            new(1, OpCode.CheckNotEqual, new LocalVariable("flag", new Register(null, "flag")), next, new Immediate(8)),
+            new(2, OpCode.Return)]);
+        method.Locals = [counter, next];
+        method.ParameterLocals = [];
+
+        LocalVariables.ResolveLateGeneratedTypes(method);
+
+        Assert.That(next.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+    }
+
     [TestCase(OpCode.Add)]
     [TestCase(OpCode.Subtract)]
     [TestCase(OpCode.Multiply)]

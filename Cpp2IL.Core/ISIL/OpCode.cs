@@ -89,6 +89,12 @@ public enum OpCode
     /// <summary>Negates op 2, moves the result into op 1</summary>
     Negate,
 
+    /// <summary>Component-wise minimum of two Unity vectors.</summary>
+    VectorMin,
+
+    /// <summary>Component-wise maximum of two Unity vectors.</summary>
+    VectorMax,
+
     /// <summary>Moves 1 into op 1, if op 2 and op 3 are equal</summary>
     CheckEqual,
 

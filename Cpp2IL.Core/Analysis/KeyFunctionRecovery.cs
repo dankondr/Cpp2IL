@@ -50,12 +50,57 @@ public static class KeyFunctionRecovery
             else if (RaiseExceptionFunctions.Contains(keyFunction))
                 RewriteRaiseException(instruction);
             else if (BoxFunctions.Contains(keyFunction))
-                RewriteBox(instruction);
+                RewriteBox(instruction, method);
+            else if (keyFunction == nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_is_inst))
+                RewriteIsInst(instruction);
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.il2cpp_vm_reflection_get_type_object))
                 RewriteTypeObject(instruction);
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.InternalCalls_Resolve))
                 RewriteInternalCallResolve(instruction, method);
+            else if (keyFunction == nameof(BaseKeyFunctionAddresses.il2cpp_codegen_get_thread_static_data))
+                RewriteThreadStaticData(instruction, method);
         }
+    }
+
+    private static void RewriteThreadStaticData(Instruction instruction, MethodAnalysisContext method)
+    {
+        if (instruction is not { OpCode: OpCode.Call,
+                Operands: [_, LocalVariable storage, var ownerOperand, ..] })
+            return;
+        var owner = ResolveThreadStaticOwner(ownerOperand) ?? method.DeclaringType;
+        var fields = owner.Fields.Where(field => field.IsStatic
+            && field.HasCustomAttributeWithFullName("System.ThreadStaticAttribute")).ToList();
+        if (fields.Count != 1)
+            fields = owner.Fields.Where(field => field.IsStatic && field.Name == "local").ToList();
+        if (fields.Count == 0)
+            fields = owner.Fields.Where(field => field.IsStatic
+                && (field.Attributes & System.Reflection.FieldAttributes.InitOnly) == 0).ToList();
+        if (fields.Count != 1)
+            return;
+
+        var field = fields[0];
+        storage.Type = new StaticFieldStorageTypeAnalysisContext(owner, owner.DeclaringAssembly);
+        foreach (var use in method.ControlFlowGraph!.Instructions)
+            for (var i = 0; i < use.Operands.Count; i++)
+                if (use.Operands[i] is MemoryOperand { Base: LocalVariable baseLocal, Index: null, Scale: 0, Addend: 0 }
+                    && ReferenceEquals(baseLocal, storage))
+                    use.SetOperand(i, new FieldReference(field, storage, 0));
+
+        instruction.OpCode = OpCode.Nop;
+        instruction.SetOperands();
+    }
+
+    private static TypeAnalysisContext? ResolveThreadStaticOwner(IOperand? operand)
+    {
+        return operand switch
+        {
+            RuntimeClassTypeAnalysisContext runtimeClass => runtimeClass.RepresentedType,
+            LocalVariable { Type: { } type } => ResolveThreadStaticOwner(type),
+            MemoryOperand memory => ResolveThreadStaticOwner(memory.Base),
+            WrappedTypeAnalysisContext wrapped => ResolveThreadStaticOwner(wrapped.ElementType),
+            TypeAnalysisContext type => type,
+            _ => null,
+        };
     }
 
     private static void RemoveWriteBarrier(Instruction instruction)
@@ -78,15 +123,95 @@ public static class KeyFunctionRecovery
         instruction.SetOperands(exception);
     }
 
-    private static void RewriteBox(Instruction instruction)
+    internal static void RewriteBox(Instruction instruction, MethodAnalysisContext? method = null)
     {
         // function name, result, class, address of value.
-        if (instruction.OpCode != OpCode.Call || instruction.Operands is not [_, var result, TypeAnalysisContext boxedType, var value, ..])
+        if (instruction.OpCode != OpCode.Call || instruction.Operands is not [_, var result, var classOperand, var value, ..])
+            return;
+
+        var boxedType = classOperand as TypeAnalysisContext ?? value switch
+        {
+            AddressOf { Target: LocalVariable { Type: { } type } } => type,
+            LocalVariable { Type: ByRefTypeAnalysisContext { ElementType: { } type } } => type,
+            _ => null,
+        } ?? (method == null ? null : InferDefaultsBoxType(method, classOperand));
+        if (boxedType == null)
             return;
 
         instruction.OpCode = OpCode.Box;
         instruction.SetOperands(result, boxedType, value);
     }
+
+    internal static void RewriteIsInst(Instruction instruction)
+    {
+        // helper, result, object, target class. The surrounding native code
+        // already performs the null test and throws where castclass semantics
+        // are required, so a managed reference cast preserves the observable path.
+        if (instruction.OpCode != OpCode.Call
+            || instruction.Operands is not [_, var result, LocalVariable value, TypeAnalysisContext target, ..])
+            return;
+        instruction.OpCode = OpCode.Move;
+        instruction.SetOperands(result, new ReferenceCast(value, target));
+    }
+
+    private static TypeAnalysisContext? InferDefaultsBoxType(MethodAnalysisContext method, IOperand classOperand)
+    {
+        classOperand = ResolveMoveSource(method.ControlFlowGraph!, classOperand);
+        if (!method.AppContext.UnityVersion.GreaterThanOrEquals(6000)
+            || classOperand is not MemoryOperand
+            {
+                Base: LocalVariable defaults, Index: null, Addend: var offset
+            }
+            || !HasAbsoluteDefinition(method.ControlFlowGraph!, defaults))
+            return null;
+
+        return Unity6PrimitiveDefaultsClass(method.AppContext.SystemTypes, offset);
+    }
+
+    internal static IOperand ResolveMoveSource(Graphs.ISILControlFlowGraph cfg, IOperand operand)
+    {
+        for (var depth = 0; depth < 4 && operand is LocalVariable local; depth++)
+        {
+            var definition = cfg.Instructions.LastOrDefault(i =>
+                i.OpCode == OpCode.Move
+                && i.Destination is LocalVariable candidate
+                && candidate.Register == local.Register);
+            if (definition?.Operands is not [_, var source] || ReferenceEquals(source, operand))
+                break;
+            operand = source;
+        }
+
+        return operand;
+    }
+
+    internal static bool HasAbsoluteDefinition(Graphs.ISILControlFlowGraph cfg, LocalVariable local) =>
+        cfg.Instructions.Any(i => i.OpCode == OpCode.Move
+                                  && i.Destination is LocalVariable candidate
+                                  && candidate.Register == local.Register
+                                  && i.Operands is [_, MemoryOperand { IsConstant: true }]);
+
+    // Unity 6 Il2CppDefaults starts with corlib and corlib_gen, followed by primitive class pointers.
+    internal static TypeAnalysisContext? Unity6PrimitiveDefaultsClass(SystemTypesContext types, long offset) =>
+        offset switch
+        {
+            0x18 => types.SystemByteType,
+            0x20 => types.SystemVoidType,
+            0x28 => types.SystemBooleanType,
+            0x30 => types.SystemSByteType,
+            0x38 => types.SystemInt16Type,
+            0x40 => types.SystemUInt16Type,
+            0x48 => types.SystemInt32Type,
+            0x50 => types.SystemUInt32Type,
+            0x58 => types.SystemIntPtrType,
+            0x60 => types.SystemUIntPtrType,
+            0x68 => types.SystemInt64Type,
+            0x70 => types.SystemUInt64Type,
+            0x78 => types.SystemSingleType,
+            0x80 => types.SystemDoubleType,
+            0x88 => types.SystemCharType,
+            0x90 => types.SystemStringType,
+            _ => null,
+        };
 
     private static void RewriteTypeObject(Instruction instruction)
     {

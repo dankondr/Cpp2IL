@@ -11,13 +11,16 @@ namespace Cpp2IL.Core.Tests.Isil;
 public class Arm64MissingOpsTests
 {
     private static System.Collections.Generic.List<Instruction> Lift(uint word)
+        => Lift([word]);
+
+    private static System.Collections.Generic.List<Instruction> Lift(params uint[] words)
     {
         Cpp2IlApi.ResetInternalState();
         var app = TestGameLoader.LoadSimple2019Game();
         var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Test",
             app.SystemTypes.SystemVoidType, MethodAttributes.Public | MethodAttributes.Static, []);
         return new NewArmV8InstructionSet().ConvertInstructions(
-            Disassembler.Disassemble(BitConverter.GetBytes(word), 0), context);
+            Disassembler.Disassemble(words.SelectMany(BitConverter.GetBytes).ToArray(), 0), context);
     }
 
     [Test]
@@ -55,11 +58,39 @@ public class Arm64MissingOpsTests
     }
 
     [Test]
+    public void MoviShiftedSingleLanesBecomeBroadcastFloat()
+    {
+        var move = Lift(0x0f0167e2).Single(i => i.OpCode == OpCode.Move);
+        Assert.That(move.Operands[1], Is.EqualTo(new Vector128Literal(0.5f, 0.5f, 0.5f, 0.5f)));
+    }
+
+    [Test]
     public void WordMaddRetainsIntegerWidthOnBothLoweredOperations()
     {
         var il = Lift(0x1b080288); // madd w8, w20, w8, w0
         Assert.That(il.Where(i => i.OpCode is OpCode.Multiply or OpCode.Add)
             .Select(i => i.NativeIntegerWidthBits), Is.EqualTo(new int?[] { 32, 32 }));
+    }
+
+    [Test]
+    public void AddRetainsShiftedRegisterScale()
+    {
+        var il = Lift(0x8b0a0d29); // add x9, x9, x10, lsl #3
+        var shift = il.Single(i => i.OpCode == OpCode.ShiftLeft);
+        Assert.That(shift.Operands[1].ToString(), Is.EqualTo("X10"));
+        Assert.That(shift.Operands[2], Is.EqualTo(new Immediate(3)));
+        Assert.That(il.Any(i => i.OpCode == OpCode.Add && Equals(i.Operands[2], shift.Operands[0])), Is.True);
+    }
+
+    [TestCase(0x4a180ae8u, OpCode.ShiftLeft, 2)]  // eor w8, w23, w24, lsl #2
+    [TestCase(0x4a990908u, OpCode.ShiftRight, 2)] // eor w8, w8, w25, asr #2
+    [TestCase(0x4a800508u, OpCode.ShiftRight, 1)] // eor w8, w8, w0, asr #1
+    public void LogicalOpsRetainShiftedRegisterOperand(uint word, OpCode shiftOp, long amount)
+    {
+        var il = Lift(word);
+        var shift = il.Single(i => i.OpCode == shiftOp);
+        Assert.That(shift.Operands[2], Is.EqualTo(new Immediate(amount)));
+        Assert.That(il.Any(i => i.OpCode == OpCode.Xor && Equals(i.Operands[2], shift.Operands[0])), Is.True);
     }
 
     [Test]
@@ -75,5 +106,18 @@ public class Arm64MissingOpsTests
     {
         var move = Lift(word).Single(i => i.OpCode == OpCode.Move);
         Assert.That(move.NativeIntegerWidthBits, Is.EqualTo(64));
+    }
+
+    [Test]
+    public void AdrpAddKeepsExactAddressForFollowingLoad()
+    {
+        var il = Lift(
+            0x90000008u, // adrp x8, #0
+            0x91354108u, // add x8, x8, #0xd50
+            0xf9400100u  // ldr x0, [x8]
+        );
+
+        Assert.That(il.Any(i => i.OpCode == OpCode.Move
+            && i.Operands is [_, MemoryOperand { Base: null, Addend: 0xd50 }]), Is.True);
     }
 }

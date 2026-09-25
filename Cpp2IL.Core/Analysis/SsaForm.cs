@@ -3,6 +3,7 @@ using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Extensions;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -31,6 +32,7 @@ public class SsaForm
     public static void Build(ISILControlFlowGraph graph, DominatorInfo dominatorInfo)
     {
         var ssa = new SsaForm();
+        SinkHoistedAddressTakes(graph);
         ssa.FindClobberingAddressTakes(graph);
 
         graph.BuildUseDefLists(ssa._clobbering);
@@ -38,6 +40,40 @@ public class SsaForm
         ssa.CollectRegisters(graph);
         ssa.InsertPhiFunctions(graph, dominatorInfo);
         ssa.Rename(graph.EntryBlock, dominatorInfo);
+    }
+
+    // Compilers may calculate &slot before storing the value passed to a native byref call.
+    // SSA must bind that address to the stored version, not the stale value that preceded it.
+    private static void SinkHoistedAddressTakes(ISILControlFlowGraph graph)
+    {
+        foreach (var block in graph.Blocks)
+        {
+            for (var i = 0; i < block.Instructions.Count; i++)
+            {
+                var addressTake = block.Instructions[i];
+                if (addressTake is not { OpCode: OpCode.Move, Operands: [Register pointer, AddressOf { Target: Register slot }] })
+                    continue;
+
+                var lastSlotDefinition = -1;
+                for (var j = i + 1; j < block.Instructions.Count; j++)
+                {
+                    var candidate = block.Instructions[j];
+                    if (Reads(candidate, pointer)
+                        || candidate.Destination is Register pointerDefinition && pointerDefinition.Number == pointer.Number)
+                        break;
+
+                    if (candidate.Destination is Register slotDefinition && slotDefinition.Number == slot.Number)
+                        lastSlotDefinition = j;
+                }
+
+                if (lastSlotDefinition < 0)
+                    continue;
+
+                block.Instructions.RemoveAt(i);
+                block.Instructions.Insert(lastSlotDefinition, addressTake);
+                i = lastSlotDefinition;
+            }
+        }
     }
 
     // The address-takes whose slot is read again afterwards, and so have to be treated as definitions.
@@ -397,6 +433,16 @@ public class SsaForm
 
                     // Skip redundant self-copies.
                     if (Equals(destination, source))
+                        continue;
+
+                    // Native registers can merge unrelated managed references at a
+                    // control-flow join (especially normal and exception paths). Such
+                    // a bit-pattern phi has no legal managed copy; emitting castclass
+                    // makes the normal path throw. Leave that edge at default instead.
+                    if (destination is LocalVariable { Type: { IsValueType: false } destinationType }
+                        && source is LocalVariable { Type: { IsValueType: false } sourceType }
+                        && !sourceType.IsAssignableTo(destinationType)
+                        && !destinationType.IsAssignableTo(sourceType))
                         continue;
 
                     moves.Add(new Instruction(-1, OpCode.Move, destination, source));

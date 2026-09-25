@@ -85,8 +85,15 @@ public static class CopyCoalescer
         var escapedSlotNumbers = new HashSet<int>();
         foreach (var instruction in cfg.Instructions)
             foreach (var operand in instruction.Operands)
-                if (operand is AddressOf { Target: LocalVariable addressed })
-                    escapedSlotNumbers.Add(addressed.Register.Number);
+                switch (operand)
+                {
+                    case AddressOf { Target: LocalVariable addressed }:
+                        escapedSlotNumbers.Add(addressed.Register.Number);
+                        break;
+                    case AddressOf { Target: FieldReference field }:
+                        escapedSlotNumbers.Add(field.Local.Register.Number);
+                        break;
+                }
 
         if (escapedSlotNumbers.Count == 0)
             return [];
@@ -247,6 +254,11 @@ public static class CopyCoalescer
                 case FieldReference field:
                     yield return field.Local;
                     break;
+                case SelectedFieldReference selected:
+                    yield return selected.Selector;
+                    foreach (var choice in selected.Choices)
+                        yield return choice.Field.Local;
+                    break;
                 case ArrayAccess array:
                     yield return array.Array;
                     if (array.Index is LocalVariable arrayIndex)
@@ -257,6 +269,19 @@ public static class CopyCoalescer
                     break;
                 case AddressOf { Target: LocalVariable addressed }:
                     yield return addressed;
+                    break;
+                case AddressOf { Target: FieldReference field }:
+                    yield return field.Local;
+                    break;
+                case ArrayElementFieldReference elementField:
+                    yield return elementField.Array;
+                    if (elementField.Index is LocalVariable elementIndex)
+                        yield return elementIndex;
+                    break;
+                case AddressOf { Target: ArrayElementFieldReference elementField }:
+                    yield return elementField.Array;
+                    if (elementField.Index is LocalVariable addressedElementIndex)
+                        yield return addressedElementIndex;
                     break;
             }
         }
@@ -285,6 +310,11 @@ public static class CopyCoalescer
                         case FieldReference field:
                             field.Local = groups.Find(field.Local);
                             break;
+                        case SelectedFieldReference selected:
+                            selected.Selector = groups.Find(selected.Selector);
+                            foreach (var choice in selected.Choices)
+                                choice.Field.Local = groups.Find(choice.Field.Local);
+                            break;
                         case ArrayAccess array:
                             array.Array = groups.Find(array.Array);
                             if (array.Index is LocalVariable arrayIndex)
@@ -295,6 +325,19 @@ public static class CopyCoalescer
                             break;
                         case AddressOf { Target: LocalVariable addressed } addressOf:
                             addressOf.Target = groups.Find(addressed);
+                            break;
+                        case AddressOf { Target: FieldReference field }:
+                            field.Local = groups.Find(field.Local);
+                            break;
+                        case ArrayElementFieldReference elementField:
+                            elementField.Array = groups.Find(elementField.Array);
+                            if (elementField.Index is LocalVariable elementIndex)
+                                elementField.Index = groups.Find(elementIndex);
+                            break;
+                        case AddressOf { Target: ArrayElementFieldReference elementField }:
+                            elementField.Array = groups.Find(elementField.Array);
+                            if (elementField.Index is LocalVariable addressedElementIndex)
+                                elementField.Index = groups.Find(addressedElementIndex);
                             break;
                     }
                 }

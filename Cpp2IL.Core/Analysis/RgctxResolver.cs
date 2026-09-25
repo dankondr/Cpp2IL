@@ -92,10 +92,15 @@ public static class RgctxResolver
         if (definition.Definition is not { } typeDefinition)
             return null;
 
-        var typeArguments = (instance as GenericInstanceTypeAnalysisContext)?.GenericArguments ?? [];
+        var typeArguments = TypeArgumentsFor(instance);
 
         return ResolveEntry(typeDefinition.RgctXs, index, typeArguments, [], instance.AppContext);
     }
+
+    internal static IReadOnlyList<TypeAnalysisContext> TypeArgumentsFor(TypeAnalysisContext instance) =>
+        instance is GenericInstanceTypeAnalysisContext concrete
+            ? concrete.GenericArguments
+            : instance.GenericParameters;
 
     // Only a generic method (or one on a generic type) gets a per-method rgctx table
     private static bool HasMethodRgctx(MethodAnalysisContext method) => method switch

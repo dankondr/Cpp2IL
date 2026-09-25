@@ -19,7 +19,7 @@ public static class MetadataResolver
     {
         if (method.AppContext.Binary is ElfFile elf)
             ResolveGotLoads(method.ControlFlowGraph!, address =>
-                elf.ReadReadOnlyGotPointer(address) is { } pointer
+                elf.ReadReadOnlyRelocatedPointer(address) is { } pointer
                 && method.AppContext.LibCpp2IlContext.GetAnyGlobalByAddress(pointer) != null ? pointer : null);
 
         ResolveStringLiteralAccessors(method);
@@ -28,29 +28,45 @@ public static class MetadataResolver
         ResolveMetadataUsages(method);
     }
 
-    // In SSA, a GOT load defines a constant *address of* a metadata slot. The second load
-    // dereferences that slot. Preserve both levels; treating the first load as its value
-    // would confuse MethodInfo*/Il2CppClass* with their addresses.
+    // A RELRO load defines the address of a metadata slot. Lift each such load to the slot
+    // itself before branch/conditional-select merges, then remove the native dereference:
+    // ResolveMetadataUsages turns the slot into the actual managed value afterwards.
     public static void ResolveGotLoads(ISILControlFlowGraph graph, Func<ulong, ulong?> readGotPointer)
     {
-        var slots = new Dictionary<LocalVariable, ulong>();
+        var slots = new HashSet<LocalVariable>();
         foreach (var instruction in graph.Instructions)
             if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable destination, MemoryOperand { IsConstant: true } source] }
                 && readGotPointer((ulong)source.Addend) is { } slot)
-                slots[destination] = slot;
+            {
+                slots.Add(destination);
+                source.Addend = (long)slot;
+                instruction.SetOperand(1, source);
+            }
+
+        bool changed;
+        do
+        {
+            changed = false;
+            foreach (var instruction in graph.Instructions)
+            {
+                if (instruction.OpCode is not (OpCode.Move or OpCode.Phi)
+                    || instruction.Operands.Count < 2
+                    || instruction.Operands[0] is not LocalVariable destination)
+                    continue;
+                var inputs = instruction.Operands.Skip(1).OfType<LocalVariable>().ToList();
+                if (inputs.Count == instruction.Operands.Count - 1 && inputs.Count > 0
+                    && inputs.All(slots.Contains))
+                    changed |= slots.Add(destination);
+            }
+        } while (changed);
 
         foreach (var instruction in graph.Instructions)
         {
-            if (instruction is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable address } memory] }
-                || !slots.TryGetValue(address, out var slot))
-                continue;
-
-            memory.Base = null;
-            memory.Addend = (long)slot;
-            instruction.SetOperand(1, memory);
+            for (var i = 0; i < instruction.Operands.Count; i++)
+                if (instruction.Operands[i] is MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable address }
+                    && slots.Contains(address))
+                    instruction.SetOperand(i, address);
         }
-        // Leave the original address-producing load alone. Metadata initialization may still
-        // consume it; normal dead-code elimination removes it once all its uses are resolved.
     }
 
     private static void ResolveStringLiteralAccessors(MethodAnalysisContext method)
@@ -102,56 +118,56 @@ public static class MetadataResolver
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
-            if (instruction.OpCode != OpCode.Move)
-                continue;
-
-            if (instruction.Operands[0] is not LocalVariable)
-                continue;
-
-            var address = instruction.Operands[1] switch
+            for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
             {
-                MemoryOperand { Base: null, Index: null, Scale: 0 } memory => (ulong)memory.Addend,
-                Immediate immediate => immediate.UnsignedValue,
-                _ => 0ul,
-            };
+                if (instruction.OpCode == OpCode.Move && operandIndex == 0)
+                    continue;
 
-            if (address == 0)
-                continue;
-
-            // String literal.
-            var stringLiteral = libContext.GetLiteralByAddress(address);
-            if (stringLiteral != null)
-            {
-                instruction.SetOperand(1, new StringLiteral(stringLiteral));
-                continue;
-            }
-
-            // Type metadata usage (Il2CppType* / Il2CppClass*).
-            if (method.DeclaringType is { } declaringType)
-            {
-                var typeGlobal = libContext.GetTypeGlobalByAddress(address);
-                if (typeGlobal != null)
+                var address = instruction.Operands[operandIndex] switch
                 {
-                    instruction.SetOperand(1, declaringType.AppContext.ResolveIl2CppType(typeGlobal));
+                    MemoryOperand { Base: null, Index: null, Scale: 0 } memory => (ulong)memory.Addend,
+                    Immediate immediate when instruction.OpCode == OpCode.Move && operandIndex == 1 => immediate.UnsignedValue,
+                    _ => 0ul,
+                };
+
+                if (address == 0)
+                    continue;
+
+                // String literal.
+                var stringLiteral = libContext.GetLiteralByAddress(address);
+                if (stringLiteral != null)
+                {
+                    instruction.SetOperand(operandIndex, new StringLiteral(stringLiteral));
                     continue;
                 }
-            }
 
-            // Method metadata usage (MethodInfo*). On metadata v27+ GetMethodGlobalByAddress can return
-            // any global, so confirm it is actually a method before resolving - the resolver's switch
-            // throws on other usage kinds.
-            var methodUsage = libContext.GetMethodGlobalByAddress(address);
-            if (methodUsage?.Type is MetadataUsageType.MethodDef or MetadataUsageType.MethodRef
-                && method.AppContext.ResolveContextForMethod(methodUsage) is { DeclaringType: { } methodDeclaringType } methodContext)
-            {
-                instruction.SetOperand(1, new RuntimeMethodInfoAnalysisContext(methodContext, methodDeclaringType.DeclaringAssembly));
-                continue;
-            }
+                // Type metadata usage (Il2CppType* / Il2CppClass*).
+                if (method.DeclaringType is { } declaringType)
+                {
+                    var typeGlobal = libContext.GetTypeGlobalByAddress(address);
+                    if (typeGlobal != null)
+                    {
+                        instruction.SetOperand(operandIndex, declaringType.AppContext.ResolveIl2CppType(typeGlobal));
+                        continue;
+                    }
+                }
 
-            // Field metadata usage (FieldInfo*), e.g. the RuntimeFieldHandle passed to InitializeArray.
-            if (libContext.GetRawFieldGlobalByAddress(address) is { Type: MetadataUsageType.FieldInfo } fieldUsage
-                && method.AppContext.ResolveContextForField(fieldUsage.AsField()) is { DeclaringType.DeclaringAssembly: { } fieldAssembly } fieldContext)
-                instruction.SetOperand(1, new RuntimeFieldInfoAnalysisContext(fieldContext, fieldAssembly));
+                // Method metadata usage (MethodInfo*). On metadata v27+ GetMethodGlobalByAddress can return
+                // any global, so confirm it is actually a method before resolving - the resolver's switch
+                // throws on other usage kinds.
+                var methodUsage = libContext.GetMethodGlobalByAddress(address);
+                if (methodUsage?.Type is MetadataUsageType.MethodDef or MetadataUsageType.MethodRef
+                    && method.AppContext.ResolveContextForMethod(methodUsage) is { DeclaringType: { } methodDeclaringType } methodContext)
+                {
+                    instruction.SetOperand(operandIndex, new RuntimeMethodInfoAnalysisContext(methodContext, methodDeclaringType.DeclaringAssembly));
+                    continue;
+                }
+
+                // Field metadata usage (FieldInfo*), e.g. the RuntimeFieldHandle passed to InitializeArray.
+                if (libContext.GetRawFieldGlobalByAddress(address) is { Type: MetadataUsageType.FieldInfo } fieldUsage
+                    && method.AppContext.ResolveContextForField(fieldUsage.AsField()) is { DeclaringType.DeclaringAssembly: { } fieldAssembly } fieldContext)
+                    instruction.SetOperand(operandIndex, new RuntimeFieldInfoAnalysisContext(fieldContext, fieldAssembly));
+            }
         }
     }
 
@@ -165,6 +181,11 @@ public static class MetadataResolver
     public static bool ResolveFieldOffsets(MethodAnalysisContext method)
     {
         var changed = NormalizeObjectAddressAliases(method);
+        var definitions = method.ControlFlowGraph!.Instructions
+            .Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!)
+            .Where(g => g.Count() == 1)
+            .ToDictionary(g => g.Key, g => g.Single());
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
@@ -175,56 +196,170 @@ public static class MetadataResolver
                 if (operand is not MemoryOperand memory)
                     continue;
 
+                if (memory.Base is not LocalVariable local
+                    || EffectiveObjectType(local, definitions) is not { } localType)
+                    continue;
+
+                // check if static field access
+                var staticOwner = (localType as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
+                var owner = staticOwner ?? localType;
+                var genericOwner = owner as GenericInstanceTypeAnalysisContext;
+
+                if (memory.Index is LocalVariable selector
+                    && TryResolveFiniteConstants(selector, definitions, [], out var selectorValues))
+                {
+                    var choices = new List<(long Value, FieldReference Field)>();
+                    var scale = memory.Scale <= 1 ? 1 : memory.Scale;
+                    foreach (var selectorValue in selectorValues.OrderBy(value => value))
+                    {
+                        long offset;
+                        try { offset = checked(memory.Addend + selectorValue * scale); }
+                        catch (System.OverflowException) { choices.Clear(); break; }
+
+                        if (ResolveField(owner, staticOwner, offset, memory.AccessSize) is not { } selectedField)
+                        {
+                            choices.Clear();
+                            break;
+                        }
+
+                        var resolvedField = selectedField.Field;
+                        if (genericOwner != null && resolvedField is not ConcreteGenericFieldAnalysisContext)
+                            resolvedField = new ConcreteGenericFieldAnalysisContext(resolvedField, genericOwner);
+                        choices.Add((selectorValue,
+                            new FieldReference(resolvedField, local, (int)offset, selectedField.Containers,
+                                memory.AccessSize)));
+                    }
+
+                    if (choices.Count > 0
+                        && choices.All(c => c.Field.Field.FieldType.FullName == choices[0].Field.Field.FieldType.FullName))
+                    {
+                        instruction.SetOperand(i, new SelectedFieldReference(selector, choices));
+                        changed = true;
+                    }
+                    continue;
+                }
+
                 // Has to be [base (local) + addend (field offset)]
                 if (memory.Index != null || memory.Scale != 0)
                     continue;
 
-                if (memory.Base is not LocalVariable local || local?.Type == null)
-                    continue;
-
-                // check if static field access
-                var staticOwner = (local.Type as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
-                var owner = staticOwner ?? local.Type;
-                var genericOwner = owner as GenericInstanceTypeAnalysisContext;
-
-                FieldAnalysisContext? field;
-                if (genericOwner != null && staticOwner == null)
-                {
-                    // metadata has all-0 offsets for generic definitions, so recompute layout
-                    // TODO support user-defined value types
-                    if (genericOwner.GenericArguments.Any(a => a.IsValueType))
-                        continue;
-
-                    field = GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner.GenericType, memory.Addend);
-                }
-                else if (staticOwner == null && owner.GenericParameters.Count > 0)
-                {
-                    field = GenericInstanceFieldLayout.FindFieldAtOffset(owner, memory.Addend);
-                }
-                else
-                {
-                    // an inherited field exists on the base type but sits at the same offset in the
-                    // derived layout, so the whole chain is searched
-                    field = null;
-                    for (var candidateOwner = genericOwner?.GenericType ?? owner; candidateOwner != null && field == null; candidateOwner = candidateOwner.BaseType)
-                        field = candidateOwner.Fields.FirstOrDefault(f => f.IsStatic == (staticOwner != null)
-                            && (f.Attributes & FieldAttributes.Literal) == 0 // consts have no storage but their metadata offset is 0, which would match
-                            && f.BackingData?.FieldOffset == memory.Addend);
-                }
+                var resolved = ResolveField(owner, staticOwner, memory.Addend, memory.AccessSize);
+                var field = resolved?.Field;
 
                 if (field == null) // TODO: Support nested fields (Field1.Field2.Field3)
                     continue;
 
                 // make sure we have a full GIT for field access. open type is bad.
-                if (genericOwner != null)
+                if (genericOwner != null && field is not ConcreteGenericFieldAnalysisContext)
                     field = new ConcreteGenericFieldAnalysisContext(field, genericOwner);
 
-                instruction.SetOperand(i, new FieldReference(field, local, (int)memory.Addend));
+                instruction.SetOperand(i, new FieldReference(field, local, (int)memory.Addend,
+                    resolved!.Value.Containers, memory.AccessSize));
                 changed = true;
             }
         }
 
         return changed;
+    }
+
+    private static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)? ResolveField(
+        TypeAnalysisContext owner, TypeAnalysisContext? staticOwner, long offset, int accessSize)
+    {
+        if (staticOwner != null)
+        {
+            if (FindStaticFieldAtOffset(owner, offset) is { } staticField)
+                return (staticField, []);
+            if (FindNestedStaticFieldAtOffset(owner, offset, accessSize) is { } nestedStatic)
+                return (nestedStatic.Field, [nestedStatic.Container]);
+            return null;
+        }
+
+        return FindInstanceFieldPathAtOffset(owner, offset, accessSize);
+    }
+
+    internal static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)?
+        FindInstanceFieldPathAtOffset(TypeAnalysisContext owner, long offset, int accessSize)
+    {
+        if (FindNestedInstanceFieldAtOffset(owner, offset, accessSize) is { } nested)
+            return (nested.Field, [nested.Container]);
+        return FindInstanceFieldAtOffset(owner, offset) is { } field ? (field, []) : null;
+    }
+
+    private static (FieldAnalysisContext Container, FieldAnalysisContext Field)? FindNestedStaticFieldAtOffset(
+        TypeAnalysisContext owner, long offset, int accessSize)
+    {
+        if (accessSize <= 0 || owner is GenericInstanceTypeAnalysisContext || owner.GenericParameters.Count > 0)
+            return null;
+
+        for (var candidate = owner; candidate != null; candidate = candidate.BaseType)
+        foreach (var container in candidate.Fields.Where(field => field.IsStatic
+                         && (field.Attributes & FieldAttributes.Literal) == 0 && field.FieldType.IsValueType)
+                     .OrderByDescending(field => field.Offset))
+        {
+            var relativeOffset = offset - container.Offset;
+            if (relativeOffset < 0)
+                continue;
+            var nested = container.FieldType.Fields.FirstOrDefault(field => !field.IsStatic
+                && field.Offset == relativeOffset
+                && PrimitiveStorageSize(field.FieldType, owner.AppContext.Binary.PointerSizeBytes) == accessSize);
+            if (nested != null)
+                return (container, nested);
+        }
+
+        return null;
+    }
+
+    private static bool TryResolveFiniteConstants(LocalVariable local,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions, HashSet<LocalVariable> visiting,
+        out HashSet<long> values)
+    {
+        values = [];
+        if (!visiting.Add(local) || !definitions.TryGetValue(local, out var definition))
+            return false;
+
+        var sources = definition.OpCode switch
+        {
+            OpCode.Move when definition.Operands.Count == 2 => definition.Operands.Skip(1),
+            OpCode.Phi => definition.Operands.Skip(1),
+            _ => []
+        };
+
+        foreach (var source in sources)
+        {
+            if (source is Immediate immediate)
+                values.Add(immediate.Value);
+            else if (source is LocalVariable sourceLocal
+                && TryResolveFiniteConstants(sourceLocal, definitions, visiting, out var nested))
+                values.UnionWith(nested);
+            else
+            {
+                visiting.Remove(local);
+                values.Clear();
+                return false;
+            }
+        }
+
+        visiting.Remove(local);
+        return values.Count > 0;
+    }
+
+    internal static FieldAnalysisContext? FindStaticFieldAtOffset(TypeAnalysisContext owner, long offset)
+    {
+        if (owner is GenericInstanceTypeAnalysisContext genericOwner)
+            return GenericLayoutDependsOnValueArgument(genericOwner)
+                ? null
+                : GenericInstanceFieldLayout.FindStaticFieldAtOffset(genericOwner.GenericType, offset);
+
+        if (owner.GenericParameters.Count > 0)
+            return GenericInstanceFieldLayout.FindStaticFieldAtOffset(owner, offset);
+
+        for (var candidateOwner = owner; candidateOwner != null; candidateOwner = candidateOwner.BaseType)
+            if (candidateOwner.Fields.FirstOrDefault(f => f.IsStatic
+                    && (f.Attributes & FieldAttributes.Literal) == 0
+                    && f.Offset == offset) is { } field)
+                return field;
+
+        return null;
     }
 
     // SSA pre-indexed accesses can leave subsequent loads and stores relative to an
@@ -246,9 +381,8 @@ public static class MetadataResolver
             if (instruction.Operands[i] is not MemoryOperand { Base: LocalVariable alias } memory
                 || !definitions.TryGetValue(alias, out var definition)
                 || definition is not { OpCode: OpCode.Add, Operands: [_, LocalVariable root, Immediate displacement] }
-                || alias.Type is { IsValueType: true }
                 || ReferenceEquals(root, alias)
-                || root.Type is not { IsValueType: false } rootType)
+                || EffectiveObjectType(root, definitions) is not { IsValueType: false } rootType)
                 continue;
             long offset;
             try { offset = checked(memory.Addend + displacement.Value); }
@@ -264,12 +398,109 @@ public static class MetadataResolver
         return changed;
     }
 
+    private static TypeAnalysisContext? EffectiveObjectType(LocalVariable local,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions) =>
+        EffectiveObjectType(local, definitions, []);
+
+    private static TypeAnalysisContext? EffectiveObjectType(LocalVariable local,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions, HashSet<LocalVariable> visiting)
+    {
+        if (!visiting.Add(local) || !definitions.TryGetValue(local, out var definition))
+            return local.Type;
+
+        var recovered = definition switch
+        {
+            { OpCode: OpCode.Newobj, Operands.Count: > 1 } => definition.Operands[1] switch
+            {
+                RuntimeClassTypeAnalysisContext runtimeClass => runtimeClass.RepresentedType,
+                TypeAnalysisContext allocatedType => allocatedType,
+                LocalVariable { Type: RuntimeClassTypeAnalysisContext runtimeClass } => runtimeClass.RepresentedType,
+                _ => null,
+            },
+            { OpCode: OpCode.Move, Operands: [_, LocalVariable source] }
+                => EffectiveObjectType(source, definitions, visiting),
+            _ => null,
+        };
+
+        visiting.Remove(local);
+        return recovered ?? local.Type;
+    }
+
     private static bool ResolvesToKnownAccess(TypeAnalysisContext owner, MemoryOperand memory, int pointerSize)
     {
         if (owner is SzArrayTypeAnalysisContext arrayType)
             return ArrayRecovery.ResolvesAccess(memory, arrayType, pointerSize);
 
-        return memory.Index == null && memory.Scale == 0 && FindInstanceFieldAtOffset(owner, memory.Addend) != null;
+        if (owner is StaticFieldStorageTypeAnalysisContext staticStorage)
+            return memory.Index == null && memory.Scale == 0
+                && FindStaticFieldAtOffset(staticStorage.OwnerType, memory.Addend) != null;
+
+        return memory.Index == null && memory.Scale == 0
+            && FindInstanceFieldPathAtOffset(owner, memory.Addend, memory.AccessSize) != null;
+    }
+
+    internal static (FieldAnalysisContext Container, FieldAnalysisContext Field)? FindNestedInstanceFieldAtOffset(
+        TypeAnalysisContext owner, long offset, int accessSize)
+    {
+        if (accessSize <= 0)
+            return null;
+
+        if (owner is GenericInstanceTypeAnalysisContext genericOwner)
+        {
+            var containing = GenericInstanceFieldLayout.FindFieldContainingOffset(genericOwner, offset);
+            if (containing is not { Field.FieldType.IsValueType: true } range
+                || range.Size == accessSize)
+                return null;
+            var relativeOffset = offset - range.Offset;
+            var nested = range.Field.FieldType is GenericInstanceTypeAnalysisContext nestedGeneric
+                ? GenericInstanceFieldLayout.FindFieldContainingOffset(nestedGeneric, relativeOffset) is
+                    { Offset: var nestedFieldOffset, Size: var nestedFieldSize, Field: var concrete }
+                    && nestedFieldOffset == relativeOffset && nestedFieldSize == accessSize ? concrete : null
+                : range.Field.FieldType.Fields.FirstOrDefault(field => !field.IsStatic
+                    && (field.BackingData?.FieldOffset ?? field.Offset) == relativeOffset
+                    && PrimitiveStorageSize(field.FieldType, owner.AppContext.Binary.PointerSizeBytes) == accessSize);
+            return nested == null ? null : (range.Field, nested);
+        }
+
+        if (owner.GenericParameters.Count > 0)
+            return null;
+
+        for (var candidate = owner; candidate != null; candidate = candidate.BaseType)
+        foreach (var container in candidate.Fields.Where(f => !f.IsStatic && f.FieldType.IsValueType)
+                     .OrderByDescending(f => f.Offset))
+        {
+            var relativeOffset = offset - container.Offset;
+            if (relativeOffset < 0 || PrimitiveStorageSize(container.FieldType, owner.AppContext.Binary.PointerSizeBytes) == accessSize)
+                continue;
+
+            var nested = container.FieldType.Fields.FirstOrDefault(f => !f.IsStatic
+                && f.Offset == relativeOffset
+                && PrimitiveStorageSize(f.FieldType, owner.AppContext.Binary.PointerSizeBytes) == accessSize);
+            if (nested != null)
+                return (container, nested);
+        }
+
+        return null;
+    }
+
+    private static int? PrimitiveStorageSize(TypeAnalysisContext type, int pointerSize)
+    {
+        if (!type.IsValueType)
+            return pointerSize;
+        if (type.IsEnumType)
+            return PrimitiveStorageSize(type.EnumUnderlyingType
+                                        ?? type.Fields.FirstOrDefault(f => !f.IsStatic)?.FieldType
+                                        ?? type.AppContext.SystemTypes.SystemInt32Type,
+                pointerSize);
+        return type.FullName switch
+        {
+            "System.Boolean" or "System.Byte" or "System.SByte" => 1,
+            "System.Int16" or "System.UInt16" or "System.Char" => 2,
+            "System.Int32" or "System.UInt32" or "System.Single" => 4,
+            "System.Int64" or "System.UInt64" or "System.Double" => 8,
+            "System.IntPtr" or "System.UIntPtr" => pointerSize,
+            _ => null
+        };
     }
 
     // Mirrors the owner selection in ResolveFieldOffsets: generic definitions have
@@ -277,7 +508,7 @@ public static class MetadataResolver
     internal static FieldAnalysisContext? FindInstanceFieldAtOffset(TypeAnalysisContext owner, long offset)
     {
         if (owner is GenericInstanceTypeAnalysisContext genericOwner)
-            return genericOwner.GenericArguments.Any(a => a.IsValueType)
+            return GenericLayoutDependsOnValueArgument(genericOwner)
                 ? null
                 : GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner.GenericType, offset);
 
@@ -287,13 +518,26 @@ public static class MetadataResolver
         // an inherited field exists on the base type but sits at the same offset in
         // the derived layout, so the whole chain is searched
         for (var candidate = owner; candidate != null; candidate = candidate.BaseType)
+        {
+            if (candidate is GenericInstanceTypeAnalysisContext genericCandidate
+                && !GenericLayoutDependsOnValueArgument(genericCandidate)
+                && GenericInstanceFieldLayout.FindFieldAtOffset(genericCandidate.GenericType, offset) is { } genericField)
+                return new ConcreteGenericFieldAnalysisContext(genericField, genericCandidate);
+            if (candidate.GenericParameters.Count > 0
+                && GenericInstanceFieldLayout.FindFieldAtOffset(candidate, offset) is { } openGenericField)
+                return openGenericField;
             if (candidate.Fields.FirstOrDefault(f => !f.IsStatic
                     && (f.Attributes & FieldAttributes.Literal) == 0 // consts have no storage but their metadata offset is 0, which would match
-                    && f.BackingData?.FieldOffset == offset) is { } field)
+                    && (f.BackingData?.FieldOffset ?? f.Offset) == offset) is { } field)
                 return field;
+        }
 
         return null;
     }
+
+    private static bool GenericLayoutDependsOnValueArgument(GenericInstanceTypeAnalysisContext instance)
+        => instance.GenericArguments.Any(a => a.IsValueType)
+           && instance.GenericType.Fields.Any(f => f.FieldType is GenericParameterTypeAnalysisContext);
 
     private static void ResolveCalls(MethodAnalysisContext method)
     {
@@ -411,6 +655,23 @@ public static class MetadataResolver
                 var preferred = PreferredOf(candidates);
                 instruction.SetOperand(0, preferred);
                 preferred.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, preferred);
+                changed = true;
+                continue;
+            }
+
+            // A shared generic wrapper (for example ClearListAtExit<T>.Dispose)
+            // can lose its stack receiver type while every address candidate still
+            // names the same base method. Rebuild that declaring instantiation from
+            // the enclosing method's generic parameters instead of leaving a known
+            // managed call unresolved.
+            var baseMethods = candidates.Select(BaseMethodOf).Distinct().ToList();
+            if (baseMethods is [{ DeclaringType: { } baseDeclaring } baseMethod]
+                && baseDeclaring.GenericParameters.Count > 0
+                && baseDeclaring.GenericParameters.Count == method.GenericParameters.Count)
+            {
+                var concrete = new ConcreteGenericMethodAnalysisContext(baseMethod, method.GenericParameters, []);
+                instruction.SetOperand(0, concrete);
+                concrete.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, concrete);
                 changed = true;
                 continue;
             }
@@ -607,13 +868,44 @@ public static class MetadataResolver
             if (!instruction.IsCall)
                 continue;
 
-            if (instruction.Operands[0] is not Immediate target)
-                //Already resolved
-                continue;
-
             if (GetMethodInfoArgument(instruction) is not { RepresentedMethod: { } representedMethod })
                 //No MethodInfo to work with
                 continue;
+
+            if (instruction.Operands[0] is MethodAnalysisContext resolved)
+            {
+                if (!ReferenceEquals(resolved, representedMethod)
+                    && ReferenceEquals(BaseMethodOf(resolved), BaseMethodOf(representedMethod))
+                    && ErasedGenericArgumentCount(representedMethod) < ErasedGenericArgumentCount(resolved))
+                {
+                    instruction.SetOperand(0, representedMethod);
+                    representedMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, representedMethod);
+                    changed = true;
+                }
+                continue;
+            }
+
+            if (instruction.Operands[0] is not Immediate target)
+                continue;
+
+            // A concrete MethodInfo* in the exact hidden-argument slot is more
+            // authoritative than the shared native thunk's address. A thunk can
+            // have one unrelated representative in MethodsByAddress (the common
+            // AddComponent<T> case), which previously blocked this recovery.
+            var firstArg = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
+            var hiddenParamIndex = firstArg
+                + (representedMethod.AppContext.InstructionSet.CallingConventionResolver?.ReturnsViaHiddenBuffer(representedMethod) == true ? 1 : 0)
+                + (representedMethod.IsStatic ? 0 : 1) + representedMethod.Parameters.Count;
+            if (!ReferenceEquals(representedMethod, method)
+                && hiddenParamIndex < instruction.Operands.Count
+                && AsMethodInfo(instruction.Operands[hiddenParamIndex]) is { RepresentedMethod: { } hiddenMethod }
+                && ReferenceEquals(BaseMethodOf(hiddenMethod), BaseMethodOf(representedMethod)))
+            {
+                instruction.SetOperand(0, representedMethod);
+                representedMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, representedMethod);
+                changed = true;
+                continue;
+            }
 
             if (!method.AppContext.MethodsByAddress.TryGetValue(target.UnsignedValue, out var candidates))
             {
@@ -622,11 +914,6 @@ public static class MetadataResolver
                 // However, make sure it isn't our OWN hidden MethodInfo arg, because that would turn all unknown calls into recursion
                 if (ReferenceEquals(representedMethod, method))
                     continue;
-
-                var firstArg = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
-                var hiddenParamIndex = firstArg
-                    + (representedMethod.AppContext.InstructionSet.CallingConventionResolver?.ReturnsViaHiddenBuffer(representedMethod) == true ? 1 : 0)
-                    + (representedMethod.IsStatic ? 0 : 1) + representedMethod.Parameters.Count;
 
                 if (hiddenParamIndex >= instruction.Operands.Count
                     || AsMethodInfo(instruction.Operands[hiddenParamIndex]) == null)
@@ -652,6 +939,18 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    private static int ErasedGenericArgumentCount(MethodAnalysisContext method)
+    {
+        var count = method.DeclaringType is GenericInstanceTypeAnalysisContext declaring
+            ? declaring.GenericArguments.Count(argument => argument.FullName == "System.Object"
+                || argument is GenericParameterTypeAnalysisContext)
+            : 0;
+        if (method is ConcreteGenericMethodAnalysisContext concrete)
+            count += concrete.MethodGenericParameters.Count(argument => argument.FullName == "System.Object"
+                || argument is GenericParameterTypeAnalysisContext);
+        return count;
     }
 
     // Offset of Il2CppClass::vtable, VirtualInvokeData entries of {methodPtr, MethodInfo*}.
@@ -799,6 +1098,8 @@ public static class MetadataResolver
         var method = "";
         if (kFA.WriteBarrierAliases.Contains(target))
             method = nameof(kFA.il2cpp_codegen_write_barrier);
+        else if (kFA.BoxAliases.Contains(target))
+            method = nameof(kFA.il2cpp_vm_object_box);
         else if (target == kFA.il2cpp_codegen_initialize_method || target == kFA.il2cpp_codegen_initialize_runtime_metadata)
         {
             if (appContext.MetadataVersion < 27)

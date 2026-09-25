@@ -1,4 +1,5 @@
 using System.Linq;
+using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
 
@@ -44,5 +45,19 @@ public class GenericTypeArgsTests
             var expectedArgs = string.Join(", ", gi.GenericArguments.Select(CsFileUtils.GetTypeName));
             Assert.That(name, Does.EndWith("<" + expectedArgs + ">"), name);
         }
+    }
+
+    [Test]
+    public void Open_generic_uses_its_parameters_as_rgctx_arguments()
+    {
+        var definition = _ctx.AssembliesByName["mscorlib"]
+            .GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var instance = new GenericInstanceTypeAnalysisContext(definition, [_ctx.SystemTypes.SystemStringType]);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(RgctxResolver.TypeArgumentsFor(definition), Is.EqualTo(definition.GenericParameters));
+            Assert.That(RgctxResolver.TypeArgumentsFor(instance), Is.EqualTo(instance.GenericArguments));
+        });
     }
 }

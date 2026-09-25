@@ -35,29 +35,30 @@ internal static class InaccessibleCalleeRecovery
         if (callerType is null)
             return true; // no metadata basis to judge the access
 
-        if (callee is ConcreteGenericMethodAnalysisContext concrete)
+        var concrete = callee as ConcreteGenericMethodAnalysisContext;
+        var declaring = concrete?.BaseMethodContext.DeclaringType ?? callee.DeclaringType;
+        var keepsDeclaredAccessibility = concrete != null
+            || Extensions.AccessibilityExtensions.IsExternalRuntimeAssembly(declaring?.DeclaringAssembly?.Name);
+        if (keepsDeclaredAccessibility && declaring is not null)
         {
-            var declaring = concrete.BaseMethodContext.DeclaringType;
-            if (declaring is not null)
+            var sameAssembly = ReferenceEquals(callerType.DeclaringAssembly, declaring.DeclaringAssembly)
+                || Extensions.AccessibilityExtensions.SharesEmittedInternals(callerType.DeclaringAssembly, declaring.DeclaringAssembly);
+            var memberVisible = (callee.Attributes & MethodAttributes.MemberAccessMask) switch
             {
-                var sameAssembly = ReferenceEquals(callerType.DeclaringAssembly, declaring.DeclaringAssembly)
-                    || Extensions.AccessibilityExtensions.SharesEmittedInternals(callerType.DeclaringAssembly, declaring.DeclaringAssembly);
-                var memberVisible = (callee.Attributes & MethodAttributes.MemberAccessMask) switch
-                {
-                    MethodAttributes.Public => true,
-                    // Private members are visible to the declaring type itself, to anything nested
-                    // inside it, and to the enclosing type of a nested declaration.
-                    MethodAttributes.Private => IsWithinOrSame(callerType, declaring) || IsWithinOrSame(declaring, callerType),
-                    MethodAttributes.Assembly => sameAssembly,
-                    MethodAttributes.Family => IsWithinOrSame(callerType, declaring) || callerType.IsAssignableTo(declaring),
-                    MethodAttributes.FamANDAssem => sameAssembly && (IsWithinOrSame(callerType, declaring) || callerType.IsAssignableTo(declaring)),
-                    MethodAttributes.FamORAssem => sameAssembly || IsWithinOrSame(callerType, declaring) || callerType.IsAssignableTo(declaring),
-                    _ => false,
-                };
-                if (!memberVisible)
-                    return false;
-            }
+                MethodAttributes.Public => true,
+                MethodAttributes.Private => IsWithinOrSame(callerType, declaring) || IsWithinOrSame(declaring, callerType),
+                MethodAttributes.Assembly => sameAssembly,
+                MethodAttributes.Family => IsWithinOrSame(callerType, declaring) || callerType.IsAssignableTo(declaring),
+                MethodAttributes.FamANDAssem => sameAssembly && (IsWithinOrSame(callerType, declaring) || callerType.IsAssignableTo(declaring)),
+                MethodAttributes.FamORAssem => sameAssembly || IsWithinOrSame(callerType, declaring) || callerType.IsAssignableTo(declaring),
+                _ => false,
+            };
+            if (!memberVisible)
+                return false;
+        }
 
+        if (concrete != null)
+        {
             // The emitted member reference names the constructed declaring type and the
             // method's generic arguments verbatim: every type argument must be visible.
             if (!IsVisibleType(concrete.DeclaringType, callerType)

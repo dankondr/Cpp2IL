@@ -38,6 +38,11 @@ public class Instruction : IOperand
     // Native integer arithmetic can carry a width that register normalization erases.
     public int? NativeIntegerWidthBits;
 
+    // Width of the native memory access that produced this instruction. Stack-slot
+    // normalization erases MemoryOperand/StackOffset, but aggregate-return recovery
+    // still needs the width to distinguish a whole struct from one of its fields.
+    public int? NativeMemoryAccessSize;
+
     public bool IsFallThrough =>
         OpCode switch
         {
@@ -112,6 +117,8 @@ public class Instruction : IOperand
             case OpCode.Xor:
             case OpCode.Not:
             case OpCode.Negate:
+            case OpCode.VectorMin:
+            case OpCode.VectorMax:
             case OpCode.SignExtend32:
             case OpCode.CheckEqual:
             case OpCode.CheckGreater:
@@ -164,7 +171,7 @@ public class Instruction : IOperand
 
             OpCode.Box => [_operands[2]],
 
-            OpCode.Add or OpCode.Subtract or OpCode.Multiply
+            OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.VectorMin or OpCode.VectorMax
                 or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight
                 or OpCode.And or OpCode.Or or OpCode.Xor
                 => [_operands[2], _operands[1]],
@@ -187,10 +194,29 @@ public class Instruction : IOperand
         if (OpCode == OpCode.Return && _operands.Count == 1)
             sources.Add(_operands[0]);
 
+        sources = sources.SelectMany(ExpandCompoundSource).ToList();
+
         if (constantsOnly)
             sources = sources.Where(o => !IsConstantValue(o)).ToList();
 
         return sources;
+    }
+
+    private static IEnumerable<IOperand> ExpandCompoundSource(IOperand operand)
+    {
+        if (operand is ArrayElementFieldReference elementField)
+            return elementField.Index is LocalVariable index
+                ? [operand, elementField.Array, index]
+                : [operand, elementField.Array];
+        if (operand is AddressOf { Target: ArrayElementFieldReference addressedElementField })
+            return addressedElementField.Index is LocalVariable index
+                ? [operand, addressedElementField.Array, index]
+                : [operand, addressedElementField.Array];
+        if (operand is not SelectedFieldReference selected)
+            return [operand];
+
+        return selected.Choices.Select(c => (IOperand)c.Field.Local)
+            .Append(selected.Selector).Prepend(selected).Distinct();
     }
 
     public override string ToString()
@@ -232,7 +258,7 @@ public class Instruction : IOperand
         operand switch
         {
             Register or StackOffset or LocalVariable => false,
-            AddressOf or ArrayAccess or ArrayLength or ReferenceCast => false,
+            AddressOf or ArrayAccess or ArrayLength or ArrayElementFieldReference or ReferenceCast or SelectedFieldReference => false,
             MemoryOperand memory => memory.IsConstant,
             _ => true
         };
