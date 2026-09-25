@@ -466,18 +466,24 @@ public static class MetadataResolver
             return null;
 
         for (var candidate = owner; candidate != null; candidate = candidate.BaseType)
-        foreach (var container in candidate.Fields.Where(f => !f.IsStatic && f.FieldType.IsValueType)
-                     .OrderByDescending(f => f.Offset))
         {
-            var relativeOffset = offset - container.Offset;
-            if (relativeOffset < 0 || PrimitiveStorageSize(container.FieldType, owner.AppContext.Binary.PointerSizeBytes) == accessSize)
+            // generic candidates' field offsets are layout placeholders, not real offsets
+            if (candidate is GenericInstanceTypeAnalysisContext || candidate.GenericParameters.Count > 0)
                 continue;
 
-            var nested = container.FieldType.Fields.FirstOrDefault(f => !f.IsStatic
-                && f.Offset == relativeOffset
-                && PrimitiveStorageSize(f.FieldType, owner.AppContext.Binary.PointerSizeBytes) == accessSize);
-            if (nested != null)
-                return (container, nested);
+            foreach (var container in candidate.Fields.Where(f => !f.IsStatic && f.FieldType.IsValueType)
+                         .OrderByDescending(f => f.Offset))
+            {
+                var relativeOffset = offset - container.Offset;
+                if (relativeOffset < 0 || PrimitiveStorageSize(container.FieldType, owner.AppContext.Binary.PointerSizeBytes) == accessSize)
+                    continue;
+
+                var nested = container.FieldType.Fields.FirstOrDefault(f => !f.IsStatic
+                    && f.Offset == relativeOffset
+                    && PrimitiveStorageSize(f.FieldType, owner.AppContext.Binary.PointerSizeBytes) == accessSize);
+                if (nested != null)
+                    return (container, nested);
+            }
         }
 
         return null;
@@ -504,28 +510,41 @@ public static class MetadataResolver
     }
 
     // Mirrors the owner selection in ResolveFieldOffsets: generic definitions have
-    // all-0 metadata offsets, so their layout is recomputed instead.
+    // all-0 metadata offsets, so their layout is recomputed instead. A generic
+    // instance's own fields are recomputed that way too, but fields inherited from a
+    // non-generic base keep their real metadata offsets, so the whole chain is searched.
     internal static FieldAnalysisContext? FindInstanceFieldAtOffset(TypeAnalysisContext owner, long offset)
     {
         if (owner is GenericInstanceTypeAnalysisContext genericOwner)
-            return GenericLayoutDependsOnValueArgument(genericOwner)
-                ? null
-                : GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner.GenericType, offset);
+        {
+            // Own-field layout is recomputed; a value-type argument affecting field
+            // placement makes it untrustworthy, but inherited fields on the chain
+            // keep their real metadata offsets, so fall through to the walk.
+            if (!GenericLayoutDependsOnValueArgument(genericOwner)
+                && GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner.GenericType, offset) is { } ownField)
+                return ownField;
+        }
+        else if (owner.GenericParameters.Count > 0
+                 && GenericInstanceFieldLayout.FindFieldAtOffset(owner, offset) is { } openOwnerField)
+        {
+            return openOwnerField;
+        }
 
-        if (owner.GenericParameters.Count > 0)
-            return GenericInstanceFieldLayout.FindFieldAtOffset(owner, offset);
-
-        // an inherited field exists on the base type but sits at the same offset in
-        // the derived layout, so the whole chain is searched
         for (var candidate = owner; candidate != null; candidate = candidate.BaseType)
         {
-            if (candidate is GenericInstanceTypeAnalysisContext genericCandidate
-                && !GenericLayoutDependsOnValueArgument(genericCandidate)
-                && GenericInstanceFieldLayout.FindFieldAtOffset(genericCandidate.GenericType, offset) is { } genericField)
-                return new ConcreteGenericFieldAnalysisContext(genericField, genericCandidate);
-            if (candidate.GenericParameters.Count > 0
-                && GenericInstanceFieldLayout.FindFieldAtOffset(candidate, offset) is { } openGenericField)
-                return openGenericField;
+            if (candidate is GenericInstanceTypeAnalysisContext genericCandidate)
+            {
+                if (!GenericLayoutDependsOnValueArgument(genericCandidate)
+                    && GenericInstanceFieldLayout.FindFieldAtOffset(genericCandidate.GenericType, offset) is { } genericField)
+                    return new ConcreteGenericFieldAnalysisContext(genericField, genericCandidate);
+                continue; // a generic instance's metadata offsets are layout placeholders, never real
+            }
+            if (candidate.GenericParameters.Count > 0)
+            {
+                if (GenericInstanceFieldLayout.FindFieldAtOffset(candidate, offset) is { } openGenericField)
+                    return openGenericField;
+                continue;
+            }
             if (candidate.Fields.FirstOrDefault(f => !f.IsStatic
                     && (f.Attributes & FieldAttributes.Literal) == 0 // consts have no storage but their metadata offset is 0, which would match
                     && (f.BackingData?.FieldOffset ?? f.Offset) == offset) is { } field)
