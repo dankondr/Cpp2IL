@@ -34,16 +34,35 @@ public class Arm64MissingOpsTests
             0x1e20c000, // fabs s0, s0
             0x7ea1d400, // fabd s0, s0, s1 (REPORT bytes 00d4a17e)
             0x4e219800, // frintm v0.4s, v0.4s
-            0x4e140420, // dup v0.4s, w1
-            0x4e040c20, // dup v0.4s, v1.s[0]
         })
         {
             var il = Lift(word);
-            var isVector = word is 0x4e219800 or 0x4e140420 or 0x4e040c20;
+            var isVector = word is 0x4e219800;
             if (isVector)
                 Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.True, $"0x{word:x8}");
             else
                 Assert.That(il.Any(i => i.OpCode is OpCode.Call or OpCode.NotImplemented), Is.True, $"0x{word:x8}");
+        }
+    }
+
+    [Test]
+    public void DupBroadcastWitnessesFoldToLaneMoves()
+    {
+        foreach (var (word, dest, src) in new (uint, string, string)[]
+        {
+            (0x0e040d20u, "V0", "X9"), // dup v0.2s, w9
+            (0x0e040d01u, "V1", "X8"), // dup v1.2s, w8
+        })
+        {
+            var il = Lift(word);
+            Assert.Multiple(() =>
+            {
+                Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False, $"0x{word:x8}");
+                for (var lane = 0; lane < 2; lane++)
+                    Assert.That(il.Any(i => i.OpCode == OpCode.Move
+                        && i.Operands[0] is Register d && d.Name == $"{dest}.S{lane}"
+                        && i.Operands[1] is Register s && s.Name == src), Is.True, $"0x{word:x8} lane {lane}");
+            });
         }
     }
 
@@ -66,8 +85,11 @@ public class Arm64MissingOpsTests
     [Test]
     public void MoviShiftedSingleLanesBecomeBroadcastFloat()
     {
-        var move = Lift(0x0f0167e2).Single(i => i.OpCode == OpCode.Move);
-        Assert.That(move.Operands[1], Is.EqualTo(new Vector128Literal(0.5f, 0.5f, 0.5f, 0.5f)));
+        // the vector Move keeps the float broadcast; the scalarizer also emits
+        // integer per-window Moves recording the lane provenance
+        var moves = Lift(0x0f0167e2).Where(i => i.OpCode == OpCode.Move).ToList();
+        Assert.That(moves[0].Operands[1], Is.EqualTo(new Vector128Literal(0.5f, 0.5f, 0.5f, 0.5f)));
+        Assert.That(moves.Skip(1).All(i => i.Operands[1].Equals(new Immediate(0x3F000000))), Is.True);
     }
 
     [Test]
