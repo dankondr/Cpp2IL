@@ -65,7 +65,7 @@ internal sealed class Arm64VectorScalarizer
     private readonly HashSet<ulong> _mergeTargets = new();
     private readonly HashSet<string> _claimedDests = new();
     private int _tempCounter;
-    private bool _sawIndirectJump;
+    private bool _clearProvenanceNext;
 
     private Func<ulong, OpCode, List<IOperand>, Instruction> _add = null!;
     private ulong _address;
@@ -140,7 +140,7 @@ internal sealed class Arm64VectorScalarizer
         _mergeTargets.Clear();
         _claimedDests.Clear();
         _tempCounter = 0;
-        _sawIndirectJump = false;
+        _clearProvenanceNext = false;
 
         foreach (var insn in instructions)
         {
@@ -165,14 +165,18 @@ internal sealed class Arm64VectorScalarizer
     /// <summary>
     /// Called before each instruction is converted. A branch target may be
     /// reached by a path that built each vector differently, so all lane state
-    /// is dropped there; the same applies after an indirect jump whose targets
-    /// cannot be enumerated.
+    /// is dropped there; the same applies after any control-flow instruction
+    /// whose effect on registers cannot be tracked (calls clobber V0-V7 and
+    /// V16-V31, indirect jumps cannot be enumerated).
     /// </summary>
     public void BeginInstruction(ulong address)
     {
         _claimedDests.Clear();
-        if (_mergeTargets.Contains(address) || _sawIndirectJump)
+        if (_mergeTargets.Contains(address) || _clearProvenanceNext)
+        {
             _vectors.Clear();
+            _clearProvenanceNext = false;
+        }
     }
 
     /// <summary>
@@ -202,20 +206,48 @@ internal sealed class Arm64VectorScalarizer
     /// </summary>
     public void NoteUnhandled(Arm64Instruction insn)
     {
-        if (insn.Mnemonic is Arm64Mnemonic.BR or Arm64Mnemonic.BLR)
-            _sawIndirectJump = true; // jump-table targets cannot be enumerated
+        // Anything that can transfer control out of this instruction's linear
+        // flow invalidates lane state at the next instruction: a call clobbers
+        // argument/temporary vector registers and may write the V0 result, an
+        // indirect jump's targets cannot be enumerated, and bytes following an
+        // unconditional branch or return are not this path's code.
+        if (insn.Mnemonic is Arm64Mnemonic.B or Arm64Mnemonic.BL
+            or Arm64Mnemonic.BR or Arm64Mnemonic.BLR
+            or Arm64Mnemonic.RET or Arm64Mnemonic.RETAA or Arm64Mnemonic.RETAB)
+            _clearProvenanceNext = true;
 
         // stores read the register rather than writing it — no invalidation
         if (insn.Mnemonic is Arm64Mnemonic.STR or Arm64Mnemonic.STUR or Arm64Mnemonic.STP
             or Arm64Mnemonic.STRB or Arm64Mnemonic.STRH or Arm64Mnemonic.STURB or Arm64Mnemonic.STURH)
             return;
 
+        var name = insn.Op0Kind is Arm64OperandKind.Register or Arm64OperandKind.VectorRegisterElement
+            ? Normalize(insn.Op0Reg)
+            : null;
+        if (name != null && _claimedDests.Remove(name))
+            return; // lane state was already written by this pass
+
+        if (insn.Op0Kind == Arm64OperandKind.VectorRegisterElement)
+        {
+            // an element write we did not claim rewrites one lane window
+            var element = insn.Op0VectorElement;
+            var elementState = Ensure(insn.Op0Reg);
+            elementState.Slots[ElementBits(element) * element.Index / 32] = null;
+            elementState.Whole = false;
+            return;
+        }
+
+        if (insn.Op0Kind == Arm64OperandKind.None)
+        {
+            // no identifiable destination: undecoded words (UNIMPLEMENTED) or
+            // exotic forms may still write any vector register — drop all
+            // provenance rather than fold against stale lanes
+            _vectors.Clear();
+            return;
+        }
+
         if (insn.Op0Kind != Arm64OperandKind.Register || !IsVectorRegister(insn.Op0Reg))
             return;
-
-        var name = Normalize(insn.Op0Reg);
-        if (_claimedDests.Remove(name))
-            return; // lane state was already written by this pass
 
         if (WholeVectorLoad(insn))
         {
@@ -260,7 +292,7 @@ internal sealed class Arm64VectorScalarizer
             return;
         }
 
-        if (_vectors.TryGetValue(name, out var existing))
+        if (_vectors.TryGetValue(name!, out var existing))
         {
             for (var i = 0; i < 4; i++)
                 existing.Slots[i] = null; // opaque write: lanes no longer provable
@@ -418,6 +450,49 @@ internal sealed class Arm64VectorScalarizer
         };
     }
 
+    /// <summary>
+    /// Best operand for an element read on <paramref name="reg"/>: the proven
+    /// window when the register is tracked, otherwise the register local
+    /// itself for element 0 (the local holds the scalar a caller left in the
+    /// low lane — an argument register or an FP pipeline result) or the
+    /// element local the caller's normal path would read for higher lanes.
+    /// </summary>
+    private IOperand ResolveElementSource(Arm64Register reg, Arm64VectorElement element)
+        => ResolveLaneElement(reg, element)
+            ?? ElementRegister(Normalize(reg), ElementBits(element), element.Index);
+
+    /// <summary>
+    /// Element read for lane-wise consumers: a tracked register's unproven
+    /// window stays unproven (null) so the consuming lane reports it, while an
+    /// untracked register resolves as in <see cref="ResolveElementSource"/>.
+    /// </summary>
+    private IOperand? ResolveLaneElement(Arm64Register reg, Arm64VectorElement element)
+    {
+        var state = State(reg);
+        if (state != null)
+            return ElementOperand(state, element);
+        return ElementBits(element) * element.Index == 0
+            ? Reg(reg)
+            : ElementRegister(Normalize(reg), ElementBits(element), element.Index);
+    }
+
+    /// <summary>
+    /// Scalar-register reads (FADD Sd, Sn, Sm and friends) consult the register
+    /// local. A lane-level write only materializes element locals, so the
+    /// register local must be kept in sync with the lane-0 window it models,
+    /// otherwise a scalar consumer would read a stale or unwritten local.
+    /// </summary>
+    private void SyncScalarView(VectorState dest, string name)
+    {
+        var slice = dest.Slots[0];
+        if (slice == null || slice.Value.BitOffset != 0)
+            return;
+        if (slice.Value.Operand is Register { Name: var operandName } && operandName == name)
+            return; // the register local already holds the lane-0 value
+        _add(_address, OpCode.Move, [new Register(null, name), slice.Value.Operand]);
+        _emitted = true;
+    }
+
     private IOperand? NarrowElementOperand(VectorState state, int slot, int offsetInSlot, int bits)
     {
         var slotOp = SlotOperand(state, slot);
@@ -488,8 +563,8 @@ internal sealed class Arm64VectorScalarizer
     {
         if (IsLaneWiseBinop(insn.Mnemonic)
             && insn.Op0Kind == Arm64OperandKind.Register
-            && insn.Op1Kind == Arm64OperandKind.Register
-            && insn.Op2Kind == Arm64OperandKind.Register
+            && insn.Op1Kind is Arm64OperandKind.Register or Arm64OperandKind.VectorRegisterElement
+            && insn.Op2Kind is Arm64OperandKind.Register or Arm64OperandKind.VectorRegisterElement
             && insn.Op0Arrangement != Arm64ArrangementSpecifier.None
             && IsVectorRegister(insn.Op0Reg))
         {
@@ -576,11 +651,7 @@ internal sealed class Arm64VectorScalarizer
         if (insn.Op1Kind == Arm64OperandKind.Register)
             source = convertOperand(insn, 1);
         else if (insn.Op1Kind == Arm64OperandKind.VectorRegisterElement)
-        {
-            var sourceState = State(insn.Op1Reg);
-            source = sourceState != null ? ElementOperand(sourceState, insn.Op1VectorElement) : null;
-            source ??= ElementRegister(Normalize(insn.Op1Reg), ElementBits(insn.Op1VectorElement), insn.Op1VectorElement.Index);
-        }
+            source = ResolveElementSource(insn.Op1Reg, insn.Op1VectorElement);
         else
             return false;
 
@@ -609,6 +680,7 @@ internal sealed class Arm64VectorScalarizer
         for (var slot = slotsUsed; slot < 4; slot++)
             dest.Slots[slot] = new LaneSlice(Zero, 0); // 64-bit forms zero the upper half
 
+        SyncScalarView(dest, destName);
         if (!_emitted)
             _add(_address, OpCode.Nop, []);
         return true;
@@ -631,11 +703,7 @@ internal sealed class Arm64VectorScalarizer
 
         IOperand source;
         if (insn.Op1Kind == Arm64OperandKind.VectorRegisterElement)
-        {
-            var sourceState = State(insn.Op1Reg);
-            source = sourceState != null ? ElementOperand(sourceState, insn.Op1VectorElement) : null;
-            source ??= ElementRegister(Normalize(insn.Op1Reg), ElementBits(insn.Op1VectorElement), insn.Op1VectorElement.Index);
-        }
+            source = ResolveElementSource(insn.Op1Reg, insn.Op1VectorElement);
         else
             source = convertOperand(insn, 1);
 
@@ -655,6 +723,8 @@ internal sealed class Arm64VectorScalarizer
                 dest.Slots[elementBits * element.Index / 32] = null; // partial-window write
                 break;
         }
+        if (elementBits * element.Index < 32)
+            SyncScalarView(dest, destName);
         return true;
     }
 
@@ -735,6 +805,7 @@ internal sealed class Arm64VectorScalarizer
                     dest.Slots[slot] = null;
             for (var slot = slotsUsed; slot < 4; slot++)
                 dest.Slots[slot] = new LaneSlice(Zero, 0);
+            SyncScalarView(dest, destName);
             return true;
         }
 
@@ -926,6 +997,7 @@ internal sealed class Arm64VectorScalarizer
         }
         for (var slot = slotsUsed; slot < 4; slot++)
             dest.Slots[slot] = new LaneSlice(Zero, 0);
+        SyncScalarView(dest, destName);
         return true;
     }
 
@@ -965,6 +1037,7 @@ internal sealed class Arm64VectorScalarizer
             EmitLaneOp(op, destName, laneBits, lane, operands[lane]!, new Immediate(insn.Op2Imm), dest);
         for (var slot = slotsUsed; slot < 4; slot++)
             dest.Slots[slot] = new LaneSlice(Zero, 0);
+        SyncScalarView(dest, destName);
         return true;
     }
 
@@ -981,11 +1054,16 @@ internal sealed class Arm64VectorScalarizer
         var isFloat = IsFloatLaneOp(insn.Mnemonic);
         var accumulates = insn.Mnemonic is Arm64Mnemonic.MLA or Arm64Mnemonic.MLS;
 
-        var sourceA = LaneState(insn.Op1Reg);
-        var sourceB = LaneState(insn.Op2Reg);
+        // an element operand (FMUL Vd.2S, Vn.2S, Vm.S[i]) broadcasts one lane
+        var aIsElement = insn.Op1Kind == Arm64OperandKind.VectorRegisterElement;
+        var bIsElement = insn.Op2Kind == Arm64OperandKind.VectorRegisterElement;
+        var sourceA = aIsElement ? null : LaneState(insn.Op1Reg);
+        var sourceB = bIsElement ? null : LaneState(insn.Op2Reg);
+        var elementA = aIsElement ? ResolveLaneElement(insn.Op1Reg, insn.Op1VectorElement) : null;
+        var elementB = bIsElement ? ResolveLaneElement(insn.Op2Reg, insn.Op2VectorElement) : null;
         var sourceD = accumulates ? LaneState(insn.Op0Reg) : null;
 
-        if (sourceA == null && sourceB == null && sourceD == null)
+        if (sourceA == null && sourceB == null && sourceD == null && elementA == null && elementB == null)
             return false; // fully opaque chain: caller's normal path
 
         var dest = Ensure(insn.Op0Reg);
@@ -1011,13 +1089,13 @@ internal sealed class Arm64VectorScalarizer
             }
             else if (bitwise)
             {
-                aOps[lane] = sourceA == null ? null : SlotOperand(sourceA, lane);
-                bOps[lane] = sourceB == null ? null : SlotOperand(sourceB, lane);
+                aOps[lane] = aIsElement ? elementA : sourceA == null ? null : SlotOperand(sourceA, lane);
+                bOps[lane] = bIsElement ? elementB : sourceB == null ? null : SlotOperand(sourceB, lane);
             }
             else
             {
-                aOps[lane] = LaneOperand(sourceA, laneBits, lane);
-                bOps[lane] = LaneOperand(sourceB, laneBits, lane);
+                aOps[lane] = aIsElement ? elementA : LaneOperand(sourceA, laneBits, lane);
+                bOps[lane] = bIsElement ? elementB : LaneOperand(sourceB, laneBits, lane);
             }
 
             if (accumulates)
@@ -1085,6 +1163,7 @@ internal sealed class Arm64VectorScalarizer
         }
         for (var slot = vectorSlots; slot < 4; slot++)
             dest.Slots[slot] = new LaneSlice(Zero, 0);
+        SyncScalarView(dest, destName);
         if (unprovenLanes > 0)
             Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarized {rows - unprovenLanes} of {rows} lanes.");
         return true;

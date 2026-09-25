@@ -399,6 +399,153 @@ public class Arm64VectorScalarizerTests
         });
     }
 
+    [Test]
+    public void IndirectCallClobbersVectorProvenance()
+    {
+        // An indirect call clobbers the argument/temporary vector registers
+        // and writes its result to v0: lane state from before the call must
+        // not fold the following lane op.
+        var il = Lift(
+            0x0e040d00, // dup v0.2s, w8
+            0xd63f0100, // blr x8
+            0x0ea08401, // add v1.2s, v0.2s, v0.2s
+            0xd65f03c0);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => IsMove(i, "V0.S0", "X8")), Is.True, "dup folded before the call");
+            Assert.That(FindOp(il, OpCode.Add, "V1.S0"), Is.Null, "stale v0 lanes must not be reused");
+            Assert.That(FindOp(il, OpCode.Add, "V1"), Is.Not.Null, "falls back to the whole-register op");
+        });
+    }
+
+    [Test]
+    public void DirectCallClobbersVectorProvenance()
+    {
+        // A direct BL has no indirect target to enumerate, but it clobbers the
+        // same argument/temporary registers: NoteUnhandled must drop lane
+        // state before the following instruction converts.
+        var dup = MakeInsn(m =>
+        {
+            Set(m, "Mnemonic", Arm64Mnemonic.DUP);
+            Set(m, "Op0Kind", Arm64OperandKind.Register);
+            Set(m, "Op0Reg", Arm64Register.V0);
+            Set(m, "Op0Arrangement", Arm64ArrangementSpecifier.TwoS);
+            Set(m, "Op1Kind", Arm64OperandKind.Register);
+            Set(m, "Op1Reg", Arm64Register.W8);
+        });
+        var call = MakeInsn(m =>
+        {
+            Set(m, "Mnemonic", Arm64Mnemonic.BL);
+            Set(m, "Address", (ulong)4);
+            Set(m, "Op0Kind", Arm64OperandKind.ImmediatePcRelative);
+            Set(m, "Op0Imm", (long)0x14);
+        });
+        var add = MakeInsn(m =>
+        {
+            Set(m, "Mnemonic", Arm64Mnemonic.ADD);
+            Set(m, "Address", (ulong)8);
+            Set(m, "Op0Kind", Arm64OperandKind.Register);
+            Set(m, "Op0Reg", Arm64Register.V1);
+            Set(m, "Op0Arrangement", Arm64ArrangementSpecifier.TwoS);
+            Set(m, "Op1Kind", Arm64OperandKind.Register);
+            Set(m, "Op1Reg", Arm64Register.V0);
+            Set(m, "Op2Kind", Arm64OperandKind.Register);
+            Set(m, "Op2Reg", Arm64Register.V0);
+        });
+
+        var emitted = new List<Instruction>();
+        Instruction Add(ulong address, OpCode opCode, List<IOperand> operands)
+        {
+            var insn = new Instruction(emitted.Count, opCode, operands);
+            emitted.Add(insn);
+            return insn;
+        }
+        Func<Arm64Instruction, int, IOperand> conv = (_, _) => new Register(null, "X8");
+
+        var scalarizer = new Arm64VectorScalarizer();
+        scalarizer.Begin([dup, call, add]);
+        scalarizer.TryBroadcastDup(dup, Add, conv);
+        scalarizer.BeginInstruction(4);
+        scalarizer.NoteUnhandled(call);
+        scalarizer.BeginInstruction(8); // BL just invalidated every tracked lane
+        Assert.That(scalarizer.TryConvert(add, Add, conv), Is.False,
+            "the consumer after a direct call must fall back, not reuse stale v0 lanes");
+    }
+
+    [Test]
+    public void UndecodedInstructionClobbersVectorProvenance()
+    {
+        // An undecoded word may write any vector register (the real USHLL in
+        // the hash routines rewrites v3), so it invalidates all lane state.
+        var dup = MakeInsn(m =>
+        {
+            Set(m, "Mnemonic", Arm64Mnemonic.DUP);
+            Set(m, "Op0Kind", Arm64OperandKind.Register);
+            Set(m, "Op0Reg", Arm64Register.V0);
+            Set(m, "Op0Arrangement", Arm64ArrangementSpecifier.TwoS);
+            Set(m, "Op1Kind", Arm64OperandKind.Register);
+            Set(m, "Op1Reg", Arm64Register.W8);
+        });
+        var undecoded = MakeInsn(m =>
+        {
+            Set(m, "Mnemonic", Arm64Mnemonic.UNIMPLEMENTED);
+            Set(m, "Address", (ulong)4);
+        });
+        var add = MakeInsn(m =>
+        {
+            Set(m, "Mnemonic", Arm64Mnemonic.ADD);
+            Set(m, "Address", (ulong)8);
+            Set(m, "Op0Kind", Arm64OperandKind.Register);
+            Set(m, "Op0Reg", Arm64Register.V1);
+            Set(m, "Op0Arrangement", Arm64ArrangementSpecifier.TwoS);
+            Set(m, "Op1Kind", Arm64OperandKind.Register);
+            Set(m, "Op1Reg", Arm64Register.V0);
+            Set(m, "Op2Kind", Arm64OperandKind.Register);
+            Set(m, "Op2Reg", Arm64Register.V0);
+        });
+
+        var emitted = new List<Instruction>();
+        Instruction Add(ulong address, OpCode opCode, List<IOperand> operands)
+        {
+            var insn = new Instruction(emitted.Count, opCode, operands);
+            emitted.Add(insn);
+            return insn;
+        }
+        Func<Arm64Instruction, int, IOperand> conv = (_, _) => new Register(null, "X8");
+
+        var scalarizer = new Arm64VectorScalarizer();
+        scalarizer.Begin([dup, undecoded, add]);
+        scalarizer.TryBroadcastDup(dup, Add, conv);
+        scalarizer.BeginInstruction(4);
+        scalarizer.NoteUnhandled(undecoded); // Op0Kind None — unidentifiable destination
+        scalarizer.BeginInstruction(8);
+        Assert.That(scalarizer.TryConvert(add, Add, conv), Is.False,
+            "the consumer after an undecoded word must fall back, not reuse stale v0 lanes");
+    }
+
+    [Test]
+    public void ElementOperandBroadcastsProvenScalar()
+    {
+        // FMUL Vd.2S, Vn.2S, Vm.S[0] multiplies every lane by one element: the
+        // element reads the scalar the caller left in the register local.
+        var il = Lift(
+            0x0e040d23, // dup v3.2s, w9
+            0x1e270104, // fmov s4, w8
+            0x0f849063); // fmul v3.2s, v3.2s, v4.s[0]
+
+        var lo = FindOp(il, OpCode.Multiply, "V3.S0");
+        var hi = FindOp(il, OpCode.Multiply, "V3.S1");
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+            Assert.That(lo, Is.Not.Null);
+            Assert.That(hi, Is.Not.Null);
+            Assert.That(lo!.Operands[2], Is.EqualTo(new Register(null, "V4")));
+            Assert.That(hi!.Operands[2], Is.EqualTo(new Register(null, "V4")));
+        });
+    }
+
     // Arm64Instruction is a struct with internal setters: build it boxed so
     // the properties mutate the same instance that gets returned.
     private static Arm64Instruction MakeInsn(Action<object> init)
