@@ -51,10 +51,16 @@ public class Arm64MissingOpsTests
     public void BicKeepsShiftedRegisterOperand()
     {
         var il = Lift(0x0aa87d00); // little-endian bytes 00 7d a8 0a, report word 007da80a
-        Assert.That(il.Any(i => i.OpCode == OpCode.ShiftRight
+        // bic w0, w8, w8, asr #31 - a word ASR takes its sign from bit 31, so the
+        // arithmetic shift reads either X8 directly or a sign-extended copy of it
+        var shiftRightInputs = il.Where(i => i.OpCode == OpCode.ShiftRight
             && i.Operands.Count == 3
-            && i.Operands[1].ToString() == "X8"
-            && i.Operands[2].Equals(new Immediate(31))), Is.True);
+            && i.Operands[2].Equals(new Immediate(31)))
+            .Select(i => i.Operands[1].ToString());
+        Assert.That(shiftRightInputs.Any(input => input == "X8"
+            || il.Any(i => i.OpCode == OpCode.SignExtend32
+                && i.Operands[0].ToString() == input
+                && i.Operands[1].ToString() == "X8")), Is.True);
     }
 
     [Test]
