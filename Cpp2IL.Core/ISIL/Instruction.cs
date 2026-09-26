@@ -147,6 +147,17 @@ public class Instruction : IOperand
                     SetOperand(1, newDestination);
                 return IsConstantValue(_operands[1]) ? null : _operands[1];
 
+            // A block memory op carries the call's return-value local in the trailing
+            // operand when something still reads it.
+            case OpCode.MemoryCopy:
+            case OpCode.MemorySet:
+            case OpCode.MemoryMove:
+                if (_operands.Count < 4)
+                    return null;
+                if (newDestination != null)
+                    SetOperand(3, newDestination);
+                return IsConstantValue(_operands[3]) ? null : _operands[3];
+
             default:
                 return null;
         }
@@ -188,6 +199,10 @@ public class Instruction : IOperand
                 : _operands.Take(1).ToList(),
 
             OpCode.CallVoid or OpCode.Phi => _operands.Skip(1).ToList(),
+
+            // dst/src-or-fill/size are all reads; the optional 4th operand is the write.
+            OpCode.MemoryCopy or OpCode.MemorySet or OpCode.MemoryMove
+                => [_operands[0], _operands[1], _operands[2]],
             OpCode.CheckEqual or OpCode.CheckGreater or OpCode.CheckLess
                 or OpCode.CheckNotEqual or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual
                 => [_operands[1], _operands[2]],
