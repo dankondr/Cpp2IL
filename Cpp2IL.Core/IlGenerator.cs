@@ -5489,7 +5489,10 @@ public static class IlGenerator
         if (operand is FieldReference nestedField
             && WholeValueContainerReference(nestedField, contract) is { } wholeValue)
             operand = wholeValue;
-        if (operand is TypeAnalysisContext && contract is { IsValueType: true }
+        // A bare type operand into a value-type slot has no honest emission - except the
+        // synthetic method-handle context, which is a real ldftn/ldtoken value.
+        if (operand is TypeAnalysisContext and not RuntimeMethodInfoAnalysisContext
+            && contract is { IsValueType: true }
             && contract.FullName is not ("System.RuntimeTypeHandle" or "System.RuntimeMethodHandle" or "System.RuntimeFieldHandle"))
         {
             PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context);
