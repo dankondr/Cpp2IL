@@ -24,13 +24,11 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
 
     private long _globalOffset;
 
-    /// <summary>Reads a relocated, pointer-aligned GOT slot protected by GNU RELRO.</summary>
-    public ulong? ReadReadOnlyGotPointer(ulong address)
+    /// <summary>Reads a relocated, pointer-aligned slot protected by GNU RELRO.</summary>
+    public ulong? ReadReadOnlyRelocatedPointer(ulong address)
     {
         var width = (ulong)PointerSizeBytes;
         if (address % width != 0
-            || !_elfSectionHeaderEntries.Any(s => s.Name == ".got" && s.Size >= width
-                && address >= s.VirtualAddress && address - s.VirtualAddress <= s.Size - width)
             || !_elfProgramHeaderEntries.Any(p => (uint)p.Type == 0x6474e552 /* PT_GNU_RELRO */
                 && p.VirtualSize >= width && address >= p.VirtualAddress
                 && address - p.VirtualAddress <= p.VirtualSize - width)
@@ -39,6 +37,14 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
 
         return ReadPointerAtVirtualAddress(address);
     }
+
+    public bool IsReadOnlyRange(ulong address, int size) => size > 0 && _elfProgramHeaderEntries.Any(p =>
+        p.Type == ElfProgramEntryType.PT_LOAD
+        && (p.Flags & ElfProgramHeaderFlags.PF_R) != 0
+        && (p.Flags & ElfProgramHeaderFlags.PF_W) == 0
+        && p.RawSize >= (ulong)size
+        && address >= p.VirtualAddress
+        && address - p.VirtualAddress <= p.RawSize - (ulong)size);
 
     public ElfFile(MemoryStream input) : base(input)
     {

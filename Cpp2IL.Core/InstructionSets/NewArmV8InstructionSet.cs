@@ -8,6 +8,7 @@ using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
 using Disarm.InternalDisassembly;
+using LibCpp2IL.Elf;
 
 namespace Cpp2IL.Core.InstructionSets;
 
@@ -16,7 +17,30 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     [ThreadStatic]
     private static Dictionary<string, ulong>? adrpOffsets;
 
+    [ThreadStatic]
+    private static Dictionary<string, (bool Greater, IOperand Value, IOperand Bound)>? vectorComparisons;
+
     private static readonly Arm64CallingConventionResolver CallingConventions = new();
+
+    // Scalar libm imports with an exact managed spelling. fmod/fmodf are truncated
+    // remainders (sign of the dividend), which is precisely CIL `rem` —
+    // Math.IEEERemainder rounds the quotient instead, so Method=null maps them to
+    // OpCode.Modulo rather than a call.
+    internal static readonly IReadOnlyDictionary<string, (string? Method, bool IsDouble, int ArgumentCount)> ScalarMathImports
+        = new Dictionary<string, (string?, bool, int)>
+        {
+            ["sinf"] = ("Sin", false, 1),     ["sin"] = ("Sin", true, 1),
+            ["cosf"] = ("Cos", false, 1),     ["cos"] = ("Cos", true, 1),
+            ["tanf"] = ("Tan", false, 1),     ["tan"] = ("Tan", true, 1),
+            ["asinf"] = ("Asin", false, 1),   ["asin"] = ("Asin", true, 1),
+            ["acosf"] = ("Acos", false, 1),   ["acos"] = ("Acos", true, 1),
+            ["atanf"] = ("Atan", false, 1),   ["atan"] = ("Atan", true, 1),
+            ["expf"] = ("Exp", false, 1),     ["exp"] = ("Exp", true, 1),
+            ["logf"] = ("Log", false, 1),     ["log"] = ("Log", true, 1),
+            ["atan2f"] = ("Atan2", false, 2), ["atan2"] = ("Atan2", true, 2),
+            ["powf"] = ("Pow", false, 2),     ["pow"] = ("Pow", true, 2),
+            ["fmodf"] = (null, false, 2),    ["fmod"] = (null, true, 2),
+        };
 
     public override BaseCallingConventionResolver CallingConventionResolver => CallingConventions;
 
@@ -42,6 +66,16 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             or >= Arm64Register.D0 and <= Arm64Register.D31;
 
     private static bool IsWordRegister(Arm64Register reg) => reg is >= Arm64Register.W0 and <= Arm64Register.W31;
+
+    private static int RegisterWidthBytes(Arm64Register reg) => reg switch
+    {
+        >= Arm64Register.B0 and <= Arm64Register.B31 => 1,
+        >= Arm64Register.H0 and <= Arm64Register.H31 => 2,
+        >= Arm64Register.W0 and <= Arm64Register.W31 or >= Arm64Register.S0 and <= Arm64Register.S31 => 4,
+        >= Arm64Register.X0 and <= Arm64Register.X31 or >= Arm64Register.D0 and <= Arm64Register.D31 => 8,
+        >= Arm64Register.V0 and <= Arm64Register.V31 => 16,
+        _ => 0
+    };
 
     // integer register 31 is SP or ZR depending on context, callers must decide which
     private static bool IsReg31(Arm64Register reg) => reg is Arm64Register.X31 or Arm64Register.W31;
@@ -145,18 +179,25 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     public override List<Instruction> GetIsilFromMethod(MethodAnalysisContext context)
         => ConvertInstructions(NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext, context.UnderlyingPointer), context);
 
-    internal List<Instruction> ConvertInstructions(IEnumerable<Arm64Instruction> insns, MethodAnalysisContext context)
+    internal List<Instruction> ConvertInstructions(IEnumerable<Arm64Instruction> insns, MethodAnalysisContext context,
+        Func<ulong, string?>? importNameResolver = null)
     {
         if (adrpOffsets == null) // initializers for ThreadStatic fields only run on the first thread
             adrpOffsets = new();
         else
             adrpOffsets.Clear();
+        vectorComparisons ??= new();
+        vectorComparisons.Clear();
 
         var instructions = new List<Instruction>();
         var addresses = new List<ulong>();
 
-        foreach (var instruction in insns)
-            ConvertInstructionStatement(instruction, instructions, addresses, context);
+        var instructionList = insns as IReadOnlyList<Arm64Instruction> ?? insns.ToList();
+        var scalarizer = new Arm64VectorScalarizer();
+        scalarizer.Begin(instructionList);
+
+        foreach (var instruction in instructionList)
+            ConvertInstructionStatement(instruction, instructions, addresses, context, scalarizer, importNameResolver);
 
         // Add return if the function doesn't end with one already
         if (instructions.Count > 0 && instructions[^1].OpCode != OpCode.Return)
@@ -196,7 +237,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return instructions;
     }
 
-    private void ConvertInstructionStatement(Arm64Instruction instruction, List<Instruction> instructions, List<ulong> addresses, MethodAnalysisContext context)
+    private void ConvertInstructionStatement(Arm64Instruction instruction, List<Instruction> instructions, List<ulong> addresses, MethodAnalysisContext context, Arm64VectorScalarizer scalarizer, Func<ulong, string?>? importNameResolver)
     {
         var address = instruction.Address;
 
@@ -218,6 +259,15 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
         void AddCallAt(ulong target)
         {
+            if (IsThreadStaticDataHelper(context.AppContext, target))
+            {
+                var threadStatic = Add(address, OpCode.Call,
+                    new StringLiteral(nameof(BaseKeyFunctionAddresses.il2cpp_codegen_get_thread_static_data)),
+                    new Register(null, "X0"));
+                threadStatic.AddOperands([new Register(null, "X0")]);
+                return;
+            }
+
             if (context.AppContext.MethodsByAddress.TryGetValue(target, out var possibleMethods) && possibleMethods.Count > 0)
             {
                 MethodAnalysisContext ctx;
@@ -243,11 +293,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
                 var call = ctx.IsVoid
                     ? Add(address, OpCode.CallVoid, Imm(target))
-                    : Add(address, OpCode.Call, Imm(target), CallingConventions.ReturnRegister(ctx));
+                    : Add(address, OpCode.Call, Imm(target),
+                        CallingConventions.ReturnsViaHiddenBuffer(ctx)
+                            ? new MemoryOperand(CallingConventions.HiddenReturnBufferRegister(ctx))
+                            : CallingConventions.ReturnRegister(ctx));
 
                 call.AddOperands(CallingConventions.ResolveForManaged(ctx));
             }
-            else
+            else if (!TryEmitScalarMathImport(target))
             {
                 // Not a managed method, so we don't know its signature, preserve all argument registers
                 var call = Add(address, OpCode.Call, Imm(target), new Register(null, "X0"));
@@ -333,6 +386,83 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             Add(address, OpCode.Move, flagV, Imm(0));
         }
 
+        // Evaluates the "Rm {<shift> #imm}" operand of a logical shifted-register
+        // encoding into ISIL. The produced operand carries the register width: a
+        // word form is a real 32-bit value (zero-extended/truncated), an x form
+        // keeps the full 64 bits. Returns null when the encoding carries a shift
+        // combination that cannot be represented honestly.
+        IOperand? EmitLogicalShiftedOperand()
+        {
+            var source = ConvertOperand(instruction, 2);
+
+            // Logical immediate encodings carry no shift triple, and a zero
+            // amount passes the operand through untouched - no temporary is
+            // created for either case.
+            if (instruction.Op2Kind != Arm64OperandKind.Register || instruction.Op3Imm == 0)
+                return source;
+
+            var shift = instruction.Op3ShiftType;
+            var amount = (int)instruction.Op3Imm;
+            var is32 = IsWordRegister(instruction.Op0Reg);
+            var width = is32 ? 32 : 64;
+
+            // Disarm rejects out-of-range shift encodings during decode; refuse
+            // to guess if one ever slips through.
+            if (amount < 0 || amount >= width || shift == Arm64ShiftType.NONE)
+                return null;
+
+            // OpCode.ShiftRight is an arithmetic shift, so a logical right shift
+            // is the shift followed by a mask clearing the sign-filled bits.
+            IOperand EmitLogicalShiftRight(IOperand input)
+            {
+                var raw = new Register(null, "TEMP_LOGICAL_SHIFT_RAW");
+                Add(address, OpCode.ShiftRight, raw, input, Imm(amount));
+                var masked = new Register(null, "TEMP_LOGICAL_SHIFT");
+                AddInteger(address, OpCode.And, masked, raw, Imm((1L << (width - amount)) - 1));
+                return masked;
+            }
+
+            switch (shift)
+            {
+                case Arm64ShiftType.LSL:
+                {
+                    var shifted = new Register(null, "TEMP_LOGICAL_SHIFT");
+                    AddInteger(address, OpCode.ShiftLeft, shifted, source, Imm(amount));
+                    return shifted;
+                }
+                case Arm64ShiftType.LSR:
+                    return EmitLogicalShiftRight(source);
+                case Arm64ShiftType.ASR:
+                {
+                    // a word arithmetic shift takes its sign from bit 31, not bit 63
+                    var input = source;
+                    if (is32)
+                    {
+                        input = new Register(null, "TEMP_LOGICAL_SHIFT_SRC");
+                        Add(address, OpCode.SignExtend32, input, source);
+                    }
+
+                    var shifted = new Register(null, "TEMP_LOGICAL_SHIFT");
+                    AddInteger(address, OpCode.ShiftRight, shifted, input, Imm(amount));
+                    return shifted;
+                }
+                case Arm64ShiftType.ROR:
+                {
+                    // ror(x, n) = lsr(x, n) | lsl(x, width - n)
+                    var rightPart = EmitLogicalShiftRight(source);
+
+                    var leftPart = new Register(null, "TEMP_LOGICAL_SHIFT_LEFT");
+                    AddInteger(address, OpCode.ShiftLeft, leftPart, source, Imm(width - amount));
+
+                    var rotated = new Register(null, "TEMP_LOGICAL_SHIFT_ROT");
+                    AddInteger(address, OpCode.Or, rotated, rightPart, leftPart);
+                    return rotated;
+                }
+                default:
+                    return null;
+            }
+        }
+
         // emits any instructions needed to evaluate the condition, returning an operand that is nonzero when it holds
         IOperand EmitCondition(Arm64ConditionCode condition)
         {
@@ -403,22 +533,48 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             Add(address + 2, OpCode.Nop);
         }
 
-        MethodAnalysisContext? ResolveMathMethod(string name, bool isDouble)
+        MethodAnalysisContext? ResolveMathMethod(string name, bool isDouble, int argumentCount)
         {
             var assembly = context.AppContext.SystemTypes.SystemDoubleType.DeclaringAssembly;
-            var mathType = assembly.GetTypeByFullName(isDouble ? "System.Math" : "System.MathF");
-            var numberType = isDouble ? context.AppContext.SystemTypes.SystemDoubleType : context.AppContext.SystemTypes.SystemSingleType;
-            return mathType?.Methods.FirstOrDefault(method =>
-                method.IsStatic && method.Name == name && method.Parameters.Count == 1
-                && method.Parameters[0].ParameterType == numberType);
+            var single = context.AppContext.SystemTypes.SystemSingleType;
+            var @double = context.AppContext.SystemTypes.SystemDoubleType;
+            var types = isDouble
+                ? new[] { assembly.GetTypeByFullName("System.Math") }
+                : new[]
+                {
+                    argumentCount == 2
+                        ? context.AppContext.AssembliesByName.GetValueOrDefault("UnityEngine.CoreModule")
+                            ?.GetTypeByFullName("UnityEngine.Mathf")
+                        : null,
+                    assembly.GetTypeByFullName("System.MathF"),
+                    assembly.GetTypeByFullName("System.Math")
+                };
+
+            foreach (var mathType in types.OfType<TypeAnalysisContext>())
+                foreach (var numberType in isDouble ? new[] { @double } : new[] { single, @double })
+                    if (mathType.Methods.FirstOrDefault(method =>
+                            method.IsStatic && method.Name == name && method.Parameters.Count == argumentCount
+                            && method.Parameters.All(parameter => parameter.ParameterType == numberType)) is { } method)
+                        return method;
+
+            return null;
         }
 
         void EmitMathUnary(string name, IOperand destination, IOperand source, bool isDouble)
         {
-            if (ResolveMathMethod(name, isDouble) is { } method)
+            if (ResolveMathMethod(name, isDouble, 1) is { } method)
             {
+                var needsSingleBridge = !isDouble && method.Parameters[0].ParameterType == context.AppContext.SystemTypes.SystemDoubleType;
+                var argument = source;
+                if (needsSingleBridge)
+                {
+                    argument = new Register(null, "TEMP_MATH_ARG");
+                    Add(address, OpCode.Move, argument, source).NativeFloatWidthBits = 32;
+                }
                 var call = Add(address, OpCode.Call, method, destination);
-                call.AddOperands([source]);
+                call.AddOperands([argument]);
+                if (needsSingleBridge)
+                    call.NativeFloatWidthBits = 32;
             }
             else
             {
@@ -426,7 +582,83 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             }
         }
 
-        switch (instruction.Mnemonic)
+        void EmitMathBinary(string name, IOperand destination, IOperand left, IOperand right, bool isDouble)
+        {
+            if (ResolveMathMethod(name, isDouble, 2) is not { } method)
+            {
+                Add(address, OpCode.NotImplemented, new StringLiteral($"ARM64 {name} intrinsic is unavailable for this target framework."));
+                return;
+            }
+
+            var arguments = new[] { left, right };
+            if (!isDouble && method.Parameters[0].ParameterType == context.AppContext.SystemTypes.SystemDoubleType)
+            {
+                arguments = arguments.Select((operand, index) =>
+                {
+                    var argument = new Register(null, $"TEMP_MATH_ARG{index}");
+                    Add(address, OpCode.Move, argument, operand).NativeFloatWidthBits = 32;
+                    return (IOperand)argument;
+                }).ToArray();
+            }
+            var call = Add(address, OpCode.Call, method, destination);
+            call.AddOperands(arguments);
+            if (!isDouble)
+                call.NativeFloatWidthBits = 32;
+        }
+
+        // A call target that is an adrp+ldr(+add)+br GOT trampoline names its
+        // import through the dynamic relocation on the pointer slot. Pure scalar
+        // libm calls lower to their managed equivalents; AAPCS64 passes the
+        // first float/double arguments in s0/d0..s1/d1 (normalized V0/V1) and
+        // leaves the scalar result in s0/d0. Anything unrecognized keeps the
+        // unresolved call target — imports are never masked as key functions.
+        bool TryEmitScalarMathImport(ulong callTarget)
+        {
+            var importName = importNameResolver != null
+                ? importNameResolver(callTarget)
+                : NewArm64KeyFunctionAddresses.TryResolveGotVeneerImportName(context.AppContext.Binary, callTarget, out var resolved)
+                    ? resolved
+                    : null;
+
+            if (importName == null || !ScalarMathImports.TryGetValue(importName, out var import))
+                return false;
+
+            var result = new Register(null, "V0");
+            if (import.Method is not { } managedName)
+            {
+                Add(address, OpCode.Modulo, result, new Register(null, "V0"), new Register(null, "V1"))
+                    .NativeFloatWidthBits = import.IsDouble ? 64 : 32;
+                return true;
+            }
+            if (import.ArgumentCount == 2)
+                EmitMathBinary(managedName, result, new Register(null, "V0"), new Register(null, "V1"), import.IsDouble);
+            else
+                EmitMathUnary(managedName, result, new Register(null, "V0"), import.IsDouble);
+            return true;
+        }
+
+        TypeAnalysisContext? UnityVector4() => context.AppContext.AssembliesByName
+            .GetValueOrDefault("UnityEngine.CoreModule")?.Types
+            .FirstOrDefault(type => type.DefaultFullName == "UnityEngine.Vector4");
+
+        bool EmitVector4Call(string name, IOperand destination, params IOperand[] operands)
+        {
+            var method = UnityVector4()?.Methods.FirstOrDefault(candidate => candidate.IsStatic
+                && candidate.Name == name && candidate.Parameters.Count == operands.Length);
+            if (method == null)
+                return false;
+            var call = Add(address, OpCode.Call, method, destination);
+            call.AddOperands(operands);
+            return true;
+        }
+
+        var preserveAdrpOffset = false;
+        scalarizer.BeginInstruction(address);
+        // lane-wise SIMD chains (DUP broadcast + following integer lanes) are
+        // scalarized by the helper when lane provenance is fully proven; it
+        // returns false for anything it cannot prove, leaving the normal path
+        if (!scalarizer.TryConvert(instruction, Add, ConvertOperand))
+            switch (instruction.Mnemonic)
         {
             case Arm64Mnemonic.FRINTM:
             case Arm64Mnemonic.FRINTP:
@@ -465,8 +697,45 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     EmitMathUnary("Abs", destination, difference, instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31);
                     break;
                 }
+            case Arm64Mnemonic.FMAXNM:
+            case Arm64Mnemonic.FMINNM:
+                {
+                    if (!IsScalarFloatRegister(instruction.Op0Reg))
+                    {
+                        Add(address, OpCode.NotImplemented,
+                            new StringLiteral($"Instruction {instruction.Mnemonic} vector form is not supported."));
+                        break;
+                    }
+
+                    EmitMathBinary(instruction.Mnemonic == Arm64Mnemonic.FMAXNM ? "Max" : "Min",
+                        ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2),
+                        instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31);
+                    break;
+                }
             case Arm64Mnemonic.DUP:
-                Add(address, OpCode.NotImplemented, new StringLiteral("Instruction DUP vector broadcast is not supported."));
+                if (instruction.Op0Arrangement == Arm64ArrangementSpecifier.FourS
+                    && UnityVector4()?.Methods.FirstOrDefault(candidate => candidate is
+                        { Name: "get_one", IsStatic: true, Parameters.Count: 0 }) is { } getOne)
+                {
+                    var one = new Register(null, "TEMP_VECTOR_ONE");
+                    Add(address, OpCode.Call, getOne, one);
+                    if (!EmitVector4Call("op_Multiply", ConvertOperand(instruction, 0), one, ConvertOperand(instruction, 1)))
+                        Add(address, OpCode.NotImplemented, new StringLiteral("UnityEngine.Vector4.op_Multiply is unavailable."));
+                }
+                else if (!scalarizer.TryBroadcastDup(instruction, Add, ConvertOperand))
+                    Add(address, OpCode.NotImplemented, new StringLiteral("Instruction DUP vector broadcast is not supported."));
+                break;
+            case Arm64Mnemonic.FCMGT:
+            case Arm64Mnemonic.FCMLT:
+                if (instruction.Op0Arrangement == Arm64ArrangementSpecifier.FourS)
+                {
+                    vectorComparisons![NormalizeRegister(instruction.Op0Reg)] =
+                        (instruction.Mnemonic == Arm64Mnemonic.FCMGT,
+                            ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                    Add(address, OpCode.Nop);
+                }
+                else
+                    Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction {instruction.Mnemonic} not yet implemented."));
                 break;
             case Arm64Mnemonic.MOV:
             case Arm64Mnemonic.MOVZ:
@@ -501,6 +770,21 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.MOVI:
             case Arm64Mnemonic.MVNI when instruction.Op1Kind == Arm64OperandKind.Immediate:
                 {
+                    // MOVI Vn.{2,4}S, #imm, LSL #shift materializes the same
+                    // IEEE-754 bit pattern in every lane. Keeping only #imm
+                    // turns 0.5f (0x3f << 24) into integer 63 and poisons every
+                    // following vector multiply.
+                    if (instruction.Op0Arrangement is Arm64ArrangementSpecifier.TwoS
+                        or Arm64ArrangementSpecifier.FourS)
+                    {
+                        var bits = unchecked((uint)instruction.Op1Imm << (int)instruction.Op2Imm);
+                        if (instruction.Mnemonic == Arm64Mnemonic.MVNI)
+                            bits = ~bits;
+                        var laneValue = BitConverter.Int32BitsToSingle(unchecked((int)bits));
+                        Add(address, OpCode.Move, ConvertOperand(instruction, 0),
+                            new Vector128Literal(laneValue, laneValue, laneValue, laneValue));
+                        break;
+                    }
                     var value = instruction.Mnemonic == Arm64Mnemonic.MVNI ? ~instruction.Op1Imm : instruction.Op1Imm;
                     Add(address, OpCode.Move, ConvertOperand(instruction, 0), Imm(value));
                     break;
@@ -547,15 +831,40 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 {
                     EmitWriteback(beforeAccess: true);
 
+                    var loadSize = instruction.Mnemonic switch
+                    {
+                        Arm64Mnemonic.LDRB or Arm64Mnemonic.LDRSB or Arm64Mnemonic.LDURB or Arm64Mnemonic.LDURSB => 1,
+                        Arm64Mnemonic.LDRH or Arm64Mnemonic.LDRSH or Arm64Mnemonic.LDURH or Arm64Mnemonic.LDURSH => 2,
+                        Arm64Mnemonic.LDRSW or Arm64Mnemonic.LDURSW => 4,
+                        _ => RegisterWidthBytes(instruction.Op0Reg)
+                    };
+
                     // ldr with a pc-relative literal is an absolute load
                     var source = instruction.Op1Kind == Arm64OperandKind.ImmediatePcRelative
-                        ? new MemoryOperand(addend: (long)address + instruction.Op1Imm)
-                        : MemOperand();
+                        ? new MemoryOperand(addend: (long)address + instruction.Op1Imm, accessSize: loadSize)
+                        : MemOperand(accessSize: loadSize);
+
+                    if (source is MemoryOperand { IsConstant: true } constant
+                        && context.AppContext.Binary is ElfFile elf
+                        && elf.IsReadOnlyRange((ulong)constant.Addend, loadSize)
+                        && context.AppContext.Binary.TryMapVirtualAddressToRaw((ulong)constant.Addend, out var raw))
+                    {
+                        var bytes = context.AppContext.Binary.GetRawBinaryContent().Slice((int)raw, loadSize).ToArray();
+                        if (IsScalarFloatRegister(instruction.Op0Reg))
+                            source = loadSize == 4
+                                ? new FloatLiteral(BitConverter.ToSingle(bytes, 0))
+                                : new DoubleLiteral(BitConverter.ToDouble(bytes, 0));
+                        else if (loadSize == 16)
+                            source = new Vector128Literal(
+                                BitConverter.ToSingle(bytes, 0), BitConverter.ToSingle(bytes, 4),
+                                BitConverter.ToSingle(bytes, 8), BitConverter.ToSingle(bytes, 12));
+                    }
 
                     if (instruction.Op0Kind == Arm64OperandKind.Register && IsReg31(instruction.Op0Reg))
                         Add(address, OpCode.Nop); // load to xzr = prefetch, discard
                     else
-                        Add(address, OpCode.Move, ConvertOperand(instruction, 0), source);
+                        Add(address, OpCode.Move, ConvertOperand(instruction, 0), source)
+                            .NativeMemoryAccessSize = loadSize;
 
                     EmitWriteback(beforeAccess: false);
                     break;
@@ -579,7 +888,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     }
                 };
                 EmitWriteback(beforeAccess: true);
-                Add(address, OpCode.Move, MemOperand(accessSize: storeSize), ConvertOperand(instruction, 0));
+                Add(address, OpCode.Move, MemOperand(accessSize: storeSize), ConvertOperand(instruction, 0))
+                    .NativeMemoryAccessSize = storeSize;
                 EmitWriteback(beforeAccess: false);
                 break;
             }
@@ -602,13 +912,17 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     {
                         var storeSize = instruction.Op0Reg is >= Arm64Register.X0 and <= Arm64Register.X31
                             or >= Arm64Register.W0 and <= Arm64Register.W31 ? pairSize : 0;
-                        Add(address, OpCode.Move, MemOperand(accessSize: storeSize), ConvertOperand(instruction, 0));
-                        Add(address, OpCode.Move, MemOperand(pairSize, storeSize), ConvertOperand(instruction, 1));
+                        Add(address, OpCode.Move, MemOperand(accessSize: storeSize), ConvertOperand(instruction, 0))
+                            .NativeMemoryAccessSize = storeSize;
+                        Add(address, OpCode.Move, MemOperand(pairSize, storeSize), ConvertOperand(instruction, 1))
+                            .NativeMemoryAccessSize = storeSize;
                     }
                     else
                     {
-                        Add(address, OpCode.Move, ConvertOperand(instruction, 0), MemOperand());
-                        Add(address, OpCode.Move, ConvertOperand(instruction, 1), MemOperand(pairSize));
+                        Add(address, OpCode.Move, ConvertOperand(instruction, 0), MemOperand(accessSize: pairSize))
+                            .NativeMemoryAccessSize = pairSize;
+                        Add(address, OpCode.Move, ConvertOperand(instruction, 1), MemOperand(pairSize, pairSize))
+                            .NativeMemoryAccessSize = pairSize;
                     }
 
                     EmitWriteback(beforeAccess: false);
@@ -637,6 +951,20 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         break;
                     }
 
+                    // ADRP + ADD forms the exact address of a metadata/global slot. Keeping
+                    // the page base as ordinary integer arithmetic lets metadata resolution
+                    // mistake a different slot at the start of the page for this address.
+                    if (!isSubtract && instruction.Op2Kind == Arm64OperandKind.Immediate
+                        && adrpOffsets!.TryGetValue(NormalizeRegister(instruction.Op1Reg), out var page))
+                    {
+                        var target = page + ((ulong)instruction.Op2Imm << (int)instruction.Op3Imm);
+                        Add(address, OpCode.Move, ConvertOperand(instruction, 0), Imm((long)target))
+                            .NativeIntegerWidthBits = context.AppContext.Binary.PointerSizeBytes * 8;
+                        adrpOffsets[NormalizeRegister(instruction.Op0Reg)] = target;
+                        preserveAdrpOffset = true;
+                        break;
+                    }
+
                     var src1 = ConvertOperand(instruction, 1);
                     var src2 = ConvertOperand(instruction, 2);
                     if (instruction.FinalOpExtendType == Arm64ExtendType.SXTW
@@ -645,12 +973,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         var extended = new Register(null, "TEMP_EXTEND");
                         Add(address, OpCode.SignExtend32, extended, src2);
                         src2 = extended;
-                        if (instruction.Op3Imm != 0)
-                        {
-                            var shifted = new Register(null, "TEMP_SHIFT");
-                            Add(address, OpCode.ShiftLeft, shifted, src2, Imm(instruction.Op3Imm));
-                            src2 = shifted;
-                        }
+                    }
+                    if (instruction.Op3Imm != 0)
+                    {
+                        var shifted = new Register(null, "TEMP_SHIFT");
+                        Add(address, OpCode.ShiftLeft, shifted, src2, Imm(instruction.Op3Imm));
+                        src2 = shifted;
                     }
                     // a discarded result means this is only about the flags
                     var dest = IsReg31(instruction.Op0Reg) ? new Register(null, "TEMP") : ConvertOperand(instruction, 0);
@@ -708,32 +1036,52 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     };
 
                     var dest = IsReg31(instruction.Op0Reg) ? new Register(null, "TEMP") : ConvertOperand(instruction, 0);
-                    AddInteger(address, opCode, dest, ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                    var right = EmitLogicalShiftedOperand();
+                    if (right == null)
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral($"{instruction.Mnemonic} shift {instruction.Op3ShiftType} is not supported."));
+                        break;
+                    }
+                    AddInteger(address, opCode, dest, ConvertOperand(instruction, 1), right);
 
                     if (instruction.Mnemonic == Arm64Mnemonic.ANDS)
                         EmitResultFlags(dest);
 
                     break;
                 }
+            case Arm64Mnemonic.BIF:
+                if (instruction.Op0Arrangement == Arm64ArrangementSpecifier.SixteenB
+                    && vectorComparisons!.TryGetValue(NormalizeRegister(instruction.Op2Reg), out var upper)
+                    && upper.Greater)
+                {
+                    Add(address, OpCode.VectorMin, ConvertOperand(instruction, 0), upper.Value, upper.Bound);
+                    break;
+                }
+                Add(address, OpCode.NotImplemented, new StringLiteral("Instruction BIF not yet implemented."));
+                break;
             case Arm64Mnemonic.BIC:
             case Arm64Mnemonic.BICS:
             case Arm64Mnemonic.ORN:
             case Arm64Mnemonic.EON:
                 {
+                    if (instruction.Mnemonic == Arm64Mnemonic.BIC
+                        && instruction.Op0Arrangement == Arm64ArrangementSpecifier.SixteenB
+                        && vectorComparisons!.TryGetValue(NormalizeRegister(instruction.Op2Reg), out var lower)
+                        && !lower.Greater
+                        && UnityVector4()?.Methods.FirstOrDefault(candidate => candidate is
+                            { Name: "get_zero", IsStatic: true, Parameters.Count: 0 }) is { } getZero)
+                    {
+                        var zero = new Register(null, "TEMP_VECTOR_ZERO");
+                        Add(address, OpCode.Call, getZero, zero);
+                        Add(address, OpCode.VectorMax, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), zero);
+                        break;
+                    }
                     var temp = new Register(null, "TEMP");
-                    var shiftedOperand = ConvertOperand(instruction, 2);
-                    if (instruction.Op3Imm != 0 && instruction.Op3ShiftType is not (Arm64ShiftType.LSL or Arm64ShiftType.ASR))
+                    var shiftedOperand = EmitLogicalShiftedOperand();
+                    if (shiftedOperand == null)
                     {
                         Add(address, OpCode.NotImplemented, new StringLiteral($"{instruction.Mnemonic} shift {instruction.Op3ShiftType} is not supported."));
                         break;
-                    }
-
-                    if (instruction.Op3Imm != 0)
-                    {
-                        var shifted = new Register(null, "TEMP_BIC_SHIFT");
-                        Add(address, instruction.Op3ShiftType == Arm64ShiftType.LSL ? OpCode.ShiftLeft : OpCode.ShiftRight,
-                            shifted, shiftedOperand, Imm(instruction.Op3Imm));
-                        shiftedOperand = shifted;
                     }
 
                     Add(address, OpCode.Not, temp, shiftedOperand);
@@ -744,7 +1092,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         _ => OpCode.And
                     };
                     var dest = IsReg31(instruction.Op0Reg) ? new Register(null, "TEMP") : ConvertOperand(instruction, 0);
-                    Add(address, opCode, dest, ConvertOperand(instruction, 1), temp);
+                    AddInteger(address, opCode, dest, ConvertOperand(instruction, 1), temp);
 
                     if (instruction.Mnemonic == Arm64Mnemonic.BICS)
                         EmitResultFlags(dest);
@@ -1014,11 +1362,35 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 break;
         }
 
+        scalarizer.NoteUnhandled(instruction);
+
         // any register write invalidates a tracked ADRP page address (ADRP itself just set one)
-        if (instruction.Mnemonic != Arm64Mnemonic.ADRP && instruction.Op0Kind == Arm64OperandKind.Register)
+        if (!preserveAdrpOffset && instruction.Mnemonic != Arm64Mnemonic.ADRP && instruction.Op0Kind == Arm64OperandKind.Register)
             adrpOffsets!.Remove(NormalizeRegister(instruction.Op0Reg));
         if (instruction.MemIndexMode != Arm64MemoryIndexMode.Offset && instruction.MemBase != Arm64Register.INVALID)
             adrpOffsets!.Remove(NormalizeRegister(instruction.MemBase));
+    }
+
+    private static bool IsThreadStaticDataHelper(ApplicationAnalysisContext context, ulong target)
+    {
+        var binary = context.Binary;
+        var raw = (int)binary.MapVirtualAddressToRaw(target);
+        var content = binary.GetRawBinaryContent();
+        if (raw <= 0 || raw + 8 > content.Length)
+            return false;
+        try
+        {
+            var instructions = Disassembler.Disassemble(content.Slice(raw, 8), target,
+                new Disassembler.Options(true, true, false)).ToList();
+            return instructions.Count == 2
+                && instructions[0] is { Mnemonic: Arm64Mnemonic.LDR, Op0Reg: Arm64Register.W0,
+                    MemBase: Arm64Register.X0 }
+                && instructions[1].Mnemonic == Arm64Mnemonic.B;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private IOperand ConvertOperand(Arm64Instruction instruction, int operand)

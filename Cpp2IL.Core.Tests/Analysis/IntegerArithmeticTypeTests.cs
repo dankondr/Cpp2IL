@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Collections.Generic;
+using System.Linq;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
@@ -152,6 +153,27 @@ public class IntegerArithmeticTypeTests
         });
     }
 
+    [Test]
+    public void LateArithmeticRecoveryPreservesInt32LoopCounter()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, []);
+        var counter = new LocalVariable("counter", new Register(null, "counter"))
+            { Type = app.SystemTypes.SystemInt32Type };
+        var next = new LocalVariable("next", new Register(null, "next"));
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Add, next, counter, new Immediate(1)),
+            new(1, OpCode.CheckNotEqual, new LocalVariable("flag", new Register(null, "flag")), next, new Immediate(8)),
+            new(2, OpCode.Return)]);
+        method.Locals = [counter, next];
+        method.ParameterLocals = [];
+
+        LocalVariables.ResolveLateGeneratedTypes(method);
+
+        Assert.That(next.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+    }
+
     [TestCase(OpCode.Add)]
     [TestCase(OpCode.Subtract)]
     [TestCase(OpCode.Multiply)]
@@ -290,6 +312,69 @@ public class IntegerArithmeticTypeTests
         LocalVariables.ResolveTypesAndFields(method);
 
         Assert.That(result.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+    }
+
+    [Test]
+    public void NativeFloatWidthWinsOverDoubleFallbackCallSignature()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var sqrt = app.SystemTypes.SystemDoubleType.DeclaringAssembly.GetTypeByFullName("System.Math")!.Methods
+            .Single(candidate => candidate.Name == "Sqrt" && candidate.Parameters.Count == 1);
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, []);
+        var source = new LocalVariable("source", new Register(null, "source"));
+        var argument = new LocalVariable("argument", new Register(null, "argument"));
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var move = new Instruction(0, OpCode.Move, argument, source) { NativeFloatWidthBits = 32 };
+        var call = new Instruction(1, OpCode.Call, sqrt, result, argument) { NativeFloatWidthBits = 32 };
+        method.ControlFlowGraph = new ISILControlFlowGraph([move, call, new(2, OpCode.Return)]);
+        method.Locals = [source, argument, result];
+        method.ParameterLocals = [];
+
+        LocalVariables.ResolveTypesAndFields(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(source.Type, Is.SameAs(app.SystemTypes.SystemSingleType));
+            Assert.That(argument.Type, Is.SameAs(app.SystemTypes.SystemSingleType));
+            Assert.That(result.Type, Is.SameAs(app.SystemTypes.SystemSingleType));
+        });
+    }
+
+    [Test]
+    public void ResolvedFieldLoadOverridesNativeWidthGuessWithoutEquivalentTypeChurn()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Owner",
+            app.SystemTypes.SystemObjectType, TypeAttributes.Public | TypeAttributes.Sealed);
+        var field = new InjectedFieldAnalysisContext("Value", app.SystemTypes.SystemStringType,
+            FieldAttributes.Public, owner, 0x10);
+        owner.Fields.Add(field);
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver")) { Type = owner };
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var load = new Instruction(0, OpCode.Move, result, new FieldReference(field, receiver, 0x10))
+        {
+            NativeIntegerWidthBits = 32
+        };
+        var method = new InjectedMethodAnalysisContext(owner, "Fixture", app.SystemTypes.SystemVoidType,
+            MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([load, new(1, OpCode.Return)]),
+            Locals = [receiver, result],
+            ParameterLocals = [],
+        };
+
+        LocalVariables.ResolveTypesAndFields(method);
+
+        Assert.That(result.Type, Is.SameAs(app.SystemTypes.SystemStringType));
+
+        var equivalentString = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "System", "String",
+            app.SystemTypes.SystemObjectType, TypeAttributes.Public | TypeAttributes.Sealed);
+        result.Type = equivalentString;
+
+        LocalVariables.ResolveTypesAndFields(method);
+
+        Assert.That(result.Type, Is.SameAs(equivalentString));
     }
 
     [Test]

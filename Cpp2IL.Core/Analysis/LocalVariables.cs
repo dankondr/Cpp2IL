@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
@@ -98,10 +99,6 @@ public static class LocalVariables
                 thisLocal.IsThis = true;
                 paramLocals.Add(thisLocal);
             }
-            else
-            {
-                method.AddWarning($"'this' local not found (operand: {thisOperand})");
-            }
         }
 
         // Check if method has MethodInfo*
@@ -170,9 +167,67 @@ public static class LocalVariables
 
             foreach (var definedVar in block.Def.OfType<LocalVariable>())
                 usedLocals.Add(definedVar);
+
+            // Use/def only sees top-level LocalVariable operands, but a local can be
+            // referenced only through a nested operand - a field lane inside an array
+            // index, an addressed field's receiver, a selected field's owner.
+            // Emission resolves any of those through the locals table, so a local
+            // reachable through any operand shape stays registered.
+            foreach (var instruction in block.Instructions)
+                foreach (var operand in instruction.Operands)
+                    foreach (var nested in OperandLocals(operand))
+                        usedLocals.Add(nested);
         }
 
         method.Locals.RemoveAll(x => !usedLocals.Contains(x));
+    }
+
+    // Every local an operand can reach, through any nesting the emitter walks:
+    // field receivers, array bases and indices, addressed targets, casts.
+    private static IEnumerable<LocalVariable> OperandLocals(IOperand operand)
+    {
+        switch (operand)
+        {
+            case LocalVariable local:
+                yield return local;
+                break;
+            case FieldReference field:
+                yield return field.Local;
+                break;
+            case SelectedFieldReference selected:
+                yield return selected.Selector;
+                foreach (var (_, choiceField) in selected.Choices)
+                    yield return choiceField.Local;
+                break;
+            case AddressOf { Target: { } target }:
+                foreach (var nested in OperandLocals(target))
+                    yield return nested;
+                break;
+            case ArrayAccess access:
+                yield return access.Array;
+                foreach (var nested in OperandLocals(access.Index))
+                    yield return nested;
+                break;
+            case ArrayElementFieldReference elementField:
+                yield return elementField.Array;
+                foreach (var nested in OperandLocals(elementField.Index))
+                    yield return nested;
+                break;
+            case ArrayLength arrayLength:
+                yield return arrayLength.Array;
+                break;
+            case MemoryOperand memory:
+                if (memory.Base is { } memoryBase)
+                    foreach (var nested in OperandLocals(memoryBase))
+                        yield return nested;
+                if (memory.Index is { } memoryIndex)
+                    foreach (var nested in OperandLocals(memoryIndex))
+                        yield return nested;
+                break;
+            case ReferenceCast cast:
+                yield return cast.Value;
+                break;
+        }
     }
 
     private static List<Register> GetRegisters(Instruction instruction)
@@ -232,11 +287,15 @@ public static class LocalVariables
         PropagateFromReturn(method);
         PropagateFromParameters(method);
         SeedRuntimeClassTypes(method);
+        SeedIl2CppDefaultsClassTypes(method);
         SeedNewobjResults(method);
         SeedMethodInfoTypes(method);
         SeedComparisonResults(method);
         SeedFloatLiterals(method);
         SeedNativeIntegerWidths(method);
+        SeedNativeFloatWidths(method);
+
+        ResolveHiddenReturnBuffers(method);
 
         // Everywhere there's a CallVoid after a Newobj, we can resolve the constructor call.
         MetadataResolver.ResolveConstructorCalls(method);
@@ -248,6 +307,7 @@ public static class LocalVariables
         // fills a previously-unknown type - so the loop converges.
         var changed = true;
         var loopCount = 0;
+        var hiddenReturnsSharpened = false;
 
         while (changed)
         {
@@ -264,7 +324,296 @@ public static class LocalVariables
             changed |= PropagateStaticFieldStorage(method);
             changed |= TypeAddressedLocals(method);
             changed |= PropagateTypesOnce(method);
+            changed |= ResolveStackAggregateFields(method);
+            changed |= InheritEscapedCellVersions(method);
+
+            // Hidden struct returns are discovered before field/type propagation, when a shared-
+            // generic receiver may still be untyped. Once the regular fixpoint settles, use its
+            // concrete receiver type to sharpen the return and run the same fixpoint once more.
+            if (!changed && !hiddenReturnsSharpened)
+            {
+                hiddenReturnsSharpened = true;
+                changed = SharpenHiddenReturnBuffers(method);
+            }
         }
+
+        // With every local's stack kind resolved, operand positions whose kind is
+        // incompatible with the whole-register local they read can be split off to
+        // the register's lane-0 view - the slot the scalar operation actually sees.
+        SplitScalarOperandViews(method);
+    }
+
+    private static bool ResolveStackAggregateFields(MethodAnalysisContext method)
+    {
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        var roots = method.Locals
+            .Select(local => (Local: local, Offset: TryStackOffset(local.Register.Name), Size:
+                local.Type is { IsValueType: true } type ? TypeSizes.MinimumUnboxedSize(type, pointerSize) : 0))
+            .Where(candidate => candidate.Offset != null && candidate.Size > pointerSize)
+            .ToList();
+        var changed = false;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
+        {
+            if (operandIndex == 0 && instruction.IsAssignment
+                || instruction.Operands[operandIndex] is not LocalVariable slot
+                || TryStackOffset(slot.Register.Name) is not { } slotOffset)
+                continue;
+            var accessSize = instruction.NativeMemoryAccessSize
+                ?? (int)System.Math.Min(TypeSizes.MinimumUnboxedSize(
+                    slot.Type ?? method.AppContext.SystemTypes.SystemObjectType, pointerSize), int.MaxValue);
+            if (accessSize <= 0)
+                continue;
+            var matches = roots.Select(root =>
+                {
+                    var relativeOffset = slotOffset - root.Offset!.Value;
+                    var nested = relativeOffset > 0
+                        ? MetadataResolver.FindNestedInstanceFieldAtOffset(root.Local.Type!, relativeOffset, accessSize)
+                        : null;
+                    return (Root: root.Local, Offset: relativeOffset, Nested: nested);
+                })
+                .Where(match => match.Nested != null)
+                .ToList();
+            if (matches.Count == 0)
+                continue;
+            var nearestOffset = matches.Min(match => match.Offset);
+            var nearest = matches.Where(match => match.Offset == nearestOffset)
+                .GroupBy(match => (match.Root.Register.Number, match.Nested!.Value.Field))
+                .Select(group => group.First())
+                .ToList();
+            if (nearest.Count != 1)
+                continue;
+            var match = nearest[0];
+            instruction.SetOperand(operandIndex, new FieldReference(match.Nested!.Value.Field,
+                match.Root, match.Offset, [match.Nested.Value.Container], accessSize));
+            if (instruction.OpCode == OpCode.Move && operandIndex == 1
+                && instruction.Destination is LocalVariable destination)
+                destination.Type = match.Nested.Value.Field.FieldType;
+            changed = true;
+        }
+        return changed;
+    }
+
+    internal static void ResolveHiddenReturnBuffers(MethodAnalysisContext method)
+    {
+        var instructions = method.ControlFlowGraph!.Instructions;
+        var addressed = method.ControlFlowGraph!.Instructions
+            .Where(instruction => instruction is { OpCode: OpCode.Move,
+                Operands: [LocalVariable, AddressOf { Target: LocalVariable }] })
+            .ToDictionary(instruction => (LocalVariable)instruction.Operands[0],
+                instruction => (LocalVariable)((AddressOf)instruction.Operands[1]).Target);
+
+        var hiddenReturns = new List<(Instruction Call, LocalVariable Buffer,
+            MethodAnalysisContext Target, TypeAnalysisContext ResultType, int Index)>();
+        foreach (var call in instructions)
+        {
+            if (call is not { OpCode: OpCode.Call,
+                    Operands: [MethodAnalysisContext target, MemoryOperand { Index: null, Addend: 0, Scale: 0,
+                        Base: LocalVariable pointer }, ..] }
+                || !addressed.TryGetValue(pointer, out var buffer))
+                continue;
+
+            var concreteTarget = !target.IsStatic && call.Operands.Count > 2
+                ? IlGenerator.RetargetToReceiverInstantiation(target,
+                    IlGenerator.SharedGenericEvidenceType(call.Operands[2], method))
+                : target;
+            var resultType = IlGenerator.EffectiveCallReturnType(concreteTarget);
+            hiddenReturns.Add((call, buffer, concreteTarget, resultType, instructions.IndexOf(call)));
+        }
+
+        foreach (var hiddenReturn in hiddenReturns)
+        {
+            var (call, buffer, _, resultType, callIndex) = hiddenReturn;
+            var endIndex = hiddenReturns
+                .Where(candidate => candidate.Index > callIndex
+                    && (ReferenceEquals(candidate.Buffer, buffer)
+                        || TryStackOffset(candidate.Buffer.Register.Name) is { } candidateOffset
+                        && TryStackOffset(buffer.Register.Name) == candidateOffset))
+                .Select(candidate => candidate.Index)
+                .DefaultIfEmpty(instructions.Count)
+                .Min();
+            // The same native stack slot is routinely reused for several different
+            // generic struct returns. A CLR local has one fixed type, so model each
+            // hidden return as its own local and reconnect only its own lifetime.
+            LocalVariable? result = null;
+            var aliases = new HashSet<LocalVariable> { buffer };
+            foreach (var next in instructions.Skip(callIndex + 1).Take(endIndex - callIndex - 1))
+                if (next is { OpCode: OpCode.Move,
+                        Operands: [LocalVariable destination, LocalVariable source] }
+                    && !ReferenceEquals(destination, source) && aliases.Contains(source))
+                {
+                    aliases.Add(destination);
+                    result = destination;
+                }
+            if (result == null)
+            {
+                result = new LocalVariable($"{buffer.Name}_hret_{call.Index}",
+                    new Register(null, $"HRET_{call.Index}"), resultType);
+                method.Locals.Add(result);
+            }
+            result.Type = resultType;
+            result.HiddenReturnBuffer = buffer;
+            call.Destination = result;
+
+            for (var i = callIndex + 1; i < endIndex; i++)
+            {
+                var next = instructions[i];
+                var destination = next.Destination;
+                for (var operandIndex = 0; operandIndex < next.Operands.Count; operandIndex++)
+                {
+                    var operand = next.Operands[operandIndex];
+                    if (ReferenceEquals(operand, destination))
+                        continue;
+                    if (RewriteHiddenReturnStackOperand(operand, buffer, result, resultType,
+                            next.NativeMemoryAccessSize ?? 0) is { } rewritten)
+                        next.SetOperand(operandIndex, rewritten);
+                }
+            }
+        }
+    }
+
+    private static bool SharpenHiddenReturnBuffers(MethodAnalysisContext method)
+    {
+        var changed = false;
+        foreach (var call in method.ControlFlowGraph!.Instructions)
+        {
+            if (call is not { OpCode: OpCode.Call,
+                    Operands: [MethodAnalysisContext target, LocalVariable result, var receiver, ..] }
+                || target.IsStatic
+                || result.HiddenReturnBuffer == null)
+                continue;
+
+            var concreteTarget = IlGenerator.RetargetToReceiverInstantiation(target,
+                IlGenerator.SharedGenericEvidenceType(receiver, method));
+            var resultType = IlGenerator.EffectiveCallReturnType(concreteTarget);
+            if (result.Type?.FullName == resultType.FullName)
+                continue;
+
+            result.Type = resultType;
+            call.SetOperand(0, concreteTarget);
+            foreach (var instruction in method.ControlFlowGraph.Instructions)
+            for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
+            {
+                var operand = instruction.Operands[operandIndex];
+                var field = operand switch
+                {
+                    FieldReference direct when ReferenceEquals(direct.Local, result) => direct,
+                    AddressOf { Target: FieldReference addressed } when ReferenceEquals(addressed.Local, result)
+                        => addressed,
+                    _ => null,
+                };
+                IOperand? replacement = field == null
+                    ? result.HiddenReturnBuffer == null || operandIndex == 0 && instruction.IsAssignment ? null
+                        : RewriteHiddenReturnStackOperand(operand, result.HiddenReturnBuffer, result,
+                            resultType, instruction.NativeMemoryAccessSize ?? 0)
+                    : HiddenReturnField(resultType, result, field.Offset, field.AccessSize);
+                if (replacement == null)
+                    continue;
+                instruction.SetOperand(operandIndex, field != null && operand is AddressOf
+                    ? new AddressOf(replacement)
+                    : replacement);
+                if (instruction.OpCode == OpCode.Move && operandIndex == 1
+                    && instruction.Destination is LocalVariable destination
+                    && replacement is FieldReference replacementField)
+                    destination.Type = replacementField.Field.FieldType;
+            }
+
+            foreach (var instruction in method.ControlFlowGraph.Instructions)
+                if (instruction is { OpCode: OpCode.Move,
+                        Operands: [LocalVariable klass,
+                            MemoryOperand { Index: null, Scale: 0, Addend: 0,
+                                Base: LocalVariable { Type: { IsValueType: false } instance } }] }
+                    && klass.Type is RuntimeClassTypeAnalysisContext { RepresentedType: var represented }
+                    && represented.FullName != instance.FullName)
+                    klass.Type = new RuntimeClassTypeAnalysisContext(instance, instance.DeclaringAssembly);
+            changed = true;
+        }
+        return changed;
+    }
+
+    private static IOperand? RewriteHiddenReturnStackOperand(IOperand operand, LocalVariable buffer,
+        LocalVariable result, TypeAnalysisContext returnType, int accessSize)
+    {
+        if (operand is AddressOf address
+            && HiddenReturnStackStorage(address.Target, buffer, result, returnType, accessSize) is { } addressed)
+            return new AddressOf(addressed);
+
+        return HiddenReturnStackStorage(operand, buffer, result, returnType, accessSize);
+    }
+
+    private static IOperand? HiddenReturnStackStorage(IOperand operand, LocalVariable buffer,
+        LocalVariable result, TypeAnalysisContext returnType, int accessSize)
+    {
+        if (operand is not LocalVariable local
+            || TryStackOffset(buffer.Register.Name) is not { } bufferOffset
+            || TryStackOffset(local.Register.Name) is not { } localOffset)
+            return null;
+
+        var relativeOffset = localOffset - bufferOffset;
+        if (relativeOffset == 0)
+            return result;
+        if (relativeOffset < 0)
+            return null;
+
+        return HiddenReturnField(returnType, result, relativeOffset, accessSize);
+    }
+
+    private static FieldReference? HiddenReturnField(TypeAnalysisContext returnType,
+        LocalVariable result, int relativeOffset, int accessSize = 0)
+    {
+        FieldAnalysisContext? field;
+        long fieldOffset;
+        long fieldSize;
+        if (returnType is GenericInstanceTypeAnalysisContext generic)
+        {
+            var containing = GenericInstanceFieldLayout.FindFieldContainingOffset(generic, relativeOffset);
+            field = containing?.Field;
+            fieldOffset = containing?.Offset ?? 0;
+            fieldSize = containing?.Size ?? 0;
+        }
+        else
+        {
+            field = returnType.Fields.FirstOrDefault(candidate => !candidate.IsStatic
+                && (candidate.BackingData?.FieldOffset ?? candidate.Offset) == relativeOffset);
+            fieldOffset = field == null ? 0 : field.BackingData?.FieldOffset ?? field.Offset;
+            fieldSize = field == null ? 0 : TypeSizes.MinimumUnboxedSize(field.FieldType,
+                returnType.AppContext.Binary.PointerSizeBytes);
+        }
+
+        if (field == null)
+            return null;
+
+        if (accessSize > 0 && field.FieldType.IsValueType && fieldSize > accessSize)
+        {
+            var nestedOffset = relativeOffset - fieldOffset;
+            var nested = field.FieldType is GenericInstanceTypeAnalysisContext nestedGeneric
+                ? GenericInstanceFieldLayout.FindFieldContainingOffset(nestedGeneric, nestedOffset) is
+                    { Offset: var offset, Size: var size, Field: var concrete }
+                    && offset == nestedOffset && size == accessSize ? concrete : null
+                : field.FieldType.Fields.FirstOrDefault(candidate => !candidate.IsStatic
+                    && (candidate.BackingData?.FieldOffset ?? candidate.Offset) == nestedOffset
+                    && TypeSizes.MinimumUnboxedSize(candidate.FieldType,
+                        returnType.AppContext.Binary.PointerSizeBytes) == accessSize);
+            if (nested != null)
+                return new FieldReference(nested, result, relativeOffset, [field], accessSize);
+        }
+
+        return new FieldReference(field, result, relativeOffset, accessSize: accessSize);
+    }
+
+    private static int? TryStackOffset(string registerName)
+    {
+        const string Prefix = "stack_";
+        if (!registerName.StartsWith(Prefix, System.StringComparison.Ordinal))
+            return null;
+        var offset = registerName[Prefix.Length..];
+        var negative = offset.StartsWith("-", System.StringComparison.Ordinal);
+        if (negative)
+            offset = offset[1..];
+        return System.Int32.TryParse(offset, System.Globalization.NumberStyles.HexNumber,
+            System.Globalization.CultureInfo.InvariantCulture, out var value)
+            ? negative ? -value : value
+            : null;
     }
 
     // A type-metadata global load (Move local, typeof(T)) puts the runtime class pointer for T into
@@ -284,23 +633,59 @@ public static class LocalVariables
         }
     }
 
+    internal static void SeedIl2CppDefaultsClassTypes(MethodAnalysisContext method)
+    {
+        if (!method.AppContext.UnityVersion.GreaterThanOrEquals(6000))
+            return;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction is not { OpCode: OpCode.Move,
+                    Operands: [LocalVariable destination,
+                        MemoryOperand { Base: LocalVariable defaults, Index: null, Scale: 0, Addend: var offset }] }
+                || !KeyFunctionRecovery.HasAbsoluteDefinition(method.ControlFlowGraph, defaults)
+                || KeyFunctionRecovery.Unity6PrimitiveDefaultsClass(method.AppContext.SystemTypes, offset) is not { } type)
+                continue;
+            destination.Type = new RuntimeClassTypeAnalysisContext(type, type.DeclaringAssembly);
+        }
+    }
+
     private static void SeedNewobjResults(MethodAnalysisContext method)
     {
+        var definitions = method.ControlFlowGraph!.Instructions
+            .Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!)
+            .Where(g => g.Count() == 1)
+            .ToDictionary(g => g.Key, g => g.Single());
+
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             if (instruction.OpCode != OpCode.Newobj || instruction.Operands.Count < 2)
                 continue;
 
-            if (instruction.Operands[0] is LocalVariable destination && InstantiatedType(instruction.Operands[1]) is { } type)
+            if (instruction.Operands[0] is LocalVariable destination
+                && InstantiatedType(instruction.Operands[1], definitions) is { } type)
                 destination.Type = type;
         }
     }
 
-    private static TypeAnalysisContext? InstantiatedType(IOperand classOperand) =>
+    private static TypeAnalysisContext? InstantiatedType(IOperand classOperand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions) =>
+        InstantiatedType(classOperand, definitions, []);
+
+    // The class operand is often a copy of the ldtoken'ed klass (Move local, source). Untyped copy
+    // locals are only typed later inside the fixpoint, so follow single-definition Move chains here
+    // to still identify the allocated type through the copy.
+    private static TypeAnalysisContext? InstantiatedType(IOperand classOperand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions, HashSet<LocalVariable> visiting) =>
         classOperand switch
         {
             LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: var t } } => t,
             RuntimeClassTypeAnalysisContext { RepresentedType: var t } => t,
+            LocalVariable { Type: { } t } => t,
+            LocalVariable local when visiting.Add(local)
+                && definitions.TryGetValue(local, out var definition)
+                && definition is { OpCode: OpCode.Move, Operands: [_, { } source] }
+                => InstantiatedType(source, definitions, visiting),
             TypeAnalysisContext type => type, //not sure this is actually valid but for completeness
             _ => null,
         };
@@ -373,6 +758,41 @@ public static class LocalVariables
         return changed;
     }
 
+    // An address-taken cell whose content may be observed by later reads gets a fresh SSA version
+    // for the post-call value (the callee can write through the pointer). That version is never a
+    // definition target - the write comes through the pointer, not an assignment. When nothing else
+    // resolved such a version's type, it inherits the type of the most recent earlier version of
+    // the same storage: a write barrier or an initobj-style helper stores or reinitializes the same
+    // slot, it does not change the managed type the slot models. This runs last in the fixpoint so
+    // real byref/addressed typing (TypeAddressedLocals, PropagateFromCallParameters) wins.
+    private static bool InheritEscapedCellVersions(MethodAnalysisContext method)
+    {
+        var definedLocals = method.ControlFlowGraph!.Instructions
+            .Select(instruction => instruction.Destination)
+            .OfType<LocalVariable>()
+            .ToHashSet();
+        var typedVersions = method.Locals.Where(local => local.Type != null).ToList();
+
+        var changed = false;
+        foreach (var local in method.Locals)
+        {
+            // a defined nowhere, versioned local is a clobbered cell version
+            if (local.Type != null || local.Register.Version <= 0 || definedLocals.Contains(local))
+                continue;
+
+            var prior = typedVersions
+                .Where(candidate => candidate.Register.Name == local.Register.Name
+                    && candidate.Register.Version < local.Register.Version)
+                .MaxBy(candidate => candidate.Register.Version);
+            if (prior == null)
+                continue;
+
+            local.Type = prior.Type;
+            changed = true;
+        }
+        return changed;
+    }
+
     // Fills in a local's type only when it is currently unknown, keeping propagation monotonic (a
     // type, once set, is never changed) so the fixpoint terminates. Returns whether it set anything.
     private static bool SetTypeIfUnknown(LocalVariable local, TypeAnalysisContext? type)
@@ -387,9 +807,14 @@ public static class LocalVariables
     private static bool PropagateStaticFieldStorage(MethodAnalysisContext method)
     {
         var staticFieldsOffset = method.AppContext.Binary.is32Bit ? StaticFieldsOffset32 : StaticFieldsOffset64;
+        var definitions = method.ControlFlowGraph!.Instructions
+            .Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!)
+            .Where(g => g.Count() == 1)
+            .ToDictionary(g => g.Key, g => g.Single());
         var changed = false;
 
-        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
         {
             if (instruction.OpCode != OpCode.Move || instruction.Operands.Count < 2)
                 continue;
@@ -397,10 +822,20 @@ public static class LocalVariables
             if (instruction.Operands[0] is not LocalVariable destination || destination.Type is StaticFieldStorageTypeAnalysisContext)
                 continue;
 
-            if (instruction.Operands[1] is not MemoryOperand { Index: null, Scale: 0 } memory || memory.Addend != staticFieldsOffset)
+            if (instruction.Operands[1] is not MemoryOperand { Index: null, Scale: 0 } memory
+                || memory.Base is not LocalVariable baseLocal)
                 continue;
 
-            if (memory.Base is not LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: var owner } })
+            var addend = memory.Addend;
+            if (definitions.TryGetValue(baseLocal, out var definition)
+                && definition is { OpCode: OpCode.Add, Operands: [_, LocalVariable root, Immediate displacement] })
+            {
+                baseLocal = root;
+                addend += displacement.Value;
+            }
+
+            if (addend != staticFieldsOffset
+                || baseLocal.Type is not RuntimeClassTypeAnalysisContext { RepresentedType: var owner })
                 continue;
 
             destination.Type = new StaticFieldStorageTypeAnalysisContext(owner, owner.DeclaringAssembly);
@@ -430,7 +865,7 @@ public static class LocalVariables
                 case OpCode.Phi:
                     changed |= PropagatePhi(instruction);
                     break;
-                case OpCode.Add or OpCode.Subtract or OpCode.Multiply:
+                case OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.VectorMin or OpCode.VectorMax:
                     changed |= PropagateArithmetic(instruction, method);
                     break;
                 case OpCode.Divide or OpCode.Modulo:
@@ -514,11 +949,19 @@ public static class LocalVariables
             changed = false;
             foreach (var instruction in method.ControlFlowGraph!.Instructions)
             {
+                if (instruction.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.VectorMin or OpCode.VectorMax
+                    or OpCode.Divide or OpCode.Modulo)
+                    changed |= PropagateArithmetic(instruction, method);
+
                 if (instruction.OpCode == OpCode.Move
                     && instruction.Operands is [LocalVariable destination, ArrayLength])
                     changed |= SetTypeIfUnknown(destination, int32);
 
                 foreach (var access in instruction.Operands.OfType<ArrayAccess>())
+                    if (access.Index is LocalVariable index)
+                        changed |= SetTypeIfUnknown(index, int32);
+
+                foreach (var access in instruction.Operands.OfType<ArrayElementFieldReference>())
                     if (access.Index is LocalVariable index)
                         changed |= SetTypeIfUnknown(index, int32);
 
@@ -536,6 +979,10 @@ public static class LocalVariables
                 }
             }
         }
+
+        // Same kind-splitting as in ResolveTypesAndFields, applied to the copies
+        // SSA teardown and copy coalescing leave behind.
+        SplitScalarOperandViews(method);
     }
 
     private static bool PropagateBooleanResult(Instruction instruction, MethodAnalysisContext method)
@@ -575,10 +1022,35 @@ public static class LocalVariables
         }
     }
 
+    private static void SeedNativeFloatWidths(MethodAnalysisContext method)
+    {
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction.Destination is not LocalVariable destination)
+                continue;
+            if (instruction.NativeFloatWidthBits == 32)
+                SetTypeIfUnknown(destination, method.AppContext.SystemTypes.SystemSingleType);
+            else if (instruction.NativeFloatWidthBits == 64)
+                SetTypeIfUnknown(destination, method.AppContext.SystemTypes.SystemDoubleType);
+        }
+    }
+
     // Preserve numeric result types without guessing pointer arithmetic or mixed widths.
     private static bool PropagateArithmetic(Instruction instruction, MethodAnalysisContext method)
     {
-        if (instruction.Operands is not [LocalVariable { Type: null } destination, var left, var right])
+        if (instruction.Operands is not [LocalVariable destination, var left, var right])
+            return false;
+
+        if (instruction.OpCode is OpCode.VectorMin or OpCode.VectorMax
+            && (UnityVectorOperandType(left) ?? UnityVectorOperandType(right)) is { } vectorType)
+        {
+            if (destination.Type == vectorType)
+                return false;
+            destination.Type = vectorType;
+            return true;
+        }
+
+        if (destination.Type != null)
             return false;
 
         if ((FloatOperandType(left, method) ?? FloatOperandType(right, method)) is { } floatType)
@@ -600,6 +1072,18 @@ public static class LocalVariables
         return changed;
     }
 
+    private static TypeAnalysisContext? UnityVectorOperandType(IOperand operand)
+    {
+        var type = operand switch
+        {
+            LocalVariable local => local.Type,
+            FieldReference field => field.Field.FieldType,
+            SelectedFieldReference selected => selected.FieldType,
+            _ => null,
+        };
+        return type?.FullName is "UnityEngine.Vector2" or "UnityEngine.Vector3" or "UnityEngine.Vector4" ? type : null;
+    }
+
     private static TypeAnalysisContext? IntegerImmediateType(IOperand operand, MethodAnalysisContext method) =>
         operand is Immediate immediate
             ? immediate.Value is >= int.MinValue and <= uint.MaxValue
@@ -614,7 +1098,10 @@ public static class LocalVariables
         AddressOf address => ContainsLocal(address.Target, local),
         ReferenceCast referenceCast => ReferenceEquals(referenceCast.Value, local),
         FieldReference field => ReferenceEquals(field.Local, local),
+        SelectedFieldReference selected => ReferenceEquals(selected.Selector, local)
+            || selected.Choices.Any(c => ReferenceEquals(c.Field.Local, local)),
         ArrayAccess array => ReferenceEquals(array.Array, local) || ContainsLocal(array.Index, local),
+        ArrayElementFieldReference field => ReferenceEquals(field.Array, local) || ContainsLocal(field.Index, local),
         ArrayLength length => ReferenceEquals(length.Array, local),
         _ => false,
     };
@@ -653,6 +1140,7 @@ public static class LocalVariables
         {
             LocalVariable { Type: { } localType } => localType,
             FieldReference field => field.Field.FieldType,
+            SelectedFieldReference selected => selected.FieldType,
             _ => null,
         };
 
@@ -672,6 +1160,8 @@ public static class LocalVariables
             DoubleLiteral => method.AppContext.SystemTypes.SystemDoubleType,
             LocalVariable { Type: { FullName: "System.Single" } single } => single,
             LocalVariable { Type: { FullName: "System.Double" } @double } => @double,
+            SelectedFieldReference { FieldType.FullName: "System.Single" } selected => selected.FieldType,
+            SelectedFieldReference { FieldType.FullName: "System.Double" } selected => selected.FieldType,
             _ => null,
         };
 
@@ -682,12 +1172,35 @@ public static class LocalVariables
 
         // Move local, local: copy a known type in whichever direction is missing it.
         if (destination is LocalVariable destLocal && source is LocalVariable sourceLocal)
+        {
+            if (destLocal.Type?.FullName == "System.Object"
+                && sourceLocal.Type is { IsValueType: false } sourceType
+                && sourceType.FullName != "System.Object")
+            {
+                destLocal.Type = sourceType;
+                return true;
+            }
             return SetTypeIfUnknown(destLocal, sourceLocal.Type) || SetTypeIfUnknown(sourceLocal, destLocal.Type);
+        }
 
         // Move local, field: a field load types its result with the field's type. This is the edge
         // that lets the loaded value go on to be the base of a further field access.
         if (destination is LocalVariable loadDest && source is FieldReference loadField)
-            return SetTypeIfUnknown(loadDest, loadField.Field.FieldType);
+        {
+            var fieldType = loadField.Field.FieldType;
+            if (loadDest.Type?.FullName == fieldType.FullName)
+                return false;
+            loadDest.Type = fieldType;
+            return true;
+        }
+
+        if (destination is LocalVariable selectedDest && source is SelectedFieldReference selectedField)
+        {
+            if (selectedDest.Type?.FullName == selectedField.FieldType.FullName)
+                return false;
+            selectedDest.Type = selectedField.FieldType;
+            return true;
+        }
 
         // Move field, local: a field store types the stored value with the field's type.
         if (destination is FieldReference storeField && source is LocalVariable storeSource)
@@ -729,6 +1242,21 @@ public static class LocalVariables
             return false;
 
         var changed = false;
+
+        if (destination.Type?.FullName == "System.Object")
+        {
+            var concrete = phi.Operands.Skip(1).OfType<LocalVariable>()
+                .Select(input => input.Type)
+                .Where(type => type is { IsValueType: false } && type.FullName != "System.Object")
+                .GroupBy(type => type!.FullName).Select(group => group.First()).ToArray();
+            if (concrete is [{ } only]
+                && phi.Operands.Skip(1).OfType<LocalVariable>()
+                    .All(input => input.Type == null || input.Type.FullName is "System.Object" || input.Type.FullName == only.FullName))
+            {
+                destination.Type = only;
+                changed = true;
+            }
+        }
 
         // Forward: an untyped phi result takes the type of any typed input.
         if (destination.Type == null)
@@ -786,6 +1314,8 @@ public static class LocalVariables
             if (instruction.Operands[0] is not MethodAnalysisContext calledMethod)
                 continue;
 
+            var thisParamIndex = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
+
             // Return value: a constructor yields its declaring type, otherwise the declared return type.
             if (instruction.Destination is LocalVariable returnValue)
             {
@@ -806,8 +1336,6 @@ public static class LocalVariables
             // 0. Target
             // 1. thisParam
             // ... parameters
-            var thisParamIndex = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
-
             // 'this' param
             if (!calledMethod.IsStatic
                 && instruction.Operands[thisParamIndex] is LocalVariable thisParam)
@@ -839,7 +1367,14 @@ public static class LocalVariables
                 if (parameterType is ByRefTypeAnalysisContext { ElementType: { } referencedType }
                     && Addressed(instruction.Operands[i]) is { } referenced)
                 {
-                    changed |= SetTypeIfUnknown(referenced, referencedType);
+                    if (referenced.Type == method.AppContext.SystemTypes.SystemObjectType
+                        && referencedType != method.AppContext.SystemTypes.SystemObjectType)
+                    {
+                        referenced.Type = referencedType;
+                        changed = true;
+                    }
+                    else
+                        changed |= SetTypeIfUnknown(referenced, referencedType);
                     continue;
                 }
 
@@ -894,4 +1429,119 @@ public static class LocalVariables
                 local.Type = method.ReturnType;
         }
     }
+
+    // A lifted register is a bag of bytes the lifter tracks as one whole, but each
+    // scalar use of it only touches the low lane: `fneg s8, s0` reads 32 bits of v0
+    // and `mov w8, w0` copies 32 bits of x0, never the whole vector register. Once
+    // locals are typed, an operand position whose required stack kind is a scalar
+    // (I4/I8/F/native-int) cannot honestly read a local whose type is a different
+    // stack kind (a value-type aggregate). Split that use off the register's
+    // whole-value local: the slot the operation sees is the aggregate's lane-0
+    // field. The same applies to a scalar store into an aggregate-typed register:
+    // `fmov s0, s8` defines the low lane alone, so the store's slot is that field.
+    private static void SplitScalarOperandViews(MethodAnalysisContext method)
+    {
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            switch (instruction.OpCode)
+            {
+                case OpCode.Move:
+                    SplitMoveOperandViews(instruction);
+                    break;
+                case OpCode.Negate or OpCode.Not
+                    or OpCode.Add or OpCode.Subtract or OpCode.Multiply
+                    or OpCode.Divide or OpCode.Modulo
+                    or OpCode.And or OpCode.Or or OpCode.Xor
+                    or OpCode.ShiftLeft or OpCode.ShiftRight:
+                    SplitScalarSources(instruction);
+                    break;
+                case OpCode.CheckEqual or OpCode.CheckNotEqual
+                    or OpCode.CheckGreater or OpCode.CheckGreaterOrEqual
+                    or OpCode.CheckLess or OpCode.CheckLessOrEqual:
+                    SplitScalarComparisonSources(instruction);
+                    break;
+            }
+        }
+    }
+
+    private static void SplitMoveOperandViews(Instruction instruction)
+    {
+        if (instruction.Operands.Count < 2 || instruction.Operands[0] is not LocalVariable destination)
+            return;
+
+        if (IsScalarLaneType(destination.Type))
+        {
+            SplitScalarSources(instruction);
+            return;
+        }
+
+        // The destination is an aggregate while the source is a scalar: only the low
+        // lane is being defined, so the slot written is that lane's field, emitted
+        // as a field store on the local.
+        if (destination.Type is { IsValueType: true } destinationType
+            && instruction.Operands[1] is LocalVariable { Type: { } sourceType }
+            && IsScalarLaneType(sourceType)
+            && LaneZeroField(destinationType, sourceType) is { } lane)
+            instruction.SetOperand(0, new FieldReference(lane, destination, 0));
+    }
+
+    private static void SplitScalarSources(Instruction instruction)
+    {
+        if (instruction.Operands[0] is not LocalVariable destination
+            || !IsScalarLaneType(destination.Type))
+            return;
+
+        for (var i = 1; i < instruction.Operands.Count; i++)
+            if (LaneOperand(instruction.Operands[i], destination.Type!) is { } lane)
+                instruction.SetOperand(i, lane);
+    }
+
+    private static void SplitScalarComparisonSources(Instruction instruction)
+    {
+        // A comparison's operand pair shares one stack kind, which the flag-typed
+        // destination does not reveal; take it from whichever side is already scalar.
+        if (instruction.Operands.Count < 3
+            || instruction.Operands[1] is not LocalVariable left
+            || instruction.Operands[2] is not LocalVariable right)
+            return;
+
+        var laneType = IsScalarLaneType(left.Type) ? left.Type
+            : IsScalarLaneType(right.Type) ? right.Type
+            : null;
+        if (laneType == null)
+            return;
+
+        if (LaneOperand(right, laneType) is { } rightLane)
+            instruction.SetOperand(2, rightLane);
+        if (LaneOperand(left, laneType) is { } leftLane)
+            instruction.SetOperand(1, leftLane);
+    }
+
+    private static IOperand? LaneOperand(IOperand operand, TypeAnalysisContext laneType)
+    {
+        if (operand is not LocalVariable { Type: { } aggregateType } local
+            || !aggregateType.IsValueType || IsScalarLaneType(aggregateType)
+            || LaneZeroField(aggregateType, laneType) is not { } lane)
+            return null;
+
+        return new FieldReference(lane, local, 0);
+    }
+
+    // The low lane of an aggregate local is its publicly visible offset-0 field of
+    // the scalar's exact type - `Vector3.x` for a Single view, a leading int for an
+    // I4 view. A private or mismatched field is no lane the operand could honestly
+    // name, so the operand stays whole and the emitter keeps its diagnostic.
+    private static FieldAnalysisContext? LaneZeroField(TypeAnalysisContext aggregateType,
+        TypeAnalysisContext laneType)
+        => aggregateType.Fields.FirstOrDefault(field => !field.IsStatic
+            && field.Offset == 0
+            && field.Visibility == FieldAttributes.Public
+            && (ReferenceEquals(field.FieldType, laneType) || field.FieldType.FullName == laneType.FullName));
+
+    // The CLR stack kinds a scalar register lane can carry: a `w`/`s` lane-0 view
+    // sees 4 bytes, a `d`/`x` view sees 8.
+    private static bool IsScalarLaneType(TypeAnalysisContext? type)
+        => type is { IsValueType: true } && type.FullName is "System.Int32" or "System.UInt32"
+            or "System.Int64" or "System.UInt64" or "System.IntPtr" or "System.UIntPtr"
+            or "System.Single" or "System.Double";
 }

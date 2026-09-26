@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 
@@ -14,7 +15,7 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
     private static readonly string[] FloatRegisters = ["V0", "V1", "V2", "V3", "V4", "V5", "V6", "V7"];
 
     public override Register ReturnRegister(MethodAnalysisContext ctx)
-        => new(null, IsFloatingPoint(ctx.ReturnType) ? "V0" : "X0");
+        => new(null, FloatingRegisterCount(ctx.ReturnType) > 0 ? "V0" : "X0");
 
     public override Register? HiddenReturnBufferRegister(MethodAnalysisContext ctx)
         => ReturnsViaHiddenBuffer(ctx) ? new Register(null, "X8") : null;
@@ -29,6 +30,8 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
             return false;
 
         var size = TypeSizes.UnboxedSize(returnType, PtrSize);
+        if (size == 0)
+            size = TypeSizes.MinimumUnboxedSize(returnType, PtrSize);
         if (size == 0)
             return false; // unknown size (e.g. generic), assume a register return
 
@@ -50,13 +53,17 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
 
         void AddParameter(ParameterAnalysisContext? par)
         {
-            if (par != null && IsFloatingPoint(par))
+            var floatingRegisterCount = par == null ? 0 : FloatingRegisterCount(par.ParameterType);
+            if (floatingRegisterCount > 0)
             {
-                if (floating < FloatRegisters.Length)
+                if (floating + floatingRegisterCount <= FloatRegisters.Length)
                 {
-                    args.Add(new Register(null, FloatRegisters[floating++]));
+                    args.Add(new Register(null, FloatRegisters[floating]));
+                    floating += floatingRegisterCount;
                     return;
                 }
+
+                floating = FloatRegisters.Length;
             }
             else if (integer < IntegerRegisters.Length)
             {
@@ -77,5 +84,52 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
         AddParameter(null); // The MethodInfo argument
 
         return args.ToArray();
+    }
+
+    private static int FloatingRegisterCount(TypeAnalysisContext type)
+        => TryGetHomogeneousFloatAggregate(type, [], out _, out var count) ? count : 0;
+
+    private static bool TryGetHomogeneousFloatAggregate(TypeAnalysisContext type,
+        HashSet<TypeAnalysisContext> active, out TypeAnalysisContext? elementType, out int count)
+    {
+        if (IsFloatingPoint(type))
+        {
+            elementType = type;
+            count = 1;
+            return true;
+        }
+
+        elementType = null;
+        count = 0;
+        if (!type.IsValueType || !active.Add(type))
+            return false;
+
+        var fields = type.Fields.Where(field => !field.IsStatic).ToArray();
+        if (fields.Length is < 1 or > 4)
+        {
+            active.Remove(type);
+            return false;
+        }
+
+        foreach (var field in fields)
+        {
+            if (!TryGetHomogeneousFloatAggregate(field.FieldType, active, out var fieldElementType, out var fieldCount)
+                || count + fieldCount > 4)
+            {
+                active.Remove(type);
+                return false;
+            }
+            if (elementType != null && fieldElementType != elementType)
+            {
+                active.Remove(type);
+                return false;
+            }
+
+            elementType = fieldElementType;
+            count += fieldCount;
+        }
+
+        active.Remove(type);
+        return true;
     }
 }

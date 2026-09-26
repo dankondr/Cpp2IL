@@ -24,6 +24,18 @@ public class MemberInjectionTests
     }
 
     [Test]
+    public void HelpersTypeHasObjectBase()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+
+        IlGenerator.InjectHelpersType(appContext);
+
+        Assert.That(
+            appContext.Assemblies.Select(a => a.GetTypeByFullName("Cpp2ILInjected.Cpp2ILHelpers")?.BaseType),
+            Has.All.EqualTo(appContext.SystemTypes.SystemObjectType));
+    }
+
+    [Test]
     public void TestZeroArgumentMethodInjection()
     {
         var appContext = Cpp2IlApi.CurrentAppContext;

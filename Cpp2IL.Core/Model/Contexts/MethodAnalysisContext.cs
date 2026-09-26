@@ -404,9 +404,12 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         InjectedCheckRemover.Run(this);
 
-        InterfaceDispatchRecovery.Run(this);
+        var finishInterfaceDispatchRecovery = InterfaceDispatchRecovery.Run(this);
 
         LocalVariables.ResolveTypesAndFields(this);
+        // Runtime class targets become available only after type resolution.
+        KeyFunctionRecovery.Run(this);
+        ArrayRecovery.RecoverObjectFieldAddresses(this);
 
         // Needs the MethodInfo* receivers typed, so runs after resolution unlike the class-init guards
         MetadataInitGuardRemover.RunRgctx(this);
@@ -417,6 +420,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         DelegateInvokeRecovery.Run(this);
         BooleanFlagSimplifier.Run(this);
         DeadCodeEliminator.Run(this);
+        finishInterfaceDispatchRecovery?.Invoke();
 
         // Copy/constant propagation belongs in SSA, where one definition dominates all uses and phis
         // make joins explicit, so forwarding a value is an unconditional global substitution.
@@ -426,7 +430,15 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         for (var i = 0; i < 8 && ConstantFolder.Run(this); i++)
             SsaSimplifier.Run(this);
 
+        // SSA propagation can expose a trailing concrete MethodInfo* only after
+        // the initial type-resolution fixpoint. Give the normal resolver one more
+        // chance before SSA is removed (shared generic thunks depend on this).
+        MetadataResolver.ResolveCallsViaMethodInfo(this);
+        MetadataInitGuardRemover.Run(this);
+        MetadataInitGuardRemover.RewriteUnguardedInits(this);
+
         InternalCallGuardRemover.Run(this);
+        ArrayRecovery.RecoverAccesses(this);
         KeyFunctionRecovery.Run(this);
 
         SsaForm.Remove(this);
@@ -442,9 +454,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Fix float literals
         FloatLiteralRecovery.Run(this);
 
-        // Runs late so the array type and length reach the allocation call as operands after copy propagation has inlined them
+        // Runs late so array and runtime-class operands reach their helpers after copy propagation has inlined them.
         ArrayRecovery.Run(this);
         LocalVariables.ResolveLateGeneratedTypes(this);
+        KeyFunctionRecovery.Run(this);
 
         LocalVariables.TypeAddressedLocals(this);
 
@@ -458,9 +471,16 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         ReferenceCastRecovery.Run(this);
         ReferenceCompareExchangeRecovery.Run(this);
         CallArgumentTrimmer.Run(this);
+        InlinedListClearRecovery.Run(this);
+        InlinedListAddRecovery.Run(this);
+        // Some helpers only acquire their canonical key-function name in late recovery. This final
+        // cleanup prevents runtime-only metadata/class-init helpers from reaching managed IL.
+        MetadataInitGuardRemover.Run(this);
+        MetadataInitGuardRemover.RewriteUnguardedInits(this);
         DeadCodeEliminator.Run(this);
 
         LocalVariables.RemoveUnused(this);
+
     }
 
     public void AddWarning(string warning) => AnalysisWarnings.Add(warning);

@@ -14,6 +14,18 @@ namespace Cpp2IL.Core.Tests;
 
 public class ByRefStoreTests
 {
+    [TestCase(0xbd400000u, 4)] // ldr s0, [x0]
+    [TestCase(0xf9400020u, 8)] // ldr x0, [x1]
+    [TestCase(0x39400020u, 1)] // ldrb w0, [x1]
+    public void NativeLoadRetainsWidth(uint encoding, int width)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Load",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, []);
+        var lifted = new NewArmV8InstructionSet().ConvertInstructions(Disassembler.Disassemble(BitConverter.GetBytes(encoding), 0), caller);
+        Assert.That(((MemoryOperand)lifted[0].Operands[1]).AccessSize, Is.EqualTo(width));
+    }
+
     [TestCase(0xf900003fu, 8)] // str xzr, [x1]
     [TestCase(0xb900003fu, 4)] // str wzr, [x1]
     [TestCase(0x7900003fu, 2)] // strh wzr, [x1]

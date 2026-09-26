@@ -107,8 +107,16 @@ public static class DeadCodeEliminator
                     foreach (var used in ArrayAccessLocals(addressedElement))
                         yield return used;
                     break;
+                case AddressOf { Target: ArrayElementFieldReference addressedField }:
+                    foreach (var used in ArrayElementFieldLocals(addressedField))
+                        yield return used;
+                    break;
                 case ArrayAccess access:
                     foreach (var used in ArrayAccessLocals(access))
+                        yield return used;
+                    break;
+                case ArrayElementFieldReference elementField:
+                    foreach (var used in ArrayElementFieldLocals(elementField))
                         yield return used;
                     break;
                 case ArrayLength { Array: { } lengthArray }:
@@ -123,6 +131,13 @@ public static class DeadCodeEliminator
         yield return access.Array;
 
         if (access.Index is LocalVariable index)
+            yield return index;
+    }
+
+    private static IEnumerable<LocalVariable> ArrayElementFieldLocals(ArrayElementFieldReference field)
+    {
+        yield return field.Array;
+        if (field.Index is LocalVariable index)
             yield return index;
     }
 

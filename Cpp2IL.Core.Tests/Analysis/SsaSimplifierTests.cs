@@ -103,4 +103,20 @@ public class SsaSimplifierTests
         var call = live.Single(i => i.OpCode == OpCode.CallVoid);
         Assert.That(ReferenceEquals(call.Operands[1], p), Is.True, "the parameter flows through to the use");
     }
+
+    [Test]
+    public void KeepsDefinitionOfAddressedLocal()
+    {
+        var value = Local("value");
+
+        var live = Run(new List<Instruction>
+        {
+            new(0, OpCode.Move, value, Imm(7)),
+            new(1, OpCode.CallVoid, Str("f"), new AddressOf(value), Imm(0)),
+            new(2, OpCode.Return),
+        });
+
+        Assert.That(live.Any(i => i.OpCode == OpCode.Move && ReferenceEquals(i.Operands[0], value)), Is.True,
+            "taking a local's address still consumes the value stored in that local");
+    }
 }

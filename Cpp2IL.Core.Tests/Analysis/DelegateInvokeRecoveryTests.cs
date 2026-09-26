@@ -20,15 +20,22 @@ public class DelegateInvokeRecoveryTests
         var method=new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType,"Tail",app.SystemTypes.SystemVoidType,MethodAttributes.Static,[]);
         var value=new LocalVariable("value",new Register(null,"X1"),action);
         var target=new LocalVariable("target",new Register(null,"X2"),app.SystemTypes.SystemIntPtrType);
-        var raw=app.InstructionSet.CallingConventionResolver!.ResolveForUnmanaged(app,0);
-        var operands=new System.Collections.Generic.List<IOperand>{target,new LocalVariable("stale",new Register(null,"X0"))};
-        operands.AddRange(raw);
-        var dispatch=new Instruction(1,OpCode.IndirectJump,operands);
+        // The frame's own delegate-internal loads prove the call is the delegate's invoke,
+        // carried in the raw integer argument registers the unknown-callee layout leaves.
+        var thisArg=new LocalVariable("thisArg",new Register(null,"rcx"));
+        var methodInfo=new LocalVariable("methodInfo",new Register(null,"rdx"));
+        var operands=new System.Collections.Generic.List<IOperand>{target,new LocalVariable("stale",new Register(null,"X0")),
+            thisArg,methodInfo,new Register(null,"r8"),new Register(null,"r9"),
+            new Register(null,"xmm0"),new Register(null,"xmm1"),new Register(null,"xmm2"),new Register(null,"xmm3")};
+        var dispatch=new Instruction(3,OpCode.IndirectJump,operands);
         IOperand invokeImpl=resolvedField
             ? new FieldReference(app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Delegate")!.Fields.First(f=>f.Name=="invoke_impl"),value,app.Binary.PointerSizeBytes*3)
             : new MemoryOperand(value,addend:app.Binary.PointerSizeBytes*3);
         method.ControlFlowGraph=new ISILControlFlowGraph([
-            new Instruction(0,OpCode.Move,target,invokeImpl),dispatch]);
+            new Instruction(0,OpCode.Move,target,invokeImpl),
+            new Instruction(1,OpCode.Move,thisArg,new MemoryOperand(value,addend:16)),
+            new Instruction(2,OpCode.Move,methodInfo,new MemoryOperand(value,addend:8)),
+            dispatch]);
 
         DelegateInvokeRecovery.Run(method);
 

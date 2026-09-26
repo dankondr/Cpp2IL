@@ -19,6 +19,8 @@ public class IsilDumpOutputFormat : Cpp2IlOutputFormat
     public override void DoOutput(ApplicationAnalysisContext context, string outputRoot)
     {
         outputRoot = Path.Combine(outputRoot, "IsilDump");
+        var typeFilters = Environment.GetEnvironmentVariable("CPP2IL_ISIL_TYPE_FILTER")?
+            .Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries).Select(filter => filter.Trim()).ToArray();
 
         var numAssemblies = context.Assemblies.Count;
         var i = 1;
@@ -31,6 +33,9 @@ public class IsilDumpOutputFormat : Cpp2IlOutputFormat
             MiscUtils.ExecuteParallel(assembly.Types, type =>
             {
                 if (type is InjectedTypeAnalysisContext)
+                    return;
+
+                if (typeFilters is { Length: > 0 } && !typeFilters.Any(filter => type.FullName.Contains(filter, StringComparison.Ordinal)))
                     return;
 
                 if (type.Methods.Count == 0)

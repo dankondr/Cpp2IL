@@ -6,6 +6,22 @@ namespace Cpp2IL.Core.Tests;
 
 public class AccessibilityExtensionsTests
 {
+    [TestCase("mscorlib")]
+    [TestCase("System.Diagnostics.DiagnosticSource")]
+    [TestCase("UnityEngine.CoreModule")]
+    [TestCase("Unity.RenderPipelines.Core.Runtime")]
+    public void EditorRuntimeAssembliesAreNotRecoveryFriends(string name)
+    {
+        Assert.That(AccessibilityExtensions.IsExternalRuntimeAssembly(name), Is.True);
+    }
+
+    [TestCase("CastleClashers.Game")]
+    [TestCase("Newtonsoft.Json")]
+    public void RecoveredLibrariesCanBeRecoveryFriends(string name)
+    {
+        Assert.That(AccessibilityExtensions.IsExternalRuntimeAssembly(name), Is.False);
+    }
+
     [Test]
     public void AccessibilityTests()
     {

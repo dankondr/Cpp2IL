@@ -4,6 +4,7 @@ using System.Linq;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Model.Contexts;
 
 namespace Cpp2IL.Core.Tests.Analysis;
 
@@ -66,6 +67,29 @@ public class SsaAndDominators
         => graph.Blocks.SelectMany(b => b.Instructions).Where(i => i.OpCode == OpCode.Phi).ToList();
 
     private static string? RegName(object operand) => operand is Register r ? r.Name : null;
+
+    [Test]
+    public void HoistedAddressTakeBindsToFollowingStore()
+    {
+        var slot = new Register(null, "slot");
+        var pointer = new Register(null, "pointer");
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Move, slot, new Immediate(0)),
+            new(1, OpCode.Move, pointer, new AddressOf(slot)),
+            new(2, OpCode.Move, slot, new Immediate(7)),
+            new(3, OpCode.Return, pointer),
+        };
+        var graph = new ISILControlFlowGraph(instructions);
+
+        SsaForm.Build(graph, new DominatorInfo(graph));
+
+        var store = graph.Instructions.Single(i => i is { OpCode: OpCode.Move, Operands: [Register { Name: "slot" }, Immediate { Value: 7 }] });
+        var address = graph.Instructions.Single(i => i.Operands.Count > 1 && i.Operands[1] is AddressOf);
+        Assert.That(graph.Instructions.IndexOf(address), Is.GreaterThan(graph.Instructions.IndexOf(store)));
+        Assert.That(((Register)((AddressOf)address.Operands[1]).Target).Version,
+            Is.EqualTo(((Register)store.Operands[0]).Version));
+    }
 
     [Test]
     public void DiamondDominatorsAreCorrect()
@@ -140,6 +164,47 @@ public class SsaAndDominators
         var phi = iPhis[0];
         Assert.That(header.Instructions, Does.Contain(phi));
         Assert.That(phi.Operands.Count, Is.EqualTo(1 + header.Predecessors.Count));
+    }
+
+    [Test]
+    public void SsaRemovalDoesNotCopyUnrelatedManagedReferencesAcrossPhiEdge()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var leftType = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "Tests", "Left", app.SystemTypes.SystemObjectType, System.Reflection.TypeAttributes.Public);
+        var rightType = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "Tests", "Right", app.SystemTypes.SystemObjectType, System.Reflection.TypeAttributes.Public);
+        var incompatible = new LocalVariable("incompatible", new Register(null, "X0", 1), leftType);
+        var compatible = new LocalVariable("compatible", new Register(null, "X0", 2), rightType);
+        var destination = new LocalVariable("destination", new Register(null, "X0", 3), rightType);
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.ConditionalJump, new Immediate(3), new Register(null, "cond")),
+            new(1, OpCode.Nop),
+            new(2, OpCode.Jump, new Immediate(4)),
+            new(3, OpCode.Nop),
+            new(4, OpCode.Return),
+        };
+        var graph = BuildGraph(instructions);
+        var join = BlockWith(graph, instruction => instruction.OpCode == OpCode.Return);
+        join.Instructions.Insert(0, new Instruction(-1, OpCode.Phi,
+            destination, incompatible, compatible));
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Join",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = graph,
+        };
+
+        SsaForm.Remove(method);
+
+        var copies = graph.Instructions.Where(instruction => instruction.OpCode == OpCode.Move).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(copies.Any(copy => ReferenceEquals(copy.Operands[1], compatible)), Is.True);
+            Assert.That(copies.Any(copy => ReferenceEquals(copy.Operands[1], incompatible)), Is.False);
+        });
     }
 
     // Two sibling leaves under the entry branch, one redefining x and one reading it. Both orders tested

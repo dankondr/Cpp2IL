@@ -16,5 +16,10 @@ public class LocalVariable(string name, Register register, TypeAnalysisContext? 
     public bool IsReturn = false;
     public bool IsMethodInfo = false;
 
+    // The native stack slot backing a synthesized hidden-return local. Kept so a
+    // later generic sharpening pass can resolve offsets that did not exist in the
+    // erased (usually object-instantiated) layout.
+    public LocalVariable? HiddenReturnBuffer;
+
     public override string ToString() => Type == null ? $"{Name} @ {Register}" : $"{Name} @ {Register} ({Type.FullName})";
 }

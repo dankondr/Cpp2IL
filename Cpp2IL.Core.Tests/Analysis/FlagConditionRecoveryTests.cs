@@ -139,6 +139,80 @@ public class FlagConditionRecoveryTests
     }
 
     [Test]
+    public void RecoversConditionMovedIntoCsetResult()
+    {
+        var t1 = Flag("TEMP1");
+        var t2 = Flag("TEMP2");
+        var t3 = Flag("TEMP3");
+        var t4 = Flag("TEMP4");
+        var of = Flag("OF");
+        var sf = Flag("SF");
+        var zf = Flag("ZF");
+        var sfEqOf = Flag("TEMP_sf_eq_of");
+        var notZero = Flag("TEMP_nz");
+        var condition = Flag("TEMP_condition");
+        var result = Flag("result");
+        var graph = new ISILControlFlowGraph(new List<Instruction>
+        {
+            new(0, OpCode.Subtract, t1, A, B),
+            new(1, OpCode.Xor, t2, A, B),
+            new(2, OpCode.Xor, t3, A, t1),
+            new(3, OpCode.And, t4, t2, t3),
+            new(4, OpCode.CheckLess, of, t4, Imm(0)),
+            new(5, OpCode.CheckLess, sf, t1, Imm(0)),
+            new(6, OpCode.CheckEqual, zf, t1, Imm(0)),
+            new(7, OpCode.CheckEqual, sfEqOf, sf, of),
+            new(8, OpCode.Not, notZero, zf),
+            new(9, OpCode.And, condition, sfEqOf, notZero),
+            new(10, OpCode.Move, result, condition),
+            new(11, OpCode.Return, result),
+        });
+
+        FlagConditionRecovery.Run(graph);
+
+        var definition = graph.Instructions.First(i => ReferenceEquals(i.Destination, condition));
+        Assert.That(definition.OpCode, Is.EqualTo(OpCode.CheckGreater));
+        Assert.That(definition.Operands[1], Is.EqualTo(A));
+        Assert.That(definition.Operands[2], Is.EqualTo(B));
+    }
+
+    [Test]
+    public void RecoversInvertedSignedGreaterFromConditionalSelect()
+    {
+        var t1 = Flag("TEMP1");
+        var t2 = Flag("TEMP2");
+        var t3 = Flag("TEMP3");
+        var t4 = Flag("TEMP4");
+        var of = Flag("OF");
+        var sf = Flag("SF");
+        var zf = Flag("ZF");
+        var sfEqOf = Flag("TEMP_sf_eq_of");
+        var notZero = Flag("TEMP_nz");
+        var greater = Flag("TEMP_greater");
+        var inverse = Flag("TEMP_inverse");
+
+        var def = RecoverAndGetConditionDef(new List<Instruction>
+        {
+            new(0, OpCode.Subtract, t1, A, B),
+            new(1, OpCode.Xor, t2, A, B),
+            new(2, OpCode.Xor, t3, A, t1),
+            new(3, OpCode.And, t4, t2, t3),
+            new(4, OpCode.CheckLess, of, t4, Imm(0)),
+            new(5, OpCode.CheckLess, sf, t1, Imm(0)),
+            new(6, OpCode.CheckEqual, zf, t1, Imm(0)),
+            new(7, OpCode.CheckEqual, sfEqOf, sf, of),
+            new(8, OpCode.Not, notZero, zf),
+            new(9, OpCode.And, greater, sfEqOf, notZero),
+            new(10, OpCode.Not, inverse, greater),
+            new(11, OpCode.ConditionalJump, Imm(0), inverse),
+        }, inverse);
+
+        Assert.That(def.OpCode, Is.EqualTo(OpCode.CheckLessOrEqual));
+        Assert.That(def.Operands[1], Is.EqualTo(A));
+        Assert.That(def.Operands[2], Is.EqualTo(B));
+    }
+
+    [Test]
     public void LeavesUnrecognisedConditionsAlone()
     {
         // A conditional jump on a plain boolean local with no flag pattern must be untouched.

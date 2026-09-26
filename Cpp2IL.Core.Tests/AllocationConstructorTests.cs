@@ -106,6 +106,75 @@ public class AllocationConstructorTests
     }
 
     [Test]
+    public void InlinedReadonlyFieldInitializationRestoresConcreteConstructorCall()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "Tests", "Owner", app.SystemTypes.SystemObjectType, R.TypeAttributes.Public);
+        var allocated = new InjectedTypeAnalysisContext(owner.DeclaringAssembly, "Tests", "Item",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public);
+        var field = allocated.InjectFieldContext("_config", app.SystemTypes.SystemStringType,
+            R.FieldAttributes.Private | R.FieldAttributes.InitOnly);
+        var constructor = allocated.InjectMethodContext(".ctor", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public, app.SystemTypes.SystemStringType);
+        var baseConstructor = new NativeCtor(app.SystemTypes.SystemObjectType, 0x2000);
+        var result = new LocalVariable("result", new Register(null, "result"), app.SystemTypes.SystemObjectType);
+        var config = new LocalVariable("config", new Register(null, "config"), app.SystemTypes.SystemStringType);
+        var caller = new InjectedMethodAnalysisContext(owner, "Create", app.SystemTypes.SystemObjectType,
+            R.MethodAttributes.Public | R.MethodAttributes.Static, [app.SystemTypes.SystemStringType]);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Newobj, result, allocated),
+            new(1, OpCode.CallVoid, baseConstructor, result),
+            new(2, OpCode.Move, new FieldReference(field, result, 16), config),
+            new(3, OpCode.Return, result)]);
+        caller.Locals = [result, config];
+        caller.ParameterLocals = [config];
+        caller.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("InlinedReadonlyCtor.dll");
+        var ownerDefinition = new TypeDefinition("Tests", "Owner", TypeAttributes.Public,
+            module.CorLibTypeFactory.Object.Type);
+        var itemDefinition = new TypeDefinition("Tests", "Item", TypeAttributes.Public,
+            module.CorLibTypeFactory.Object.Type);
+        var objectDefinition = new TypeDefinition("System", "Object", TypeAttributes.Public);
+        var stringDefinition = new TypeDefinition("System", "String", TypeAttributes.Public);
+        module.TopLevelTypes.Add(ownerDefinition);
+        module.TopLevelTypes.Add(itemDefinition);
+        module.TopLevelTypes.Add(objectDefinition);
+        module.TopLevelTypes.Add(stringDefinition);
+        var baseDefinition = new MethodDefinition(".ctor", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        objectDefinition.Methods.Add(baseDefinition);
+        var constructorDefinition = new MethodDefinition(".ctor", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.String]));
+        itemDefinition.Methods.Add(constructorDefinition);
+        var fieldDefinition = new FieldDefinition("_config", FieldAttributes.Private | FieldAttributes.InitOnly,
+            new FieldSignature(module.CorLibTypeFactory.String));
+        itemDefinition.Fields.Add(fieldDefinition);
+        owner.PutExtraData("AsmResolverType", ownerDefinition);
+        allocated.PutExtraData("AsmResolverType", itemDefinition);
+        app.SystemTypes.SystemObjectType.PutExtraData("AsmResolverType", objectDefinition);
+        app.SystemTypes.SystemStringType.PutExtraData("AsmResolverType", stringDefinition);
+        constructor.PutExtraData("AsmResolverMethod", constructorDefinition);
+        baseConstructor.PutExtraData("AsmResolverMethod", baseDefinition);
+        field.PutExtraData("AsmResolverField", fieldDefinition);
+        var definition = new MethodDefinition("Create", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Object, [module.CorLibTypeFactory.String]));
+        definition.ParameterDefinitions.Add(new ParameterDefinition(1, "config", 0));
+        ownerDefinition.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Single(instruction => instruction.OpCode == CilOpCodes.Newobj).Operand,
+                Is.SameAs(constructorDefinition));
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Stfld), Is.False);
+        });
+    }
+
+    [Test]
     public void ConstructorCallForDifferentLocalIsNotFused()
     {
         var app = Cpp2IlApi.CurrentAppContext!;

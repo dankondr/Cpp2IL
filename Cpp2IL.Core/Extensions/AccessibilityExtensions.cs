@@ -219,7 +219,15 @@ internal static class AccessibilityExtensions
     internal static bool SharesEmittedInternals(AssemblyAnalysisContext? a, AssemblyAnalysisContext? b) =>
         ReferenceEquals(a, b)
         || (a != null && b != null && (a.Name == b.Name
-            || (EmittedInternalsAreShared && a.Definition != null && b.Definition != null)));
+            || (EmittedInternalsAreShared && a.Definition != null && b.Definition != null
+                && !IsExternalRuntimeAssembly(a.Name) && !IsExternalRuntimeAssembly(b.Name))));
+
+    // These assemblies are stubbed during extraction and the Unity project uses
+    // its real runtime copies, so synthetic InternalsVisibleTo grants in the
+    // generated stubs cannot make their internal members callable at runtime.
+    internal static bool IsExternalRuntimeAssembly(string? name) =>
+        name == "mscorlib" || name == "System" || name?.StartsWith("System.") == true
+        || name?.StartsWith("UnityEngine.") == true || name?.StartsWith("Unity.") == true;
 
     private static bool IsDependencyOf(this AssemblyAnalysisContext referencedAssembly, AssemblyAnalysisContext referencingAssembly)
     {
