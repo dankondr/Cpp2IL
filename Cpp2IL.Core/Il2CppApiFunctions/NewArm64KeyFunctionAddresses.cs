@@ -26,11 +26,11 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
 
     // A function entry that is just one unconditional B forwards its caller to the
     // branch destination: an identity (one-hop / tail-call) veneer. Returns the
-    // branch destination, or 0 when the entry word is not an unconditional B.
-    internal static ulong MatchTailCallVeneerTarget(ulong address, System.Func<ulong, uint> read)
+    // branch destination, or 0 when the entry word is unreadable or not an
+    // unconditional B. `read` must return null for words it cannot supply.
+    internal static ulong MatchTailCallVeneerTarget(ulong address, System.Func<ulong, uint?> read)
     {
-        var word = read(address);
-        if (!IsUnconditionalBranch(word))
+        if (read(address) is not { } word || !IsUnconditionalBranch(word))
             return 0;
         var delta = (long)((int)(word << 6) >> 4);
         return unchecked((ulong)((long)address + delta));
@@ -38,13 +38,14 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
 
     // Linker-style GOT trampoline: adrp xd, page; ldr xt, [xd, #off];
     // (optional) add xd, xd, #off; br xt — materializes the call target from a
-    // pointer slot. On success returns the VA of the pointer slot read by the ldr.
-    internal static bool TryDecodeGotVeneerSlot(ulong address, System.Func<ulong, uint> read, out ulong slotVa)
+    // pointer slot. `read` must return null for unmappable/truncated words; any
+    // word that cannot be read fails the match. On success returns the VA of the
+    // pointer slot read by the ldr.
+    internal static bool TryDecodeGotVeneerSlot(ulong address, System.Func<ulong, uint?> read, out ulong slotVa)
     {
         slotVa = 0;
 
-        var adrp = read(address);
-        if ((adrp & 0x9f000000) != 0x90000000)
+        if (read(address) is not { } adrp || (adrp & 0x9f000000) != 0x90000000)
             return false;
         var pageReg = (int)(adrp & 0x1f);
         var imm21 = (long)((adrp >> 5) & 0x7ffff) << 2 | (long)((adrp >> 29) & 0x3);
@@ -52,21 +53,23 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
             imm21 -= 0x200000;
         var page = (long)(address & ~0xfffUL) + (imm21 << 12);
 
-        var ldr = read(address + 4);
-        if ((ldr & 0xffc00000) != 0xf9400000 || (int)((ldr >> 5) & 0x1f) != pageReg)
+        if (read(address + 4) is not { } ldr
+            || (ldr & 0xffc00000) != 0xf9400000
+            || (int)((ldr >> 5) & 0x1f) != pageReg)
             return false;
         var targetReg = (int)(ldr & 0x1f);
         var slotOffset = (long)((ldr >> 10) & 0xfff) * 8;
 
-        var next = 8UL;
-        var maybeAdd = read(address + next);
-        if ((maybeAdd & 0xff000000) == 0x91000000
+        var brWord = read(address + 8);
+        if (brWord is { } maybeAdd
+            && (maybeAdd & 0xff000000) == 0x91000000
             && (int)(maybeAdd & 0x1f) == pageReg
             && (int)((maybeAdd >> 5) & 0x1f) == pageReg)
-            next += 4;
+            brWord = read(address + 12);
 
-        var br = read(address + next);
-        if ((br & 0xfffffc1f) != 0xd61f0000 || (int)((br >> 5) & 0x1f) != targetReg)
+        if (brWord is not { } br
+            || (br & 0xfffffc1f) != 0xd61f0000
+            || (int)((br >> 5) & 0x1f) != targetReg)
             return false;
 
         slotVa = (ulong)(page + slotOffset);
@@ -212,7 +215,7 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
         foreach (var (address, name) in FindTailCallVeneerAliases(disassembly, addressToName, CallTargets))
             AddResolvedAlias(name, address);
 
-        uint Read(ulong va) => ReadWord(va);
+        uint? Read(ulong va) => TryReadWord(va);
         for (var index = 0; index < disassembly.Count; index++)
             if (disassembly[index].Mnemonic == Arm64Mnemonic.ADRP
                 && IsFunctionStart(disassembly, index)
@@ -220,11 +223,18 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
                 AddResolvedAlias(name, disassembly[index].Address);
     }
 
-    private uint ReadWord(ulong va) => System.BitConverter.ToUInt32(
-        _appContext.Binary.GetRawBinaryContent().Slice((int)_appContext.Binary.MapVirtualAddressToRaw(va), 4).ToArray(), 0);
+    // Bounds-checked 4-byte read: null when va is unmappable or fewer than 4
+    // bytes of the loaded image remain at the mapped offset.
+    private uint? TryReadWord(ulong va)
+    {
+        var binary = _appContext.Binary;
+        if (!binary.TryMapVirtualAddressToRaw(va, out var raw) || raw < 0 || raw + 4 > binary.RawLength)
+            return null;
+        return System.BitConverter.ToUInt32(binary.GetRawBinaryContent().Slice((int)raw, 4).ToArray(), 0);
+    }
 
     private bool TryResolveGotVeneer(ulong address, IReadOnlyDictionary<ulong, string> addressToName,
-        System.Func<ulong, uint> read, out string name)
+        System.Func<ulong, uint?> read, out string name)
     {
         name = string.Empty;
         var binary = _appContext.Binary;
@@ -255,7 +265,7 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
         if (binary.TryMapVirtualAddressToRaw(address, out var raw) && raw >= 0 && raw + 4 <= binary.RawLength)
         {
             var addressToName = GetAddressToNameMap();
-            uint Read(ulong va) => ReadWord(va);
+            uint? Read(ulong va) => TryReadWord(va);
 
             var branchTarget = MatchTailCallVeneerTarget(address, Read);
             if (branchTarget != 0 && addressToName.TryGetValue(branchTarget, out var name))

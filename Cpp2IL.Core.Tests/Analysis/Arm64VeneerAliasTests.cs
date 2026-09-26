@@ -49,14 +49,19 @@ public class Arm64VeneerAliasTests
     private static List<Arm64Instruction> Disassemble(byte[] blob, ulong va) =>
         Disassembler.Disassemble(blob, va, new Disassembler.Options(true, true, false)).ToList();
 
+    // Read callback over a word dictionary: null for absent words, matching the
+    // bounds-checked contract used by production reads.
+    private static Func<ulong, uint?> Reader(IReadOnlyDictionary<ulong, uint> words) =>
+        a => words.TryGetValue(a, out var w) ? w : null;
+
     [Test]
     public void TailCallVeneerTargetIsPositionIndependent()
     {
         // veneer entry: b leaf (leaf 0x40 bytes ahead)
         var words = new Dictionary<ulong, uint> { [0x1000] = B(0x40) };
-        Assert.That(NewArm64KeyFunctionAddresses.MatchTailCallVeneerTarget(0x1000, a => words[a]), Is.EqualTo(0x1040UL));
+        Assert.That(NewArm64KeyFunctionAddresses.MatchTailCallVeneerTarget(0x1000, Reader(words)), Is.EqualTo(0x1040UL));
         words = new Dictionary<ulong, uint> { [0x801000] = B(0x40) };
-        Assert.That(NewArm64KeyFunctionAddresses.MatchTailCallVeneerTarget(0x801000, a => words[a]), Is.EqualTo(0x801040UL));
+        Assert.That(NewArm64KeyFunctionAddresses.MatchTailCallVeneerTarget(0x801000, Reader(words)), Is.EqualTo(0x801040UL));
     }
 
     [Test]
@@ -70,7 +75,14 @@ public class Arm64VeneerAliasTests
             [0x100c] = MovX0X1,
         };
         foreach (var va in words.Keys)
-            Assert.That(NewArm64KeyFunctionAddresses.MatchTailCallVeneerTarget(va, a => words[a]), Is.Zero, $"at {va:X}");
+            Assert.That(NewArm64KeyFunctionAddresses.MatchTailCallVeneerTarget(va, Reader(words)), Is.Zero, $"at {va:X}");
+    }
+
+    [Test]
+    public void TailCallVeneerReturnsZeroWhenEntryWordUnreadable()
+    {
+        // Call target at the very end of a mapped region: no word available.
+        Assert.That(NewArm64KeyFunctionAddresses.MatchTailCallVeneerTarget(0x1000, _ => null), Is.Zero);
     }
 
     // Blob layout shared by the scan tests. LeafA/LeafB are resolved targets;
@@ -149,7 +161,7 @@ public class Arm64VeneerAliasTests
             for (var i = 0; i < words.Length; i++)
                 dict[veneerVa + (ulong)i * 4] = words[i];
 
-            Assert.That(NewArm64KeyFunctionAddresses.TryDecodeGotVeneerSlot(veneerVa, a => dict[a], out var slot),
+            Assert.That(NewArm64KeyFunctionAddresses.TryDecodeGotVeneerSlot(veneerVa, Reader(dict), out var slot),
                 Is.True, $"withAdd={withAdd} at {veneerVa:X}");
             Assert.That(slot, Is.EqualTo(PageOf(veneerVa) + 0x2000 + 0x38));
         }
@@ -178,8 +190,55 @@ public class Arm64VeneerAliasTests
             var dict = new Dictionary<ulong, uint>();
             for (var i = 0; i < words.Length; i++)
                 dict[veneerVa + (ulong)i * 4] = words[i];
-            Assert.That(NewArm64KeyFunctionAddresses.TryDecodeGotVeneerSlot(veneerVa, a => dict[a], out _),
+            Assert.That(NewArm64KeyFunctionAddresses.TryDecodeGotVeneerSlot(veneerVa, Reader(dict), out _),
                 Is.False, string.Join(",", words.Select(w => w.ToString("x8"))));
         }
+    }
+
+    [Test]
+    public void GotVeneerRejectsTruncatedSequences()
+    {
+        var veneerVa = 0x80000UL;
+        var pageDelta = 0x2000L;
+        var cases = new[]
+        {
+            // adrp is the final word of the section
+            new[] { Adrp(16, pageDelta) },
+            // adrp+ldr with no following br
+            new[] { Adrp(16, pageDelta), Ldr64(17, 16, 0x38) },
+            // adrp+ldr+add with no following br
+            new[] { Adrp(16, pageDelta), Ldr64(17, 16, 0x38), Add64(16, 16, 0x38) },
+        };
+        foreach (var words in cases)
+        {
+            var dict = new Dictionary<ulong, uint>();
+            for (var i = 0; i < words.Length; i++)
+                dict[veneerVa + (ulong)i * 4] = words[i];
+            Assert.That(NewArm64KeyFunctionAddresses.TryDecodeGotVeneerSlot(veneerVa, Reader(dict), out _),
+                Is.False, string.Join(",", words.Select(w => w.ToString("x8"))));
+        }
+    }
+
+    [TestCase(4)]
+    [TestCase(8)]
+    [TestCase(12)]
+    public void LazyResolutionRejectsFewerThan16RemainingBytes(int remainingBytes)
+    {
+        // Full adrp+ldr+add+br pattern exists, but the reader exposes only
+        // `remainingBytes` from `veneerVa` — the lazy per-target read is
+        // bounds-checked the same way as the production TryReadWord.
+        var veneerVa = 0x80000UL;
+        var words = GotVeneerWords(0x2000, 0x38, true);
+        var dict = new Dictionary<ulong, uint>();
+        for (var i = 0; i < words.Length; i++)
+            dict[veneerVa + (ulong)i * 4] = words[i];
+
+        uint? BoundedRead(ulong va) =>
+            va >= veneerVa && va + 4 <= veneerVa + (ulong)remainingBytes && dict.TryGetValue(va, out var w)
+                ? w
+                : null;
+
+        Assert.That(NewArm64KeyFunctionAddresses.TryDecodeGotVeneerSlot(veneerVa, BoundedRead, out _),
+            Is.False, $"remaining={remainingBytes}");
     }
 }
