@@ -237,15 +237,14 @@ public static class KeyFunctionRecovery
 
     internal static void RewriteIsInst(Instruction instruction, Graphs.ISILControlFlowGraph cfg, bool is32Bit)
     {
-        // helper, result, object, target class. The surrounding native code
-        // already performs the null test and throws where castclass semantics
-        // are required, so a managed reference cast preserves the observable path.
+        // helper, result, object, target class. Object::IsInst returns null when
+        // the object is not assignable; it does not have castclass semantics.
         if (instruction.OpCode != OpCode.Call
             || instruction.Operands is not [_, var result, LocalVariable value, var classOperand, ..]
             || IsInstTarget(ResolveMoveSource(cfg, classOperand), cfg, is32Bit) is not { } target)
             return;
         instruction.OpCode = OpCode.Move;
-        instruction.SetOperands(result, new ReferenceCast(value, target));
+        instruction.SetOperands(result, new ReferenceCast(value, target, nullOnFailure: true));
     }
 
     private static TypeAnalysisContext? IsInstTarget(IOperand operand, Graphs.ISILControlFlowGraph cfg, bool is32Bit)
