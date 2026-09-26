@@ -526,6 +526,13 @@ public abstract class Il2CppBinary(Stream input) : ClassReadingBinaryReader(inpu
 
     public virtual IEnumerable<KeyValuePair<string, ulong>> GetExportedFunctions() => [];
 
+    public virtual bool TryGetRelocatedSymbolNameAtPointerSlot(ulong slot,
+        [NotNullWhen(true)] out string? name)
+    {
+        name = null;
+        return false;
+    }
+
     public abstract ReadOnlySpan<byte> GetEntirePrimaryExecutableSection();
 
     public abstract ulong GetVirtualAddressOfPrimaryExecutableSection();
