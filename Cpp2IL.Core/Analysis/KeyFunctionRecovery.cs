@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.Il2CppApiFunctions;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -36,12 +37,34 @@ public static class KeyFunctionRecovery
         nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_box),
     ];
 
+    // On LP64 the thrown exception object (an Il2CppExceptionWrapper for il2cpp
+    // codegen) immediately follows the _Unwind_Exception inside the allocation,
+    // so __cxa_begin_catch(hdr) returns hdr + sizeof(_Unwind_Exception) and the
+    // managed exception reference is the wrapper's first word.
+    internal const long UnwindHeaderToObjectOffset = 0x20;
+
     public static void Run(MethodAnalysisContext method)
     {
         RewriteElementClassLoads(method);
         RewriteInlinedClassIsInst(method);
 
-        foreach (var instruction in method.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))
+        var blocks = method.ControlFlowGraph!.Blocks;
+        var instructions = blocks.SelectMany(block => block.Instructions).ToList();
+        var homeOf = new Dictionary<Instruction, Block>();
+        var beginCatchResults = new Dictionary<LocalVariable, (Instruction instruction, Block block)>();
+        foreach (var block in blocks)
+        foreach (var instruction in block.Instructions)
+        {
+            homeOf[instruction] = block;
+            if (instruction is
+                {
+                    OpCode: OpCode.Call,
+                    Operands: [StringLiteral { Value: "__cxa_begin_catch" or "__cxa_get_exception_ptr" }, LocalVariable result, ..]
+                })
+                beginCatchResults.TryAdd(result, (instruction, block));
+        }
+
+        foreach (var instruction in instructions)
         {
             if (instruction.Operands is not [StringLiteral { Value: var keyFunction }, ..])
                 continue;
@@ -55,6 +78,14 @@ public static class KeyFunctionRecovery
                 instruction.OpCode = OpCode.Nop;
                 instruction.SetOperands();
             }
+            else if (keyFunction is "__cxa_begin_catch" or "__cxa_get_exception_ptr")
+                RewriteNativeBeginCatch(method, instruction);
+            else if (keyFunction == "__cxa_rethrow")
+                RewriteNativeRethrow(method, instruction, beginCatchResults, homeOf);
+            else if (keyFunction == "_Unwind_Resume")
+                RewriteNativeUnwindResume(method, instruction, beginCatchResults, homeOf);
+            else if (keyFunction == "__clang_call_terminate")
+                RewriteCallTerminate(method, instruction);
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.il2cpp_codegen_write_barrier))
                 RemoveWriteBarrier(instruction, method);
             else if (RaiseExceptionFunctions.Contains(keyFunction))
@@ -381,6 +412,267 @@ public static class KeyFunctionRecovery
             _ => null,
         };
     
+    private static void RewriteNativeBeginCatch(MethodAnalysisContext method, Instruction instruction)
+    {
+        if (method.AppContext.Binary.is32Bit)
+            return;
+
+        if (instruction.OpCode == OpCode.CallVoid)
+        {
+            // The return value is discarded; the remaining bookkeeping lives
+            // entirely in the runtime's caught-exception stack, unobservable
+            // from flat IL — same treatment as __cxa_end_catch.
+            if (instruction.Operands.Count == 2)
+            {
+                instruction.OpCode = OpCode.Nop;
+                instruction.SetOperands();
+            }
+            return;
+        }
+
+        if (instruction.OpCode != OpCode.Call
+            || instruction.Operands is not [_, LocalVariable wrapper, var unwindHeader])
+            return;
+
+        instruction.OpCode = OpCode.Add;
+        instruction.SetOperands(wrapper, unwindHeader, new Immediate(UnwindHeaderToObjectOffset));
+
+        // [wrapper] is the wrapper's exception field: the managed exception
+        // object. Typing the cell makes those loads emit as real managed
+        // references through ldind.ref — but only when every use of the result
+        // is that extraction, a plain copy, or a null check, so unrelated uses
+        // of the pointer keep their honest unmanaged diagnostics.
+        var exceptionType = method.AppContext.SystemTypes.SystemExceptionType;
+        var cellLocals = new HashSet<LocalVariable> { wrapper };
+        var loadDestinations = new List<LocalVariable>();
+        var queue = new Queue<LocalVariable>();
+        queue.Enqueue(wrapper);
+        var compatible = true;
+        while (queue.Count > 0 && compatible)
+        {
+            var cell = queue.Dequeue();
+            foreach (var use in method.ControlFlowGraph!.Instructions)
+            {
+                if (ReferenceEquals(use, instruction) || !ReferencesLocal(use, cell))
+                    continue;
+                if (use is { OpCode: OpCode.Move, Operands: [LocalVariable loadDest, MemoryOperand { Index: null, Scale: 0, Addend: 0 } memory] }
+                    && ReferenceEquals(memory.Base, cell))
+                    loadDestinations.Add(loadDest);
+                else if (use is { OpCode: OpCode.Move, Operands: [LocalVariable copy, LocalVariable source] }
+                         && ReferenceEquals(source, cell))
+                {
+                    if (cellLocals.Add(copy))
+                        queue.Enqueue(copy);
+                }
+                else if (use is { OpCode: OpCode.Move, Operands: [MemoryOperand, var stored] }
+                         && OperandReferences(stored, cell))
+                    continue; // a spill of the cell pointer is type-agnostic
+                else if (!IsNullComparison(use, cell))
+                    compatible = false;
+            }
+        }
+
+        if (!compatible)
+            return;
+        var cellType = new PointerTypeAnalysisContext(exceptionType);
+        foreach (var cell in cellLocals)
+            cell.Type ??= cellType;
+        foreach (var loadDestination in loadDestinations)
+            loadDestination.Type ??= exceptionType;
+    }
+
+    private static void RewriteNativeRethrow(MethodAnalysisContext method, Instruction instruction,
+        IReadOnlyDictionary<LocalVariable, (Instruction instruction, Block block)> beginCatchResults,
+        IReadOnlyDictionary<Instruction, Block> homeOf)
+    {
+        // `throw;` rethrows the exception on top of the runtime's caught-exception
+        // stack — the exception cell of the innermost dominating __cxa_begin_catch.
+        if (instruction.OpCode != OpCode.CallVoid || instruction.Operands.Count != 1
+            || !homeOf.TryGetValue(instruction, out var home))
+            return;
+
+        var cell = InnermostDominatingBeginCatch(method, beginCatchResults, home, instruction);
+        if (cell == null)
+            return;
+
+        var exception = FindDominatingExceptionLoad(method, cell, home, instruction)
+            ?? InsertExceptionLoad(method, home, instruction, cell);
+        instruction.OpCode = OpCode.Throw;
+        instruction.SetOperands(exception);
+    }
+
+    private static void RewriteNativeUnwindResume(MethodAnalysisContext method, Instruction instruction,
+        IReadOnlyDictionary<LocalVariable, (Instruction instruction, Block block)> beginCatchResults,
+        IReadOnlyDictionary<Instruction, Block> homeOf)
+    {
+        // _Unwind_Resume(u) keeps propagating the exception whose unwind header
+        // sits at u; its Il2CppExceptionWrapper follows the header and the
+        // managed exception is the wrapper's first word.
+        var argumentIndex = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
+        if (!instruction.IsCall || instruction.Operands.Count != argumentIndex + 1
+            || instruction.Operands[argumentIndex] is not LocalVariable header
+            || !homeOf.TryGetValue(instruction, out var home))
+            return;
+
+        var insertAt = home.Instructions.IndexOf(instruction);
+        var cell = header;
+        if (!IsWrapperCell(method, header, beginCatchResults))
+        {
+            cell = new LocalVariable($"exceptionObject{instruction.Index}",
+                new Register(null, $"exceptionObject{instruction.Index}"),
+                new PointerTypeAnalysisContext(method.AppContext.SystemTypes.SystemExceptionType));
+            home.Instructions.Insert(insertAt++, new Instruction(instruction.Index, OpCode.Add,
+                cell, header, new Immediate(UnwindHeaderToObjectOffset)));
+        }
+
+        var exception = FindDominatingExceptionLoad(method, cell, home, instruction)
+            ?? InsertExceptionLoad(method, home, instruction, cell, insertAt);
+        instruction.OpCode = OpCode.Throw;
+        instruction.SetOperands(exception);
+    }
+
+    private static void RewriteCallTerminate(MethodAnalysisContext method, Instruction instruction)
+    {
+        // __clang_call_terminate calls std::terminate unconditionally: abnormal
+        // termination that never returns. Flat IL has no uncatchable-abort
+        // primitive; an exception raise is the honest terminal rendering.
+        if (!instruction.IsCall)
+            return;
+        instruction.OpCode = OpCode.Throw;
+        instruction.SetOperands(method.AppContext.SystemTypes.SystemExceptionType);
+    }
+
+    // The cell for a rethrow is the result of the innermost __cxa_begin_catch
+    // dominating it: in the same block the latest one before the site; across
+    // blocks the deepest dominator (dominators form a chain, so at most one).
+    private static LocalVariable? InnermostDominatingBeginCatch(MethodAnalysisContext method,
+        IReadOnlyDictionary<LocalVariable, (Instruction instruction, Block block)> beginCatchResults,
+        Block home, Instruction instruction)
+    {
+        LocalVariable? cell = null;
+        Block? cellBlock = null;
+        var cellPosition = -1;
+        var dominators = method.DominatorInfo;
+        foreach (var (candidate, (definition, block)) in beginCatchResults)
+        {
+            if (block == home)
+            {
+                var position = home.Instructions.IndexOf(definition);
+                var sitePosition = home.Instructions.IndexOf(instruction);
+                if (position >= 0 && position < sitePosition && position > cellPosition)
+                {
+                    cell = candidate;
+                    cellBlock = block;
+                    cellPosition = position;
+                }
+            }
+            else if (dominators != null && dominators.Dominates(block, home)
+                     && cellBlock != home
+                     && (cellBlock == null || dominators.Dominates(cellBlock, block)))
+            {
+                cell = candidate;
+                cellBlock = block;
+            }
+        }
+        return cell;
+    }
+
+    // The exception cell can reach the resume/rethrow site through plain
+    // register saves (mov x19, x0 chains). Walk copy definitions back to a
+    // __cxa_begin_catch result to decide whether a local already names it.
+    private static bool IsWrapperCell(MethodAnalysisContext method, LocalVariable local,
+        IReadOnlyDictionary<LocalVariable, (Instruction instruction, Block block)> beginCatchResults)
+    {
+        var visited = new HashSet<LocalVariable>();
+        var current = local;
+        while (visited.Add(current))
+        {
+            if (beginCatchResults.ContainsKey(current))
+                return true;
+            var definition = method.ControlFlowGraph!.Instructions.FirstOrDefault(i =>
+                i is { OpCode: OpCode.Move, Operands: [LocalVariable destination, LocalVariable] }
+                && ReferenceEquals(destination, current));
+            if (definition == null)
+                return false;
+            current = (LocalVariable)definition.Operands[1];
+        }
+        return false;
+    }
+
+    private static LocalVariable? FindDominatingExceptionLoad(MethodAnalysisContext method,
+        LocalVariable cell, Block home, Instruction instruction)
+    {
+        var cells = CellClosure(method, cell);
+        var dominators = method.DominatorInfo;
+        var sitePosition = home.Instructions.IndexOf(instruction);
+        foreach (var block in method.ControlFlowGraph!.Blocks)
+        foreach (var candidate in block.Instructions)
+        {
+            if (candidate is not { OpCode: OpCode.Move,
+                    Operands: [LocalVariable loadDest, MemoryOperand { Index: null, Scale: 0, Addend: 0 } memory] }
+                || memory.Base is not LocalVariable baseLocal
+                || !cells.Contains(baseLocal))
+                continue;
+            if (block == home ? block.Instructions.IndexOf(candidate) < sitePosition
+                : dominators != null && dominators.Dominates(block, home))
+                return loadDest;
+        }
+        return null;
+    }
+
+    // A cell local and every plain copy of it all name the same wrapper cell.
+    private static HashSet<LocalVariable> CellClosure(MethodAnalysisContext method, LocalVariable cell)
+    {
+        var set = new HashSet<LocalVariable> { cell };
+        var queue = new Queue<LocalVariable>([cell]);
+        while (queue.Count > 0)
+        {
+            var current = queue.Dequeue();
+            foreach (var candidate in method.ControlFlowGraph!.Instructions)
+                if (candidate is { OpCode: OpCode.Move, Operands: [LocalVariable destination, LocalVariable source] }
+                    && ReferenceEquals(source, current) && set.Add(destination))
+                    queue.Enqueue(destination);
+        }
+        return set;
+    }
+
+    private static LocalVariable InsertExceptionLoad(MethodAnalysisContext method, Block home,
+        Instruction before, LocalVariable cell, int insertAt = -1)
+    {
+        var exception = new LocalVariable($"caughtException{before.Index}",
+            new Register(null, $"caughtException{before.Index}"),
+            method.AppContext.SystemTypes.SystemExceptionType);
+        home.Instructions.Insert(insertAt < 0 ? home.Instructions.IndexOf(before) : insertAt,
+            new Instruction(before.Index, OpCode.Move, exception, new MemoryOperand(cell)));
+        return exception;
+    }
+
+    private static bool ReferencesLocal(Instruction instruction, LocalVariable local)
+    {
+        foreach (var operand in instruction.Operands)
+            if (OperandReferences(operand, local))
+                return true;
+        return false;
+    }
+
+    private static bool OperandReferences(IOperand operand, LocalVariable local) => operand switch
+    {
+        _ when ReferenceEquals(operand, local) => true,
+        MemoryOperand memory => ReferenceEquals(memory.Base, local)
+            || memory.Index is LocalVariable index && ReferenceEquals(index, local),
+        FieldReference field => ReferenceEquals(field.Local, local),
+        ReferenceCast cast => ReferenceEquals(cast.Value, local),
+        AddressOf addressOf => ReferenceEquals(addressOf.Target, local),
+        ArrayAccess access => ReferenceEquals(access.Array, local)
+            || access.Index is LocalVariable index && ReferenceEquals(index, local),
+        _ => false,
+    };
+
+    private static bool IsNullComparison(Instruction instruction, LocalVariable local)
+        => instruction is { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual }
+            && instruction.Operands.Skip(1).Any(operand => ReferenceEquals(operand, local))
+            && instruction.Operands.Skip(1).Any(operand => operand is Immediate { Value: 0 });
+
     private static void RewriteRaiseException(Instruction instruction)
     {
         // A void call has no return value operand, so the exception is one slot earlier

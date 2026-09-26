@@ -1,3 +1,4 @@
+using System.Linq;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
@@ -50,6 +51,358 @@ public class KeyFunctionRecoveryTests
         {
             Assert.That(end.OpCode, Is.EqualTo(OpCode.Nop));
             Assert.That(end.Operands, Is.Empty);
+        });
+    }
+
+    [Test]
+    public void NativeBeginCatchBecomesWrapperCellPointer()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var header = new LocalVariable("header", new Register(null, "x0"));
+        var wrapper = new LocalVariable("wrapper", new Register(null, "x1"));
+        var exception = new LocalVariable("exception", new Register(null, "x2"));
+        var beginCatch = new Instruction(0, OpCode.Call,
+            new StringLiteral("__cxa_begin_catch"), wrapper, header);
+        var load = new Instruction(1, OpCode.Move, exception, new MemoryOperand(wrapper));
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([beginCatch, load, new(2, OpCode.Return)])
+        };
+
+        KeyFunctionRecovery.Run(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(beginCatch.OpCode, Is.EqualTo(OpCode.Add));
+            Assert.That(beginCatch.Operands[0], Is.SameAs(wrapper));
+            Assert.That(beginCatch.Operands[1], Is.SameAs(header));
+            Assert.That(((Immediate)beginCatch.Operands[2]).Value,
+                Is.EqualTo(KeyFunctionRecovery.UnwindHeaderToObjectOffset));
+            Assert.That(wrapper.Type, Is.TypeOf<PointerTypeAnalysisContext>());
+            Assert.That(((PointerTypeAnalysisContext)wrapper.Type!).ElementType,
+                Is.SameAs(app.SystemTypes.SystemExceptionType));
+            Assert.That(exception.Type, Is.SameAs(app.SystemTypes.SystemExceptionType));
+        });
+    }
+
+    [Test]
+    public void NativeBeginCatchDiscardedResultIsRemoved()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var header = new LocalVariable("header", new Register(null, "x0"));
+        var beginCatch = new Instruction(0, OpCode.CallVoid,
+            new StringLiteral("__cxa_begin_catch"), header);
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([beginCatch, new(1, OpCode.Return)])
+        };
+
+        KeyFunctionRecovery.Run(method);
+
+        Assert.That(beginCatch.OpCode, Is.EqualTo(OpCode.Nop));
+    }
+
+    [Test]
+    public void NativeBeginCatchWithForeignUseKeepsUntypedPointer()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var header = new LocalVariable("header", new Register(null, "x0"));
+        var wrapper = new LocalVariable("wrapper", new Register(null, "x1"));
+        var other = new LocalVariable("other", new Register(null, "x2"));
+        var beginCatch = new Instruction(0, OpCode.Call,
+            new StringLiteral("__cxa_begin_catch"), wrapper, header);
+        // A read past the exception field: not the il2cpp wrapper extraction.
+        var foreignLoad = new Instruction(1, OpCode.Move, other, new MemoryOperand(wrapper, addend: 8));
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([beginCatch, foreignLoad, new(2, OpCode.Return)])
+        };
+
+        KeyFunctionRecovery.Run(method);
+
+        Assert.Multiple(() =>
+        {
+            // The pointer arithmetic is still provable; the exception typing is not.
+            Assert.That(beginCatch.OpCode, Is.EqualTo(OpCode.Add));
+            Assert.That(wrapper.Type, Is.Null);
+            Assert.That(other.Type, Is.Null);
+        });
+    }
+
+    [Test]
+    public void NativeRethrowThrowsTheCaughtException()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var header = new LocalVariable("header", new Register(null, "x0"));
+        var wrapper = new LocalVariable("wrapper", new Register(null, "x1"));
+        var exception = new LocalVariable("exception", new Register(null, "x2"));
+        var beginCatch = new Instruction(0, OpCode.Call,
+            new StringLiteral("__cxa_begin_catch"), wrapper, header);
+        var load = new Instruction(1, OpCode.Move, exception, new MemoryOperand(wrapper));
+        var rethrow = new Instruction(2, OpCode.CallVoid, new StringLiteral("__cxa_rethrow"));
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([beginCatch, load, rethrow])
+        };
+        method.DominatorInfo = new DominatorInfo(method.ControlFlowGraph);
+
+        KeyFunctionRecovery.Run(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(rethrow.OpCode, Is.EqualTo(OpCode.Throw));
+            Assert.That(rethrow.Operands[0], Is.SameAs(exception));
+        });
+    }
+
+    // Innermost means the home-block catch always beats an ancestor, no matter which
+    // block is enumerated first: beginCatchResults follows cfg.Blocks order.
+    [Test]
+    public void NativeRethrowPrefersInnerCatchOverAncestorRegardlessOfEnumerationOrder()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var headerOuter = new LocalVariable("headerOuter", new Register(null, "x0"));
+        var wrapperOuter = new LocalVariable("wrapperOuter", new Register(null, "x1"));
+        var exceptionOuter = new LocalVariable("exceptionOuter", new Register(null, "x2"));
+        var headerInner = new LocalVariable("headerInner", new Register(null, "x3"));
+        var wrapperInner = new LocalVariable("wrapperInner", new Register(null, "x4"));
+        var exceptionInner = new LocalVariable("exceptionInner", new Register(null, "x5"));
+
+        var beginCatchOuter = new Instruction(0, OpCode.Call,
+            new StringLiteral("__cxa_begin_catch"), wrapperOuter, headerOuter);
+        var loadOuter = new Instruction(1, OpCode.Move, exceptionOuter, new MemoryOperand(wrapperOuter));
+        var beginCatchInner = new Instruction(2, OpCode.Call,
+            new StringLiteral("__cxa_begin_catch"), wrapperInner, headerInner);
+        var loadInner = new Instruction(3, OpCode.Move, exceptionInner, new MemoryOperand(wrapperInner));
+        var rethrow = new Instruction(4, OpCode.CallVoid, new StringLiteral("__cxa_rethrow"));
+
+        // ISILControlFlowGraph.Build always splits a block after a call, so the
+        // ancestor ends up in its own block; the inner begin_catch is then placed
+        // into the rethrow's home block, matching a pad merged by later passes.
+        var cfg = new ISILControlFlowGraph([beginCatchOuter, loadOuter, rethrow]);
+        var ancestorBlock = cfg.Blocks.Single(b => b.Instructions.Contains(beginCatchOuter));
+        var home = cfg.Blocks.Single(b => b.Instructions.Contains(rethrow));
+        home.Instructions.InsertRange(0, [beginCatchInner, loadInner]);
+
+        // Adversarial order: enumerate the home block before its dominator so the
+        // ancestor is visited after the inner catch was already selected.
+        cfg.Blocks.Remove(ancestorBlock);
+        cfg.Blocks.Insert(cfg.Blocks.IndexOf(home) + 1, ancestorBlock);
+
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = cfg
+        };
+        method.DominatorInfo = new DominatorInfo(method.ControlFlowGraph);
+
+        KeyFunctionRecovery.Run(method);
+
+        Assert.That(rethrow.OpCode, Is.EqualTo(OpCode.Throw));
+        Assert.That(rethrow.Operands[0], Is.SameAs(exceptionInner));
+    }
+
+    [Test]
+    public void NativeRethrowWithoutExceptionLoadSynthesizesIt()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var header = new LocalVariable("header", new Register(null, "x0"));
+        var wrapper = new LocalVariable("wrapper", new Register(null, "x1"));
+        var beginCatch = new Instruction(0, OpCode.Call,
+            new StringLiteral("__cxa_begin_catch"), wrapper, header);
+        var rethrow = new Instruction(1, OpCode.CallVoid, new StringLiteral("__cxa_rethrow"));
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([beginCatch, rethrow])
+        };
+        method.DominatorInfo = new DominatorInfo(method.ControlFlowGraph);
+
+        KeyFunctionRecovery.Run(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(rethrow.OpCode, Is.EqualTo(OpCode.Throw));
+            var exception = rethrow.Operands[0] as LocalVariable;
+            Assert.That(exception, Is.Not.Null);
+            Assert.That(exception!.Type, Is.SameAs(app.SystemTypes.SystemExceptionType));
+            var load = method.ControlFlowGraph!.Instructions
+                .Single(i => i.OpCode == OpCode.Move && i.Operands[0] == (IOperand)exception);
+            Assert.That(((MemoryOperand)load.Operands[1]).Base, Is.SameAs(wrapper));
+        });
+    }
+
+    [Test]
+    public void NativeRethrowOutsideCatchStaysUnresolved()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var rethrow = new Instruction(0, OpCode.CallVoid, new StringLiteral("__cxa_rethrow"));
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([rethrow, new(1, OpCode.Return)])
+        };
+
+        KeyFunctionRecovery.Run(method);
+
+        Assert.That(rethrow.OpCode, Is.EqualTo(OpCode.CallVoid));
+        Assert.That(rethrow.Operands[0], Is.TypeOf<StringLiteral>());
+    }
+
+    [Test]
+    public void NativeUnwindResumeRethrowsTheResumedException()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var header = new LocalVariable("header", new Register(null, "x0"));
+        var resume = new Instruction(0, OpCode.CallVoid,
+            new StringLiteral("_Unwind_Resume"), header);
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([resume])
+        };
+
+        KeyFunctionRecovery.Run(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(resume.OpCode, Is.EqualTo(OpCode.Throw));
+            var exception = resume.Operands[0] as LocalVariable;
+            Assert.That(exception, Is.Not.Null);
+            Assert.That(exception!.Type, Is.SameAs(app.SystemTypes.SystemExceptionType));
+
+            var instructions = method.ControlFlowGraph!.Instructions;
+            var add = instructions.FirstOrDefault(i => i.OpCode == OpCode.Add);
+            var load = instructions.FirstOrDefault(i => i.OpCode == OpCode.Move);
+            Assert.That(add, Is.Not.Null);
+            Assert.That(load, Is.Not.Null);
+            Assert.That(load!.Operands[0], Is.SameAs(exception));
+            Assert.That(((MemoryOperand)load.Operands[1]).Base, Is.SameAs(add!.Operands[0]));
+            Assert.That(((Immediate)add.Operands[2]).Value,
+                Is.EqualTo(KeyFunctionRecovery.UnwindHeaderToObjectOffset));
+        });
+    }
+
+    [Test]
+    public void NativeUnwindResumeOnWrapperCellLoadsDirectly()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var header = new LocalVariable("header", new Register(null, "x0"));
+        var wrapper = new LocalVariable("wrapper", new Register(null, "x1"));
+        var beginCatch = new Instruction(0, OpCode.Call,
+            new StringLiteral("__cxa_begin_catch"), wrapper, header);
+        var resume = new Instruction(1, OpCode.CallVoid,
+            new StringLiteral("_Unwind_Resume"), wrapper);
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([beginCatch, resume])
+        };
+
+        method.DominatorInfo = new DominatorInfo(method.ControlFlowGraph);
+
+        KeyFunctionRecovery.Run(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(resume.OpCode, Is.EqualTo(OpCode.Throw));
+            var exception = resume.Operands[0] as LocalVariable;
+            Assert.That(exception, Is.Not.Null);
+            // The argument already is the wrapper cell: no extra header add.
+            Assert.That(method.ControlFlowGraph!.Instructions
+                .Any(i => i.OpCode == OpCode.Add && i.Operands[1] == (IOperand)wrapper), Is.False);
+        });
+    }
+
+    [Test]
+    public void NativeUnwindResumeWithImmediateArgumentStaysUnresolved()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var resume = new Instruction(0, OpCode.CallVoid,
+            new StringLiteral("_Unwind_Resume"), new Immediate(0));
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([resume])
+        };
+
+        KeyFunctionRecovery.Run(method);
+
+        Assert.That(resume.OpCode, Is.EqualTo(OpCode.CallVoid));
+    }
+
+    [Test]
+    public void CallTerminateThunkBecomesTerminalThrow()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var call = new Instruction(0, OpCode.CallVoid,
+            new StringLiteral("__clang_call_terminate"));
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([call])
+        };
+
+        KeyFunctionRecovery.Run(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(call.OpCode, Is.EqualTo(OpCode.Throw));
+            Assert.That(call.Operands[0], Is.SameAs(app.SystemTypes.SystemExceptionType));
+        });
+    }
+
+    [Test]
+    public void CaughtExceptionLoadEmitsManagedReferenceLoadAndRethrow()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var exceptionType = app.SystemTypes.SystemExceptionType;
+        var header = new LocalVariable("header", new Register(null, "x0"));
+        var wrapper = new LocalVariable("wrapper", new Register(null, "x1"));
+        var exception = new LocalVariable("exception", new Register(null, "x2"));
+        var beginCatch = new Instruction(0, OpCode.Call,
+            new StringLiteral("__cxa_begin_catch"), wrapper, header);
+        var load = new Instruction(1, OpCode.Move, exception, new MemoryOperand(wrapper));
+        var rethrow = new Instruction(2, OpCode.CallVoid, new StringLiteral("__cxa_rethrow"));
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([beginCatch, load, rethrow])
+        };
+        method.DominatorInfo = new DominatorInfo(method.ControlFlowGraph);
+        method.Locals = [header, wrapper, exception];
+        method.ParameterLocals = [];
+        method.AnalysisWarnings = [];
+
+        KeyFunctionRecovery.Run(method);
+
+        var module = new AsmResolver.DotNet.ModuleDefinition("CatchPad.dll");
+        var callerType = new AsmResolver.DotNet.TypeDefinition("Tests", "CatchPad",
+            AsmResolver.PE.DotNet.Metadata.Tables.TypeAttributes.Public,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(callerType);
+        if (exceptionType.GetExtraData<AsmResolver.DotNet.TypeDefinition>("AsmResolverType") == null)
+            exceptionType.PutExtraData("AsmResolverType",
+                new AsmResolver.DotNet.TypeDefinition(exceptionType.Namespace, exceptionType.Name,
+                    AsmResolver.PE.DotNet.Metadata.Tables.TypeAttributes.Public));
+        var emit = new AsmResolver.DotNet.MethodDefinition("Run",
+            AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Public
+                | AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Static,
+            AsmResolver.DotNet.Signatures.MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        callerType.Methods.Add(emit);
+
+        IlGenerator.GenerateIl(method, emit);
+        var il = emit.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == AsmResolver.PE.DotNet.Cil.CilOpCodes.Ldind_Ref),
+                Is.True, () => string.Join("\n", il));
+            Assert.That(il.Any(i => i.OpCode == AsmResolver.PE.DotNet.Cil.CilOpCodes.Throw),
+                Is.True, () => string.Join("\n", il));
         });
     }
 
