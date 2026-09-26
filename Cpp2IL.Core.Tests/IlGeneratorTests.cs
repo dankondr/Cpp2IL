@@ -530,6 +530,53 @@ public class IlGeneratorTests
     }
 
     [Test]
+    public void ScalarViewOfVectorLiteralKeepsLowLaneBits()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("VectorLiteralScalar.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemSingleType,
+            app.SystemTypes.SystemDoubleType, app.SystemTypes.SystemInt32Type);
+        var type = new TypeDefinition("Tests", "VectorLiteralScalar", TypeAttributes.Public,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);
+        var literal = new Vector128Literal(1.5f, 2.25f, 3.5f, 4.75f);
+        var lowDoubleBits = (long)(uint)BitConverter.SingleToInt32Bits(literal.X)
+            | (long)BitConverter.SingleToInt32Bits(literal.Y) << 32;
+        var cases = new[]
+        {
+            (Type: app.SystemTypes.SystemSingleType, Signature: module.CorLibTypeFactory.Single,
+                OpCode: CilOpCodes.Ldc_R4, Value: (object)literal.X),
+            (Type: app.SystemTypes.SystemDoubleType, Signature: module.CorLibTypeFactory.Double,
+                OpCode: CilOpCodes.Ldc_R8, Value: (object)BitConverter.Int64BitsToDouble(lowDoubleBits)),
+            (Type: app.SystemTypes.SystemInt32Type, Signature: module.CorLibTypeFactory.Int32,
+                OpCode: CilOpCodes.Ldc_I4, Value: (object)BitConverter.SingleToInt32Bits(literal.X)),
+        };
+
+        foreach (var test in cases)
+        {
+            var result = new LocalVariable("result", new Register(null, "result")) { Type = test.Type };
+            var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Read",
+                test.Type, ReflectionMethodAttributes.Static, [])
+            {
+                ControlFlowGraph = new ISILControlFlowGraph([
+                    new(0, OpCode.Move, result, literal),
+                    new(1, OpCode.Return, result)]),
+                Locals = [result],
+                ParameterLocals = [],
+                AnalysisWarnings = [],
+            };
+            var method = new MethodDefinition("Read" + test.Type.Name, MethodAttributes.Public | MethodAttributes.Static,
+                MethodSignature.CreateStatic(test.Signature));
+            type.Methods.Add(method);
+
+            IlGenerator.GenerateIl(context, method);
+
+            var load = method.CilMethodBody!.Instructions.First(instruction => instruction.OpCode == test.OpCode);
+            Assert.That(load.Operand, Is.EqualTo(test.Value), test.Type.FullName);
+        }
+    }
+
+    [Test]
     public void InvalidStackRemainsExplicitlyDiagnosedAndBodyIsPreserved()
     {
         var app = Cpp2IlApi.CurrentAppContext!;
