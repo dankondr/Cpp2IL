@@ -793,6 +793,162 @@ public class ManagedDispatchRecoveryTests
         Assert.That(dispatch.OpCode, Is.EqualTo(OpCode.IndirectCall));
     }
 
+    // ===== ARM64 lookup excision with merged register phis =====
+
+    // The real residual form (Castle, Unity 6000.0.72f1 arm64): beside the invokeData phi the
+    // merge also phis the scan's scratch registers, and those phis plus the methodInfo load result
+    // feed phis/arguments in later join blocks. Excising the lookup must redirect such uses to the
+    // register version reaching the head - after excision the head is the merge's only
+    // predecessor, so that is exactly the value the machine leaves in the register.
+    private static LocalVariable V(string name, string register) => new(name, new Register(null, register));
+
+    private static List<Instruction> MergedScratchPhiInterfaceShape(TypeAnalysisContext declaringInterface,
+        int slot, bool reachablePreHead)
+    {
+        var receiver = L("receiver", App.SystemTypes.SystemObjectType);
+        var klassLocal = L("klass");
+        var entry = L("entryOffset");
+        var index = L("index");
+        var extended = L("extended");
+        var shifted = L("shifted");
+        var sum = L("sum");
+        var vtableEntry = L("vtableEntry");
+        var slow = L("slow");
+        var iface = L("iface");
+        var slotArg = L("slot");
+        var invokeData = L("invokeData");
+        var target = L("target");
+        var keep = L("keep");
+        var keep2 = L("keep2");
+        var keep3 = L("keep3");
+        var scratchFast = V("scratchFast", "scratch");
+        var scratchSlow = V("scratchSlow", "scratch");
+        var scratchPhi = V("scratchPhi", "scratch");
+        var scratchJoin = V("scratchJoin", "scratch");
+        var scratchPre = V("scratchPre", "scratch");
+        var methodInfo = V("methodInfo", "x1");
+        var x1Pre = V("x1Pre", "x1");
+        var x1Join = V("x1Join", "x1");
+        var arg2Slow = V("arg2Slow", "arg2");
+        var arg2Phi = V("arg2Phi", "arg2");
+        var arg2Pre = V("arg2Pre", "arg2");
+        // register that is never defined before the lookup head, so no reaching version exists
+        var orphanFast = V("orphanFast", "orphan");
+        var orphanSlow = V("orphanSlow", "orphan");
+        var orphanPhi = V("orphanPhi", "orphan");
+        var argPhiInputs = reachablePreHead
+            ? new List<IOperand> { arg2Phi, arg2Pre, arg2Slow }
+            : new List<IOperand> { orphanPhi, orphanFast, orphanSlow };
+
+        var skip = new Instruction(0, OpCode.ConditionalJump, new Immediate(0));
+        var branch = new Instruction(0, OpCode.ConditionalJump, new Immediate(0));
+        var jump = new Instruction(0, OpCode.Jump, new Immediate(0));
+        var slowBlock = new Instruction(0, OpCode.Move, iface, declaringInterface);
+        // the fast path jumps at the head of the merge block: all merge phis land there
+        var firstMergePhi = new Instruction(0, OpCode.Phi, scratchPhi, scratchFast, scratchSlow);
+        var mergePhi = new Instruction(0, OpCode.Phi, invokeData, slow, vtableEntry);
+        var joinPhi = new Instruction(0, OpCode.Phi, scratchJoin, scratchPre, scratchPhi);
+
+        var instructions = new List<Instruction>
+        {
+            // pre-dispatch block: fallthrough into the lookup head, or jump straight to the join
+            new Instruction(0, OpCode.Move, scratchPre, new Immediate(0)),
+            new Instruction(1, OpCode.Move, x1Pre, new Immediate(0)),
+            new Instruction(2, OpCode.Move, arg2Pre, new Immediate(0)),
+            skip,
+            // head: klass load + branch into the two inlined paths
+            new Instruction(4, OpCode.Move, klassLocal, Load(receiver, 0)),
+            new Instruction(5, OpCode.CheckNotEqual, L("cond"), receiver, new Immediate(0)),
+            branch,
+            // fast path: klass + (SXTW(entryOffset + slot) << 4) + 0x138
+            new Instruction(7, OpCode.Move, entry, Load(klassLocal, 16)),
+            new Instruction(8, OpCode.Add, index, entry, new Immediate(slot)),
+            new Instruction(9, OpCode.SignExtend32, extended, index),
+            new Instruction(10, OpCode.ShiftLeft, shifted, extended, new Immediate(4)),
+            new Instruction(11, OpCode.Add, sum, klassLocal, shifted),
+            new Instruction(12, OpCode.Add, vtableEntry, sum, new Immediate(VTableOffset)),
+            new Instruction(13, OpCode.Move, scratchFast, new Immediate(1)),
+            new Instruction(14, OpCode.Move, orphanFast, new Immediate(1)),
+            jump,
+            // slow path
+            slowBlock,
+            new Instruction(16, OpCode.Move, slotArg, new Immediate(slot)),
+            new Instruction(17, OpCode.Call, new Immediate(0x9000), slow, receiver, iface, slotArg),
+            new Instruction(18, OpCode.Move, scratchSlow, new Immediate(2)),
+            new Instruction(19, OpCode.Move, arg2Slow, new Immediate(0)),
+            new Instruction(20, OpCode.Move, orphanSlow, new Immediate(2)),
+            // merge: the invokeData phi plus phis for the scratch and argument registers
+            firstMergePhi,
+            new Instruction(22, OpCode.Phi, argPhiInputs),
+            mergePhi,
+            new Instruction(23, OpCode.Move, target, Load(invokeData, 0)),
+            new Instruction(24, OpCode.Move, methodInfo, Load(invokeData, 8)),
+            new Instruction(25, OpCode.IndirectCall, target, L("junk"), receiver, methodInfo),
+            // join: downstream phis and a real call consume the merged register values
+            joinPhi,
+            new Instruction(27, OpCode.Phi, x1Join, x1Pre, methodInfo),
+            new Instruction(28, OpCode.Call, new Immediate(0x8000), L("callJunk"),
+                reachablePreHead ? arg2Phi : orphanPhi),
+            new Instruction(29, OpCode.Move, keep, scratchJoin),
+            new Instruction(30, OpCode.Move, keep2, x1Join),
+            new Instruction(31, OpCode.Add, keep3, keep, keep2),
+            new Instruction(32, OpCode.Return, keep3),
+        };
+        ResolveJumps(instructions, (skip, joinPhi), (branch, slowBlock), (jump, firstMergePhi));
+        return instructions;
+    }
+
+    [Test]
+    public void InterfaceDispatchExcisesLookupThroughMergedRegisterPhis()
+    {
+        var disposable = CorLib("System.IDisposable");
+        var instructions = MergedScratchPhiInterfaceShape(disposable,
+            InterfaceSlotOf(disposable, "Dispose"), reachablePreHead: true);
+        var dispatch = instructions.Single(i => i.OpCode == OpCode.IndirectCall);
+        var methodInfoLoad = instructions.Single(i =>
+            i.OpCode == OpCode.Move && i.Operands[1] is MemoryOperand { Addend: 8 });
+        var scratchJoin = instructions.Where(i => i.OpCode == OpCode.Phi)
+            .First(i => i.Operands[0] is LocalVariable { Name: "scratchJoin" });
+        var sinkCall = instructions.Single(i => i.IsCall
+            && i.Operands[0] is Immediate { Value: 0x8000 });
+        var method = Caller(App.SystemTypes.SystemVoidType, instructions);
+
+        InterfaceDispatchRecovery.Run(method);
+
+        Assert.That(dispatch.OpCode, Is.EqualTo(OpCode.CallVoid));
+        Assert.That((MethodAnalysisContext)dispatch.Operands[0], Has.Property("Name").EqualTo("Dispose"));
+        // the slow-lookup helper and its region are gone entirely
+        Assert.That(method.ControlFlowGraph!.Instructions, Has.None.Matches<Instruction>(i =>
+            i.IsCall && i.Operands[0] is Immediate { Value: 0x9000 }));
+        // the scratch-register phi web was redirected to the version reaching the head
+        Assert.That(scratchJoin.Operands.Skip(1).OfType<LocalVariable>(),
+            Has.All.Matches<LocalVariable>(o => o.Name == "scratchPre"));
+        // the argument-register phi's use in the later call was redirected the same way
+        Assert.That(sinkCall.Operands.OfType<LocalVariable>(),
+            Has.Some.Matches<LocalVariable>(o => o.Name == "arg2Pre")
+                .And.None.Matches<LocalVariable>(o => o.Name == "arg2Phi"));
+        // the live methodInfo load became a copy of the value entering the lookup
+        Assert.That(methodInfoLoad.Operands[1] is LocalVariable { Name: "x1Pre" });
+    }
+
+    [Test]
+    public void InterfaceDispatchKeepsHelperWhenMergedRegisterHasNoReachingValue()
+    {
+        var disposable = CorLib("System.IDisposable");
+        var instructions = MergedScratchPhiInterfaceShape(disposable,
+            InterfaceSlotOf(disposable, "Dispose"), reachablePreHead: false);
+        var dispatch = instructions.Single(i => i.OpCode == OpCode.IndirectCall);
+        var method = Caller(App.SystemTypes.SystemVoidType, instructions);
+
+        InterfaceDispatchRecovery.Run(method);
+
+        // the dispatch itself is still resolved, but the unprovable register value keeps the
+        // helper call (and therefore its diagnostic) alive
+        Assert.That(dispatch.OpCode, Is.EqualTo(OpCode.CallVoid));
+        Assert.That(method.ControlFlowGraph!.Instructions, Has.Some.Matches<Instruction>(i =>
+            i.IsCall && i.Operands[0] is Immediate { Value: 0x9000 }));
+    }
+
     // ===== delegate invoke =====
 
     // Raw-layout delegate call: operand[2] is the invoke_impl_this carrier (first integer

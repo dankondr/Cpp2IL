@@ -1302,21 +1302,20 @@ public static class InterfaceDispatchRecovery
     {
         var merge = match.Merge;
 
-        if (!homeBlock.TryGetValue(match.SlowCall, out var slowBlock))
+        if (!homeBlock.TryGetValue(match.SlowCall, out var slowBlock) || !cfg.Blocks.Contains(slowBlock))
             return;
 
         if (Definition(definitions, match.KlassLocal) is not { } klassDefinition
             || !homeBlock.TryGetValue(klassDefinition, out var head) || head == merge)
             return;
 
-        if (!TryCollectRegion(cfg, head, merge, out var region) || !region.Contains(slowBlock))
+        if (!TryCollectRegion(cfg, head, merge, out var region) || !region.Contains(slowBlock)
+            || !RegionIsSideEffectFree(region, match.SlowCall) || AnyValueEscapes(cfg, region, merge)
+            || !MergePhisAreDead(cfg, merge, head, region, out var removable, out var patches))
             return;
 
-        if (!RegionIsSideEffectFree(region, match.SlowCall) || AnyValueEscapes(cfg, region, merge))
-            return;
-
-        if (!MergePhisAreDead(cfg, merge, out var removable))
-            return;
+        foreach (var (instruction, operandIndex, incoming) in patches)
+            instruction.SetOperand(operandIndex, incoming);
 
         foreach (var instruction in removable)
         {
@@ -1451,10 +1450,19 @@ public static class InterfaceDispatchRecovery
         return false;
     }
 
-    // They may only feed loads off the VirtualInvokeData pointer, which must themselves be dead
-    private static bool MergePhisAreDead(ISILControlFlowGraph cfg, Block merge, out List<Instruction> removable)
+    // They may only feed loads off the VirtualInvokeData pointer. Those loads' results, and any
+    // other uses of a merge phi (arguments of later calls, phis in later blocks for loop-only
+    // temporaries such as the interface-scan scratch registers), read plain register values: once
+    // the lookup is excised the head is the merge's only predecessor, so the register version
+    // reaching the head is exactly what downstream code observes. Uses are redirected to it; only a
+    // use we cannot redirect keeps the lookup alive.
+    private static bool MergePhisAreDead(ISILControlFlowGraph cfg, Block merge, Block head,
+        HashSet<Block> region,
+        out List<Instruction> removable,
+        out List<(Instruction Instruction, int OperandIndex, IOperand Replacement)> patches)
     {
         removable = [];
+        patches = [];
 
         var useSites = new Dictionary<LocalVariable, List<Instruction>>();
         foreach (var block in cfg.Blocks)
@@ -1470,27 +1478,146 @@ public static class InterfaceDispatchRecovery
             }
         }
 
+        var reaching = new Dictionary<string, LocalVariable?>();
+
         foreach (var phi in merge.Instructions)
         {
             if (phi.OpCode != OpCode.Phi)
                 continue;
 
             if (phi.Operands[0] is not LocalVariable phiDest)
+            {
                 return false;
+            }
 
             foreach (var use in useSites.TryGetValue(phiDest, out var phiUses) ? phiUses : [])
             {
-                if (use is not { OpCode: OpCode.Move, Operands: [LocalVariable loaded, MemoryOperand] }
-                    || (useSites.TryGetValue(loaded, out var loadUses) && loadUses.Count > 0))
-                    return false;
+                // Loads off the merged pointer read memory the lookup produced. A dead result is
+                // simply removed; a live result becomes a copy of the version reaching the head,
+                // which is what the register holds once the lookup is gone.
+                if (use is { OpCode: OpCode.Move, Operands: [LocalVariable loaded, MemoryOperand] })
+                {
+                    if (useSites.TryGetValue(loaded, out var loadUses) && loadUses.Count > 0)
+                    {
+                        if (Reaching(loaded.Register.Name) is not { } loadedIncoming)
+                        {
+                            return false;
+                        }
 
-                removable.Add(use);
+                        patches.Add((use, 1, loadedIncoming));
+                    }
+                    else if (!removable.Contains(use))
+                        removable.Add(use);
+                    continue;
+                }
+
+                if (Reaching(phiDest.Register.Name) is not { } incoming)
+                {
+                    return false;
+                }
+
+                var patched = false;
+                for (var i = 0; i < use.Operands.Count; i++)
+                    if (OperandPatch(use.Operands[i], phiDest, incoming) is { } replacement)
+                    {
+                        patches.Add((use, i, replacement));
+                        patched = true;
+                    }
+
+                if (!patched)
+                    return false;
             }
 
             removable.Add(phi);
         }
 
         return true;
+
+        LocalVariable? Reaching(string registerName)
+        {
+            if (!reaching.TryGetValue(registerName, out var value))
+                reaching[registerName] = value = ReachingRegisterValue(registerName, head, region, merge);
+            return value;
+        }
+    }
+
+    // The operand replacement if the slot references `from`, else null. Deferred: patching must not
+    // mutate operands while the use-site map for this merge is being walked.
+    private static IOperand? OperandPatch(IOperand operand, LocalVariable from, IOperand to)
+    {
+        switch (operand)
+        {
+            case LocalVariable local when ReferenceEquals(local, from):
+                return to;
+            case MemoryOperand memory:
+                var hit = false;
+                if (ReferenceEquals(memory.Base, from))
+                {
+                    memory.Base = to;
+                    hit = true;
+                }
+                if (ReferenceEquals(memory.Index, from))
+                {
+                    memory.Index = to;
+                    hit = true;
+                }
+                return hit ? memory : null;
+            case AddressOf addressOf when ReferenceEquals(addressOf.Target, from):
+                return new AddressOf(to);
+            default:
+                return null;
+        }
+    }
+
+    // The register version reaching the end of head: the last definition inside head, or the unique
+    // version reaching it along every predecessor path (guaranteed consistent in SSA, otherwise head
+    // itself would carry a phi for the register).
+    private static LocalVariable? ReachingRegisterValue(string registerName, Block head,
+        HashSet<Block> region, Block merge)
+    {
+        for (var i = head.Instructions.Count - 1; i >= 0; i--)
+            if (head.Instructions[i].Destination is LocalVariable headLocal
+                && headLocal.Register.Name == registerName)
+                return headLocal;
+
+        LocalVariable? found = null;
+        var visited = new HashSet<Block>();
+        var pending = new Stack<Block>(head.Predecessors);
+
+        while (pending.Count > 0)
+        {
+            var block = pending.Pop();
+            if (!visited.Add(block) || visited.Count > 4096)
+                return null;
+
+            if (block == merge || region.Contains(block))
+                continue; // these defs cannot contribute to the value entering the region
+
+            LocalVariable? candidate = null;
+            for (var i = block.Instructions.Count - 1; i >= 0; i--)
+                if (block.Instructions[i].Destination is LocalVariable blockLocal
+                    && blockLocal.Register.Name == registerName)
+                {
+                    candidate = blockLocal;
+                    break;
+                }
+
+            if (candidate == null)
+            {
+                if (block.Predecessors.Count == 0)
+                    return null; // register is never defined on this path
+                foreach (var predecessor in block.Predecessors)
+                    pending.Push(predecessor);
+                continue;
+            }
+
+            if (found == null)
+                found = candidate;
+            else if (found != candidate)
+                return null; // disagreeing paths would have phied at head; treat as unresolvable
+        }
+
+        return found;
     }
 
     private static bool Uses(Instruction instruction, HashSet<LocalVariable> candidates)
