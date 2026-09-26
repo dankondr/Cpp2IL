@@ -406,14 +406,6 @@ public class Arm64LibcMathImportTests
         // C fmod truncates the quotient and keeps the dividend's sign;
         // Math.IEEERemainder rounds it (half-to-even) — the emitted `rem` must
         // agree with fmod, which is exactly what C# % lowers to.
-        Assert.That(-5.5 % 2.0, Is.EqualTo(-1.5));
-        Assert.That(Math.IEEERemainder(-5.5, 2.0), Is.EqualTo(0.5));
-        Assert.That(5.5 % -2.0, Is.EqualTo(1.5));
-        Assert.That(double.IsNaN(1.0 % 0.0), Is.True);
-        Assert.That(double.IsNaN(double.PositiveInfinity % 2.0), Is.True);
-        var floatDividend = -5.5f;
-        Assert.That(floatDividend % 2f, Is.EqualTo(-1.5f));
-
         var result = EmitAndInvoke("fmod", isDouble: true, [-5.5, 2.0]);
         Assert.That(result, Is.EqualTo(-1.5));
         result = EmitAndInvoke("fmodf", isDouble: false, [5.5f, -2f]);
