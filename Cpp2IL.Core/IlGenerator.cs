@@ -3323,7 +3323,8 @@ public static class IlGenerator
                 LoadLocal(referenceCast.Value, method, locals, callingContext);
                 // A cast to the value's own type verifies without the opcode.
                 if (!ThisConstructorCallPlan.SameTypeIdentity(castValueType, castTarget))
-                    instructions.Add(CilOpCodes.Castclass, castTarget.ToTypeSignature().ToTypeDefOrRef());
+                    instructions.Add(referenceCast.NullOnFailure ? CilOpCodes.Isinst : CilOpCodes.Castclass,
+                        castTarget.ToTypeSignature().ToTypeDefOrRef());
                 break;
             case ArrayLength arrayLength:
                 LoadArrayBase(arrayLength.Array, method, locals, callingContext);

@@ -3441,6 +3441,35 @@ public class IlGeneratorTests
     }
 
     [Test]
+    public void NullReturningReferenceCastEmitsIsInst()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("IsInst.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemVoidType,
+            app.SystemTypes.SystemObjectType, app.SystemTypes.SystemStringType);
+        var source = new LocalVariable("source", new Register(null, "source"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var result = new LocalVariable("result", new Register(null, "result"))
+            { Type = app.SystemTypes.SystemStringType };
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, result,
+                new ReferenceCast(source, app.SystemTypes.SystemStringType, nullOnFailure: true)),
+            new(1, OpCode.Return)], [source, result]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Isinst), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Castclass), Is.False);
+        });
+    }
+
+    [Test]
     public void NewArrOverInternalMarkerEmitsDefault()
     {
         Cpp2IlApi.ResetInternalState();

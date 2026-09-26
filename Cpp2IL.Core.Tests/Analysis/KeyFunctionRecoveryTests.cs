@@ -53,6 +53,7 @@ public class KeyFunctionRecoveryTests
         Assert.That(instruction.Operands[1], Is.TypeOf<ReferenceCast>());
         Assert.That(((ReferenceCast)instruction.Operands[1]).Type,
             Is.SameAs(app.SystemTypes.SystemStringType));
+        Assert.That(((ReferenceCast)instruction.Operands[1]).NullOnFailure, Is.True);
     }
 
     [Test]
