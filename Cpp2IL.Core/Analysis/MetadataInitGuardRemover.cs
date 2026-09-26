@@ -81,7 +81,7 @@ public static class MetadataInitGuardRemover
     // lazy initializer rather than arbitrary code: either the context local itself (the unmodelled
     // extra generic-context argument) or a MethodInfo* for the method whose rgctx table is loaded.
     private sealed class ContextArgumentRequirement(
-        LocalVariable? contextLocal, MethodAnalysisContext? contextOwner, int contextRegisterNumber = -1)
+        LocalVariable? contextLocal, MethodAnalysisContext? contextOwner, int? contextRegisterNumber = null)
     {
         public bool SatisfiedBy(ISILControlFlowGraph cfg, Instruction instruction)
         {
@@ -102,7 +102,7 @@ public static class MetadataInitGuardRemover
                 && ReferenceEquals(represented, contextOwner))
                 return true;
 
-            if (contextRegisterNumber >= 0 && local.Register.Number == contextRegisterNumber)
+            if (local.Register.Number == contextRegisterNumber)
                 return true;
 
             if (depth >= 4)
@@ -145,7 +145,7 @@ public static class MetadataInitGuardRemover
                     // the helper call receives the method's own MethodInfo* - the last calling-
                     // convention parameter - but SSA renames and type resets can detach the arg
                     // local from it, so bind by the parameter's register as well.
-                    var methodInfoRegister = method.ParameterOperands.LastOrDefault() is Register register ? register.Number : -1;
+                    int? methodInfoRegister = method.ParameterOperands.LastOrDefault() is Register register ? register.Number : null;
                     requirement = new ContextArgumentRequirement(null, table.OwnerMethod, methodInfoRegister);
                     return true;
                 }
