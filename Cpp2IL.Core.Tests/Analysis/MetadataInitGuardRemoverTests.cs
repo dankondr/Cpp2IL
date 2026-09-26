@@ -203,6 +203,94 @@ public class MetadataInitGuardRemoverTests
     private static readonly IOperand[] OneParamAndMethodInfoOperands =
         [new Register(null, "X0"), new Register(null, "X1")];
 
+    // After RgctxResolver runs, the guarded [methodInfo + rgctx] load is rewritten into the method's
+    // rgctx table object, so the compare is directly on a local typed MethodRgctxTableTypeAnalysisContext
+    // and the init helper receives the method's own MethodInfo* - possibly through untyped SSA copies.
+    private static (InjectedMethodAnalysisContext Method, ISILControlFlowGraph Graph) LazyTableFixture(
+        Func<InjectedMethodAnalysisContext, MethodAnalysisContext> tableOwner,
+        Func<InjectedMethodAnalysisContext, IOperand> callArgument,
+        params Instruction[] armPrefix)
+    {
+        var method = new InjectedMethodAnalysisContext(App.SystemTypes.SystemObjectType, "Fixture",
+            App.SystemTypes.SystemObjectType, System.Reflection.MethodAttributes.Static,
+            [App.SystemTypes.SystemObjectType]);
+        var table = new LocalVariable("table", new Register(null, "X8"))
+        {
+            Type = new MethodRgctxTableTypeAnalysisContext(tableOwner(method),
+                App.SystemTypes.SystemObjectType.DeclaringAssembly),
+        };
+        var condition = new LocalVariable("condition", new Register(null, "condition"));
+        var negated = new LocalVariable("negated", new Register(null, "negated"));
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var merge = new Instruction(8, OpCode.Nop);
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.CheckEqual, condition, table, new Immediate(0)),
+            new(1, OpCode.Not, negated, condition),
+            new(2, OpCode.ConditionalJump, merge, negated),
+            new(3, OpCode.Nop),
+            new(4, OpCode.Call, new Immediate(0x12345678), result, callArgument(method)),
+            new(5, OpCode.Jump, merge),
+            merge,
+            new(9, OpCode.Return, result),
+        };
+        instructions.InsertRange(3, armPrefix);
+        method.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        method.ParameterOperands = OneParamAndMethodInfoOperands.ToList();
+        return (method, method.ControlFlowGraph);
+    }
+
+    [Test]
+    public void RgctxGuardOnMethodRgctxTableIsExcised()
+    {
+        var (method, graph) = LazyTableFixture(m => m, m =>
+            new LocalVariable("methodInfo", new Register(null, "X1"))
+            {
+                Type = new RuntimeMethodInfoAnalysisContext(m,
+                    App.SystemTypes.SystemObjectType.DeclaringAssembly),
+            });
+
+        MetadataInitGuardRemover.RunRgctx(method);
+
+        Assert.That(graph.Instructions.Any(instruction => instruction.IsCall), Is.False);
+    }
+
+    [Test]
+    public void RgctxGuardOnMethodRgctxTableAcceptsUntypedRegisterCopy()
+    {
+        // SSA renames the argument at every copy, so the call may take an untyped local defined by
+        // Move of the method's MethodInfo* local.
+        var methodInfo = new LocalVariable("methodInfo", new Register(null, "X1"));
+        var copy = new LocalVariable("copy", new Register(null, "X0"));
+        var (method, graph) = LazyTableFixture(m => m, _ => copy,
+            new Instruction(3, OpCode.Move, methodInfo, new Register(null, "X1")),
+            new Instruction(10, OpCode.Move, copy, methodInfo));
+
+        MetadataInitGuardRemover.RunRgctx(method);
+
+        Assert.That(graph.Instructions.Any(instruction => instruction.IsCall), Is.False);
+    }
+
+    [Test]
+    public void RgctxGuardOnAnotherMethodsTableIsKept()
+    {
+        // The table belongs to a different method - the guard protects a different context and
+        // excising it would drop a real init.
+        var (method, graph) = LazyTableFixture(m =>
+            new InjectedMethodAnalysisContext(App.SystemTypes.SystemObjectType, "Other",
+                App.SystemTypes.SystemObjectType, System.Reflection.MethodAttributes.Static,
+                [App.SystemTypes.SystemObjectType]),
+            m => new LocalVariable("methodInfo", new Register(null, "X1"))
+            {
+                Type = new RuntimeMethodInfoAnalysisContext(m,
+                    App.SystemTypes.SystemObjectType.DeclaringAssembly),
+            });
+
+        MetadataInitGuardRemover.RunRgctx(method);
+
+        Assert.That(graph.Instructions.Any(instruction => instruction.IsCall), Is.True);
+    }
+
     [Test]
     public void RgctxGuardForUntypedExtraContextArgumentIsExcised()
     {
