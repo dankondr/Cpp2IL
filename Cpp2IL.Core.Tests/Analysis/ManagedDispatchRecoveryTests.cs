@@ -473,6 +473,40 @@ public class ManagedDispatchRecoveryTests
         Assert.That(resolved.TypeGenericParameters[0].FullName, Is.EqualTo("System.Int32"));
     }
 
+    [Test]
+    public void GenericVirtualHelperDispatchResolvesConcreteInterfaceMethod()
+    {
+        var disposable = CorLib("System.IDisposable");
+        var dispose = disposable.Methods.First(method => method.Name == "Dispose");
+        dispose.GenericParameters.Add(new GenericParameterTypeAnalysisContext("T", 0,
+            LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_MVAR, 0, dispose));
+        var concrete = dispose.MakeGenericInstanceMethod(App.SystemTypes.SystemInt32Type);
+        var concreteInfo = new RuntimeMethodInfoAnalysisContext(concrete, disposable.DeclaringAssembly);
+        var instructions = InterfaceDispatchShape(disposable, InterfaceSlotOf(disposable, "Dispose"), false);
+        var declaredMethodInfo = L("declaredMethodInfo",
+            new RuntimeMethodInfoAnalysisContext(dispose, disposable.DeclaringAssembly));
+        instructions[4].SetOperand(2, Load(declaredMethodInfo, 0x50));
+        instructions[10].SetOperand(1, Load(declaredMethodInfo, 0x20));
+        instructions[11].SetOperand(1, Load(declaredMethodInfo, 0x50));
+        var receiver = (LocalVariable)((MemoryOperand)instructions[0].Operands[1]).Base!;
+        var openMethodInfo = (LocalVariable)instructions[15].Destination!;
+        var inflatedMethodInfo = L("inflatedMethodInfo");
+        var helper = new Instruction(16, OpCode.Call, new Immediate(0xA000), inflatedMethodInfo,
+            openMethodInfo, concreteInfo);
+        var dispatch = new Instruction(17, OpCode.IndirectCall,
+            Load(inflatedMethodInfo, App.Binary.PointerSizeBytes), L("junk"), receiver, inflatedMethodInfo);
+        instructions[16] = helper;
+        instructions.Insert(17, dispatch);
+        var method = Caller(App.SystemTypes.SystemVoidType, instructions);
+
+        InterfaceDispatchRecovery.Run(method);
+
+        Assert.That(dispatch.OpCode, Is.EqualTo(OpCode.CallVoid));
+        Assert.That(dispatch.Operands[0], Is.SameAs(concrete));
+        Assert.That(method.ControlFlowGraph!.Instructions, Has.None.Matches<Instruction>(instruction =>
+            instruction.IsCall && instruction.Operands[0] is Immediate { Value: 0xA000 }));
+    }
+
     // ===== delegate invoke =====
 
     // Raw-layout delegate call: operand[2] is the invoke_impl_this carrier (first integer
