@@ -652,6 +652,46 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             return true;
         }
 
+        // Scalar FCM* write a boolean mask into an FP register: all-ones when
+        // the ordered comparison holds, zero otherwise. Check* yields 0/1 —
+        // negating it produces the mask. FCMGE/FCMLE are composite
+        // (a>b)|(a==b) / (a<b)|(a==b) so unordered input masks to zero, which
+        // the emitted ordered compares already guarantee on NaN.
+        void EmitScalarCompareMask()
+        {
+            var compareDest = ConvertOperand(instruction, 0);
+            var left = ConvertOperand(instruction, 1);
+            IOperand right;
+            if (instruction.Op2Kind == Arm64OperandKind.FloatingPointImmediate)
+                right = instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31
+                    ? new DoubleLiteral(0)
+                    : new FloatLiteral(0f);
+            else if (instruction.Op2Kind == Arm64OperandKind.Register)
+                right = ConvertOperand(instruction, 2);
+            else
+            {
+                Add(address, OpCode.NotImplemented,
+                    new StringLiteral($"Instruction {instruction.Mnemonic} form is not supported."));
+                return;
+            }
+
+            var mask = new Register(null, "TEMP_CMP");
+            Add(address, instruction.Mnemonic is Arm64Mnemonic.FCMLT or Arm64Mnemonic.FCMLE
+                ? OpCode.CheckLess
+                : instruction.Mnemonic == Arm64Mnemonic.FCMEQ ? OpCode.CheckEqual : OpCode.CheckGreater,
+                mask, left, right);
+            if (instruction.Mnemonic is Arm64Mnemonic.FCMGE or Arm64Mnemonic.FCMLE)
+            {
+                var equal = new Register(null, "TEMP_CMP2");
+                Add(address, OpCode.CheckEqual, equal, left, right);
+                Add(address, OpCode.Or, mask, mask, equal);
+            }
+            // Pin the mask Int32: the Check* seed types its 0/1 result
+            // Boolean, and a Boolean-typed mask would evaluate `and` as
+            // 1 & n where the hardware mask is all-ones.
+            Add(address, OpCode.Negate, compareDest, mask).NativeIntegerWidthBits = 32;
+        }
+
         var preserveAdrpOffset = false;
         scalarizer.BeginInstruction(address);
         // lane-wise SIMD chains (DUP broadcast + following integer lanes) are
@@ -725,17 +765,48 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 else if (!scalarizer.TryBroadcastDup(instruction, Add, ConvertOperand))
                     Add(address, OpCode.NotImplemented, new StringLiteral("Instruction DUP vector broadcast is not supported."));
                 break;
+            case Arm64Mnemonic.FADDP:
+                // the vector pairwise form is lane-wise and handled by the
+                // scalarizer's TryConvert above; here is the scalar reduction
+                // FADDP Sd/Dd, Vn.2S/2D, which only folds when both lanes are
+                // honest float carriers (element locals or constants) — an
+                // LDR D may carry a managed Vector2/aggregate and cannot be
+                // sliced into lanes by shifting the register local.
+                if (!scalarizer.TryScalarFaddp(instruction, Add, ConvertOperand))
+                    Add(address, OpCode.NotImplemented, new StringLiteral("Instruction FADDP not yet implemented."));
+                break;
             case Arm64Mnemonic.FCMGT:
             case Arm64Mnemonic.FCMLT:
-                if (instruction.Op0Arrangement == Arm64ArrangementSpecifier.FourS)
+            case Arm64Mnemonic.FCMGE:
+            case Arm64Mnemonic.FCMLE:
+            case Arm64Mnemonic.FCMEQ:
+                if (IsScalarFloatRegister(instruction.Op0Reg))
                 {
+                    // the compare is emitted only when its operands provably
+                    // carry scalars — a register holding wider data may be a
+                    // managed aggregate, and comparing that fabricates float
+                    // semantics for managed bits
+                    if (scalarizer.ScalarCompareOperandsHonest(instruction))
+                        EmitScalarCompareMask();
+                    else
+                        Add(address, OpCode.NotImplemented,
+                            new StringLiteral($"Instruction {instruction.Mnemonic} operand provenance is not supported."));
+                    break;
+                }
+                var recordsVector4Compare = instruction.Op0Arrangement == Arm64ArrangementSpecifier.FourS
+                    && instruction.Mnemonic is Arm64Mnemonic.FCMGT or Arm64Mnemonic.FCMLT;
+                if (recordsVector4Compare)
                     vectorComparisons![NormalizeRegister(instruction.Op0Reg)] =
                         (instruction.Mnemonic == Arm64Mnemonic.FCMGT,
                             ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
-                    Add(address, OpCode.Nop);
-                }
-                else
-                    Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction {instruction.Mnemonic} not yet implemented."));
+                if (scalarizer.TryCompareMask(instruction, Add, ConvertOperand))
+                    break;
+                // a recorded 4S comparison may still feed a Vector4 min/max
+                // select; the rest reports an honest diagnostic
+                Add(address, recordsVector4Compare ? OpCode.Nop : OpCode.NotImplemented,
+                    recordsVector4Compare
+                        ? []
+                        : [new StringLiteral($"Instruction {instruction.Mnemonic} not yet implemented.")]);
                 break;
             case Arm64Mnemonic.MOV:
             case Arm64Mnemonic.MOVZ:
@@ -1049,15 +1120,19 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
                     break;
                 }
+            case Arm64Mnemonic.BIT:
             case Arm64Mnemonic.BIF:
-                if (instruction.Op0Arrangement == Arm64ArrangementSpecifier.SixteenB
+            case Arm64Mnemonic.BSL:
+                if (instruction.Mnemonic == Arm64Mnemonic.BIF
+                    && instruction.Op0Arrangement == Arm64ArrangementSpecifier.SixteenB
                     && vectorComparisons!.TryGetValue(NormalizeRegister(instruction.Op2Reg), out var upper)
                     && upper.Greater)
                 {
                     Add(address, OpCode.VectorMin, ConvertOperand(instruction, 0), upper.Value, upper.Bound);
                     break;
                 }
-                Add(address, OpCode.NotImplemented, new StringLiteral("Instruction BIF not yet implemented."));
+                if (!scalarizer.TryBitSelect(instruction, Add, ConvertOperand))
+                    Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction {instruction.Mnemonic} not yet implemented."));
                 break;
             case Arm64Mnemonic.BIC:
             case Arm64Mnemonic.BICS:

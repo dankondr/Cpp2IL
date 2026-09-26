@@ -547,7 +547,8 @@ internal sealed class Arm64VectorScalarizer
         or Arm64Mnemonic.BIC or Arm64Mnemonic.ORN or Arm64Mnemonic.EON
         or Arm64Mnemonic.ADD or Arm64Mnemonic.SUB or Arm64Mnemonic.MUL
         or Arm64Mnemonic.MLA or Arm64Mnemonic.MLS or Arm64Mnemonic.ADDP
-        or Arm64Mnemonic.FADD or Arm64Mnemonic.FSUB or Arm64Mnemonic.FMUL or Arm64Mnemonic.FDIV;
+        or Arm64Mnemonic.FADD or Arm64Mnemonic.FSUB or Arm64Mnemonic.FMUL or Arm64Mnemonic.FDIV
+        or Arm64Mnemonic.FADDP;
 
     private static bool IsBitwise(Arm64Mnemonic mnemonic) => mnemonic is
         Arm64Mnemonic.AND or Arm64Mnemonic.ORR or Arm64Mnemonic.EOR
@@ -557,7 +558,108 @@ internal sealed class Arm64VectorScalarizer
         => mnemonic is Arm64Mnemonic.BIC or Arm64Mnemonic.ORN or Arm64Mnemonic.EON;
 
     private static bool IsFloatLaneOp(Arm64Mnemonic mnemonic) => mnemonic is
-        Arm64Mnemonic.FADD or Arm64Mnemonic.FSUB or Arm64Mnemonic.FMUL or Arm64Mnemonic.FDIV;
+        Arm64Mnemonic.FADD or Arm64Mnemonic.FSUB or Arm64Mnemonic.FMUL or Arm64Mnemonic.FDIV
+        or Arm64Mnemonic.FADDP;
+
+    /// <summary>
+    /// The low window of a whole-register local is honest only when the
+    /// register provably carries nothing beyond the low scalar — every upper
+    /// slot a constant, the shape left by scalar-width writes. Wider carriers
+    /// (LDR D/Q, vector copies) keep real provenance in the upper slots, where
+    /// a managed aggregate (Vector2/3) may live.
+    /// </summary>
+    private static bool IsScalarWholeWindow(VectorState state, int slot, LaneSlice slice)
+        => slot == 0
+            && slice.BitOffset == 0
+            && slice.Operand is Register { Name: { } name } && !name.Contains('.')
+            && state.Slots[1] is { Operand: Immediate }
+            && state.Slots[2] is { Operand: Immediate }
+            && state.Slots[3] is { Operand: Immediate };
+
+    /// <summary>
+    /// Whether a lane window is an honest floating-point carrier: an element
+    /// local (V6.S0-style — provably one lane's bits), a constant, or the low
+    /// window of a scalar-carrying register. A whole-register local in any
+    /// other shape is refused — an LDR S/D may leave a managed aggregate
+    /// (Vector2/Vector3) in the register local, and slicing or reading that
+    /// as lane bits fabricates lane values out of managed semantics.
+    /// </summary>
+    private static bool IsFloatCarrier(VectorState state, int slot)
+    {
+        if (state.Slots[slot] is not { } slice)
+            return false;
+        if (slice.Operand is Immediate)
+            return true;
+        if (slice.Operand is Register { Name: { } name } && name.Contains('.'))
+            return true; // element local — extracting any of its windows reads a proven lane
+        return IsScalarWholeWindow(state, slot, slice);
+    }
+
+    /// <summary>
+    /// Pure check that the lane is an honest float carrier — reads slot
+    /// provenance only, emits nothing. Every caller probes all lanes with this
+    /// first and materializes operands only once the whole vector checks out,
+    /// so a failed fold leaves no orphaned shift temps behind.
+    /// </summary>
+    private static bool CanFloatLane(VectorState? state, int laneBits, int lane)
+    {
+        if (state == null)
+            return false;
+        if (laneBits == 32)
+            return IsFloatCarrier(state, lane);
+        return IsFloatCarrier(state, 2 * lane) && IsFloatCarrier(state, 2 * lane + 1);
+    }
+
+    /// <summary>
+    /// A floating-point lane operand, or null when the lane cannot be read
+    /// without pretending a whole-register local is an integer lane carrier.
+    /// Call only after CanFloatLane passed — it may emit extraction temps.
+    /// </summary>
+    private IOperand? FloatLaneOperand(VectorState? state, int laneBits, int lane)
+    {
+        if (state == null)
+            return null;
+        if (laneBits == 32)
+            return IsFloatCarrier(state, lane) ? SlotOperand(state, lane) : null;
+        if (!IsFloatCarrier(state, 2 * lane) || !IsFloatCarrier(state, 2 * lane + 1))
+            return null;
+        return Lane64Operand(state, lane);
+    }
+
+    /// <summary>
+    /// Whether a scalar FCM* register operand provably carries a scalar: an
+    /// element local spanning the compare width, a constant, the low scalar
+    /// of a scalar-carrying register (S-width compares only), or an untracked
+    /// local (parameter/copy — typed by the signature, no aggregate ambiguity).
+    /// A D-width carrier is always ambiguous — LDR D and a double result are
+    /// indistinguishable here — so scalar FCMGT D folds only on operands with
+    /// no provenance or element-local lanes.
+    /// </summary>
+    private bool ScalarCompareOperandHonest(Arm64Register reg, int width)
+    {
+        var state = LaneState(reg);
+        if (state == null)
+            return true;
+        if (state.Slots[0] is not { BitOffset: 0 } slice)
+            return false;
+        if (slice.Operand is Immediate)
+            return true;
+        if (slice.Operand is Register { Name: { } n } && n.Contains('.'))
+            return width == 32 || n.Contains(".D");
+        return width == 32 && IsScalarWholeWindow(state, 0, slice);
+    }
+
+    /// <summary>
+    /// Whether the register operands of a scalar FCM* are honest scalars —
+    /// see ScalarCompareOperandHonest.
+    /// </summary>
+    public bool ScalarCompareOperandsHonest(Arm64Instruction insn)
+    {
+        var width = insn.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31 ? 64 : 32;
+        if (insn.Op1Kind == Arm64OperandKind.Register && !ScalarCompareOperandHonest(insn.Op1Reg, width))
+            return false;
+        return insn.Op2Kind != Arm64OperandKind.Register || ScalarCompareOperandHonest(insn.Op2Reg, width);
+    }
 
     private bool TryConvertCore(Arm64Instruction insn, Func<Arm64Instruction, int, IOperand> convertOperand)
     {
@@ -683,6 +785,246 @@ internal sealed class Arm64VectorScalarizer
         SyncScalarView(dest, destName);
         if (!_emitted)
             _add(_address, OpCode.Nop, []);
+        return true;
+    }
+
+    /// <summary>
+    /// FCMGT/FCMLT/FCMGE/FCMLE/FCMEQ vector forms (2S/4S/2D against a register
+    /// or against #0): each lane folds to the hardware's all-ones/zero mask —
+    /// a Check* op (ordered compares are unordered->0, which the emitted CIL
+    /// comparison matches) followed by Negate. FCMGE/FCMLE are composite
+    /// (a>b)|(a==b) / (a<b)|(a==b) so unordered lanes still mask to zero.
+    /// Every source lane must be an honest float carrier; returns false when
+    /// any lane is unprovable so the caller can pick a recorded-comparison or
+    /// diagnostic path.
+    /// </summary>
+    public bool TryCompareMask(Arm64Instruction insn,
+        Func<ulong, OpCode, List<IOperand>, Instruction> add,
+        Func<Arm64Instruction, int, IOperand> convertOperand)
+    {
+        _add = add;
+        _address = insn.Address;
+        _emitted = false;
+
+        if (insn.Op0Kind != Arm64OperandKind.Register
+            || insn.Op1Kind != Arm64OperandKind.Register)
+            return false;
+
+        var (laneBits, laneCount) = Arrangement(insn.Op0Arrangement);
+        if (laneBits is not (32 or 64))
+            return false;
+
+        var sourceA = LaneState(insn.Op1Reg);
+        VectorState? sourceB = null;
+        IOperand? zero = null;
+        if (insn.Op2Kind == Arm64OperandKind.Register)
+            sourceB = LaneState(insn.Op2Reg);
+        else if (insn.Op2Kind == Arm64OperandKind.FloatingPointImmediate)
+            zero = laneBits == 32 ? new FloatLiteral(0f) : new DoubleLiteral(0);
+        else
+            return false;
+
+        if (sourceA == null && sourceB == null)
+            return false; // fully opaque chain: caller's normal path
+
+        // all-or-nothing: probe every lane before emitting anything — a
+        // partially proven mask must leave the instruction unimplemented, not
+        // trade it for a fold plus orphaned extraction temps.
+        for (var lane = 0; lane < laneCount; lane++)
+            if (!CanFloatLane(sourceA, laneBits, lane)
+                || (zero == null && !CanFloatLane(sourceB, laneBits, lane)))
+                return false;
+
+        var aOps = new IOperand?[laneCount];
+        var bOps = new IOperand?[laneCount];
+        for (var lane = 0; lane < laneCount; lane++)
+        {
+            aOps[lane] = FloatLaneOperand(sourceA, laneBits, lane);
+            bOps[lane] = zero ?? FloatLaneOperand(sourceB, laneBits, lane);
+        }
+
+        var primary = insn.Mnemonic switch
+        {
+            Arm64Mnemonic.FCMLT or Arm64Mnemonic.FCMLE => OpCode.CheckLess,
+            Arm64Mnemonic.FCMEQ => OpCode.CheckEqual,
+            _ => OpCode.CheckGreater
+        };
+        var orEqual = insn.Mnemonic is Arm64Mnemonic.FCMGE or Arm64Mnemonic.FCMLE;
+
+        var dest = Ensure(insn.Op0Reg);
+        ClaimDest(insn.Op0Reg);
+        var destName = Normalize(insn.Op0Reg);
+
+        for (var lane = 0; lane < laneCount; lane++)
+        {
+            var laneReg = ElementRegister(destName, laneBits, lane);
+            EmitLaneOp(primary, destName, laneBits, lane, aOps[lane]!, bOps[lane]!, dest, isFloat: true);
+            if (orEqual)
+            {
+                var equal = Temp();
+                _add(_address, OpCode.CheckEqual, [equal, aOps[lane]!, bOps[lane]!]);
+                _add(_address, OpCode.Or, [laneReg, laneReg, equal]);
+            }
+            // Check* yields a boolean 0/1; negating it produces the mask's
+            // all-ones. The lane is pinned Int32 — the comparison seed would
+            // otherwise type the mask Boolean, whose stack value is 1, and a
+            // downstream `and` would compute 1 & n instead of ~0 & n.
+            _add(_address, OpCode.Negate, [laneReg, laneReg]).NativeIntegerWidthBits = 32;
+            _emitted = true;
+        }
+
+        for (var slot = laneCount * laneBits / 32; slot < 4; slot++)
+            dest.Slots[slot] = new LaneSlice(Zero, 0); // narrow forms zero the upper half
+        SyncScalarView(dest, destName);
+        return true;
+    }
+
+    /// <summary>
+    /// BIT/BIF/BSL Vd.{8B,16B}, Vn, Vm — three-way bitwise select folded per
+    /// 32-bit window. All three are read-modify-write on the destination:
+    ///   BIT: d = (n &amp; m) | (d &amp; ~m) — mask in operand 2
+    ///   BIF: d = (n &amp; ~m) | (d &amp; m) — inverted mask in operand 2
+    ///   BSL: d = (n &amp; d) | (m &amp; ~d) — mask is the old destination
+    /// The ops are pure bit logic, so window granularity is exact; the old
+    /// destination windows are read before its slots are claimed.
+    ///
+    /// Every consumed window must already hold a value readable as-is: an
+    /// Immediate, an element local at offset 0, or the low window of a
+    /// scalar-carrying register. Whole-register locals carrying wider data and
+    /// shifted extractions are refused — consuming a managed-aggregate local
+    /// through an integer op materializes reinterpret loads downstream, and a
+    /// partial fold trades one honest diagnostic for several.
+    /// </summary>
+    private static bool CanBitWindow(VectorState state, int w)
+    {
+        if (state.Slots[w] is not { BitOffset: 0 } slice)
+            return false;
+        if (slice.Operand is Immediate)
+            return true;
+        if (slice.Operand is Register { Name: { } n })
+            return n.Contains('.') || IsScalarWholeWindow(state, w, slice);
+        return false;
+    }
+    public bool TryBitSelect(Arm64Instruction insn,
+        Func<ulong, OpCode, List<IOperand>, Instruction> add,
+        Func<Arm64Instruction, int, IOperand> convertOperand)
+    {
+        _add = add;
+        _address = insn.Address;
+        _emitted = false;
+
+        if (insn.Op0Kind != Arm64OperandKind.Register
+            || insn.Op1Kind != Arm64OperandKind.Register
+            || insn.Op2Kind != Arm64OperandKind.Register
+            || insn.Op0Arrangement is not (Arm64ArrangementSpecifier.EightB
+                or Arm64ArrangementSpecifier.SixteenB))
+            return false;
+
+        var slots = insn.Op0Arrangement == Arm64ArrangementSpecifier.SixteenB ? 4 : 2;
+
+        var stateD = LaneState(insn.Op0Reg);
+        var stateA = LaneState(insn.Op1Reg);
+        var stateB = LaneState(insn.Op2Reg);
+        if (stateD == null && stateA == null && stateB == null)
+            return false; // fully opaque chain: caller's normal path
+
+        // all-or-nothing: a partially proven select would swap the honest
+        // diagnostic for a fold plus unknown windows — refuse instead
+        if (stateD == null || stateA == null || stateB == null)
+            return false;
+        for (var w = 0; w < slots; w++)
+            if (!CanBitWindow(stateA, w) || !CanBitWindow(stateB, w) || !CanBitWindow(stateD, w))
+                return false;
+
+        var aOps = new IOperand?[slots];
+        var bOps = new IOperand?[slots];
+        var dOps = new IOperand?[slots];
+        for (var w = 0; w < slots; w++)
+        {
+            aOps[w] = SlotOperand(stateA, w);
+            bOps[w] = SlotOperand(stateB, w);
+            dOps[w] = SlotOperand(stateD, w);
+        }
+
+        var dest = Ensure(insn.Op0Reg);
+        ClaimDest(insn.Op0Reg);
+        var destName = Normalize(insn.Op0Reg);
+
+        for (var w = 0; w < slots; w++)
+        {
+            Register left, right;
+            if (insn.Mnemonic == Arm64Mnemonic.BSL)
+            {
+                var notD = Temp();
+                _add(_address, OpCode.Not, [notD, dOps[w]!]).NativeIntegerWidthBits = 32;
+                left = Temp();
+                _add(_address, OpCode.And, [left, aOps[w]!, dOps[w]!]).NativeIntegerWidthBits = 32;
+                right = Temp();
+                _add(_address, OpCode.And, [right, bOps[w]!, notD]).NativeIntegerWidthBits = 32;
+            }
+            else
+            {
+                var notB = Temp();
+                _add(_address, OpCode.Not, [notB, bOps[w]!]).NativeIntegerWidthBits = 32;
+                var aSide = insn.Mnemonic == Arm64Mnemonic.BIF ? notB : bOps[w]!;
+                var dSide = insn.Mnemonic == Arm64Mnemonic.BIF ? bOps[w]! : notB;
+                left = Temp();
+                _add(_address, OpCode.And, [left, aOps[w]!, aSide]).NativeIntegerWidthBits = 32;
+                right = Temp();
+                _add(_address, OpCode.And, [right, dOps[w]!, dSide]).NativeIntegerWidthBits = 32;
+            }
+
+            var lane = ElementRegister(destName, 32, w);
+            _add(_address, OpCode.Or, [lane, left, right]).NativeIntegerWidthBits = 32;
+            _emitted = true;
+            dest.Slots[w] = new LaneSlice(lane, 0);
+        }
+
+        for (var w = slots; w < 4; w++)
+            dest.Slots[w] = new LaneSlice(Zero, 0); // the 8B form zeroes the upper half
+        SyncScalarView(dest, destName);
+        return true;
+    }
+
+    /// <summary>
+    /// FADDP Sd, Vn.2S / FADDP Dd, Vn.2D — the scalar pairwise reduction —
+    /// folds to a plain Add when both lanes are honest float carriers (real
+    /// element locals or constants, e.g. an INS-built vector or a windowed
+    /// vector load). Returns false otherwise: a lane reached by shifting a
+    /// whole-register local is refused, since a narrow write such as LDR D
+    /// may carry a managed Vector2/aggregate that must not be treated as an
+    /// integer lane carrier.
+    /// </summary>
+    public bool TryScalarFaddp(Arm64Instruction insn,
+        Func<ulong, OpCode, List<IOperand>, Instruction> add,
+        Func<Arm64Instruction, int, IOperand> convertOperand)
+    {
+        _add = add;
+        _address = insn.Address;
+        _emitted = false;
+
+        var laneBits = insn.Op1Arrangement switch
+        {
+            Arm64ArrangementSpecifier.TwoS => 32,
+            Arm64ArrangementSpecifier.TwoD => 64,
+            _ => 0
+        };
+        if (insn.Op0Kind != Arm64OperandKind.Register
+            || insn.Op0Arrangement != Arm64ArrangementSpecifier.None // scalar form: Sd/Dd destination
+            || insn.Op1Kind != Arm64OperandKind.Register
+            || insn.Op2Kind != Arm64OperandKind.None
+            || laneBits == 0)
+            return false;
+
+        var state = LaneState(insn.Op1Reg);
+        // probe before materializing: a refused reduction must not leave
+        // orphaned extraction temps behind
+        if (!CanFloatLane(state, laneBits, 0) || !CanFloatLane(state, laneBits, 1))
+            return false;
+
+        _add(_address, OpCode.Add,
+            [convertOperand(insn, 0), FloatLaneOperand(state, laneBits, 0)!, FloatLaneOperand(state, laneBits, 1)!]);
+        _emitted = true;
         return true;
     }
 
@@ -1066,6 +1408,19 @@ internal sealed class Arm64VectorScalarizer
         if (sourceA == null && sourceB == null && sourceD == null && elementA == null && elementB == null)
             return false; // fully opaque chain: caller's normal path
 
+        // FADDP is all-or-nothing: a partially proven pairwise fold trades the
+        // honest diagnostic for lane ops plus unknown windows — refuse before
+        // the destination is claimed or any operand is materialized.
+        if (insn.Mnemonic == Arm64Mnemonic.FADDP && laneBits is 32 or 64)
+            for (var lane = 0; lane < laneCount; lane++)
+            {
+                var pairSource = lane < laneCount / 2 ? sourceA : sourceB;
+                var pair = lane < laneCount / 2 ? lane : lane - laneCount / 2;
+                if (!CanFloatLane(pairSource, laneBits, 2 * pair)
+                    || !CanFloatLane(pairSource, laneBits, 2 * pair + 1))
+                    return false;
+            }
+
         var dest = Ensure(insn.Op0Reg);
         ClaimDest(insn.Op0Reg);
         var destName = Normalize(insn.Op0Reg);
@@ -1079,13 +1434,18 @@ internal sealed class Arm64VectorScalarizer
 
         for (var lane = 0; lane < rows; lane++)
         {
-            if (insn.Mnemonic == Arm64Mnemonic.ADDP)
+            if (insn.Mnemonic is Arm64Mnemonic.ADDP or Arm64Mnemonic.FADDP
+                && laneBits is 32 or 64)
             {
                 // out[i] = in1[2i]+in1[2i+1] for the lower half, in2 for the upper
                 var pairSource = lane < laneCount / 2 ? sourceA : sourceB;
                 var pair = lane < laneCount / 2 ? lane : lane - laneCount / 2;
-                aOps[lane] = LaneOperand(pairSource, laneBits, 2 * pair);
-                bOps[lane] = LaneOperand(pairSource, laneBits, 2 * pair + 1);
+                aOps[lane] = isFloat
+                    ? FloatLaneOperand(pairSource, laneBits, 2 * pair)
+                    : LaneOperand(pairSource, laneBits, 2 * pair);
+                bOps[lane] = isFloat
+                    ? FloatLaneOperand(pairSource, laneBits, 2 * pair + 1)
+                    : LaneOperand(pairSource, laneBits, 2 * pair + 1);
             }
             else if (bitwise)
             {
