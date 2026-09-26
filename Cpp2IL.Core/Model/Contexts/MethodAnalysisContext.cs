@@ -437,8 +437,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         MetadataInitGuardRemover.RewriteUnguardedInits(this);
 
         InternalCallGuardRemover.Run(this);
-        KeyFunctionRecovery.Run(this);
         ArrayRecovery.RecoverAccesses(this);
+        KeyFunctionRecovery.Run(this);
 
         SsaForm.Remove(this);
 
