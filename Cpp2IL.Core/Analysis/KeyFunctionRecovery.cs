@@ -512,7 +512,12 @@ public static class KeyFunctionRecovery
         if (instruction.OpCode != OpCode.Call || instruction.Operands is not [_, var result, var classOperand, var value, ..])
             return;
 
-        var boxedType = classOperand as TypeAnalysisContext ?? value switch
+        var boxedType = classOperand switch
+        {
+            RuntimeClassTypeAnalysisContext runtimeClass => runtimeClass.RepresentedType,
+            TypeAnalysisContext type => type,
+            _ => null,
+        } ?? value switch
         {
             AddressOf { Target: LocalVariable { Type: { } type } } => type,
             LocalVariable { Type: ByRefTypeAnalysisContext { ElementType: { } type } } => type,
