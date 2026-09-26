@@ -78,6 +78,53 @@ public class KeyFunctionRecoveryTests
     }
 
     [Test]
+    public void InlinedClassHierarchyCheckBecomesNullableIsInst()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var value = new LocalVariable("value", new Register(null, "value"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var runtimeClass = new LocalVariable("runtimeClass", new Register(null, "runtimeClass"))
+            { Type = new RuntimeClassTypeAnalysisContext(app.SystemTypes.SystemObjectType,
+                app.SystemTypes.SystemObjectType.DeclaringAssembly) };
+        var targetClass = new LocalVariable("targetClass", new Register(null, "targetClass"))
+            { Type = new RuntimeClassTypeAnalysisContext(app.SystemTypes.SystemStringType,
+                app.SystemTypes.SystemStringType.DeclaringAssembly) };
+        var shiftedDepth = new LocalVariable("shiftedDepth", new Register(null, "shiftedDepth"));
+        var hierarchyAddress = new LocalVariable("hierarchyAddress", new Register(null, "hierarchyAddress"));
+        var result = new LocalVariable("result", new Register(null, "result"))
+            { Type = app.SystemTypes.SystemBooleanType };
+        var check = new Instruction(4, OpCode.CheckEqual, result,
+            new MemoryOperand(hierarchyAddress, addend: -8), app.SystemTypes.SystemStringType);
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([
+                new(0, OpCode.Move, runtimeClass, new MemoryOperand(value)),
+                new(1, OpCode.Move, targetClass, app.SystemTypes.SystemStringType),
+                new(2, OpCode.ShiftLeft, shiftedDepth,
+                    new MemoryOperand(targetClass, addend: 0x130), new Immediate(3)),
+                new(3, OpCode.Add, hierarchyAddress,
+                    new MemoryOperand(runtimeClass, addend: 0xC8), shiftedDepth),
+                check,
+                new(5, OpCode.Return)]),
+        };
+
+        KeyFunctionRecovery.Run(method);
+
+        Assert.That(check.OpCode, Is.EqualTo(OpCode.CheckNotEqual));
+        Assert.That(check.Operands[1], Is.TypeOf<ReferenceCast>());
+        var cast = (ReferenceCast)check.Operands[1];
+        Assert.Multiple(() =>
+        {
+            Assert.That(cast.Value, Is.SameAs(value));
+            Assert.That(cast.Type, Is.SameAs(app.SystemTypes.SystemStringType));
+            Assert.That(cast.NullOnFailure, Is.True);
+            Assert.That(check.Operands[2], Is.TypeOf<Immediate>());
+            Assert.That(((Immediate)check.Operands[2]).Value, Is.Zero);
+        });
+    }
+
+    [Test]
     public void IsInstArrayElementClassBecomesManagedReferenceCast()
     {
         var app = Cpp2IlApi.CurrentAppContext!;
