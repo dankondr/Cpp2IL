@@ -134,5 +134,25 @@ public enum OpCode
     Throw,
 
     /// <summary>Sign-extends the low 32 bits of op 2 to 64 bits in op 1.</summary>
-    SignExtend32
+    SignExtend32,
+
+    /// <summary>
+    /// Recovered libc memcpy: byte-exact copy of op 3 bytes from op 2 into op 1, defined
+    /// only for non-overlapping regions. A 4th operand, when present, receives the
+    /// destination pointer - the value memcpy returns.
+    /// </summary>
+    MemoryCopy,
+
+    /// <summary>
+    /// Recovered libc memset: fills op 3 bytes at op 1 with the byte in op 2. A 4th
+    /// operand, when present, receives the destination pointer - memset's return value.
+    /// </summary>
+    MemorySet,
+
+    /// <summary>
+    /// Recovered libc memmove: byte copy of op 3 bytes from op 2 into op 1 that stays
+    /// correct when the regions overlap. A 4th operand, when present, receives the
+    /// destination pointer - memmove's return value.
+    /// </summary>
+    MemoryMove
 }
