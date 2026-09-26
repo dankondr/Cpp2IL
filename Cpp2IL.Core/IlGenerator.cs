@@ -2466,7 +2466,7 @@ public static class IlGenerator
         }
 
         if (includeResultContract && instruction.OpCode == OpCode.Call && instruction.Operands.Count > 1)
-            Solve(open.ReturnType, StoreContract(instruction.Operands[1], context));
+            Solve(open.ReturnType, DirectSharedGenericEvidenceType(instruction.Operands[1], context));
 
         if (!changed)
             return null;
