@@ -567,7 +567,8 @@ public static class KeyFunctionRecovery
                 }
             }
             else if (dominators != null && dominators.Dominates(block, home)
-                     && (cellBlock == null || cellBlock == home || dominators.Dominates(cellBlock, block)))
+                     && cellBlock != home
+                     && (cellBlock == null || dominators.Dominates(cellBlock, block)))
             {
                 cell = candidate;
                 cellBlock = block;

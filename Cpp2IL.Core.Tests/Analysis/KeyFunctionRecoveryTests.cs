@@ -159,6 +159,53 @@ public class KeyFunctionRecoveryTests
         });
     }
 
+    // Innermost means the home-block catch always beats an ancestor, no matter which
+    // block is enumerated first: beginCatchResults follows cfg.Blocks order.
+    [Test]
+    public void NativeRethrowPrefersInnerCatchOverAncestorRegardlessOfEnumerationOrder()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var headerOuter = new LocalVariable("headerOuter", new Register(null, "x0"));
+        var wrapperOuter = new LocalVariable("wrapperOuter", new Register(null, "x1"));
+        var exceptionOuter = new LocalVariable("exceptionOuter", new Register(null, "x2"));
+        var headerInner = new LocalVariable("headerInner", new Register(null, "x3"));
+        var wrapperInner = new LocalVariable("wrapperInner", new Register(null, "x4"));
+        var exceptionInner = new LocalVariable("exceptionInner", new Register(null, "x5"));
+
+        var beginCatchOuter = new Instruction(0, OpCode.Call,
+            new StringLiteral("__cxa_begin_catch"), wrapperOuter, headerOuter);
+        var loadOuter = new Instruction(1, OpCode.Move, exceptionOuter, new MemoryOperand(wrapperOuter));
+        var beginCatchInner = new Instruction(2, OpCode.Call,
+            new StringLiteral("__cxa_begin_catch"), wrapperInner, headerInner);
+        var loadInner = new Instruction(3, OpCode.Move, exceptionInner, new MemoryOperand(wrapperInner));
+        var rethrow = new Instruction(4, OpCode.CallVoid, new StringLiteral("__cxa_rethrow"));
+
+        // ISILControlFlowGraph.Build always splits a block after a call, so the
+        // ancestor ends up in its own block; the inner begin_catch is then placed
+        // into the rethrow's home block, matching a pad merged by later passes.
+        var cfg = new ISILControlFlowGraph([beginCatchOuter, loadOuter, rethrow]);
+        var ancestorBlock = cfg.Blocks.Single(b => b.Instructions.Contains(beginCatchOuter));
+        var home = cfg.Blocks.Single(b => b.Instructions.Contains(rethrow));
+        home.Instructions.InsertRange(0, [beginCatchInner, loadInner]);
+
+        // Adversarial order: enumerate the home block before its dominator so the
+        // ancestor is visited after the inner catch was already selected.
+        cfg.Blocks.Remove(ancestorBlock);
+        cfg.Blocks.Insert(cfg.Blocks.IndexOf(home) + 1, ancestorBlock);
+
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = cfg
+        };
+        method.DominatorInfo = new DominatorInfo(method.ControlFlowGraph);
+
+        KeyFunctionRecovery.Run(method);
+
+        Assert.That(rethrow.OpCode, Is.EqualTo(OpCode.Throw));
+        Assert.That(rethrow.Operands[0], Is.SameAs(exceptionInner));
+    }
+
     [Test]
     public void NativeRethrowWithoutExceptionLoadSynthesizesIt()
     {
