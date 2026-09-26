@@ -52,7 +52,7 @@ public static class KeyFunctionRecovery
             else if (BoxFunctions.Contains(keyFunction))
                 RewriteBox(instruction, method);
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_is_inst))
-                RewriteIsInst(instruction);
+                RewriteIsInst(instruction, method.ControlFlowGraph!, method.AppContext.Binary.is32Bit);
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.il2cpp_vm_reflection_get_type_object))
                 RewriteTypeObject(instruction);
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.InternalCalls_Resolve))
@@ -190,16 +190,41 @@ public static class KeyFunctionRecovery
         instruction.SetOperands(result, boxedType, value);
     }
 
-    internal static void RewriteIsInst(Instruction instruction)
+    internal static void RewriteIsInst(Instruction instruction, Graphs.ISILControlFlowGraph cfg, bool is32Bit)
     {
         // helper, result, object, target class. The surrounding native code
         // already performs the null test and throws where castclass semantics
         // are required, so a managed reference cast preserves the observable path.
         if (instruction.OpCode != OpCode.Call
-            || instruction.Operands is not [_, var result, LocalVariable value, TypeAnalysisContext target, ..])
+            || instruction.Operands is not [_, var result, LocalVariable value, var classOperand, ..]
+            || IsInstTarget(ResolveMoveSource(cfg, classOperand), is32Bit) is not { } target)
             return;
         instruction.OpCode = OpCode.Move;
         instruction.SetOperands(result, new ReferenceCast(value, target));
+    }
+
+    private static TypeAnalysisContext? IsInstTarget(IOperand operand, bool is32Bit)
+    {
+        return operand switch
+        {
+            TypeAnalysisContext type => type,
+            LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: var type } } => type,
+            MemoryOperand
+            {
+                Base: LocalVariable
+                {
+                    Type: RuntimeClassTypeAnalysisContext
+                    {
+                        RepresentedType: WrappedTypeAnalysisContext array
+                            and (SzArrayTypeAnalysisContext or ArrayTypeAnalysisContext)
+                    }
+                },
+                Index: null,
+                Scale: 0,
+                Addend: >= 0 and <= uint.MaxValue and var offset
+            } when Il2CppClassUsefulOffsets.IsElementTypePtr((uint)offset, is32Bit) => array.ElementType,
+            _ => null,
+        };
     }
 
     private static TypeAnalysisContext? InferDefaultsBoxType(MethodAnalysisContext method, IOperand classOperand)
