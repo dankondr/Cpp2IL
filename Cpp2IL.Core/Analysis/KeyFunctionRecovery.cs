@@ -197,14 +197,31 @@ public static class KeyFunctionRecovery
         // are required, so a managed reference cast preserves the observable path.
         if (instruction.OpCode != OpCode.Call
             || instruction.Operands is not [_, var result, LocalVariable value, var classOperand, ..]
-            || IsInstTarget(ResolveMoveSource(cfg, classOperand), is32Bit) is not { } target)
+            || IsInstTarget(ResolveMoveSource(cfg, classOperand), cfg, is32Bit) is not { } target)
             return;
         instruction.OpCode = OpCode.Move;
         instruction.SetOperands(result, new ReferenceCast(value, target));
     }
 
-    private static TypeAnalysisContext? IsInstTarget(IOperand operand, bool is32Bit)
+    private static TypeAnalysisContext? IsInstTarget(IOperand operand, Graphs.ISILControlFlowGraph cfg, bool is32Bit)
     {
+        if (operand is MemoryOperand
+            {
+                Base: LocalVariable classPointer, Index: null, Scale: 0,
+                Addend: >= 0 and <= uint.MaxValue and var elementOffset
+            }
+            && Il2CppClassUsefulOffsets.IsElementTypePtr((uint)elementOffset, is32Bit)
+            && ResolveMoveSource(cfg, classPointer) is MemoryOperand
+            {
+                Base: LocalVariable
+                {
+                    Type: WrappedTypeAnalysisContext arrayType
+                        and (SzArrayTypeAnalysisContext or ArrayTypeAnalysisContext)
+                },
+                Index: null, Scale: 0, Addend: 0
+            })
+            return arrayType.ElementType;
+
         return operand switch
         {
             TypeAnalysisContext type => type,

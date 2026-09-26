@@ -85,6 +85,35 @@ public class KeyFunctionRecoveryTests
     }
 
     [Test]
+    public void IsInstArrayObjectClassBecomesManagedReferenceCast()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var value = new LocalVariable("value", new Register(null, "value"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var array = new LocalVariable("array", new Register(null, "array"))
+            { Type = new SzArrayTypeAnalysisContext(app.SystemTypes.SystemStringType) };
+        var arrayClass = new LocalVariable("arrayClass", new Register(null, "klass"));
+        var elementClass = new LocalVariable("elementClass", new Register(null, "element"));
+        var elementClassOffset = app.Binary.is32Bit ? 0u : 0x40u;
+        var instruction = new Instruction(2, OpCode.Call,
+            new StringLiteral("il2cpp_vm_object_is_inst"), result, value,
+            elementClass, new Immediate(0));
+        var graph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, arrayClass, new MemoryOperand(array)),
+            new(1, OpCode.Move, elementClass, new MemoryOperand(arrayClass, addend: elementClassOffset)),
+            instruction,
+            new(3, OpCode.Return),
+        ]);
+
+        KeyFunctionRecovery.RewriteIsInst(instruction, graph, app.Binary.is32Bit);
+
+        Assert.That(instruction.OpCode, Is.EqualTo(OpCode.Move));
+        Assert.That(((ReferenceCast)instruction.Operands[1]).Type,
+            Is.SameAs(app.SystemTypes.SystemStringType));
+    }
+
+    [Test]
     public void Unity6DefaultsInt32ClassOffsetIsRecognized()
     {
         var types = Cpp2IlApi.CurrentAppContext!.SystemTypes;
