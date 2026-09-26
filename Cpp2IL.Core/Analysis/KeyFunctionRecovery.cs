@@ -48,6 +48,8 @@ public static class KeyFunctionRecovery
 
             if (ObjectNewFunctions.Contains(keyFunction))
                 RewriteObjectNew(instruction);
+            else if (keyFunction == "__cxa_throw")
+                RewriteNativeExceptionThrow(method, instruction);
             else if (keyFunction == "__cxa_end_catch")
             {
                 instruction.OpCode = OpCode.Nop;
@@ -391,6 +393,117 @@ public static class KeyFunctionRecovery
 
         instruction.OpCode = OpCode.Throw;
         instruction.SetOperands(exception);
+    }
+
+    internal static bool RewriteNativeExceptionThrow(MethodAnalysisContext method, Instruction throwInstruction,
+        Func<IOperand, bool>? isExceptionWrapper = null)
+    {
+        var throwArgument = throwInstruction.OpCode == OpCode.CallVoid ? 1 : 2;
+        if (!throwInstruction.IsCall
+            || throwInstruction.Operands.Count <= throwArgument + 2
+            || throwInstruction.Operands[throwArgument] is not LocalVariable allocation
+            || throwInstruction.Operands[throwArgument + 1] is not { } typeInfo
+            || throwInstruction.Operands[throwArgument + 2] is not Immediate { Value: 0 }
+            || !(isExceptionWrapper ?? (operand => IsExceptionWrapperTypeInfo(method, operand)))(typeInfo))
+            return false;
+
+        Instruction? store = null;
+        Instruction? allocate = null;
+        IOperand? exception = null;
+        foreach (var candidate in method.ControlFlowGraph!.Blocks
+                     .SelectMany(block => block.Instructions)
+                     .Where(instruction => instruction.Index < throwInstruction.Index
+                                           && throwInstruction.Index - instruction.Index <= 64)
+                     .OrderByDescending(instruction => instruction.Index))
+        {
+            if (store == null
+                && candidate is { OpCode: OpCode.Move, Operands: [var destination, var source] }
+                && IsAllocationCell(destination, allocation))
+            {
+                store = candidate;
+                exception = source;
+                continue;
+            }
+            if (store != null
+                && candidate is { OpCode: OpCode.Call,
+                    Operands: [StringLiteral { Value: "__cxa_allocate_exception" }, LocalVariable result,
+                        Immediate { Value: var size }, ..] }
+                && ReferenceEquals(result, allocation)
+                && size == (method.AppContext.Binary.is32Bit ? 4 : 8))
+            {
+                allocate = candidate;
+                break;
+            }
+        }
+
+        if (allocate == null || store == null || exception == null
+            || method.ControlFlowGraph.Instructions.Any(instruction =>
+                instruction.Index >= allocate.Index && instruction.Index <= throwInstruction.Index
+                && ReferencesOutsideWrapperPattern(instruction, allocation, allocate, store, throwInstruction, throwArgument)))
+            return false;
+
+        allocate.OpCode = OpCode.Nop;
+        allocate.SetOperands();
+        store.OpCode = OpCode.Nop;
+        store.SetOperands();
+        throwInstruction.OpCode = OpCode.Throw;
+        throwInstruction.SetOperands(exception);
+        return true;
+    }
+
+    private static bool IsAllocationCell(IOperand operand, LocalVariable allocation) => operand switch
+    {
+        MemoryOperand { Base: LocalVariable baseLocal, Index: null, Scale: 0, Addend: 0 }
+            => ReferenceEquals(baseLocal, allocation),
+        FieldReference { Local: var owner, Offset: 0 } => ReferenceEquals(owner, allocation),
+        _ => false,
+    };
+
+    private static bool IsExceptionWrapperTypeInfo(MethodAnalysisContext method, IOperand operand)
+    {
+        if (operand is not Immediate typeInfo)
+            return false;
+
+        var binary = method.AppContext.Binary;
+        var namePointerAddress = typeInfo.UnsignedValue + (binary.is32Bit ? 4u : 8u);
+        try
+        {
+            if (!binary.TryMapVirtualAddressToRaw(namePointerAddress, out _))
+                return false;
+            var nameAddress = binary.ReadPointerAtVirtualAddress(namePointerAddress);
+            return ThrowHelperRecovery.ReadCStringAtVirtualAddress(method.AppContext, nameAddress, 64)
+                is { } name && name.EndsWith("Il2CppExceptionWrapper", StringComparison.Ordinal);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool ReferencesOutsideWrapperPattern(Instruction instruction, LocalVariable allocation,
+        Instruction allocate, Instruction store, Instruction throwInstruction, int throwArgument)
+    {
+        for (var i = 0; i < instruction.Operands.Count; i++)
+        {
+            if (!References(instruction.Operands[i], allocation))
+                continue;
+            if (ReferenceEquals(instruction, allocate) && i == 1
+                || ReferenceEquals(instruction, store) && i == 0
+                || ReferenceEquals(instruction, throwInstruction) && i == throwArgument)
+                continue;
+            return true;
+        }
+        return false;
+
+        static bool References(IOperand operand, LocalVariable target) => operand switch
+        {
+            LocalVariable local => ReferenceEquals(local, target),
+            MemoryOperand memory => memory.Base != null && References(memory.Base, target)
+                                    || memory.Index != null && References(memory.Index, target),
+            FieldReference field => ReferenceEquals(field.Local, target),
+            AddressOf address => References(address.Target, target),
+            _ => false,
+        };
     }
 
     internal static void RewriteBox(Instruction instruction, MethodAnalysisContext? method = null)
