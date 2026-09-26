@@ -38,6 +38,10 @@ public class Instruction : IOperand
     // Native integer arithmetic can carry a width that register normalization erases.
     public int? NativeIntegerWidthBits;
 
+    // Native floating-point arithmetic can carry a width that S/D register
+    // normalization erases before local type inference.
+    public int? NativeFloatWidthBits;
+
     // Width of the native memory access that produced this instruction. Stack-slot
     // normalization erases MemoryOperand/StackOffset, but aggregate-return recovery
     // still needs the width to distinguish a whole struct from one of its fields.
