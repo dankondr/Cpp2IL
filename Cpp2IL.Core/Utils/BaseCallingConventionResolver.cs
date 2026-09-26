@@ -44,12 +44,21 @@ public abstract class BaseCallingConventionResolver
         if (call.Operands.Count != argBase + integerRegisters.Length + floatRegisters.Length)
             return false;
 
+        // An operand's position in the list IS its register slot, so folded values without a
+        // register identity (AddressOf, MemoryOperand, methodof operands, ...) are accepted.
+        // Register-bearing operands still have to sit in their own register's slot.
+        bool InSlot(IOperand operand, string register) => operand switch
+        {
+            Register or LocalVariable => RegisterName(operand) == register,
+            _ => true,
+        };
+
         for (var i = 0; i < integerRegisters.Length; i++)
-            if (RegisterName(call.Operands[argBase + i]) != integerRegisters[i])
+            if (!InSlot(call.Operands[argBase + i], integerRegisters[i]))
                 return false;
 
         for (var i = 0; i < floatRegisters.Length; i++)
-            if (RegisterName(call.Operands[argBase + integerRegisters.Length + i]) != floatRegisters[i])
+            if (!InSlot(call.Operands[argBase + integerRegisters.Length + i], floatRegisters[i]))
                 return false;
 
         return true;
