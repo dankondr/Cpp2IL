@@ -45,11 +45,41 @@ public class KeyFunctionRecoveryTests
             new StringLiteral("il2cpp_vm_object_is_inst"), result, value,
             app.SystemTypes.SystemStringType, new Immediate(0));
 
-        KeyFunctionRecovery.RewriteIsInst(instruction);
+        KeyFunctionRecovery.RewriteIsInst(instruction,
+            new ISILControlFlowGraph([instruction, new(1, OpCode.Return)]), app.Binary.is32Bit);
 
         Assert.That(instruction.OpCode, Is.EqualTo(OpCode.Move));
         Assert.That(instruction.Operands[0], Is.SameAs(result));
         Assert.That(instruction.Operands[1], Is.TypeOf<ReferenceCast>());
+        Assert.That(((ReferenceCast)instruction.Operands[1]).Type,
+            Is.SameAs(app.SystemTypes.SystemStringType));
+    }
+
+    [Test]
+    public void IsInstArrayElementClassBecomesManagedReferenceCast()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var value = new LocalVariable("value", new Register(null, "value"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var arrayClass = new LocalVariable("arrayClass", new Register(null, "klass"))
+        {
+            Type = new RuntimeClassTypeAnalysisContext(
+                new SzArrayTypeAnalysisContext(app.SystemTypes.SystemStringType),
+                app.SystemTypes.SystemStringType.DeclaringAssembly),
+        };
+        var elementClassOffset = app.Binary.is32Bit ? 0u : 0x40u;
+        var classPointer = new LocalVariable("classPointer", new Register(null, "target"));
+        var classLoad = new Instruction(0, OpCode.Move, classPointer,
+            new MemoryOperand(arrayClass, addend: elementClassOffset));
+        var instruction = new Instruction(1, OpCode.Call,
+            new StringLiteral("il2cpp_vm_object_is_inst"), result, value,
+            classPointer, new Immediate(0));
+        var graph = new ISILControlFlowGraph([classLoad, instruction, new(2, OpCode.Return)]);
+
+        KeyFunctionRecovery.RewriteIsInst(instruction, graph, app.Binary.is32Bit);
+
+        Assert.That(instruction.OpCode, Is.EqualTo(OpCode.Move));
         Assert.That(((ReferenceCast)instruction.Operands[1]).Type,
             Is.SameAs(app.SystemTypes.SystemStringType));
     }

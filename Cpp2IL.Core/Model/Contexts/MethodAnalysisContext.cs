@@ -407,6 +407,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         InterfaceDispatchRecovery.Run(this);
 
         LocalVariables.ResolveTypesAndFields(this);
+        // Runtime class targets become available only after type resolution.
+        KeyFunctionRecovery.Run(this);
         ArrayRecovery.RecoverObjectFieldAddresses(this);
 
         // Needs the MethodInfo* receivers typed, so runs after resolution unlike the class-init guards
