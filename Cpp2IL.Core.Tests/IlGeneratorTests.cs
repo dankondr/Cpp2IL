@@ -1254,8 +1254,10 @@ public class IlGeneratorTests
         var app = Cpp2IlApi.CurrentAppContext!;
         var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Extend",
             app.SystemTypes.SystemInt64Type, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, []);
-        var wide = new LocalVariable("wide", new Register(null, "wide"));
-        var scaled = new LocalVariable("scaled", new Register(null, "scaled"));
+        var wide = new LocalVariable("wide", new Register(null, "wide"))
+            { Type = app.SystemTypes.SystemInt64Type };
+        var scaled = new LocalVariable("scaled", new Register(null, "scaled"))
+            { Type = app.SystemTypes.SystemInt64Type };
         caller.ControlFlowGraph = new ISILControlFlowGraph([
             new(0, OpCode.SignExtend32, wide, new Immediate(input)),
             new(1, OpCode.ShiftLeft, scaled, wide, new Immediate(4)),
@@ -1264,17 +1266,17 @@ public class IlGeneratorTests
         caller.ParameterLocals = [];
         caller.AnalysisWarnings = [];
         var module = new ModuleDefinition("ExtensionTest.dll", new AssemblyReference("System.Private.CoreLib", typeof(object).Assembly.GetName().Version!));
+        app.SystemTypes.SystemInt64Type.PutExtraData("AsmResolverType",
+            new TypeDefinition("System", "Int64", TypeAttributes.Public));
         var type = new TypeDefinition("Tests", "Extension", TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
         module.TopLevelTypes.Add(type);
         var method = new MethodDefinition("Extend", MethodAttributes.Public | MethodAttributes.Static,
             MethodSignature.CreateStatic(module.CorLibTypeFactory.Int64));
         type.Methods.Add(method);
         IlGenerator.GenerateIl(caller, method);
-        // This standalone harness supplies the primitive signatures without generating the
-        // fixture game's entire mscorlib. Exercise the actual emitted conversion and shift IL.
         foreach (var local in method.CilMethodBody!.LocalVariables)
             local.VariableType = module.CorLibTypeFactory.Int64;
-        Assert.That(method.CilMethodBody.MaxStack, Is.GreaterThan(0));
+        Assert.That(method.CilMethodBody!.MaxStack, Is.GreaterThan(0));
 
         var assembly = new AssemblyDefinition("ExtensionTest", new Version(1, 0));
         assembly.Modules.Add(module);
