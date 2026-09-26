@@ -527,6 +527,272 @@ public class ManagedDispatchRecoveryTests
             instruction.IsCall && instruction.Operands[0] is Immediate { Value: 0xA000 }));
     }
 
+    // ===== ARM64 folded-slot and out-param interface dispatch =====
+
+    // Jump operands are list indices, so shapes built in parts resolve them at the end.
+    private static void ResolveJumps(List<Instruction> instructions, params (Instruction jump, Instruction target)[] edges)
+    {
+        foreach (var (jump, target) in edges)
+            jump.SetOperand(0, new Immediate(instructions.IndexOf(target)));
+    }
+
+    // ARM64 codegen folds a constant interface slot into the vtable base:
+    //   klass + (SXTW(entryOffset) << 4) + (vtableOffset + slot * sizeof(VirtualInvokeData))
+    // with no index-side +slot at all. indexAddsSlot double-counts the slot (must stay indirect),
+    // foldedSlot lets a test mis-fold the addend (must also stay indirect).
+    private static List<Instruction> FoldedSlotInterfaceShape(TypeAnalysisContext declaringInterface,
+        int slowSlot, int foldedSlot, bool indexAddsSlot)
+    {
+        var receiver = L("receiver", App.SystemTypes.SystemObjectType);
+        var klassLocal = L("klass");
+        var entry = L("entryOffset");
+        var index = L("index");
+        var shifted = L("shifted");
+        var sum = L("sum");
+        var vtableEntry = L("vtableEntry");
+        var slow = L("slow");
+        var iface = L("iface");
+        var slotArg = L("slot");
+        var invokeData = L("invokeData");
+        var target = L("target");
+        var methodInfo = L("methodInfo");
+        var result = L("result");
+        var extended = L("extended");
+        var branch = new Instruction(2, OpCode.ConditionalJump, new Immediate(0));
+        var jump = new Instruction(0, OpCode.Jump, new Immediate(0));
+        var merge = new Instruction(0, OpCode.Phi, invokeData, slow, vtableEntry);
+        var slowBlock = new Instruction(10, OpCode.Move, iface, declaringInterface);
+        var instructions = new List<Instruction>
+        {
+            // head: klass load + branch into the two inlined paths
+            new Instruction(0, OpCode.Move, klassLocal, Load(receiver, 0)),
+            new Instruction(1, OpCode.CheckNotEqual, L("cond"), receiver, new Immediate(0)),
+            branch,
+            // fast path block: klass + (SXTW(entryOffset) << 4) + 0x138+slot*16
+            new Instruction(3, OpCode.Move, entry, Load(klassLocal, 16)),
+        };
+        if (indexAddsSlot)
+            instructions.Add(new Instruction(4, OpCode.Add, index, entry, new Immediate(slowSlot)));
+        instructions.Add(new Instruction(5, OpCode.SignExtend32, extended, indexAddsSlot ? index : entry));
+        instructions.Add(new Instruction(6, OpCode.ShiftLeft, shifted, extended, new Immediate(4)));
+        instructions.Add(new Instruction(7, OpCode.Add, sum, klassLocal, shifted));
+        instructions.Add(new Instruction(8, OpCode.Add, vtableEntry, sum,
+            new Immediate(VTableOffset + foldedSlot * InvokeDataSize)));
+        instructions.Add(jump);
+        instructions.Add(slowBlock);
+        instructions.AddRange([
+            new Instruction(11, OpCode.Move, slotArg, new Immediate(slowSlot)),
+            new Instruction(12, OpCode.Call, new Immediate(0x9000), slow, receiver, iface, slotArg),
+            // merge
+            merge,
+            new Instruction(14, OpCode.Move, target, Load(invokeData, 0)),
+            new Instruction(15, OpCode.Move, methodInfo, Load(invokeData, 8)),
+            new Instruction(16, OpCode.IndirectCall, target, result, receiver, methodInfo),
+            new Instruction(17, OpCode.Return, result),
+        ]);
+        ResolveJumps(instructions, (branch, slowBlock), (jump, merge));
+        return instructions;
+    }
+
+    [Test]
+    public void FoldedSlotInterfaceDispatchResolvesDeclaredSlot()
+    {
+        var enumerator = CorLib("System.Collections.IEnumerator");
+        var slot = InterfaceSlotOf(enumerator, "get_Current");
+        Assert.That(slot, Is.GreaterThan(0));
+        var method = Caller(App.SystemTypes.SystemObjectType,
+            FoldedSlotInterfaceShape(enumerator, slot, slot, indexAddsSlot: false));
+        var dispatch = method.ControlFlowGraph!.Instructions.First(i => i.OpCode == OpCode.IndirectCall);
+
+        InterfaceDispatchRecovery.Run(method);
+
+        Assert.That(dispatch.OpCode, Is.EqualTo(OpCode.Call));
+        var resolved = (MethodAnalysisContext)dispatch.Operands[0];
+        Assert.That(resolved.Name, Is.EqualTo("get_Current"));
+        Assert.That(resolved.DeclaringType!.FullName, Is.EqualTo("System.Collections.IEnumerator"));
+
+        var emitted = Emitted(App, method, App.SystemTypes.SystemObjectType);
+        Assert.That(emitted.Any(i => i.OpCode == CilOpCodes.Callvirt
+            && i.Operand?.ToString()?.Contains("get_Current") == true), Is.True,
+            () => string.Join("\n", emitted));
+        Assert.That(method.ControlFlowGraph.Instructions, Has.None.Matches<Instruction>(instruction =>
+            instruction.IsCall && instruction.Operands.Count > 0
+                && instruction.Operands[0] is Immediate { Value: 0x9000 }));
+    }
+
+    [Test]
+    public void FoldedSlotInterfaceDispatchWithWrongFoldStaysIndirect()
+    {
+        var enumerator = CorLib("System.Collections.IEnumerator");
+        var slot = InterfaceSlotOf(enumerator, "get_Current");
+        var method = Caller(App.SystemTypes.SystemObjectType,
+            FoldedSlotInterfaceShape(enumerator, slot, slot + 1, indexAddsSlot: false));
+        var dispatch = method.ControlFlowGraph!.Instructions.First(i => i.OpCode == OpCode.IndirectCall);
+
+        InterfaceDispatchRecovery.Run(method);
+
+        Assert.That(dispatch.OpCode, Is.EqualTo(OpCode.IndirectCall));
+    }
+
+    [Test]
+    public void FoldedSlotInterfaceDispatchWithSlotCountedTwiceStaysIndirect()
+    {
+        var enumerator = CorLib("System.Collections.IEnumerator");
+        var slot = InterfaceSlotOf(enumerator, "get_Current");
+        var method = Caller(App.SystemTypes.SystemObjectType,
+            FoldedSlotInterfaceShape(enumerator, slot, slot, indexAddsSlot: true));
+        var dispatch = method.ControlFlowGraph!.Instructions.First(i => i.OpCode == OpCode.IndirectCall);
+
+        InterfaceDispatchRecovery.Run(method);
+
+        Assert.That(dispatch.OpCode, Is.EqualTo(OpCode.IndirectCall));
+    }
+
+    // il2cpp_codegen_get_generic_interface_method takes a VirtualInvokeData* out-param:
+    //   methodDef = [invokeData+8]; internal(methodDef, method, &stack[n]); blr [stack[n]]
+    // The invokeData phi exists but never forms the call target's base.
+    private static List<Instruction> OutParamInterfaceShape(TypeAnalysisContext declaringInterface,
+        IOperand methodInfoOperand, bool withMethodDefLoad)
+    {
+        var receiver = L("receiver", App.SystemTypes.SystemObjectType);
+        var methodMI = L("methodMI", new RuntimeMethodInfoAnalysisContext(
+            declaringInterface.Methods.First(), declaringInterface.DeclaringAssembly));
+        var klassLocal = L("klass");
+        var ifaceK = L("ifaceK");
+        var slotLoad = L("slotLoad");
+        var entry = L("entryOffset");
+        var index = L("index");
+        var extended = L("extended");
+        var shifted = L("shifted");
+        var sum = L("sum");
+        var vtableEntry = L("vtableEntry");
+        var slow = L("slow");
+        var invokeData = L("invokeData");
+        var methodDef = L("methodDef");
+        var buffer = L("buffer");
+        var target = L("target");
+        var methodInfo = L("methodInfo");
+        var result = L("result");
+        var branch = new Instruction(4, OpCode.ConditionalJump, new Immediate(0));
+        var jump = new Instruction(11, OpCode.Jump, new Immediate(0));
+        var slowBlock = new Instruction(12, OpCode.Call, new Immediate(0x9000),
+            slow, receiver, ifaceK, slotLoad);
+        var merge = new Instruction(13, OpCode.Phi, invokeData, slow, vtableEntry);
+        var instructions = new List<Instruction>
+        {
+            // head: klass + the method->klass/method->slot loads the helper needs
+            new Instruction(0, OpCode.Move, klassLocal, Load(receiver, 0)),
+            new Instruction(1, OpCode.Move, ifaceK, Load(methodMI, 0x20)),
+            new Instruction(2, OpCode.Move, slotLoad, Load(methodMI, 0x50)),
+            new Instruction(3, OpCode.CheckNotEqual, L("cond"), receiver, new Immediate(0)),
+            branch,
+            // fast path: runtime slot, so the index add can't fold
+            new Instruction(5, OpCode.Move, entry, Load(klassLocal, 16)),
+            new Instruction(6, OpCode.Add, index, entry, slotLoad),
+            new Instruction(7, OpCode.SignExtend32, extended, index),
+            new Instruction(8, OpCode.ShiftLeft, shifted, extended, new Immediate(4)),
+            new Instruction(9, OpCode.Add, sum, klassLocal, shifted),
+            new Instruction(10, OpCode.Add, vtableEntry, sum, new Immediate(VTableOffset)),
+            jump,
+            // slow path
+            slowBlock,
+            // merge: phi'd invokeData feeds only the out-param helper
+            merge,
+        };
+        if (withMethodDefLoad)
+            instructions.Add(new Instruction(14, OpCode.Move, methodDef, Load(invokeData, 8)));
+        instructions.Add(new Instruction(15, OpCode.Move, buffer, new AddressOf(new StackOffset(16))));
+        instructions.Add(new Instruction(16, OpCode.Call, new Immediate(0xA000), L("helperResult"),
+            withMethodDefLoad ? methodDef : L("unrelated"), methodInfoOperand, buffer));
+        // the dispatch reads the stack buffer the helper just filled
+        instructions.Add(new Instruction(17, OpCode.Move, target, new StackOffset(16)));
+        instructions.Add(new Instruction(18, OpCode.Move, methodInfo, new StackOffset(24)));
+        instructions.Add(new Instruction(19, OpCode.IndirectCall, target, result, receiver, methodInfo));
+        instructions.Add(new Instruction(20, OpCode.Return, result));
+        ResolveJumps(instructions, (branch, slowBlock), (jump, merge));
+        return instructions;
+    }
+
+    [Test]
+    public void OutParamGenericInterfaceDispatchResolvesConcreteMethod()
+    {
+        var disposable = CorLib("System.IDisposable");
+        var dispose = disposable.Methods.First(method => method.Name == "Dispose");
+        dispose.GenericParameters.Add(new GenericParameterTypeAnalysisContext("T", 0,
+            LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_MVAR, 0, dispose));
+        var concrete = dispose.MakeGenericInstanceMethod(App.SystemTypes.SystemInt32Type);
+        var concreteInfo = new RuntimeMethodInfoAnalysisContext(concrete, disposable.DeclaringAssembly);
+        var method = Caller(App.SystemTypes.SystemVoidType,
+            OutParamInterfaceShape(disposable, concreteInfo, withMethodDefLoad: true));
+        var dispatch = method.ControlFlowGraph!.Instructions.First(i => i.OpCode == OpCode.IndirectCall);
+
+        InterfaceDispatchRecovery.Run(method);
+
+        Assert.That(dispatch.OpCode, Is.EqualTo(OpCode.CallVoid));
+        Assert.That(dispatch.Operands[0], Is.SameAs(concrete));
+        // the invokeData out-param slot the helper filled is rewritten to the proven MethodInfo
+        Assert.That(dispatch.Operands, Has.Some.Matches<IOperand>(operand =>
+            operand is RuntimeMethodInfoAnalysisContext info
+            && ReferenceEquals(info.RepresentedMethod, concrete)));
+        Assert.That(method.ControlFlowGraph.Instructions, Has.None.Matches<Instruction>(instruction =>
+            instruction.IsCall && instruction.Operands.Count > 0
+                && instruction.Operands[0] is Immediate { Value: 0xA000 }));
+    }
+
+    [Test]
+    public void OutParamDispatchWithoutMethodInfoStaysIndirect()
+    {
+        var disposable = CorLib("System.IDisposable");
+        var method = Caller(App.SystemTypes.SystemVoidType,
+            OutParamInterfaceShape(disposable, L("unrelatedMethodInfo"), withMethodDefLoad: true));
+        var dispatch = method.ControlFlowGraph!.Instructions.First(i => i.OpCode == OpCode.IndirectCall);
+
+        InterfaceDispatchRecovery.Run(method);
+
+        Assert.That(dispatch.OpCode, Is.EqualTo(OpCode.IndirectCall));
+    }
+
+    [Test]
+    public void OutParamDispatchForClassMethodStaysIndirect()
+    {
+        // the same helper shape, but the RuntimeMethod* names a class method, not an interface one
+        var disposable = CorLib("System.IDisposable");
+        var owner = new InjectedTypeAnalysisContext(App.AssembliesByName["mscorlib"], "Tests",
+            "OutParamHelper", App.SystemTypes.SystemObjectType,
+            ReflectionTypeAttributes.Public | ReflectionTypeAttributes.Class);
+        var classMethod = owner.InjectMethodContext("Compute", App.SystemTypes.SystemInt32Type,
+            ReflectionMethodAttributes.Public, App.SystemTypes.SystemObjectType);
+        classMethod.GenericParameters.Add(new GenericParameterTypeAnalysisContext("T", 0,
+            LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_MVAR, 0, classMethod));
+        var concrete = classMethod.MakeGenericInstanceMethod(App.SystemTypes.SystemObjectType);
+        var concreteInfo = new RuntimeMethodInfoAnalysisContext(concrete, owner.DeclaringAssembly);
+        var method = Caller(App.SystemTypes.SystemVoidType,
+            OutParamInterfaceShape(disposable, concreteInfo, withMethodDefLoad: true));
+        var dispatch = method.ControlFlowGraph!.Instructions.First(i => i.OpCode == OpCode.IndirectCall);
+
+        InterfaceDispatchRecovery.Run(method);
+
+        Assert.That(dispatch.OpCode, Is.EqualTo(OpCode.IndirectCall));
+    }
+
+    [Test]
+    public void OutParamDispatchWithoutInvokeDataLoadStaysIndirect()
+    {
+        var disposable = CorLib("System.IDisposable");
+        var dispose = disposable.Methods.First(method => method.Name == "Dispose");
+        dispose.GenericParameters.Add(new GenericParameterTypeAnalysisContext("T", 0,
+            LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_MVAR, 0, dispose));
+        var concrete = dispose.MakeGenericInstanceMethod(App.SystemTypes.SystemInt32Type);
+        var concreteInfo = new RuntimeMethodInfoAnalysisContext(concrete, disposable.DeclaringAssembly);
+        var method = Caller(App.SystemTypes.SystemVoidType,
+            OutParamInterfaceShape(disposable, concreteInfo, withMethodDefLoad: false));
+        var dispatch = method.ControlFlowGraph!.Instructions.First(i => i.OpCode == OpCode.IndirectCall);
+
+        InterfaceDispatchRecovery.Run(method);
+
+        Assert.That(dispatch.OpCode, Is.EqualTo(OpCode.IndirectCall));
+    }
+
     // ===== delegate invoke =====
 
     // Raw-layout delegate call: operand[2] is the invoke_impl_this carrier (first integer
