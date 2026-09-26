@@ -328,6 +328,7 @@ public static class LocalVariables
             changed |= TypeAddressedLocals(method);
             changed |= PropagateTypesOnce(method);
             changed |= ResolveStackAggregateFields(method);
+            changed |= InheritEscapedCellVersions(method);
 
             // Hidden struct returns are discovered before field/type propagation, when a shared-
             // generic receiver may still be untyped. Once the regular fixpoint settles, use its
@@ -653,21 +654,41 @@ public static class LocalVariables
 
     private static void SeedNewobjResults(MethodAnalysisContext method)
     {
+        var definitions = method.ControlFlowGraph!.Instructions
+            .Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!)
+            .Where(g => g.Count() == 1)
+            .ToDictionary(g => g.Key, g => g.Single());
+
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             if (instruction.OpCode != OpCode.Newobj || instruction.Operands.Count < 2)
                 continue;
 
-            if (instruction.Operands[0] is LocalVariable destination && InstantiatedType(instruction.Operands[1]) is { } type)
+            if (instruction.Operands[0] is LocalVariable destination
+                && InstantiatedType(instruction.Operands[1], definitions) is { } type)
                 destination.Type = type;
         }
     }
 
-    private static TypeAnalysisContext? InstantiatedType(IOperand classOperand) =>
+    private static TypeAnalysisContext? InstantiatedType(IOperand classOperand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions) =>
+        InstantiatedType(classOperand, definitions, []);
+
+    // The class operand is often a copy of the ldtoken'ed klass (Move local, source). Untyped copy
+    // locals are only typed later inside the fixpoint, so follow single-definition Move chains here
+    // to still identify the allocated type through the copy.
+    private static TypeAnalysisContext? InstantiatedType(IOperand classOperand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions, HashSet<LocalVariable> visiting) =>
         classOperand switch
         {
             LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: var t } } => t,
             RuntimeClassTypeAnalysisContext { RepresentedType: var t } => t,
+            LocalVariable { Type: { } t } => t,
+            LocalVariable local when visiting.Add(local)
+                && definitions.TryGetValue(local, out var definition)
+                && definition is { OpCode: OpCode.Move, Operands: [_, { } source] }
+                => InstantiatedType(source, definitions, visiting),
             TypeAnalysisContext type => type, //not sure this is actually valid but for completeness
             _ => null,
         };
@@ -737,6 +758,41 @@ public static class LocalVariables
             }
         }
 
+        return changed;
+    }
+
+    // An address-taken cell whose content may be observed by later reads gets a fresh SSA version
+    // for the post-call value (the callee can write through the pointer). That version is never a
+    // definition target - the write comes through the pointer, not an assignment. When nothing else
+    // resolved such a version's type, it inherits the type of the most recent earlier version of
+    // the same storage: a write barrier or an initobj-style helper stores or reinitializes the same
+    // slot, it does not change the managed type the slot models. This runs last in the fixpoint so
+    // real byref/addressed typing (TypeAddressedLocals, PropagateFromCallParameters) wins.
+    private static bool InheritEscapedCellVersions(MethodAnalysisContext method)
+    {
+        var definedLocals = method.ControlFlowGraph!.Instructions
+            .Select(instruction => instruction.Destination)
+            .OfType<LocalVariable>()
+            .ToHashSet();
+        var typedVersions = method.Locals.Where(local => local.Type != null).ToList();
+
+        var changed = false;
+        foreach (var local in method.Locals)
+        {
+            // a defined nowhere, versioned local is a clobbered cell version
+            if (local.Type != null || local.Register.Version <= 0 || definedLocals.Contains(local))
+                continue;
+
+            var prior = typedVersions
+                .Where(candidate => candidate.Register.Name == local.Register.Name
+                    && candidate.Register.Version < local.Register.Version)
+                .MaxBy(candidate => candidate.Register.Version);
+            if (prior == null)
+                continue;
+
+            local.Type = prior.Type;
+            changed = true;
+        }
         return changed;
     }
 

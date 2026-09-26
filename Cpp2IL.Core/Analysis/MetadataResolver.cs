@@ -5,11 +5,13 @@ using System.Reflection;
 using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.Il2CppApiFunctions;
+using Cpp2IL.Core.InstructionSets;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
 using LibCpp2IL;
 using LibCpp2IL.Elf;
+using LibCpp2IL.PE;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -256,6 +258,19 @@ public static class MetadataResolver
                 instruction.SetOperand(i, new FieldReference(field, local, (int)memory.Addend,
                     resolved!.Value.Containers, memory.AccessSize));
                 changed = true;
+
+                // A private cross-assembly field read is an inlined accessor (e.g.
+                // String._stringLength behind get_Length) and cannot be named from the caller -
+                // emit the public accessor call the inline came from instead, but only when the
+                // candidate's own body is structurally proven to return that exact field.
+                if (i == 1 && instruction.OpCode == OpCode.Move
+                    && instruction.Operands[0] is LocalVariable destination
+                    && instruction.Operands[1] is FieldReference fieldRef
+                    && TryRecoverFieldAccessor(method, fieldRef, local) is { } accessor)
+                {
+                    instruction.OpCode = OpCode.Call;
+                    instruction.SetOperands(accessor, destination, local);
+                }
             }
         }
 
@@ -275,6 +290,198 @@ public static class MetadataResolver
         }
 
         return FindInstanceFieldPathAtOffset(owner, offset, accessSize);
+    }
+
+    // The honest public equivalent of a cross-assembly private field read: IL2CPP inlines managed
+    // accessors (String.get_Length => _stringLength, List<T>.get_Count => _size), leaving a direct
+    // read of a field the emitted assembly cannot name. A read is rewritten to an accessor call
+    // only when the candidate is structurally proven to read that exact field: the declaring type
+    // exposes exactly one public parameterless instance getter of the field's type, AND the
+    // getter's own native body is just `return this.<field>` - a single load from
+    // [this + accessOffset] into the return register followed by ret. Uniqueness, return type, or
+    // naming alone are never proof: a type could have a second private field of the same type
+    // whose only getter returns the other field, so an unproven candidate leaves the
+    // inaccessible-field read in place as the diagnostic.
+    private static MethodAnalysisContext? TryRecoverFieldAccessor(
+        MethodAnalysisContext caller, FieldReference fieldRef, LocalVariable receiver)
+    {
+        var field = fieldRef.Field;
+
+        // A container path is a nested member access (this.a.b) - no simple getter produces that.
+        if (fieldRef.Containers.Count > 0 || !NeedsAccessor(field, caller)
+            || receiver.Type is { IsValueType: true })
+            return null;
+
+        var genericInstance = field.DeclaringType as GenericInstanceTypeAnalysisContext;
+        var lookup = genericInstance?.GenericType ?? field.DeclaringType;
+        if (lookup == null)
+            return null;
+
+        var candidates = lookup.Methods
+            .Where(m => !m.IsStatic && m.Parameters.Count == 0
+                && m.Name.StartsWith("get_", StringComparison.Ordinal)
+                && (m.Attributes & MethodAttributes.MemberAccessMask) == MethodAttributes.Public
+                && m.ReturnType.FullName == field.FieldType.FullName)
+            .ToList();
+        if (candidates.Count != 1)
+            return null;
+
+        var accessor = genericInstance != null
+            ? (MethodAnalysisContext)new ConcreteGenericMethodAnalysisContext(candidates[0],
+                genericInstance.GenericArguments, [])
+            : candidates[0];
+        return GetterProvablyReadsField(caller.AppContext, accessor, fieldRef.Offset)
+            && InaccessibleCalleeRecovery.IsVisibleFrom(accessor, caller) ? accessor : null;
+    }
+
+    // Disassemble the candidate's native body and require it to be a pure field projection:
+    // a single load from [this + fieldOffset] into the return register, then ret, with no
+    // stores, calls, branches, or arithmetic in between. This is the only acceptable proof that
+    // the getter returns this field - anything else is not sound to substitute.
+    private static bool GetterProvablyReadsField(ApplicationAnalysisContext app,
+        MethodAnalysisContext accessor, long fieldOffset)
+    {
+        // Shared generic methods carry their code on the definition's method pointer.
+        var pointer = accessor.UnderlyingPointer;
+        if (pointer == 0 && accessor is ConcreteGenericMethodAnalysisContext generic)
+            pointer = generic.BaseMethodContext.UnderlyingPointer;
+        if (pointer == 0)
+            return false;
+        return app.InstructionSet switch
+        {
+            NewArmV8InstructionSet => GetterProvablyReadsFieldArm64(app, pointer, fieldOffset),
+            X86InstructionSet => GetterProvablyReadsFieldX86(app, pointer, fieldOffset),
+            _ => false,
+        };
+    }
+
+    private static bool GetterProvablyReadsFieldArm64(ApplicationAnalysisContext app,
+        ulong pointer, long fieldOffset)
+    {
+        List<Disarm.Arm64Instruction> body;
+        try
+        {
+            body = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(app, pointer);
+        }
+        catch
+        {
+            return false;
+        }
+
+        var loaded = false;
+        var thisRegister = Disarm.InternalDisassembly.Arm64Register.X0; // instance method: `this` is the first argument
+        foreach (var insn in body)
+        {
+            switch (insn.Mnemonic)
+            {
+                case Disarm.Arm64Mnemonic.NOP or Disarm.Arm64Mnemonic.HINT
+                    or Disarm.Arm64Mnemonic.PRFM or Disarm.Arm64Mnemonic.PRFUM:
+                    continue;
+                case Disarm.Arm64Mnemonic.MOV
+                    when insn.Op0Kind == Disarm.Arm64OperandKind.Register
+                        && insn.Op1Kind == Disarm.Arm64OperandKind.Register
+                        && insn.Op1Reg == thisRegister:
+                    thisRegister = insn.Op0Reg; // a `this` alias (mov x8, x0)
+                    continue;
+                case Disarm.Arm64Mnemonic.LDR or Disarm.Arm64Mnemonic.LDRB
+                    or Disarm.Arm64Mnemonic.LDRH or Disarm.Arm64Mnemonic.LDRSB
+                    or Disarm.Arm64Mnemonic.LDRSH or Disarm.Arm64Mnemonic.LDRSW
+                    or Disarm.Arm64Mnemonic.LDUR or Disarm.Arm64Mnemonic.LDURB
+                    or Disarm.Arm64Mnemonic.LDURH or Disarm.Arm64Mnemonic.LDURSB
+                    or Disarm.Arm64Mnemonic.LDURSH or Disarm.Arm64Mnemonic.LDURSW
+                    when !loaded && insn.MemBase == thisRegister
+                        && insn.MemOffset == fieldOffset && insn.MemAddendReg == Disarm.InternalDisassembly.Arm64Register.INVALID
+                        && insn.MemIndexMode == Disarm.Arm64MemoryIndexMode.Offset
+                        && insn.Op0Reg is Disarm.InternalDisassembly.Arm64Register.W0 or Disarm.InternalDisassembly.Arm64Register.X0
+                            or Disarm.InternalDisassembly.Arm64Register.S0 or Disarm.InternalDisassembly.Arm64Register.D0
+                            or Disarm.InternalDisassembly.Arm64Register.B0 or Disarm.InternalDisassembly.Arm64Register.H0
+                            or Disarm.InternalDisassembly.Arm64Register.V0:
+                    loaded = true;
+                    continue;
+                case Disarm.Arm64Mnemonic.RET or Disarm.Arm64Mnemonic.RETAA
+                    or Disarm.Arm64Mnemonic.RETAB:
+                    return loaded;
+                default:
+                    return false; // any other memory traffic, arithmetic, or control flow
+            }
+        }
+        return false;
+    }
+
+    private static bool GetterProvablyReadsFieldX86(ApplicationAnalysisContext app,
+        ulong pointer, long fieldOffset)
+    {
+        Iced.Intel.InstructionList body;
+        try
+        {
+            body = X86Utils.GetMethodBodyAtVirtAddressNew(pointer, true, app);
+        }
+        catch
+        {
+            return false;
+        }
+
+        var loaded = false;
+        var thisRegisters = new HashSet<Iced.Intel.Register>
+            { app.Binary is PE ? Iced.Intel.Register.RCX : Iced.Intel.Register.RDI };
+        foreach (var insn in body)
+        {
+            switch (insn.Mnemonic)
+            {
+                case Iced.Intel.Mnemonic.Nop or Iced.Intel.Mnemonic.Int3:
+                    continue;
+                case Iced.Intel.Mnemonic.Mov
+                    when insn.Op0Kind == Iced.Intel.OpKind.Register
+                        && insn.Op1Kind == Iced.Intel.OpKind.Register
+                        && thisRegisters.Contains(insn.Op1Register):
+                    thisRegisters.Add(insn.Op0Register); // a `this` alias (mov rbx, rcx)
+                    continue;
+                case Iced.Intel.Mnemonic.Mov or Iced.Intel.Mnemonic.Movzx
+                    or Iced.Intel.Mnemonic.Movsx or Iced.Intel.Mnemonic.Movsxd
+                    or Iced.Intel.Mnemonic.Movss or Iced.Intel.Mnemonic.Movsd
+                    or Iced.Intel.Mnemonic.Movd or Iced.Intel.Mnemonic.Movq
+                    or Iced.Intel.Mnemonic.Movaps or Iced.Intel.Mnemonic.Movups
+                    when !loaded && insn.Op1Kind == Iced.Intel.OpKind.Memory
+                        && thisRegisters.Contains(insn.MemoryBase)
+                        && insn.MemoryIndex == Iced.Intel.Register.None
+                        && insn.MemoryDisplacement64 == (ulong)fieldOffset
+                        && insn.Op0Register is Iced.Intel.Register.EAX or Iced.Intel.Register.RAX
+                            or Iced.Intel.Register.XMM0 or Iced.Intel.Register.AL:
+                    loaded = true;
+                    continue;
+                case Iced.Intel.Mnemonic.Ret:
+                    return loaded;
+                default:
+                    return false;
+            }
+        }
+        return false;
+    }
+
+    private static bool NeedsAccessor(FieldAnalysisContext field, MethodAnalysisContext caller)
+    {
+        var access = field.Attributes & FieldAttributes.FieldAccessMask;
+        if (access is FieldAttributes.Public or FieldAttributes.Family or FieldAttributes.FamORAssem)
+            return false;
+
+        var declaring = field.DeclaringType;
+        var callerType = caller.DeclaringType;
+        if (declaring == null || callerType == null)
+            return false;
+
+        if (declaring is GenericInstanceTypeAnalysisContext instance)
+            declaring = instance.GenericType;
+        if (callerType is GenericInstanceTypeAnalysisContext callerInstance)
+            callerType = callerInstance.GenericType;
+        if (ReferenceEquals(declaring, callerType))
+            return false; // private access within the same type stays a direct read
+
+        var declaringAssembly = declaring?.DeclaringAssembly;
+        var callerAssembly = callerType.DeclaringAssembly;
+        return declaringAssembly == null || callerAssembly == null
+            || !(ReferenceEquals(declaringAssembly, callerAssembly)
+                || (declaringAssembly.Name != null && declaringAssembly.Name == callerAssembly.Name)
+                || Extensions.AccessibilityExtensions.SharesEmittedInternals(declaringAssembly, callerAssembly));
     }
 
     internal static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)?
@@ -346,9 +553,7 @@ public static class MetadataResolver
     internal static FieldAnalysisContext? FindStaticFieldAtOffset(TypeAnalysisContext owner, long offset)
     {
         if (owner is GenericInstanceTypeAnalysisContext genericOwner)
-            return GenericLayoutDependsOnValueArgument(genericOwner)
-                ? null
-                : GenericInstanceFieldLayout.FindStaticFieldAtOffset(genericOwner.GenericType, offset);
+            return GenericInstanceFieldLayout.FindStaticFieldAtOffset(genericOwner, offset);
 
         if (owner.GenericParameters.Count > 0)
             return GenericInstanceFieldLayout.FindStaticFieldAtOffset(owner, offset);
@@ -517,11 +722,10 @@ public static class MetadataResolver
     {
         if (owner is GenericInstanceTypeAnalysisContext genericOwner)
         {
-            // Own-field layout is recomputed; a value-type argument affecting field
-            // placement makes it untrustworthy, but inherited fields on the chain
+            // Own-field layout is recomputed on the instantiated field types, so value-type
+            // arguments land at the offsets the runtime produced; inherited fields on the chain
             // keep their real metadata offsets, so fall through to the walk.
-            if (!GenericLayoutDependsOnValueArgument(genericOwner)
-                && GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner.GenericType, offset) is { } ownField)
+            if (GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner, offset) is { } ownField)
                 return ownField;
         }
         else if (owner.GenericParameters.Count > 0
@@ -534,9 +738,8 @@ public static class MetadataResolver
         {
             if (candidate is GenericInstanceTypeAnalysisContext genericCandidate)
             {
-                if (!GenericLayoutDependsOnValueArgument(genericCandidate)
-                    && GenericInstanceFieldLayout.FindFieldAtOffset(genericCandidate.GenericType, offset) is { } genericField)
-                    return new ConcreteGenericFieldAnalysisContext(genericField, genericCandidate);
+                if (GenericInstanceFieldLayout.FindFieldAtOffset(genericCandidate, offset) is { } genericField)
+                    return genericField;
                 continue; // a generic instance's metadata offsets are layout placeholders, never real
             }
             if (candidate.GenericParameters.Count > 0)
@@ -553,10 +756,6 @@ public static class MetadataResolver
 
         return null;
     }
-
-    private static bool GenericLayoutDependsOnValueArgument(GenericInstanceTypeAnalysisContext instance)
-        => instance.GenericArguments.Any(a => a.IsValueType)
-           && instance.GenericType.Fields.Any(f => f.FieldType is GenericParameterTypeAnalysisContext);
 
     private static void ResolveCalls(MethodAnalysisContext method)
     {

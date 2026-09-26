@@ -363,7 +363,7 @@ public class GenericInstanceFieldLayoutTests
             FieldAttributes.Public);
         var instance = new GenericInstanceTypeAnalysisContext(definition, [app.SystemTypes.SystemInt32Type]);
 
-        Assert.That(MetadataResolver.FindInstanceFieldAtOffset(instance, 24), Is.SameAs(stable));
+        Assert.That((MetadataResolver.FindInstanceFieldAtOffset(instance, 24) as ConcreteGenericFieldAnalysisContext)!.BaseFieldContext, Is.SameAs(stable));
     }
 
     [Test]
@@ -386,5 +386,141 @@ public class GenericInstanceFieldLayoutTests
         var resolved = MetadataResolver.FindInstanceFieldAtOffset(derived, 16);
         Assert.That(resolved, Is.TypeOf<ConcreteGenericFieldAnalysisContext>());
         Assert.That(((ConcreteGenericFieldAnalysisContext)resolved!).BaseFieldContext, Is.SameAs(inherited));
+    }
+
+    private static InjectedTypeAnalysisContext GenericDefinition(
+        ApplicationAnalysisContext app, string name, TypeAnalysisContext? baseType = null)
+    {
+        var assembly = app.AssembliesByName["mscorlib"];
+        var definition = new InjectedTypeAnalysisContext(assembly, "Tests", name,
+            baseType ?? app.SystemTypes.SystemObjectType, TypeAttributes.Public);
+        definition.GenericParameters.Add(new GenericParameterTypeAnalysisContext("T", 0,
+            Il2CppTypeEnum.IL2CPP_TYPE_VAR, 0, definition));
+        return definition;
+    }
+
+    [Test]
+    public void GenericInstanceWithValueTypeArgumentUsesInstantiatedLayout()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var definition = GenericDefinition(app, "Pair`1");
+        var t = definition.GenericParameters[0];
+        var head = definition.InjectFieldContext("head", app.SystemTypes.SystemInt32Type,
+            FieldAttributes.Public);
+        var tail = definition.InjectFieldContext("tail", t, FieldAttributes.Public);
+
+        // Pair<int>: head @16 (4 bytes), tail int @20 (4-aligned)
+        var intInstance = new GenericInstanceTypeAnalysisContext(definition,
+            [app.SystemTypes.SystemInt32Type]);
+        Assert.Multiple(() =>
+        {
+            Assert.That((GenericInstanceFieldLayout.FindFieldAtOffset(intInstance, 16) as ConcreteGenericFieldAnalysisContext)!.BaseFieldContext, Is.SameAs(head));
+            Assert.That((GenericInstanceFieldLayout.FindFieldAtOffset(intInstance, 20) as ConcreteGenericFieldAnalysisContext)!.BaseFieldContext, Is.SameAs(tail));
+        });
+
+        // Pair<string>: the erased def layout would also put tail @20, but the instantiated
+        // reference field is pointer-sized and 8-aligned - it lands @24
+        var stringInstance = new GenericInstanceTypeAnalysisContext(definition,
+            [app.SystemTypes.SystemStringType]);
+        Assert.Multiple(() =>
+        {
+            Assert.That((GenericInstanceFieldLayout.FindFieldAtOffset(stringInstance, 24) as ConcreteGenericFieldAnalysisContext)!.BaseFieldContext, Is.SameAs(tail));
+            Assert.That(GenericInstanceFieldLayout.FindFieldAtOffset(stringInstance, 20), Is.Null);
+        });
+    }
+
+    [Test]
+    public void GenericInstanceWithGenericStructMemberUsesInstantiatedMemberLayout()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.AssembliesByName["mscorlib"];
+        var valueType = assembly.GetTypeByFullName("System.ValueType")!;
+
+        var inner = GenericDefinition(app, "Inner`1", valueType);
+        inner.BaseType = valueType;
+        var t = inner.GenericParameters[0];
+        inner.InjectFieldContext("a", t, FieldAttributes.Public);
+        inner.InjectFieldContext("b", t, FieldAttributes.Public);
+
+        var outer = GenericDefinition(app, "Outer`1");
+        var outerT = outer.GenericParameters[0];
+        var innerInstanceOfOuter = new GenericInstanceTypeAnalysisContext(inner, [outerT]);
+        var member = outer.InjectFieldContext("inner", innerInstanceOfOuter, FieldAttributes.Public);
+        var after = outer.InjectFieldContext("after", app.SystemTypes.SystemInt32Type,
+            FieldAttributes.Public);
+
+        // Outer<int>: Inner<int> is {int,int} = 8 bytes @16, so `after` lands @24.
+        // On the erased definition `inner`'s T members would erase to two pointers (16 bytes)
+        // and `after` would wrongly land @32.
+        var intInstance = new GenericInstanceTypeAnalysisContext(outer,
+            [app.SystemTypes.SystemInt32Type]);
+        Assert.Multiple(() =>
+        {
+            Assert.That((GenericInstanceFieldLayout.FindFieldAtOffset(intInstance, 16) as ConcreteGenericFieldAnalysisContext)!.BaseFieldContext, Is.SameAs(member));
+            Assert.That((GenericInstanceFieldLayout.FindFieldAtOffset(intInstance, 24) as ConcreteGenericFieldAnalysisContext)!.BaseFieldContext, Is.SameAs(after));
+            Assert.That(GenericInstanceFieldLayout.FindFieldAtOffset(intInstance, 32), Is.Null);
+        });
+
+        // Outer<string>: Inner<string> is {string,string} = 16 bytes @16, `after` lands @32
+        var stringInstance = new GenericInstanceTypeAnalysisContext(outer,
+            [app.SystemTypes.SystemStringType]);
+        Assert.Multiple(() =>
+        {
+            Assert.That((GenericInstanceFieldLayout.FindFieldAtOffset(stringInstance, 32) as ConcreteGenericFieldAnalysisContext)!.BaseFieldContext, Is.SameAs(after));
+        });
+    }
+
+    [Test]
+    public void InstanceStructLayoutPadsMembersAndTrailingEdge()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.AssembliesByName["mscorlib"];
+        var valueType = assembly.GetTypeByFullName("System.ValueType")!;
+        var inner = new InjectedTypeAnalysisContext(assembly, "Tests", "Packed",
+            valueType, TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout);
+        inner.InjectFieldContext("small", app.SystemTypes.SystemByteType, FieldAttributes.Public);
+        inner.InjectFieldContext("wide", app.SystemTypes.SystemInt64Type, FieldAttributes.Public);
+
+        var outer = GenericDefinition(app, "Wrap`1");
+        var member = outer.InjectFieldContext("packed", inner, FieldAttributes.Public);
+        var after = outer.InjectFieldContext("after", app.SystemTypes.SystemInt32Type,
+            FieldAttributes.Public);
+
+        // Packed is {byte@0, pad, long@8} = 16 bytes with trailing pad; `after` lands @32, not @28
+        var instance = new GenericInstanceTypeAnalysisContext(outer,
+            [app.SystemTypes.SystemInt32Type]);
+        Assert.Multiple(() =>
+        {
+            Assert.That((GenericInstanceFieldLayout.FindFieldAtOffset(instance, 16) as ConcreteGenericFieldAnalysisContext)!.BaseFieldContext, Is.SameAs(member));
+            Assert.That((GenericInstanceFieldLayout.FindFieldAtOffset(instance, 32) as ConcreteGenericFieldAnalysisContext)!.BaseFieldContext, Is.SameAs(after));
+            Assert.That(GenericInstanceFieldLayout.FindFieldAtOffset(instance, 28), Is.Null);
+        });
+    }
+
+    [Test]
+    public void GenericInstanceStaticFieldsFindStorageOffsets()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var definition = GenericDefinition(app, "Statics`1");
+        var first = definition.InjectFieldContext("First", app.SystemTypes.SystemObjectType,
+            FieldAttributes.Public | FieldAttributes.Static);
+        var second = definition.InjectFieldContext("Second", app.SystemTypes.SystemObjectType,
+            FieldAttributes.Public | FieldAttributes.Static);
+        var instance = new GenericInstanceTypeAnalysisContext(definition,
+            [app.SystemTypes.SystemInt32Type]);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That((GenericInstanceFieldLayout.FindStaticFieldAtOffset(instance, 0) as ConcreteGenericFieldAnalysisContext)!.BaseFieldContext, Is.SameAs(first));
+            Assert.That((GenericInstanceFieldLayout.FindStaticFieldAtOffset(instance, 8) as ConcreteGenericFieldAnalysisContext)!.BaseFieldContext, Is.SameAs(second));
+        });
     }
 }

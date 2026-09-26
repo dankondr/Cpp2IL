@@ -46,7 +46,7 @@ public static class KeyFunctionRecovery
             if (ObjectNewFunctions.Contains(keyFunction))
                 RewriteObjectNew(instruction);
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.il2cpp_codegen_write_barrier))
-                RemoveWriteBarrier(instruction);
+                RemoveWriteBarrier(instruction, method);
             else if (RaiseExceptionFunctions.Contains(keyFunction))
                 RewriteRaiseException(instruction);
             else if (BoxFunctions.Contains(keyFunction))
@@ -103,11 +103,59 @@ public static class KeyFunctionRecovery
         };
     }
 
-    private static void RemoveWriteBarrier(Instruction instruction)
+    private static void RemoveWriteBarrier(Instruction instruction, MethodAnalysisContext method)
     {
+        // il2cpp_codegen_write_barrier(dst, obj) performs *dst = obj with GC bookkeeping - the
+        // store is real, so keep it. Dropping it loses both the write and the type flow to any
+        // later reader of the cell.
+        var args = (instruction.OpCode switch
+        {
+            OpCode.Call => instruction.Operands.Skip(2),
+            OpCode.CallVoid => instruction.Operands.Skip(1),
+            _ => [],
+        }).ToList();
+        var definitions = method.ControlFlowGraph!.Instructions
+            .Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!)
+            .Where(g => g.Count() == 1)
+            .ToDictionary(g => g.Key, g => g.Single());
+        if (args is [{ } dstOperand, { } valueOperand, ..]
+            && WriteBarrierCell(dstOperand, definitions) is { } cell)
+        {
+            // The value arg is often a register copy of the stored object - writing the operand it
+            // was copied from keeps the cell's type tied to the actual object, not the (often
+            // erased) declared signature of the helper.
+            instruction.OpCode = OpCode.Move;
+            instruction.SetOperands(cell, WriteBarrierValue(valueOperand, definitions, []));
+            return;
+        }
         instruction.OpCode = OpCode.Nop;
         instruction.SetOperands();
     }
+
+    private static IOperand WriteBarrierValue(IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions, HashSet<LocalVariable> visiting)
+        => operand switch
+        {
+            LocalVariable local when visiting.Add(local)
+                && definitions.TryGetValue(local, out var def)
+                && def is { OpCode: OpCode.Move, Operands: [_, { } source] }
+                => WriteBarrierValue(source, definitions, visiting),
+            _ => operand,
+        };
+
+    // The barrier's destination operand is the local holding the slot address - usually defined by
+    // a `Move addr, &cell`. Resolve it (or a direct &cell) to the cell it writes.
+    private static LocalVariable? WriteBarrierCell(IOperand dstOperand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+        => dstOperand switch
+        {
+            AddressOf { Target: LocalVariable cell } => cell,
+            LocalVariable dst when definitions.TryGetValue(dst, out var def)
+                && def is { OpCode: OpCode.Move, Operands: [_, AddressOf { Target: LocalVariable cell }] }
+                => cell,
+            _ => null,
+        };
     
     private static void RewriteRaiseException(Instruction instruction)
     {
