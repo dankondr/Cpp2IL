@@ -38,6 +38,8 @@ public static class KeyFunctionRecovery
 
     public static void Run(MethodAnalysisContext method)
     {
+        RewriteArrayElementClassLoads(method);
+
         foreach (var instruction in method.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))
         {
             if (instruction.Operands is not [StringLiteral { Value: var keyFunction }, ..])
@@ -59,6 +61,40 @@ public static class KeyFunctionRecovery
                 RewriteInternalCallResolve(instruction, method);
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.il2cpp_codegen_get_thread_static_data))
                 RewriteThreadStaticData(instruction, method);
+        }
+    }
+
+    private static void RewriteArrayElementClassLoads(MethodAnalysisContext method)
+    {
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction is not
+                {
+                    OpCode: OpCode.Move,
+                    Operands:
+                    [LocalVariable destination,
+                        MemoryOperand
+                        {
+                            Base: LocalVariable
+                            {
+                                Type: RuntimeClassTypeAnalysisContext
+                                {
+                                    RepresentedType: WrappedTypeAnalysisContext array
+                                        and (SzArrayTypeAnalysisContext or ArrayTypeAnalysisContext)
+                                }
+                            },
+                            Index: null,
+                            Scale: 0,
+                            Addend: >= 0 and <= uint.MaxValue and var offset
+                        }]
+                }
+                || !Il2CppClassUsefulOffsets.IsElementTypePtr((uint)offset, method.AppContext.Binary.is32Bit))
+                continue;
+
+            var elementClass = new RuntimeClassTypeAnalysisContext(array.ElementType,
+                array.ElementType.DeclaringAssembly);
+            instruction.SetOperand(1, elementClass);
+            destination.Type = elementClass;
         }
     }
 
