@@ -128,22 +128,228 @@ public class BlockMemoryImportRecoveryTests
     }
 
     [Test]
-    public void NonRawArgumentLayoutDoesNotRewrite()
+    public void MissingArgumentSlotsDoesNotRewrite()
     {
         var caller = CallerWithUnresolvedCall(out var call);
-        call.SetOperand(4, Reg("X9", _int64));
+        call.SetOperands(call.Operands[0], call.Operands[1], call.Operands[2]);
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memcpy"), Is.False);
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+    }
+
+    // The dominant real dst shape: an integral local defined by `obj + fieldOffset`
+    // arithmetic over a managed base. The write is legal only when every field the
+    // immediate byte range covers is reference-free.
+    private TypeAnalysisContext PodClass(params (string Name, TypeAnalysisContext Type, int Offset)[] fields)
+    {
+        var owner = new InjectedTypeAnalysisContext(_app.AssembliesByName["mscorlib"], "Tests", "Pod",
+            _app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
+        foreach (var (name, type, offset) in fields)
+            owner.Fields.Add(new InjectedFieldAnalysisContext(name, type,
+                R.FieldAttributes.Public, owner, offset));
+        return owner;
+    }
+
+    private MethodAnalysisContext CallerWithDefinedDst(out Instruction call,
+        Instruction dstDef, LocalVariable dst, TypeAnalysisContext? countType = null,
+        TypeAnalysisContext? srcType = null)
+    {
+        var caller = CallerWithUnresolvedCall(out call, dstType: _int64, countType: countType,
+            srcType: srcType);
+        // ControlFlowGraph.Instructions is a flattened copy - rebuild the graph so
+        // the definition actually reaches the pass.
+        var rest = caller.ControlFlowGraph!.Instructions.ToList();
+        caller.ControlFlowGraph = new ISILControlFlowGraph([dstDef, .. rest]);
+        call.SetOperand(2, dst);
+        caller.Locals!.Add(dst);
+        return caller;
+    }
+
+    [Test]
+    public void IntegralDstFromManagedFieldOffsetRewrites()
+    {
+        // dst = pod + 0x10 where pod's field@0x10 is an int32 inside a POD class:
+        // memcpy(podField, src, 4) writes a reference-free field region.
+        var pod = PodClass(("a", _int32, 0x10), ("b", _int64, 0x18));
+        var podLocal = new LocalVariable("pod", new Register(0, "X19"), pod);
+        var dst = new LocalVariable("dst", new Register(0, "X0"), _int64);
+        var def = new Instruction(0, OpCode.Add, dst, podLocal, new Immediate(0x10));
+        var caller = CallerWithDefinedDst(out var call, def, dst);
+        caller.Locals!.Add(podLocal);
+        call.SetOperand(4, new Immediate(4));
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memcpy"), Is.True);
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.MemoryCopy));
+    }
+
+    [Test]
+    public void IntegralDstIntoReferenceFieldDoesNotRewrite()
+    {
+        // pod + 0x18 lands on a `string` field: the copy would write a managed
+        // reference slot without a barrier.
+        var pod = PodClass(("a", _int32, 0x10), ("s", _app.SystemTypes.SystemStringType, 0x18));
+        var podLocal = new LocalVariable("pod", new Register(0, "X19"), pod);
+        var dst = new LocalVariable("dst", new Register(0, "X0"), _int64);
+        var def = new Instruction(0, OpCode.Add, dst, podLocal, new Immediate(0x18));
+        var caller = CallerWithDefinedDst(out var call, def, dst);
+        caller.Locals!.Add(podLocal);
+        call.SetOperand(4, new Immediate(8));
         Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memcpy"), Is.False);
         Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
     }
 
     [Test]
+    public void IntegralDstSpanningIntoReferenceFieldDoesNotRewrite()
+    {
+        // Range [0x10, 0x20) covers the POD field @0x10 and the reference field @0x18.
+        var pod = PodClass(("a", _int32, 0x10), ("s", _app.SystemTypes.SystemStringType, 0x18),
+            ("b", _int64, 0x20));
+        var podLocal = new LocalVariable("pod", new Register(0, "X19"), pod);
+        var dst = new LocalVariable("dst", new Register(0, "X0"), _int64);
+        var def = new Instruction(0, OpCode.Add, dst, podLocal, new Immediate(0x10));
+        var caller = CallerWithDefinedDst(out var call, def, dst);
+        caller.Locals!.Add(podLocal);
+        call.SetOperand(4, new Immediate(0x10));
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memcpy"), Is.False);
+    }
+
+    [Test]
+    public void IntegralDstPastKnownFieldsWithoutSizeDoesNotRewrite()
+    {
+        // Range ending past the last declared field with no instance-size metadata:
+        // the tail bytes are unprovable, so the honest answer is to keep the call.
+        var pod = PodClass(("a", _int32, 0x10));
+        var podLocal = new LocalVariable("pod", new Register(0, "X19"), pod);
+        var dst = new LocalVariable("dst", new Register(0, "X0"), _int64);
+        var def = new Instruction(0, OpCode.Add, dst, podLocal, new Immediate(0x10));
+        var caller = CallerWithDefinedDst(out var call, def, dst);
+        caller.Locals!.Add(podLocal);
+        call.SetOperand(4, new Immediate(0x40));
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memcpy"), Is.False);
+    }
+
+    [Test]
+    public void IntegralDstFromIntPtrMoveRewrites()
+    {
+        var source = new LocalVariable("src", new Register(0, "X19"), _intPtr);
+        var dst = new LocalVariable("dst", new Register(0, "X0"), _int64);
+        var def = new Instruction(0, OpCode.Move, dst, source);
+        var caller = CallerWithDefinedDst(out var call, def, dst, srcType: _int32);
+        caller.Locals!.Add(source);
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memset"), Is.True);
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.MemorySet));
+    }
+
+    [Test]
+    public void IntegralParamWithoutDefinitionsDoesNotRewrite()
+    {
+        // A bare integer is a number, not a proven pointer.
+        var caller = CallerWithUnresolvedCall(out var call, dstType: _int64);
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memcpy"), Is.False);
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+    }
+
+    [Test]
+    public void UntypedDstFromManagedMoveRewritesWhenBounded()
+    {
+        // The commonest real shape: mov x0, x19 where x19 is a managed reference -
+        // post-forwarding the dst local is untyped but every definition stores the
+        // real object reference, and conv.u yields the object base address.
+        var pod = PodClass(("a", _int32, 0x10), ("b", _int64, 0x18));
+        var podLocal = new LocalVariable("pod", new Register(0, "X19"), pod);
+        var dst = new LocalVariable("dst", new Register(0, "X0"), null);
+        var def = new Instruction(0, OpCode.Move, dst, podLocal);
+        var caller = CallerWithDefinedDst(out var call, def, dst);
+        caller.Locals!.Add(podLocal);
+        call.SetOperand(4, new Immediate(0x20));
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memcpy"), Is.True);
+    }
+
+    [Test]
+    public void UntypedDstFromIntegralMoveDoesNotRewrite()
+    {
+        // The untyped local would hold a boxed integer - conv.u reads the box header,
+        // not the pointer value.
+        var source = new LocalVariable("src", new Register(0, "X19"), _int64);
+        var dst = new LocalVariable("dst", new Register(0, "X0"), null);
+        var def = new Instruction(0, OpCode.Move, dst, source);
+        var caller = CallerWithDefinedDst(out var call, def, dst);
+        caller.Locals!.Add(source);
+        call.SetOperand(4, new Immediate(8));
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memcpy"), Is.False);
+    }
+
+    [Test]
+    public void ManagedObjectDestinationWithDynamicCountDoesNotRewrite()
+    {
+        var pod = PodClass(("a", _int32, 0x10), ("b", _int64, 0x18));
+        var caller = CallerWithUnresolvedCall(out var call, dstType: pod);
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memcpy"), Is.False);
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+    }
+
+    [Test]
+    public void ManagedObjectDestinationWithinBoundsRewrites()
+    {
+        var pod = PodClass(("a", _int32, 0x10), ("b", _int64, 0x18));
+        var caller = CallerWithUnresolvedCall(out var call, dstType: pod);
+        call.SetOperand(4, new Immediate(0x20));
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memcpy"), Is.True);
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.MemoryCopy));
+    }
+
+    [Test]
     public void ManagedReferenceDestinationDoesNotRewrite()
     {
-        // A `string`-typed operand emits as a reference, not a pointer - it cannot be
-        // a byte-copy destination at all.
+        // A `string` destination over a dynamic count cannot be bounded to a proven
+        // reference-free span.
         var caller = CallerWithUnresolvedCall(out var call, dstType: _app.SystemTypes.SystemStringType);
         Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memcpy"), Is.False);
         Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+    }
+
+    [Test]
+    public void SzArrayElementDestinationRewrites()
+    {
+        var caller = CallerWithUnresolvedCall(out var call, dstType: _byteArray);
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memcpy"), Is.True);
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.MemoryCopy));
+    }
+
+    [Test]
+    public void ManagedSourceIsRepresentableForMemcpy()
+    {
+        // A managed reference as memcpy src: conv.u yields the object address and
+        // reading it needs no barrier.
+        var caller = CallerWithUnresolvedCall(out var call, srcType: _byteArray);
+        call.SetOperand(4, new Immediate(8));
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memcpy"), Is.True);
+    }
+
+    [Test]
+    public void ObjectTypedSourceDoesNotRewrite()
+    {
+        // An `object` operand may be a boxed integer; conv.u would read the box.
+        var caller = CallerWithUnresolvedCall(out var call,
+            srcType: _app.SystemTypes.SystemObjectType);
+        call.SetOperand(4, new Immediate(8));
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memcpy"), Is.False);
+    }
+
+    [Test]
+    public void ObjectTypedResultDoesNotRewrite()
+    {
+        var caller = CallerWithUnresolvedCall(out var call, resultUsed: true);
+        ((LocalVariable)call.Operands[1]).Type = _app.SystemTypes.SystemObjectType;
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memcpy"), Is.False);
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+    }
+
+    [Test]
+    public void IntegralResultIsKept()
+    {
+        var caller = CallerWithUnresolvedCall(out var call, resultUsed: true);
+        ((LocalVariable)call.Operands[1]).Type = _int64;
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memcpy"), Is.True);
+        Assert.That(call.Operands, Has.Count.EqualTo(4));
     }
 
     [Test]
@@ -180,7 +386,8 @@ public class BlockMemoryImportRecoveryTests
         // Absolute addresses and literal sizes are honest unmanaged shapes.
         var caller = CallerWithUnresolvedCall(out _);
         var immediate = new Immediate(0x200000);
-        Assert.That(BlockMemoryImportRecovery.IsProvablyReferenceFreeRegion(immediate, caller), Is.True);
+        Assert.That(BlockMemoryImportRecovery.IsProvablyReferenceFreeRegion(immediate,
+            new Immediate(8), caller), Is.True);
         Assert.That(BlockMemoryImportRecovery.IsPointerOperandRepresentable(immediate, caller), Is.True);
         Assert.That(BlockMemoryImportRecovery.IsScalarOperand(immediate, caller), Is.True);
     }

@@ -6047,7 +6047,7 @@ public static class IlGenerator
         var contentProvable = instruction.OpCode == OpCode.MemorySet
             ? Analysis.BlockMemoryImportRecovery.IsScalarOperand(content, context)
             : Analysis.BlockMemoryImportRecovery.IsPointerOperandRepresentable(content, context);
-        if (!Analysis.BlockMemoryImportRecovery.IsProvablyReferenceFreeRegion(destination, context)
+        if (!Analysis.BlockMemoryImportRecovery.IsProvablyReferenceFreeRegion(destination, count, context)
             || !contentProvable
             || !Analysis.BlockMemoryImportRecovery.IsScalarOperand(count, context))
         {
@@ -6092,10 +6092,15 @@ public static class IlGenerator
         }
 
         // libc memcpy/memset/memmove return the destination pointer; a still-read
-        // result local receives it as a native int.
+        // result local receives it, coerced to the local's stack type.
         if (instruction.Operands.Count == 4 && instruction.Operands[3] is { } result)
         {
             EmitBlockPointerOperand(destination, true, context, method, locals, writeLine);
+            switch (IntegralStackWidth(EmittedOperandType(result, context)))
+            {
+                case 8: instructions.Add(CilOpCodes.Conv_I8); break;
+                case 4: instructions.Add(CilOpCodes.Conv_I4); break;
+            }
             StoreToOperand(result, method, locals, writeLine, context);
         }
     }
