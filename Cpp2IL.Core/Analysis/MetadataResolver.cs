@@ -11,6 +11,7 @@ using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
 using LibCpp2IL;
 using LibCpp2IL.Elf;
+using LibCpp2IL.PE;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -422,7 +423,7 @@ public static class MetadataResolver
 
         var loaded = false;
         var thisRegisters = new HashSet<Iced.Intel.Register>
-            { Iced.Intel.Register.RCX, Iced.Intel.Register.RDI }; // win64 / sysv `this`
+            { app.Binary is PE ? Iced.Intel.Register.RCX : Iced.Intel.Register.RDI };
         foreach (var insn in body)
         {
             switch (insn.Mnemonic)
