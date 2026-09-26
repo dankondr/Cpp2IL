@@ -418,6 +418,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Needs type resolved for delegate locals
         DelegateInvokeRecovery.Run(this);
+        // Needs klass/method-info locals typed, so runs after the same resolution
+        TailCallRecovery.Run(this);
         BooleanFlagSimplifier.Run(this);
         DeadCodeEliminator.Run(this);
         finishInterfaceDispatchRecovery?.Invoke();
