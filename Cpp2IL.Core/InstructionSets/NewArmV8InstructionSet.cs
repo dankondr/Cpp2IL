@@ -22,6 +22,26 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
     private static readonly Arm64CallingConventionResolver CallingConventions = new();
 
+    // Scalar libm imports with an exact managed spelling. fmod/fmodf are truncated
+    // remainders (sign of the dividend), which is precisely CIL `rem` —
+    // Math.IEEERemainder rounds the quotient instead, so Method=null maps them to
+    // OpCode.Modulo rather than a call.
+    internal static readonly IReadOnlyDictionary<string, (string? Method, bool IsDouble, int ArgumentCount)> ScalarMathImports
+        = new Dictionary<string, (string?, bool, int)>
+        {
+            ["sinf"] = ("Sin", false, 1),     ["sin"] = ("Sin", true, 1),
+            ["cosf"] = ("Cos", false, 1),     ["cos"] = ("Cos", true, 1),
+            ["tanf"] = ("Tan", false, 1),     ["tan"] = ("Tan", true, 1),
+            ["asinf"] = ("Asin", false, 1),   ["asin"] = ("Asin", true, 1),
+            ["acosf"] = ("Acos", false, 1),   ["acos"] = ("Acos", true, 1),
+            ["atanf"] = ("Atan", false, 1),   ["atan"] = ("Atan", true, 1),
+            ["expf"] = ("Exp", false, 1),     ["exp"] = ("Exp", true, 1),
+            ["logf"] = ("Log", false, 1),     ["log"] = ("Log", true, 1),
+            ["atan2f"] = ("Atan2", false, 2), ["atan2"] = ("Atan2", true, 2),
+            ["powf"] = ("Pow", false, 2),     ["pow"] = ("Pow", true, 2),
+            ["fmodf"] = (null, false, 2),    ["fmod"] = (null, true, 2),
+        };
+
     public override BaseCallingConventionResolver CallingConventionResolver => CallingConventions;
 
     private static Immediate Imm(long value) => new(value);
@@ -159,7 +179,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     public override List<Instruction> GetIsilFromMethod(MethodAnalysisContext context)
         => ConvertInstructions(NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext, context.UnderlyingPointer), context);
 
-    internal List<Instruction> ConvertInstructions(IEnumerable<Arm64Instruction> insns, MethodAnalysisContext context)
+    internal List<Instruction> ConvertInstructions(IEnumerable<Arm64Instruction> insns, MethodAnalysisContext context,
+        Func<ulong, string?>? importNameResolver = null)
     {
         if (adrpOffsets == null) // initializers for ThreadStatic fields only run on the first thread
             adrpOffsets = new();
@@ -176,7 +197,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         scalarizer.Begin(instructionList);
 
         foreach (var instruction in instructionList)
-            ConvertInstructionStatement(instruction, instructions, addresses, context, scalarizer);
+            ConvertInstructionStatement(instruction, instructions, addresses, context, scalarizer, importNameResolver);
 
         // Add return if the function doesn't end with one already
         if (instructions.Count > 0 && instructions[^1].OpCode != OpCode.Return)
@@ -216,7 +237,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return instructions;
     }
 
-    private void ConvertInstructionStatement(Arm64Instruction instruction, List<Instruction> instructions, List<ulong> addresses, MethodAnalysisContext context, Arm64VectorScalarizer scalarizer)
+    private void ConvertInstructionStatement(Arm64Instruction instruction, List<Instruction> instructions, List<ulong> addresses, MethodAnalysisContext context, Arm64VectorScalarizer scalarizer, Func<ulong, string?>? importNameResolver)
     {
         var address = instruction.Address;
 
@@ -279,7 +300,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
                 call.AddOperands(CallingConventions.ResolveForManaged(ctx));
             }
-            else
+            else if (!TryEmitScalarMathImport(target))
             {
                 // Not a managed method, so we don't know its signature, preserve all argument registers
                 var call = Add(address, OpCode.Call, Imm(target), new Register(null, "X0"));
@@ -583,6 +604,37 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             call.AddOperands(arguments);
             if (!isDouble)
                 call.NativeFloatWidthBits = 32;
+        }
+
+        // A call target that is an adrp+ldr(+add)+br GOT trampoline names its
+        // import through the dynamic relocation on the pointer slot. Pure scalar
+        // libm calls lower to their managed equivalents; AAPCS64 passes the
+        // first float/double arguments in s0/d0..s1/d1 (normalized V0/V1) and
+        // leaves the scalar result in s0/d0. Anything unrecognized keeps the
+        // unresolved call target — imports are never masked as key functions.
+        bool TryEmitScalarMathImport(ulong callTarget)
+        {
+            var importName = importNameResolver != null
+                ? importNameResolver(callTarget)
+                : NewArm64KeyFunctionAddresses.TryResolveGotVeneerImportName(context.AppContext.Binary, callTarget, out var resolved)
+                    ? resolved
+                    : null;
+
+            if (importName == null || !ScalarMathImports.TryGetValue(importName, out var import))
+                return false;
+
+            var result = new Register(null, "V0");
+            if (import.Method is not { } managedName)
+            {
+                Add(address, OpCode.Modulo, result, new Register(null, "V0"), new Register(null, "V1"))
+                    .NativeFloatWidthBits = import.IsDouble ? 64 : 32;
+                return true;
+            }
+            if (import.ArgumentCount == 2)
+                EmitMathBinary(managedName, result, new Register(null, "V0"), new Register(null, "V1"), import.IsDouble);
+            else
+                EmitMathUnary(managedName, result, new Register(null, "V0"), import.IsDouble);
+            return true;
         }
 
         TypeAnalysisContext? UnityVector4() => context.AppContext.AssembliesByName

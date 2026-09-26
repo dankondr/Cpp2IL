@@ -54,6 +54,90 @@ public class KeyFunctionRecoveryTests
     }
 
     [Test]
+    public void NativeExceptionWrapperThrowBecomesManagedThrow()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var allocation = new LocalVariable("allocation", new Register(null, "x0"));
+        var exception = new LocalVariable("exception", new Register(null, "x1"))
+            { Type = app.SystemTypes.SystemExceptionType };
+        var allocate = new Instruction(0, OpCode.Call,
+            new StringLiteral("__cxa_allocate_exception"), allocation,
+            new Immediate(app.Binary.is32Bit ? 4 : 8));
+        var store = new Instruction(1, OpCode.Move, new MemoryOperand(allocation), exception);
+        var nativeThrow = new Instruction(2, OpCode.Call,
+            new StringLiteral("__cxa_throw"), new LocalVariable("unused", new Register(null, "x0")),
+            allocation, new Immediate(0x1234), new Immediate(0));
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([allocate, store, nativeThrow])
+        };
+
+        var rewritten = KeyFunctionRecovery.RewriteNativeExceptionThrow(method, nativeThrow, _ => true);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(rewritten, Is.True);
+            Assert.That(allocate.OpCode, Is.EqualTo(OpCode.Nop));
+            Assert.That(store.OpCode, Is.EqualTo(OpCode.Nop));
+            Assert.That(nativeThrow.OpCode, Is.EqualTo(OpCode.Throw));
+            Assert.That(nativeThrow.Operands[0], Is.SameAs(exception));
+        });
+    }
+
+    [Test]
+    public void NativeExceptionWrapperWithEscapingAllocationIsPreserved()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var allocation = new LocalVariable("allocation", new Register(null, "x0"));
+        var exception = new LocalVariable("exception", new Register(null, "x1"));
+        var allocate = new Instruction(0, OpCode.Call,
+            new StringLiteral("__cxa_allocate_exception"), allocation,
+            new Immediate(app.Binary.is32Bit ? 4 : 8));
+        var store = new Instruction(1, OpCode.Move, new MemoryOperand(allocation), exception);
+        var escape = new Instruction(2, OpCode.Move,
+            new LocalVariable("copy", new Register(null, "x2")), allocation);
+        var nativeThrow = new Instruction(3, OpCode.CallVoid, new StringLiteral("__cxa_throw"),
+            allocation, new Immediate(0x1234), new Immediate(0));
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([allocate, store, escape, nativeThrow])
+        };
+
+        Assert.That(KeyFunctionRecovery.RewriteNativeExceptionThrow(method, nativeThrow, _ => true), Is.False);
+        Assert.That(nativeThrow.OpCode, Is.EqualTo(OpCode.CallVoid));
+    }
+
+    [Test]
+    public void MistypedExceptionWrapperCellStillBecomesManagedThrow()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var allocation = new LocalVariable("allocation", new Register(null, "x0"));
+        var exception = new LocalVariable("exception", new Register(null, "x1"));
+        var fakeOwner = app.SystemTypes.SystemExceptionType;
+        var fakeField = fakeOwner.Fields[0];
+        var priorUse = new Instruction(-1, OpCode.Move,
+            new LocalVariable("prior", new Register(null, "x2")), allocation);
+        var allocate = new Instruction(0, OpCode.Call,
+            new StringLiteral("__cxa_allocate_exception"), allocation,
+            new Immediate(app.Binary.is32Bit ? 4 : 8));
+        var store = new Instruction(1, OpCode.Move,
+            new FieldReference(fakeField, allocation, 0), exception);
+        var nativeThrow = new Instruction(4, OpCode.CallVoid, new StringLiteral("__cxa_throw"),
+            allocation, new Immediate(0x1234), new Immediate(0));
+        var guard = new Instruction(2, OpCode.ConditionalJump, nativeThrow, new Immediate(1));
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([priorUse, allocate, store, guard, new(3, OpCode.Nop), nativeThrow])
+        };
+
+        Assert.That(KeyFunctionRecovery.RewriteNativeExceptionThrow(method, nativeThrow, _ => true), Is.True);
+        Assert.That(nativeThrow.Operands[0], Is.SameAs(exception));
+    }
+
+    [Test]
     public void IsInstHelperBecomesManagedReferenceCast()
     {
         var app = Cpp2IlApi.CurrentAppContext!;
