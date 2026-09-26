@@ -4,11 +4,13 @@ using System.Linq;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Model.Contexts;
 
 namespace Cpp2IL.Core.Tests.Analysis;
 
 public class MetadataInitGuardRemoverTests
 {
+    private static ApplicationAnalysisContext App => Cpp2IlApi.CurrentAppContext!;
     [SetUp]
     public void Setup()
     {
@@ -165,5 +167,112 @@ public class MetadataInitGuardRemoverTests
         MetadataInitGuardRemover.Run(graph, 0x135);
 
         Assert.That(graph.Instructions.Any(instruction => instruction.IsCall), Is.False);
+    }
+
+    // if ([ctx + rgctxOffset] == 0) { <unresolved helper>(ctx); } - the shape codegen emits around
+    // the extra generic-context argument's lazily-initialized rgctx slot.
+    private static (InjectedMethodAnalysisContext Method, ISILControlFlowGraph Graph) LazyContextFixture(
+        LocalVariable context, long slotOffset, IOperand callTarget, IOperand callArgument,
+        IOperand[] parameterOperands)
+    {
+        var condition = new LocalVariable("condition", new Register(null, "condition"));
+        var negated = new LocalVariable("negated", new Register(null, "negated"));
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var reloaded = new LocalVariable("reloaded", new Register(null, "reloaded"));
+        var init = new Instruction(3, OpCode.Nop);
+        var merge = new Instruction(6, OpCode.Move, reloaded, new MemoryOperand(context, addend: slotOffset));
+        var method = new InjectedMethodAnalysisContext(App.SystemTypes.SystemObjectType, "Fixture",
+            App.SystemTypes.SystemObjectType, System.Reflection.MethodAttributes.Static,
+            [App.SystemTypes.SystemObjectType]);
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.CheckEqual, condition, new MemoryOperand(context, addend: slotOffset), new Immediate(0)),
+            new(1, OpCode.Not, negated, condition),
+            new(2, OpCode.ConditionalJump, merge, negated),
+            init,
+            new(4, OpCode.Call, callTarget, result, callArgument),
+            new(5, OpCode.Jump, merge),
+            merge,
+            new(7, OpCode.Return, reloaded),
+        };
+        method.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        method.ParameterOperands = parameterOperands.ToList();
+        return (method, method.ControlFlowGraph);
+    }
+
+    private static readonly IOperand[] OneParamAndMethodInfoOperands =
+        [new Register(null, "X0"), new Register(null, "X1")];
+
+    [Test]
+    public void RgctxGuardForUntypedExtraContextArgumentIsExcised()
+    {
+        // X2 holds the extra generic-context argument: untyped, and beyond the signature's operands.
+        var context = new LocalVariable("context", new Register(null, "X2"));
+        var (method, graph) = LazyContextFixture(context, 0x38,
+            new Immediate(0x12345678), context, OneParamAndMethodInfoOperands);
+
+        MetadataInitGuardRemover.RunRgctx(method);
+
+        Assert.That(graph.Instructions.Any(instruction => instruction.IsCall), Is.False);
+        Assert.That(graph.Instructions.Any(instruction => instruction.OpCode == OpCode.Move
+            && instruction.Operands is [_, MemoryOperand { Addend: 0x38 }]), Is.True);
+    }
+
+    [Test]
+    public void RgctxGuardOnDeclaredParameterRegisterIsKept()
+    {
+        // Same shape, but the guarded base occupies a register the signature accounts for -
+        // indistinguishable from a user lazy field init, so the call must survive.
+        var context = new LocalVariable("context", new Register(null, "X0"));
+        var (method, graph) = LazyContextFixture(context, 0x38,
+            new Immediate(0x12345678), context, OneParamAndMethodInfoOperands);
+
+        MetadataInitGuardRemover.RunRgctx(method);
+
+        Assert.That(graph.Instructions.Any(instruction => instruction.IsCall), Is.True);
+    }
+
+    [Test]
+    public void RgctxGuardKeepsArmCallThatDoesNotTakeTheContext()
+    {
+        // The region call has to be provably an initializer of the guarded object; a helper taking
+        // a different argument is an arbitrary effect and the guard stays.
+        var context = new LocalVariable("context", new Register(null, "X2"));
+        var other = new LocalVariable("other", new Register(null, "X3"));
+        var (method, graph) = LazyContextFixture(context, 0x38,
+            new Immediate(0x12345678), other, OneParamAndMethodInfoOperands);
+
+        MetadataInitGuardRemover.RunRgctx(method);
+
+        Assert.That(graph.Instructions.Any(instruction => instruction.IsCall), Is.True);
+    }
+
+    [Test]
+    public void RgctxGuardKeepsResolvedManagedCallee()
+    {
+        // A managed call we resolved is user code, not an init helper; keep the guard.
+        var context = new LocalVariable("context", new Register(null, "X2"));
+        var callee = new InjectedMethodAnalysisContext(App.SystemTypes.SystemObjectType, "Helper",
+            App.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static,
+            [App.SystemTypes.SystemObjectType]);
+        var (method, graph) = LazyContextFixture(context, 0x38,
+            callee, context, OneParamAndMethodInfoOperands);
+
+        MetadataInitGuardRemover.RunRgctx(method);
+
+        Assert.That(graph.Instructions.Any(instruction => instruction.IsCall), Is.True);
+    }
+
+    [Test]
+    public void GuardOnADifferentFieldOffsetIsKept()
+    {
+        // The rgctx slot offset is the discriminator; a different field must not match.
+        var context = new LocalVariable("context", new Register(null, "X2"));
+        var (method, graph) = LazyContextFixture(context, 0x40,
+            new Immediate(0x12345678), context, OneParamAndMethodInfoOperands);
+
+        MetadataInitGuardRemover.RunRgctx(method);
+
+        Assert.That(graph.Instructions.Any(instruction => instruction.IsCall), Is.True);
     }
 }

@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
@@ -52,14 +53,15 @@ public static class MetadataInitGuardRemover
         var removedAny = false;
 
         foreach (var guard in cfg.Blocks.ToList())
-            removedAny |= TryRemoveRgctxGuard(cfg, guard, rgctxOffset);
+            removedAny |= TryRemoveRgctxGuard(method, guard, rgctxOffset);
 
         if (removedAny)
             DeadCodeEliminator.Run(cfg);
     }
 
-    private static bool TryRemoveRgctxGuard(ISILControlFlowGraph cfg, Block guard, long rgctxOffset)
+    private static bool TryRemoveRgctxGuard(MethodAnalysisContext method, Block guard, long rgctxOffset)
     {
+        var cfg = method.ControlFlowGraph!;
         if (guard.BlockType != BlockType.TwoWay || guard.Successors.Count != 2
             || guard.Instructions.Count == 0 || guard.Instructions[^1].OpCode != OpCode.ConditionalJump)
             return false;
@@ -69,20 +71,70 @@ public static class MetadataInitGuardRemover
             && (IsRgctxLoad(i.Operands[1], rgctxOffset) && IsZero(i.Operands[2])
                 || IsRgctxLoad(i.Operands[2], rgctxOffset) && IsZero(i.Operands[1])));
 
+        // The calling convention models a single hidden MethodInfo* argument, but newer codegen
+        // passes generic methods a second runtime-metadata context pointer. It is never typed as
+        // MethodInfo*, so prove the lazy-init shape structurally: the guarded slot is the rgctx
+        // field of a parameter-register local the declared signature does not consume, and the
+        // init arm must call only unresolved helpers, at least one of which takes that local as
+        // an argument. A typed base already proves the field, so this proof is only needed for
+        // the unmodelled extra argument.
+        LocalVariable? contextArgument = null;
         if (!isRgctxGuard)
-            return false;
+        {
+            contextArgument = FindUntypedContextLoad(method, guard, rgctxOffset);
+            if (contextArgument == null)
+                return false;
+        }
 
         var first = guard.Successors[0];
         var second = guard.Successors[1];
 
         // treat region calls as init boilerplate, exactly as the class-init flag test does
-        return TryExcise(cfg, guard, first, second, true)
-            || TryExcise(cfg, guard, second, first, true);
+        return TryExcise(cfg, guard, first, second, true, requiredContextArg: contextArgument)
+            || TryExcise(cfg, guard, second, first, true, requiredContextArg: contextArgument);
     }
 
     private static bool IsRgctxLoad(IOperand operand, long rgctxOffset) =>
         operand is MemoryOperand { Index: null, Scale: 0, Base: LocalVariable { Type: RuntimeMethodInfoAnalysisContext } } memory
         && memory.Addend == rgctxOffset;
+
+    private static LocalVariable? FindUntypedContextLoad(MethodAnalysisContext method, Block guard, long rgctxOffset)
+    {
+        foreach (var comparison in guard.Instructions.Where(i => i.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual))
+        {
+            for (var i = 1; i <= 2; i++)
+            {
+                if (!IsZero(comparison.Operands[3 - i]))
+                    continue;
+
+                if (TryGetUntypedContextBase(comparison.Operands[i], rgctxOffset, out var direct)
+                    && IsExtraContextLocal(method, direct))
+                    return direct;
+
+                if (GetLoadedMemory(guard, comparison.Operands[i]) is { } loaded
+                    && TryGetUntypedContextBase(loaded, rgctxOffset, out var indirect)
+                    && IsExtraContextLocal(method, indirect))
+                    return indirect;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool TryGetUntypedContextBase(IOperand operand, long rgctxOffset,
+        [NotNullWhen(true)] out LocalVariable? local)
+    {
+        local = operand is MemoryOperand { Index: null, Scale: 0, Addend: var addend, Base: LocalVariable { Type: null } baseLocal }
+            && addend == rgctxOffset ? baseLocal : null;
+        return local != null;
+    }
+
+    // The extra generic-context argument arrives in a register beyond the operands the declared
+    // signature accounts for; anything else (this, real parameters) would be a user lazily-init'd
+    // field, which we must not excise.
+    private static bool IsExtraContextLocal(MethodAnalysisContext method, LocalVariable local) =>
+        method.ParameterOperands.Count > 0
+        && method.ParameterOperands.All(operand => operand is not Register register || register.Number != local.Register.Number);
 
     private static bool IsZero(IOperand operand) => operand is Immediate { Value: 0 };
 
@@ -377,12 +429,12 @@ public static class MetadataInitGuardRemover
                 && value == initialisedFlagOffset));
 
     private static bool TryExcise(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge,
-        bool initialisedFlagTest, MemoryOperand? metadataFlag = null)
+        bool initialisedFlagTest, MemoryOperand? metadataFlag = null, LocalVariable? requiredContextArg = null)
     {
         if (merge == cfg.EntryBlock || merge == cfg.ExitBlock)
             return false;
 
-        if (!TryCollectRegion(cfg, guard, initEntry, merge, initialisedFlagTest, out var region, metadataFlag))
+        if (!TryCollectRegion(cfg, guard, initEntry, merge, initialisedFlagTest, out var region, metadataFlag, requiredContextArg))
             return false;
 
         Excise(cfg, guard, initEntry, merge, region);
@@ -390,7 +442,8 @@ public static class MetadataInitGuardRemover
     }
 
     private static bool TryCollectRegion(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge,
-        bool initialisedFlagTest, out HashSet<Block> region, MemoryOperand? metadataFlag = null)
+        bool initialisedFlagTest, out HashSet<Block> region, MemoryOperand? metadataFlag = null,
+        LocalVariable? requiredContextArg = null)
     {
         region = [];
 
@@ -400,6 +453,7 @@ public static class MetadataInitGuardRemover
         var sawMetadataInit = false;
         var sawClassInit = false;
         var sawFlagStore = false;
+        var sawContextInit = false;
         var reconverges = false;
 
         var queue = new Queue<Block>();
@@ -422,15 +476,18 @@ public static class MetadataInitGuardRemover
             if (!region.Add(block))
                 continue;
 
-            if (!ClassifyBlock(block, initialisedFlagTest, metadataFlag,
-                    ref sawMetadataInit, ref sawClassInit, ref sawFlagStore))
+            if (!ClassifyBlock(block, initialisedFlagTest, metadataFlag, requiredContextArg,
+                    ref sawMetadataInit, ref sawClassInit, ref sawFlagStore, ref sawContextInit))
                 return false;
 
             foreach (var successor in block.Successors)
                 queue.Enqueue(successor);
         }
 
-        if (!reconverges || !(sawClassInit || (sawMetadataInit && sawFlagStore)))
+        var sawInit = requiredContextArg == null
+            ? sawClassInit || (sawMetadataInit && sawFlagStore)
+            : sawContextInit;
+        if (!reconverges || !sawInit)
             return false;
 
         var collected = region;
@@ -449,7 +506,8 @@ public static class MetadataInitGuardRemover
     // call, the flag store, or otherwise side-effect-free (writes a local, not memory). A managed call
     // or any other store would have an effect we cannot silently drop, so it disqualifies the region.
     private static bool ClassifyBlock(Block block, bool initialisedFlagTest, MemoryOperand? metadataFlag,
-        ref bool sawMetadataInit, ref bool sawClassInit, ref bool sawFlagStore)
+        LocalVariable? requiredContextArg,
+        ref bool sawMetadataInit, ref bool sawClassInit, ref bool sawFlagStore, ref bool sawContextInit)
     {
         foreach (var instruction in block.Instructions)
         {
@@ -457,6 +515,28 @@ public static class MetadataInitGuardRemover
             {
                 case OpCode.Jump:
                     break;
+
+                // Structurally-proven lazy-context guard (the unmodelled extra generic-context
+                // argument): only unresolved helpers count, and every one must take the context
+                // object itself as an argument - the proof that each call is "init X" rather than
+                // an arbitrary region call with its own effects.
+                case OpCode.Call or OpCode.CallVoid when requiredContextArg is { } required:
+                    if (instruction.Operands[0] is Immediate)
+                    {
+                        var firstArg = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
+                        if (!instruction.Operands.Skip(firstArg).Contains(required))
+                            return false;
+                        sawContextInit = true;
+                        break;
+                    }
+
+                    // Already-identified init boilerplate nested inside the arm is still boilerplate.
+                    if (instruction.Operands is [StringLiteral { Value: InitializeRuntimeMetadata or InitializeMethod }, ..])
+                    {
+                        sawMetadataInit = true;
+                        break;
+                    }
+                    return false;
 
                 // Behind an initialized_and_no_error test the callee is the class initializer, even if we didn't resolve it.
                 // If we didn't, that's fine, just skip.
