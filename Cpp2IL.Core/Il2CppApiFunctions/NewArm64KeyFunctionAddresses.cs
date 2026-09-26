@@ -3,6 +3,7 @@ using System.Linq;
 using Disarm;
 using Cpp2IL.Core.Logging;
 using Cpp2IL.Core.Utils;
+using LibCpp2IL;
 
 namespace Cpp2IL.Core.Il2CppApiFunctions;
 
@@ -225,12 +226,13 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
 
     // Bounds-checked 4-byte read: null when va is unmappable or fewer than 4
     // bytes of the loaded image remain at the mapped offset.
-    private uint? TryReadWord(ulong va)
+    private uint? TryReadWord(ulong va) => ReadBinaryWord(_appContext.Binary, va);
+
+    private static uint? ReadBinaryWord(Il2CppBinary binary, ulong va)
     {
-        var binary = _appContext.Binary;
         if (!binary.TryMapVirtualAddressToRaw(va, out var raw) || raw < 0 || raw + 4 > binary.RawLength)
             return null;
-        return System.BitConverter.ToUInt32(binary.GetRawBinaryContent().Slice((int)raw, 4).ToArray(), 0);
+        return System.BitConverter.ToUInt32(binary.GetRawBinaryContent().Slice((int)raw, 4));
     }
 
     private bool TryResolveGotVeneer(ulong address, IReadOnlyDictionary<ulong, string> addressToName,
@@ -250,13 +252,38 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
             name = resolved;
             return true;
         }
-        if (binary.TryGetRelocatedSymbolNameAtPointerSlot(slotVa, out var relocated)
-            && relocated == "__cxa_end_catch")
+        if (GetImportSymbolName(binary, slotVa) is { } relocated
+            && relocated is "__cxa_allocate_exception" or "__cxa_throw" or "__cxa_end_catch")
         {
             name = relocated;
             return true;
         }
         return false;
+    }
+
+    // The pointer slot a GOT veneer reads names its import through the dynamic
+    // relocation on the slot: JUMP_SLOT/GLOB_DAT relocations carry the imported
+    // symbol's name even when the relocated slot value does not resolve in-image.
+    internal static string? GetImportSymbolName(Il2CppBinary binary, ulong slotVa)
+        => binary.TryGetRelocatedSymbolNameAtPointerSlot(slotVa, out var name) ? name : null;
+
+    // Structural import resolution: an adrp+ldr(+add)+br GOT trampoline whose
+    // pointer slot carries a named dynamic relocation. Position-independent —
+    // the same words resolve identically at any image base.
+    internal static bool TryResolveGotVeneerImportName(Il2CppBinary binary, ulong address, out string name)
+        => TryResolveGotVeneerImportName(va => ReadBinaryWord(binary, va),
+            va => GetImportSymbolName(binary, va), address, out name);
+
+    internal static bool TryResolveGotVeneerImportName(
+        System.Func<ulong, uint?> read, System.Func<ulong, string?> slotSymbolName,
+        ulong address, out string name)
+    {
+        name = string.Empty;
+        if (!TryDecodeGotVeneerSlot(address, read, out var slotVa)
+            || slotSymbolName(slotVa) is not { Length: > 0 } symbol)
+            return false;
+        name = symbol;
+        return true;
     }
 
     private readonly HashSet<ulong> _rejectedAliasTargets = [];
