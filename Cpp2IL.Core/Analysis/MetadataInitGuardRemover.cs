@@ -49,17 +49,35 @@ public static class MetadataInitGuardRemover
     {
         var cfg = method.ControlFlowGraph!;
         var rgctxOffset = method.AppContext.Binary.is32Bit ? MethodRgctxOffset32 : MethodRgctxOffset64;
+        var flagOffset = method.AppContext.Binary.is32Bit ? InitialisedFlagOffset32 : InitialisedFlagOffset64;
 
         var removedAny = false;
+        HashSet<Block>? initGuards = null;
 
         foreach (var guard in cfg.Blocks.ToList())
-            removedAny |= TryRemoveRgctxGuard(method, guard, rgctxOffset);
+        {
+            initGuards ??= GetInitGuards(method, cfg, rgctxOffset, flagOffset);
+            removedAny |= TryRemoveRgctxGuard(method, guard, rgctxOffset, initGuards);
+        }
 
         if (removedAny)
             DeadCodeEliminator.Run(cfg);
     }
 
-    private static bool TryRemoveRgctxGuard(MethodAnalysisContext method, Block guard, long rgctxOffset)
+    // Blocks that are themselves provable init guards: an rgctx-slot check or an
+    // initialized_and_no_error class flag test. Inside a lazy-init arm such a nested check is part
+    // of the init mechanism itself (e.g. a recheck after a nested metadata-init), so region
+    // collection may treat it as boilerplate.
+    private static HashSet<Block> GetInitGuards(MethodAnalysisContext method, ISILControlFlowGraph cfg,
+        long rgctxOffset, long flagOffset) =>
+        cfg.Blocks.Where(block => block.BlockType == BlockType.TwoWay && block.Successors.Count == 2
+            && block.Instructions.Count > 0 && block.Instructions[^1].OpCode == OpCode.ConditionalJump
+            && (block.Instructions.Any(i => IsInitialisedFlagTest(cfg, i, flagOffset))
+                || TryMatchRgctxGuard(method, block, rgctxOffset, out _)))
+            .ToHashSet();
+
+    private static bool TryRemoveRgctxGuard(MethodAnalysisContext method, Block guard, long rgctxOffset,
+        HashSet<Block> initGuards)
     {
         var cfg = method.ControlFlowGraph!;
         if (guard.BlockType != BlockType.TwoWay || guard.Successors.Count != 2
@@ -73,8 +91,8 @@ public static class MetadataInitGuardRemover
         var second = guard.Successors[1];
 
         // treat region calls as init boilerplate, exactly as the class-init flag test does
-        return TryExcise(cfg, guard, first, second, true, contextRequirement: contextRequirement)
-            || TryExcise(cfg, guard, second, first, true, contextRequirement: contextRequirement);
+        return TryExcise(cfg, guard, first, second, true, contextRequirement: contextRequirement, initGuards: initGuards)
+            || TryExcise(cfg, guard, second, first, true, contextRequirement: contextRequirement, initGuards: initGuards);
     }
 
     // What an unresolved call inside an rgctx-init arm must receive as an argument to count as the
@@ -139,13 +157,15 @@ public static class MetadataInitGuardRemover
                 if (IsRgctxLoad(operand, rgctxOffset))
                     return true;
 
-                if (operand is LocalVariable { Type: MethodRgctxTableTypeAnalysisContext table }
-                    && IsCurrentMethod(table.OwnerMethod, method))
+                if (operand is LocalVariable { Type: MethodRgctxTableTypeAnalysisContext table })
                 {
-                    // the helper call receives the method's own MethodInfo* - the last calling-
-                    // convention parameter - but SSA renames and type resets can detach the arg
-                    // local from it, so bind by the parameter's register as well.
-                    int? methodInfoRegister = method.ParameterOperands.LastOrDefault() is Register register ? register.Number : null;
+                    // the helper call receives the MethodInfo* of the table's owner - which may be
+                    // a generic callee whose context is lazily initialized by the caller. When the
+                    // table belongs to this method the context is the last calling-convention
+                    // parameter - SSA renames and type resets can detach the arg local from it, so
+                    // bind by the parameter's register as well.
+                    int? methodInfoRegister = IsCurrentMethod(table.OwnerMethod, method)
+                        && method.ParameterOperands.LastOrDefault() is Register register ? register.Number : null;
                     requirement = new ContextArgumentRequirement(null, table.OwnerMethod, methodInfoRegister);
                     return true;
                 }
@@ -493,12 +513,13 @@ public static class MetadataInitGuardRemover
                 && value == initialisedFlagOffset));
 
     private static bool TryExcise(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge,
-        bool initialisedFlagTest, MemoryOperand? metadataFlag = null, ContextArgumentRequirement? contextRequirement = null)
+        bool initialisedFlagTest, MemoryOperand? metadataFlag = null, ContextArgumentRequirement? contextRequirement = null,
+        HashSet<Block>? initGuards = null)
     {
         if (merge == cfg.EntryBlock || merge == cfg.ExitBlock)
             return false;
 
-        if (!TryCollectRegion(cfg, guard, initEntry, merge, initialisedFlagTest, out var region, metadataFlag, contextRequirement))
+        if (!TryCollectRegion(cfg, guard, initEntry, merge, initialisedFlagTest, out var region, metadataFlag, contextRequirement, initGuards))
             return false;
 
         Excise(cfg, guard, initEntry, merge, region);
@@ -507,7 +528,7 @@ public static class MetadataInitGuardRemover
 
     private static bool TryCollectRegion(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge,
         bool initialisedFlagTest, out HashSet<Block> region, MemoryOperand? metadataFlag = null,
-        ContextArgumentRequirement? contextRequirement = null)
+        ContextArgumentRequirement? contextRequirement = null, HashSet<Block>? initGuards = null)
     {
         region = [];
 
@@ -540,7 +561,7 @@ public static class MetadataInitGuardRemover
             if (!region.Add(block))
                 continue;
 
-            if (!ClassifyBlock(cfg, block, initialisedFlagTest, metadataFlag, contextRequirement,
+            if (!ClassifyBlock(cfg, block, initialisedFlagTest, metadataFlag, contextRequirement, initGuards,
                     ref sawMetadataInit, ref sawClassInit, ref sawFlagStore, ref sawContextInit))
                 return false;
 
@@ -563,6 +584,33 @@ public static class MetadataInitGuardRemover
                 return false;
         }
 
+        // Region-defined locals must not escape the region: after excision only the merge survives
+        // the boundary, and its phis lose the region's inputs - any other outside read would dangle.
+        if (initGuards != null)
+        {
+            var defined = new HashSet<LocalVariable>();
+            foreach (var block in collected)
+                foreach (var instruction in block.Instructions)
+                    if (instruction.Destination is LocalVariable definedLocal)
+                        defined.Add(definedLocal);
+
+            foreach (var outside in cfg.Blocks)
+            {
+                if (collected.Contains(outside))
+                    continue;
+                foreach (var instruction in outside.Instructions)
+                {
+                    // Phi inputs arriving on the region's back-edges are dropped by Excise.
+                    if (instruction.OpCode == OpCode.Phi)
+                        continue;
+                    if (instruction.SourcesAndConstants.Any(source =>
+                            source is LocalVariable read && defined.Contains(read)
+                            || source is MemoryOperand { Base: LocalVariable memoryBase } && defined.Contains(memoryBase)))
+                        return false;
+                }
+            }
+        }
+
         return true;
     }
 
@@ -570,7 +618,7 @@ public static class MetadataInitGuardRemover
     // call, the flag store, or otherwise side-effect-free (writes a local, not memory). A managed call
     // or any other store would have an effect we cannot silently drop, so it disqualifies the region.
     private static bool ClassifyBlock(ISILControlFlowGraph cfg, Block block, bool initialisedFlagTest, MemoryOperand? metadataFlag,
-        ContextArgumentRequirement? contextRequirement,
+        ContextArgumentRequirement? contextRequirement, HashSet<Block>? initGuards,
         ref bool sawMetadataInit, ref bool sawClassInit, ref bool sawFlagStore, ref bool sawContextInit)
     {
         foreach (var instruction in block.Instructions)
@@ -578,6 +626,20 @@ public static class MetadataInitGuardRemover
             switch (instruction.OpCode)
             {
                 case OpCode.Jump:
+                    break;
+
+                // A nested init guard (rgctx-slot recheck or class-init flag test) is itself provable
+                // boilerplate - both its arms are collected and classified like any region block.
+                case OpCode.ConditionalJump:
+                    if (initGuards == null || !initGuards.Contains(block))
+                        return false;
+                    break;
+
+                // A phi inside a nested region merges the inner guard's arms; any escaping use is
+                // rejected by the post-collection escape check.
+                case OpCode.Phi:
+                    if (initGuards == null)
+                        return false;
                     break;
 
                 // Structurally-proven lazy-context guard: only unresolved helpers count, and every

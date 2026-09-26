@@ -232,7 +232,7 @@ public class MetadataInitGuardRemoverTests
             new(4, OpCode.Call, new Immediate(0x12345678), result, callArgument(method)),
             new(5, OpCode.Jump, merge),
             merge,
-            new(9, OpCode.Return, result),
+            new(9, OpCode.Return, new LocalVariable("returned", new Register(null, "returned"))),
         };
         instructions.InsertRange(3, armPrefix);
         method.ControlFlowGraph = new ISILControlFlowGraph(instructions);
@@ -271,11 +271,99 @@ public class MetadataInitGuardRemoverTests
         Assert.That(graph.Instructions.Any(instruction => instruction.IsCall), Is.False);
     }
 
+    // The chained shape: the outer guard's arm is itself a guard - a metadata-init call followed by
+    // a recheck of the same slot - and the nested guard's arm holds the actual initializer call.
+    private static (InjectedMethodAnalysisContext Method, ISILControlFlowGraph Graph) ChainedGuardFixture(
+        Func<LocalVariable, IOperand> nestedCompareOperand,
+        Func<InjectedMethodAnalysisContext, IOperand> callArgument,
+        bool returnsRegionValue = false)
+    {
+        var method = new InjectedMethodAnalysisContext(App.SystemTypes.SystemObjectType, "Fixture",
+            App.SystemTypes.SystemObjectType, System.Reflection.MethodAttributes.Static,
+            [App.SystemTypes.SystemObjectType]);
+        var assembly = App.SystemTypes.SystemObjectType.DeclaringAssembly;
+        var table = new LocalVariable("table", new Register(null, "X8"))
+        {
+            Type = new MethodRgctxTableTypeAnalysisContext(method, assembly),
+        };
+        var condition = new LocalVariable("condition", new Register(null, "condition"));
+        var negated = new LocalVariable("negated", new Register(null, "negated"));
+        var recheck = new LocalVariable("recheck", new Register(null, "recheck"));
+        var negatedRecheck = new LocalVariable("negatedRecheck", new Register(null, "negatedRecheck"));
+        var initResult = new LocalVariable("initResult", new Register(null, "initResult"));
+        var handle = new LocalVariable("handle", new Register(null, "handle"));
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var merge = new Instruction(11, OpCode.Nop);
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.CheckEqual, condition, table, new Immediate(0)),
+            new(1, OpCode.Not, negated, condition),
+            new(2, OpCode.ConditionalJump, merge, negated),
+            new(3, OpCode.Nop),
+            new(4, OpCode.Call, new StringLiteral("il2cpp_codegen_initialize_runtime_metadata"), initResult, handle),
+            new(5, OpCode.CheckEqual, recheck, nestedCompareOperand(table), new Immediate(0)),
+            new(6, OpCode.Not, negatedRecheck, recheck),
+            new(7, OpCode.ConditionalJump, merge, negatedRecheck),
+            new(8, OpCode.Call, new Immediate(0x12345678), result, callArgument(method)),
+            new(9, OpCode.Jump, merge),
+            merge,
+            returnsRegionValue ? new Instruction(12, OpCode.Return, result) : new Instruction(12, OpCode.Return),
+        };
+        method.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        method.ParameterOperands = OneParamAndMethodInfoOperands.ToList();
+        return (method, method.ControlFlowGraph);
+    }
+
+    private static LocalVariable TypedMethodInfo(MethodAnalysisContext owner) =>
+        new("methodInfo", new Register(null, "X1"))
+        {
+            Type = new RuntimeMethodInfoAnalysisContext(owner,
+                App.SystemTypes.SystemObjectType.DeclaringAssembly),
+        };
+
+    [Test]
+    public void RgctxGuardWhoseArmIsAnotherRgctxGuardIsExcised()
+    {
+        // The nested guard re-tests the same table - both are init boilerplate and the whole chain
+        // collapses.
+        var (method, graph) = ChainedGuardFixture(table => table, TypedMethodInfo);
+
+        MetadataInitGuardRemover.RunRgctx(method);
+
+        Assert.That(graph.Instructions.Any(instruction => instruction.OpCode is OpCode.Call
+            && instruction.Operands is [Immediate, ..]), Is.False);
+    }
+
+    [Test]
+    public void RgctxGuardWithNonInitNestedBranchIsKept()
+    {
+        // The nested conditional checks an unrelated value - not a provable init guard - so the
+        // region may hide real control flow and stays.
+        var (method, graph) = ChainedGuardFixture(
+            _ => new LocalVariable("other", new Register(null, "X9")),
+            TypedMethodInfo);
+
+        MetadataInitGuardRemover.RunRgctx(method);
+
+        Assert.That(graph.Instructions.Any(instruction => instruction.IsCall), Is.True);
+    }
+
+    [Test]
+    public void RgctxGuardRegionWithEscapingValueIsKept()
+    {
+        // The helper's result is read by the merge's Return: excising would dangle it.
+        var (method, graph) = ChainedGuardFixture(table => table, TypedMethodInfo, returnsRegionValue: true);
+
+        MetadataInitGuardRemover.RunRgctx(method);
+
+        Assert.That(graph.Instructions.Any(instruction => instruction.IsCall), Is.True);
+    }
+
     [Test]
     public void RgctxGuardOnAnotherMethodsTableIsKept()
     {
-        // The table belongs to a different method - the guard protects a different context and
-        // excising it would drop a real init.
+        // The table belongs to a different method but the arm call receives THIS method's
+        // MethodInfo* - provenance mismatch, so the guard protects a different context and stays.
         var (method, graph) = LazyTableFixture(m =>
             new InjectedMethodAnalysisContext(App.SystemTypes.SystemObjectType, "Other",
                 App.SystemTypes.SystemObjectType, System.Reflection.MethodAttributes.Static,
@@ -289,6 +377,22 @@ public class MetadataInitGuardRemoverTests
         MetadataInitGuardRemover.RunRgctx(method);
 
         Assert.That(graph.Instructions.Any(instruction => instruction.IsCall), Is.True);
+    }
+
+    [Test]
+    public void RgctxGuardOnForeignMethodsTableIsExcisedWhenCallTakesItsContext()
+    {
+        // Callers lazily initialize the rgctx of the generic methods they invoke: the guard
+        // compares the callee's table and the helper receives the callee's MethodInfo*.
+        var callee = new InjectedMethodAnalysisContext(App.SystemTypes.SystemObjectType, "Callee",
+            App.SystemTypes.SystemObjectType, System.Reflection.MethodAttributes.Static,
+            [App.SystemTypes.SystemObjectType]);
+        var (method, graph) = LazyTableFixture(_ => callee, _ => TypedMethodInfo(callee));
+
+        MetadataInitGuardRemover.RunRgctx(method);
+
+        Assert.That(graph.Instructions.Any(instruction => instruction.OpCode is OpCode.Call
+            && instruction.Operands is [Immediate, ..]), Is.False);
     }
 
     [Test]
