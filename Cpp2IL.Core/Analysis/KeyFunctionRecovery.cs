@@ -84,7 +84,7 @@ public static class KeyFunctionRecovery
                 RewriteNativeRethrow(method, instruction, beginCatchResults, homeOf);
             else if (keyFunction == "_Unwind_Resume")
                 RewriteNativeUnwindResume(method, instruction, beginCatchResults, homeOf);
-            else if (keyFunction == "__clang_call_terminate")
+            else if (keyFunction is "__clang_call_terminate" or "_ZSt9terminatev")
                 RewriteCallTerminate(method, instruction);
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.il2cpp_codegen_write_barrier))
                 RemoveWriteBarrier(instruction, method);
@@ -100,6 +100,39 @@ public static class KeyFunctionRecovery
                 RewriteInternalCallResolve(instruction, method);
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.il2cpp_codegen_get_thread_static_data))
                 RewriteThreadStaticData(instruction, method);
+        }
+
+        RestoreUnresolvedVeneerCalls(method, instructions);
+    }
+
+    // Call-target names this pass surfaces through GOT veneers and the
+    // __clang_call_terminate comdat thunk. A site that survives the rewrites
+    // gets its veneer-address operand back, so it emits the same
+    // "Method not found" diagnostic it produced before the target was named
+    // instead of a new "Unknown call target operand" one.
+    private static readonly HashSet<string> VeneerCallNames =
+    [
+        "__cxa_begin_catch", "__cxa_get_exception_ptr", "__cxa_rethrow",
+        "_Unwind_Resume", "_ZSt9terminatev", "__clang_call_terminate",
+    ];
+
+    private static void RestoreUnresolvedVeneerCalls(MethodAnalysisContext method, List<Instruction> instructions)
+    {
+        Dictionary<string, ulong>? addressByName = null;
+        foreach (var instruction in instructions)
+        {
+            if (!instruction.IsCall
+                || instruction.Operands is not [StringLiteral { Value: var name }, ..]
+                || !VeneerCallNames.Contains(name))
+                continue;
+
+            addressByName ??= method.AppContext.GetOrCreateKeyFunctionAddresses().Pairs
+                .Where(pair => pair.Value != 0)
+                .GroupBy(pair => pair.Key)
+                .ToDictionary(group => group.Key, group => group.First().Value);
+
+            if (addressByName.TryGetValue(name, out var veneerAddress))
+                instruction.SetOperands([new Immediate(unchecked((long)veneerAddress)), .. instruction.Operands.Skip(1)]);
         }
     }
 
@@ -422,16 +455,13 @@ public static class KeyFunctionRecovery
             // The return value is discarded; the remaining bookkeeping lives
             // entirely in the runtime's caught-exception stack, unobservable
             // from flat IL — same treatment as __cxa_end_catch.
-            if (instruction.Operands.Count == 2)
-            {
-                instruction.OpCode = OpCode.Nop;
-                instruction.SetOperands();
-            }
+            instruction.OpCode = OpCode.Nop;
+            instruction.SetOperands();
             return;
         }
 
         if (instruction.OpCode != OpCode.Call
-            || instruction.Operands is not [_, LocalVariable wrapper, var unwindHeader])
+            || instruction.Operands is not [_, LocalVariable wrapper, var unwindHeader, ..])
             return;
 
         instruction.OpCode = OpCode.Add;

@@ -104,7 +104,7 @@ public abstract class BaseKeyFunctionAddresses
     /// </summary>
     protected virtual bool TryResolveVeneerAlias(ulong address) => false;
 
-    protected void AddResolvedAlias(string name, ulong address)
+    protected internal void AddResolvedAlias(string name, ulong address)
     {
         if (address == 0 || resolvedAddressSet.Contains(address))
             return;

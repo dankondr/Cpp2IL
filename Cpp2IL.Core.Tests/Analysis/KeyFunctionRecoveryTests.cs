@@ -206,6 +206,59 @@ public class KeyFunctionRecoveryTests
         Assert.That(rethrow.Operands[0], Is.SameAs(exceptionInner));
     }
 
+    // A veneer-named call that survives the rewrites must degrade back to its
+    // address operand: downstream it then emits the same "Method not found"
+    // diagnostic it produced before the target was resolved by name.
+    [Test]
+    public void UnresolvableVeneerCallRestoresItsAddressOperand()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        app.GetOrCreateKeyFunctionAddresses().AddResolvedAlias("__cxa_begin_catch", 0x12345678);
+
+        var result = new LocalVariable("result", new Register(null, "x0"));
+        // A header-less call shape cannot become `hdr + 0x20` and stays unresolved.
+        var unrecoverable = new Instruction(0, OpCode.Call,
+            new StringLiteral("__cxa_begin_catch"), result);
+
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([unrecoverable])
+        };
+
+        KeyFunctionRecovery.Run(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(unrecoverable.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(unrecoverable.Operands[0],
+                Is.EqualTo(new Immediate(unchecked((long)0x12345678UL))));
+        });
+    }
+
+    // A direct call to std::terminate is the same uncatchable abort as the
+    // __clang_call_terminate thunk and rewrites to the terminal throw.
+    [Test]
+    public void DirectTerminateCallBecomesTerminalThrow()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var terminate = new Instruction(0, OpCode.CallVoid, new StringLiteral("_ZSt9terminatev"));
+
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([terminate])
+        };
+
+        KeyFunctionRecovery.Run(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(terminate.OpCode, Is.EqualTo(OpCode.Throw));
+            Assert.That(terminate.Operands[0], Is.SameAs(app.SystemTypes.SystemExceptionType));
+        });
+    }
+
     [Test]
     public void NativeRethrowWithoutExceptionLoadSynthesizesIt()
     {
