@@ -512,20 +512,28 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             Add(address + 2, OpCode.Nop);
         }
 
-        MethodAnalysisContext? ResolveMathMethod(string name, bool isDouble)
+        MethodAnalysisContext? ResolveMathMethod(string name, bool isDouble, int argumentCount)
         {
             var assembly = context.AppContext.SystemTypes.SystemDoubleType.DeclaringAssembly;
             var single = context.AppContext.SystemTypes.SystemSingleType;
             var @double = context.AppContext.SystemTypes.SystemDoubleType;
             var types = isDouble
                 ? new[] { assembly.GetTypeByFullName("System.Math") }
-                : new[] { assembly.GetTypeByFullName("System.MathF"), assembly.GetTypeByFullName("System.Math") };
+                : new[]
+                {
+                    argumentCount == 2
+                        ? context.AppContext.AssembliesByName.GetValueOrDefault("UnityEngine.CoreModule")
+                            ?.GetTypeByFullName("UnityEngine.Mathf")
+                        : null,
+                    assembly.GetTypeByFullName("System.MathF"),
+                    assembly.GetTypeByFullName("System.Math")
+                };
 
             foreach (var mathType in types.OfType<TypeAnalysisContext>())
                 foreach (var numberType in isDouble ? new[] { @double } : new[] { single, @double })
                     if (mathType.Methods.FirstOrDefault(method =>
-                            method.IsStatic && method.Name == name && method.Parameters.Count == 1
-                            && method.Parameters[0].ParameterType == numberType) is { } method)
+                            method.IsStatic && method.Name == name && method.Parameters.Count == argumentCount
+                            && method.Parameters.All(parameter => parameter.ParameterType == numberType)) is { } method)
                         return method;
 
             return null;
@@ -533,7 +541,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
         void EmitMathUnary(string name, IOperand destination, IOperand source, bool isDouble)
         {
-            if (ResolveMathMethod(name, isDouble) is { } method)
+            if (ResolveMathMethod(name, isDouble, 1) is { } method)
             {
                 var needsSingleBridge = !isDouble && method.Parameters[0].ParameterType == context.AppContext.SystemTypes.SystemDoubleType;
                 var argument = source;
@@ -551,6 +559,30 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             {
                 Add(address, OpCode.NotImplemented, new StringLiteral($"ARM64 {name} intrinsic is unavailable for this target framework."));
             }
+        }
+
+        void EmitMathBinary(string name, IOperand destination, IOperand left, IOperand right, bool isDouble)
+        {
+            if (ResolveMathMethod(name, isDouble, 2) is not { } method)
+            {
+                Add(address, OpCode.NotImplemented, new StringLiteral($"ARM64 {name} intrinsic is unavailable for this target framework."));
+                return;
+            }
+
+            var arguments = new[] { left, right };
+            if (!isDouble && method.Parameters[0].ParameterType == context.AppContext.SystemTypes.SystemDoubleType)
+            {
+                arguments = arguments.Select((operand, index) =>
+                {
+                    var argument = new Register(null, $"TEMP_MATH_ARG{index}");
+                    Add(address, OpCode.Move, argument, operand).NativeFloatWidthBits = 32;
+                    return (IOperand)argument;
+                }).ToArray();
+            }
+            var call = Add(address, OpCode.Call, method, destination);
+            call.AddOperands(arguments);
+            if (!isDouble)
+                call.NativeFloatWidthBits = 32;
         }
 
         TypeAnalysisContext? UnityVector4() => context.AppContext.AssembliesByName
@@ -611,6 +643,21 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     var difference = new Register(null, "TEMP_FABD");
                     Add(address, OpCode.Subtract, difference, ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                     EmitMathUnary("Abs", destination, difference, instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31);
+                    break;
+                }
+            case Arm64Mnemonic.FMAXNM:
+            case Arm64Mnemonic.FMINNM:
+                {
+                    if (!IsScalarFloatRegister(instruction.Op0Reg))
+                    {
+                        Add(address, OpCode.NotImplemented,
+                            new StringLiteral($"Instruction {instruction.Mnemonic} vector form is not supported."));
+                        break;
+                    }
+
+                    EmitMathBinary(instruction.Mnemonic == Arm64Mnemonic.FMAXNM ? "Max" : "Min",
+                        ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2),
+                        instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31);
                     break;
                 }
             case Arm64Mnemonic.DUP:

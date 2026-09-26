@@ -49,6 +49,19 @@ public class Arm64MissingOpsTests
     }
 
     [Test]
+    public void ScalarMaximumNumberLowersToMathCall()
+    {
+        var il = Lift(0x1e206820); // fmaxnm s0, s1, s0
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == OpCode.Call
+                && i.Operands[0] is MethodAnalysisContext { Name: "Max" }), Is.True);
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        });
+    }
+
+    [Test]
     public void DupBroadcastWitnessesFoldToLaneMoves()
     {
         foreach (var (word, dest, src) in new (uint, string, string)[]
