@@ -407,6 +407,13 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         var finishInterfaceDispatchRecovery = InterfaceDispatchRecovery.Run(this);
 
         LocalVariables.ResolveTypesAndFields(this);
+
+        // ARM64 ELF block-memory imports (`bl` into a GOT veneer whose relocated symbol
+        // is memcpy/memset/memmove) become dedicated block ops while the raw argument
+        // layout still shows the ABI registers. Needs operand types resolved so the
+        // destination's reference-freeness can be proven.
+        BlockMemoryImportRecovery.Run(this);
+
         // Runtime class targets become available only after type resolution.
         KeyFunctionRecovery.Run(this);
         ArrayRecovery.RecoverObjectFieldAddresses(this);

@@ -1324,6 +1324,12 @@ public static class IlGenerator
                     EmitUnrecoverableOperation(method, writeLine, $"Unrecoverable vector min/max: {instruction}");
                 break;
 
+            case OpCode.MemoryCopy:
+            case OpCode.MemorySet:
+            case OpCode.MemoryMove:
+                EmitBlockMemoryOperation(instruction, context, method, locals, writeLine);
+                break;
+
             case OpCode.CheckEqual:
             case OpCode.CheckGreater:
             case OpCode.CheckLess:
@@ -4215,7 +4221,7 @@ public static class IlGenerator
         }
     }
 
-    private static TypeAnalysisContext EmittedLocalType(LocalVariable local, MethodAnalysisContext context) =>
+    internal static TypeAnalysisContext EmittedLocalType(LocalVariable local, MethodAnalysisContext context) =>
         EmittableLocalType(EmittedLocalTypeCore(local, context, []), context);
 
     private static TypeAnalysisContext? SharpenedFieldAddressType(LocalVariable local,
@@ -4930,7 +4936,7 @@ public static class IlGenerator
     // The stack type an operand produces once emitted, before any coercion. `expectedType`
     // is the consumer's contract where the emission site knows it: literal immediates adapt
     // to it, and runtime-handle operands lower differently for handle/typeof contracts.
-    private static TypeAnalysisContext? EmittedOperandType(IOperand operand, MethodAnalysisContext context,
+    internal static TypeAnalysisContext? EmittedOperandType(IOperand operand, MethodAnalysisContext context,
         TypeAnalysisContext? expectedType = null) =>
         operand switch
         {
@@ -5066,7 +5072,7 @@ public static class IlGenerator
     // Native width of the type's evaluation-stack representation: 4 for anything
     // narrowing to i32, 8 for 64-bit primitives, -1 for native-int/pointer/byref
     // values and 0 for non-integral stack kinds.
-    private static int IntegralStackWidth(TypeAnalysisContext? type)
+    internal static int IntegralStackWidth(TypeAnalysisContext? type)
     {
         if (type == null)
             return 0;
@@ -6013,6 +6019,115 @@ public static class IlGenerator
         instructions.Add(CilOpCodes.Ldstr, Diagnostic(detail));
         instructions.Add(CilOpCodes.Newobj, exceptionCtor);
         instructions.Add(CilOpCodes.Throw);
+    }
+
+    // A recovered block-memory import. memcpy lowers to cpblk and memset to initblk;
+    // memmove cannot share cpblk because CIL gives cpblk no overlap semantics, so it
+    // calls System.Buffer.MemoryCopy - the runtime's own overlap-safe byte move and no
+    // external dependency. The proofs the recovery pass made are repeated before
+    // anything is pushed: propagation can swap operand locals after the rewrite, and
+    // an operand that can no longer be proven must fail honestly rather than let a
+    // byte copy stand in for a write-barriered store.
+    private static void EmitBlockMemoryOperation(Instruction instruction, MethodAnalysisContext context,
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        var module = method.DeclaringModule!;
+
+        if (instruction.Operands.Count is < 3 or > 4)
+        {
+            EmitUnrecoverableOperation(method, writeLine, $"Malformed block memory operation: {instruction}");
+            return;
+        }
+
+        var destination = instruction.Operands[0];
+        var content = instruction.Operands[1];
+        var count = instruction.Operands[2];
+
+        var contentProvable = instruction.OpCode == OpCode.MemorySet
+            ? Analysis.BlockMemoryImportRecovery.IsScalarOperand(content, context)
+            : Analysis.BlockMemoryImportRecovery.IsPointerOperandRepresentable(content, context);
+        if (!Analysis.BlockMemoryImportRecovery.IsProvablyReferenceFreeRegion(destination, context)
+            || !contentProvable
+            || !Analysis.BlockMemoryImportRecovery.IsScalarOperand(count, context))
+        {
+            EmitUnrecoverableOperation(method, writeLine, $"Unproven block memory operand: {instruction}");
+            return;
+        }
+
+        switch (instruction.OpCode)
+        {
+            case OpCode.MemoryCopy:
+                // cpblk accepts a managed pointer or native int for both addresses.
+                EmitBlockPointerOperand(destination, false, context, method, locals, writeLine);
+                EmitBlockPointerOperand(content, false, context, method, locals, writeLine);
+                EmitBlockSizeOperand(count, context, method, locals, writeLine);
+                instructions.Add(CilOpCodes.Cpblk);
+                break;
+            case OpCode.MemorySet:
+                EmitBlockPointerOperand(destination, false, context, method, locals, writeLine);
+                // initblk's fill is a 32-bit value; libc memsets with its low byte.
+                LoadOperand(content, method, locals, writeLine, null, context);
+                instructions.Add(CilOpCodes.Conv_U4);
+                EmitBlockSizeOperand(count, context, method, locals, writeLine);
+                instructions.Add(CilOpCodes.Initblk);
+                break;
+            case OpCode.MemoryMove:
+                // Buffer.MemoryCopy(void* source, void* destination, ulong destinationSizeInBytes,
+                // ulong sourceBytesToCopy): sourceBytesToCopy <= destinationSizeInBytes always
+                // holds when both are the same byte count.
+                EmitBlockPointerOperand(content, true, context, method, locals, writeLine);
+                EmitBlockPointerOperand(destination, true, context, method, locals, writeLine);
+                EmitBlockLengthOperand(count, context, method, locals, writeLine);
+                EmitBlockLengthOperand(count, context, method, locals, writeLine);
+                instructions.Add(CilOpCodes.Call, module.CorLibTypeFactory.CorLibScope
+                    .CreateTypeReference("System", "Buffer")
+                    .CreateMemberReference("MemoryCopy", MethodSignature.CreateStatic(
+                        module.CorLibTypeFactory.Void,
+                        [module.CorLibTypeFactory.Void.MakePointerType(),
+                            module.CorLibTypeFactory.Void.MakePointerType(),
+                            module.CorLibTypeFactory.UInt64,
+                            module.CorLibTypeFactory.UInt64])));
+                break;
+        }
+
+        // libc memcpy/memset/memmove return the destination pointer; a still-read
+        // result local receives it as a native int.
+        if (instruction.Operands.Count == 4 && instruction.Operands[3] is { } result)
+        {
+            EmitBlockPointerOperand(destination, true, context, method, locals, writeLine);
+            StoreToOperand(result, method, locals, writeLine, context);
+        }
+    }
+
+    // Loads a block-op pointer operand in a shape cpblk/initblk accept: managed
+    // pointers and native ints pass through, integral values and literals are
+    // extended. forceNativeInt converts managed pointers too, for the void*
+    // parameters of Buffer.MemoryCopy.
+    private static void EmitBlockPointerOperand(IOperand operand, bool forceNativeInt, MethodAnalysisContext context,
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        var width = operand is Immediate ? 8 : IntegralStackWidth(EmittedOperandType(operand, context));
+        LoadOperand(operand, method, locals, writeLine, null, context);
+        if (forceNativeInt || width != -1)
+            method.CilMethodBody!.Instructions.Add(CilOpCodes.Conv_U);
+    }
+
+    // A block size is size_t: native unsigned int on the stack.
+    private static void EmitBlockSizeOperand(IOperand operand, MethodAnalysisContext context,
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        LoadOperand(operand, method, locals, writeLine, null, context);
+        if (operand is Immediate || IntegralStackWidth(EmittedOperandType(operand, context)) != -1)
+            method.CilMethodBody!.Instructions.Add(CilOpCodes.Conv_U);
+    }
+
+    // Buffer.MemoryCopy's sizes are ulong.
+    private static void EmitBlockLengthOperand(IOperand operand, MethodAnalysisContext context,
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        LoadOperand(operand, method, locals, writeLine, null, context);
+        method.CilMethodBody!.Instructions.Add(CilOpCodes.Conv_U8);
     }
 
     // Integer ops on operands that cannot legally sit in an integer slot are
