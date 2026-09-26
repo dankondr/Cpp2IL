@@ -314,6 +314,42 @@ public class IntegerArithmeticTypeTests
     }
 
     [Test]
+    public void ResolvedFieldLoadOverridesNativeWidthGuessWithoutEquivalentTypeChurn()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Owner",
+            app.SystemTypes.SystemObjectType, TypeAttributes.Public | TypeAttributes.Sealed);
+        var field = new InjectedFieldAnalysisContext("Value", app.SystemTypes.SystemStringType,
+            FieldAttributes.Public, owner, 0x10);
+        owner.Fields.Add(field);
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver")) { Type = owner };
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var load = new Instruction(0, OpCode.Move, result, new FieldReference(field, receiver, 0x10))
+        {
+            NativeIntegerWidthBits = 32
+        };
+        var method = new InjectedMethodAnalysisContext(owner, "Fixture", app.SystemTypes.SystemVoidType,
+            MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([load, new(1, OpCode.Return)]),
+            Locals = [receiver, result],
+            ParameterLocals = [],
+        };
+
+        LocalVariables.ResolveTypesAndFields(method);
+
+        Assert.That(result.Type, Is.SameAs(app.SystemTypes.SystemStringType));
+
+        var equivalentString = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "System", "String",
+            app.SystemTypes.SystemObjectType, TypeAttributes.Public | TypeAttributes.Sealed);
+        result.Type = equivalentString;
+
+        LocalVariables.ResolveTypesAndFields(method);
+
+        Assert.That(result.Type, Is.SameAs(equivalentString));
+    }
+
+    [Test]
     public void ArrayLengthProducerIsInt32OnlyForRecoveredArrays()
     {
         var app = Cpp2IlApi.CurrentAppContext!;

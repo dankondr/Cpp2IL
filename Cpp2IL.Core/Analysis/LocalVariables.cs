@@ -1176,10 +1176,21 @@ public static class LocalVariables
         // Move local, field: a field load types its result with the field's type. This is the edge
         // that lets the loaded value go on to be the base of a further field access.
         if (destination is LocalVariable loadDest && source is FieldReference loadField)
-            return SetTypeIfUnknown(loadDest, loadField.Field.FieldType);
+        {
+            var fieldType = loadField.Field.FieldType;
+            if (loadDest.Type?.FullName == fieldType.FullName)
+                return false;
+            loadDest.Type = fieldType;
+            return true;
+        }
 
         if (destination is LocalVariable selectedDest && source is SelectedFieldReference selectedField)
-            return SetTypeIfUnknown(selectedDest, selectedField.FieldType);
+        {
+            if (selectedDest.Type?.FullName == selectedField.FieldType.FullName)
+                return false;
+            selectedDest.Type = selectedField.FieldType;
+            return true;
+        }
 
         // Move field, local: a field store types the stored value with the field's type.
         if (destination is FieldReference storeField && source is LocalVariable storeSource)
