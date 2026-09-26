@@ -251,7 +251,7 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
             return true;
         }
         if (binary.TryGetRelocatedSymbolNameAtPointerSlot(slotVa, out var relocated)
-            && relocated == "__cxa_end_catch")
+            && relocated is "__cxa_allocate_exception" or "__cxa_throw" or "__cxa_end_catch")
         {
             name = relocated;
             return true;
