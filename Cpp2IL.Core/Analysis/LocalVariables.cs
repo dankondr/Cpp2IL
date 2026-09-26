@@ -297,6 +297,7 @@ public static class LocalVariables
         SeedComparisonResults(method);
         SeedFloatLiterals(method);
         SeedNativeIntegerWidths(method);
+        SeedNativeFloatWidths(method);
 
         ResolveHiddenReturnBuffers(method);
 
@@ -1022,6 +1023,19 @@ public static class LocalVariables
         {
             if (instruction.NativeIntegerWidthBits == 32 && instruction.Destination is LocalVariable destination)
                 SetTypeIfUnknown(destination, method.AppContext.SystemTypes.SystemInt32Type);
+        }
+    }
+
+    private static void SeedNativeFloatWidths(MethodAnalysisContext method)
+    {
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction.Destination is not LocalVariable destination)
+                continue;
+            if (instruction.NativeFloatWidthBits == 32)
+                SetTypeIfUnknown(destination, method.AppContext.SystemTypes.SystemSingleType);
+            else if (instruction.NativeFloatWidthBits == 64)
+                SetTypeIfUnknown(destination, method.AppContext.SystemTypes.SystemDoubleType);
         }
     }
 

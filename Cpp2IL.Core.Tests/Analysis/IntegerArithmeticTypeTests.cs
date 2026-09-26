@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Collections.Generic;
+using System.Linq;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
@@ -311,6 +312,33 @@ public class IntegerArithmeticTypeTests
         LocalVariables.ResolveTypesAndFields(method);
 
         Assert.That(result.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+    }
+
+    [Test]
+    public void NativeFloatWidthWinsOverDoubleFallbackCallSignature()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var sqrt = app.SystemTypes.SystemDoubleType.DeclaringAssembly.GetTypeByFullName("System.Math")!.Methods
+            .Single(candidate => candidate.Name == "Sqrt" && candidate.Parameters.Count == 1);
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, []);
+        var source = new LocalVariable("source", new Register(null, "source"));
+        var argument = new LocalVariable("argument", new Register(null, "argument"));
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var move = new Instruction(0, OpCode.Move, argument, source) { NativeFloatWidthBits = 32 };
+        var call = new Instruction(1, OpCode.Call, sqrt, result, argument) { NativeFloatWidthBits = 32 };
+        method.ControlFlowGraph = new ISILControlFlowGraph([move, call, new(2, OpCode.Return)]);
+        method.Locals = [source, argument, result];
+        method.ParameterLocals = [];
+
+        LocalVariables.ResolveTypesAndFields(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(source.Type, Is.SameAs(app.SystemTypes.SystemSingleType));
+            Assert.That(argument.Type, Is.SameAs(app.SystemTypes.SystemSingleType));
+            Assert.That(result.Type, Is.SameAs(app.SystemTypes.SystemSingleType));
+        });
     }
 
     [Test]

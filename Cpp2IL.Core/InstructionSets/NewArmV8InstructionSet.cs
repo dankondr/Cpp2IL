@@ -515,19 +515,37 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         MethodAnalysisContext? ResolveMathMethod(string name, bool isDouble)
         {
             var assembly = context.AppContext.SystemTypes.SystemDoubleType.DeclaringAssembly;
-            var mathType = assembly.GetTypeByFullName(isDouble ? "System.Math" : "System.MathF");
-            var numberType = isDouble ? context.AppContext.SystemTypes.SystemDoubleType : context.AppContext.SystemTypes.SystemSingleType;
-            return mathType?.Methods.FirstOrDefault(method =>
-                method.IsStatic && method.Name == name && method.Parameters.Count == 1
-                && method.Parameters[0].ParameterType == numberType);
+            var single = context.AppContext.SystemTypes.SystemSingleType;
+            var @double = context.AppContext.SystemTypes.SystemDoubleType;
+            var types = isDouble
+                ? new[] { assembly.GetTypeByFullName("System.Math") }
+                : new[] { assembly.GetTypeByFullName("System.MathF"), assembly.GetTypeByFullName("System.Math") };
+
+            foreach (var mathType in types.OfType<TypeAnalysisContext>())
+                foreach (var numberType in isDouble ? new[] { @double } : new[] { single, @double })
+                    if (mathType.Methods.FirstOrDefault(method =>
+                            method.IsStatic && method.Name == name && method.Parameters.Count == 1
+                            && method.Parameters[0].ParameterType == numberType) is { } method)
+                        return method;
+
+            return null;
         }
 
         void EmitMathUnary(string name, IOperand destination, IOperand source, bool isDouble)
         {
             if (ResolveMathMethod(name, isDouble) is { } method)
             {
+                var needsSingleBridge = !isDouble && method.Parameters[0].ParameterType == context.AppContext.SystemTypes.SystemDoubleType;
+                var argument = source;
+                if (needsSingleBridge)
+                {
+                    argument = new Register(null, "TEMP_MATH_ARG");
+                    Add(address, OpCode.Move, argument, source).NativeFloatWidthBits = 32;
+                }
                 var call = Add(address, OpCode.Call, method, destination);
-                call.AddOperands([source]);
+                call.AddOperands([argument]);
+                if (needsSingleBridge)
+                    call.NativeFloatWidthBits = 32;
             }
             else
             {

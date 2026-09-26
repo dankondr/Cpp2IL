@@ -33,16 +33,19 @@ public class Arm64MissingOpsTests
             0x1e24c000, // frintp s0, s0
             0x1e20c000, // fabs s0, s0
             0x7ea1d400, // fabd s0, s0, s1 (REPORT bytes 00d4a17e)
-            0x4e219800, // frintm v0.4s, v0.4s
         })
         {
             var il = Lift(word);
-            var isVector = word is 0x4e219800;
-            if (isVector)
-                Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.True, $"0x{word:x8}");
-            else
-                Assert.That(il.Any(i => i.OpCode is OpCode.Call or OpCode.NotImplemented), Is.True, $"0x{word:x8}");
+            Assert.That(il.Any(i => i.OpCode == OpCode.Call), Is.True, $"0x{word:x8}");
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False, $"0x{word:x8}");
         }
+
+        Assert.That(Lift(0x1e21c000).Where(i => i.NativeFloatWidthBits != null)
+            .Select(i => (i.OpCode, i.NativeFloatWidthBits)),
+            Is.EqualTo(new[] { (OpCode.Move, (int?)32), (OpCode.Call, (int?)32) }));
+
+        Assert.That(Lift(0x4e219800).Any(i => i.OpCode == OpCode.NotImplemented), Is.True,
+            "frintm v0.4s, v0.4s stays conservative until vector rounding is implemented");
     }
 
     [Test]
