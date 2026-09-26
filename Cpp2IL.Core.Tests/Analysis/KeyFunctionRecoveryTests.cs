@@ -34,6 +34,25 @@ public class KeyFunctionRecoveryTests
     }
 
     [Test]
+    public void BoxRuntimeClassUsesRepresentedValueType()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var value = new LocalVariable("value", new Register(null, "value"))
+            { Type = app.SystemTypes.SystemIntPtrType };
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var runtimeClass = new RuntimeClassTypeAnalysisContext(app.SystemTypes.SystemIntPtrType,
+            app.SystemTypes.SystemIntPtrType.DeclaringAssembly);
+        var instruction = new Instruction(0, OpCode.Call,
+            new StringLiteral("il2cpp_vm_object_box"), result, runtimeClass, new AddressOf(value));
+
+        KeyFunctionRecovery.RewriteBox(instruction);
+
+        Assert.That(instruction.OpCode, Is.EqualTo(OpCode.Box));
+        Assert.That(instruction.Operands[1], Is.SameAs(app.SystemTypes.SystemIntPtrType));
+        Assert.That(instruction.Operands[2], Is.TypeOf<AddressOf>());
+    }
+
+    [Test]
     public void NativeEndCatchBookkeepingIsRemoved()
     {
         var app = Cpp2IlApi.CurrentAppContext!;
