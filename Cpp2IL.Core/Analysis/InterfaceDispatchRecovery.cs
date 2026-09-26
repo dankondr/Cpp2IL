@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Graphs;
@@ -12,11 +13,11 @@ namespace Cpp2IL.Core.Analysis;
 // helper when the scan fails.
 public static class InterfaceDispatchRecovery
 {
-    public static void Run(MethodAnalysisContext method)
+    public static Action? Run(MethodAnalysisContext method)
     {
         // offsets below are the 64-bit Il2CppClass layout
         if (method.AppContext.Binary.PointerSizeBytes != 8)
-            return;
+            return null;
 
         var cfg = method.ControlFlowGraph!;
 
@@ -24,6 +25,8 @@ public static class InterfaceDispatchRecovery
         var changed = DistributePhiedConstructions(method, cfg, definitions, homeBlock);
         if (changed)
             (definitions, homeBlock) = BuildMaps(cfg);
+
+        var lookups = new List<Match>();
 
         foreach (var block in cfg.Blocks.ToList())
         {
@@ -35,7 +38,7 @@ public static class InterfaceDispatchRecovery
                 if (MatchDispatch(method, instruction, definitions, homeBlock) is { } match)
                 {
                     RewriteDispatch(method, instruction, block, match, definitions);
-                    TryExciseLookup(cfg, match, definitions, homeBlock);
+                    lookups.Add(match);
                     changed = true;
                     continue;
                 }
@@ -49,7 +52,51 @@ public static class InterfaceDispatchRecovery
         }
 
         if (changed)
+        {
             DeadCodeEliminator.Run(method);
+
+            foreach (var lookup in lookups)
+                TryExciseLookup(cfg, lookup, definitions, homeBlock);
+
+            DeadCodeEliminator.Run(method);
+        }
+
+        return lookups.Count == 0 ? null : () =>
+        {
+            TrimResolvedCallArgumentsUsingLookups(cfg, lookups, definitions);
+            DeadCodeEliminator.Run(method);
+
+            foreach (var lookup in lookups)
+                TryExciseLookup(cfg, lookup, definitions, homeBlock);
+
+            DeadCodeEliminator.Run(method);
+        };
+    }
+
+    private static void TrimResolvedCallArgumentsUsingLookups(ISILControlFlowGraph cfg,
+        List<Match> lookups, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        var invokeDataPhis = lookups.Select(lookup => lookup.InvokeDataPhi).ToHashSet();
+
+        foreach (var call in cfg.Instructions)
+        {
+            if (!call.IsCall || call.Operands[0] is not MethodAnalysisContext called)
+                continue;
+
+            var expected = 1 + (call.OpCode == OpCode.Call ? 1 : 0)
+                + (called.IsStatic ? 0 : 1) + called.Parameters.Count;
+            for (var i = call.Operands.Count - 1; i >= expected; i--)
+            {
+                if (call.Operands[i] is not LocalVariable argument
+                    || ChaseCopies(definitions, argument) is not
+                        { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: LocalVariable invokeData }] }
+                    || ChaseCopies(definitions, invokeData) is not { } phi
+                    || !invokeDataPhis.Contains(phi))
+                    continue;
+
+                call.RemoveOperandAt(i);
+            }
+        }
     }
 
     internal static (Dictionary<LocalVariable, Instruction> Definitions, Dictionary<Instruction, Block> HomeBlock)

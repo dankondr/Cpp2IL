@@ -456,6 +456,26 @@ public class ManagedDispatchRecoveryTests
     }
 
     [Test]
+    public void InterfaceDispatchExcisesLookupAfterDeadCopyChain()
+    {
+        var disposable = CorLib("System.IDisposable");
+        var instructions = InterfaceDispatchShape(disposable, InterfaceSlotOf(disposable, "Dispose"), false);
+        var dispatch = instructions.Single(instruction => instruction.OpCode == OpCode.IndirectCall);
+        var targetCopy = L("targetCopy");
+        instructions.Insert(instructions.IndexOf(dispatch),
+            new Instruction(16, OpCode.Move, targetCopy, dispatch.Operands[0]));
+        dispatch.SetOperand(0, targetCopy);
+        var method = Caller(App.SystemTypes.SystemVoidType, instructions);
+
+        InterfaceDispatchRecovery.Run(method);
+
+        Assert.That(dispatch.OpCode, Is.EqualTo(OpCode.CallVoid));
+        Assert.That(method.ControlFlowGraph!.Instructions, Has.None.Matches<Instruction>(instruction =>
+            instruction != null && instruction.IsCall && instruction.Operands.Count > 0
+                && instruction.Operands[0] is Immediate { Value: 0x9000 }));
+    }
+
+    [Test]
     public void GenericInterfaceDispatchResolvesInstantiatedSlot()
     {
         var comparable = CorLib("System.IComparable`1")
