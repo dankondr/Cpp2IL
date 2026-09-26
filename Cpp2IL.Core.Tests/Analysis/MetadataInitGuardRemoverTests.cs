@@ -362,8 +362,8 @@ public class MetadataInitGuardRemoverTests
     [Test]
     public void RgctxGuardOnAnotherMethodsTableIsKept()
     {
-        // The table belongs to a different method - the guard protects a different context and
-        // excising it would drop a real init.
+        // The table belongs to a different method but the arm call receives THIS method's
+        // MethodInfo* - provenance mismatch, so the guard protects a different context and stays.
         var (method, graph) = LazyTableFixture(m =>
             new InjectedMethodAnalysisContext(App.SystemTypes.SystemObjectType, "Other",
                 App.SystemTypes.SystemObjectType, System.Reflection.MethodAttributes.Static,
@@ -377,6 +377,22 @@ public class MetadataInitGuardRemoverTests
         MetadataInitGuardRemover.RunRgctx(method);
 
         Assert.That(graph.Instructions.Any(instruction => instruction.IsCall), Is.True);
+    }
+
+    [Test]
+    public void RgctxGuardOnForeignMethodsTableIsExcisedWhenCallTakesItsContext()
+    {
+        // Callers lazily initialize the rgctx of the generic methods they invoke: the guard
+        // compares the callee's table and the helper receives the callee's MethodInfo*.
+        var callee = new InjectedMethodAnalysisContext(App.SystemTypes.SystemObjectType, "Callee",
+            App.SystemTypes.SystemObjectType, System.Reflection.MethodAttributes.Static,
+            [App.SystemTypes.SystemObjectType]);
+        var (method, graph) = LazyTableFixture(_ => callee, _ => TypedMethodInfo(callee));
+
+        MetadataInitGuardRemover.RunRgctx(method);
+
+        Assert.That(graph.Instructions.Any(instruction => instruction.OpCode is OpCode.Call
+            && instruction.Operands is [Immediate, ..]), Is.False);
     }
 
     [Test]

@@ -157,13 +157,15 @@ public static class MetadataInitGuardRemover
                 if (IsRgctxLoad(operand, rgctxOffset))
                     return true;
 
-                if (operand is LocalVariable { Type: MethodRgctxTableTypeAnalysisContext table }
-                    && IsCurrentMethod(table.OwnerMethod, method))
+                if (operand is LocalVariable { Type: MethodRgctxTableTypeAnalysisContext table })
                 {
-                    // the helper call receives the method's own MethodInfo* - the last calling-
-                    // convention parameter - but SSA renames and type resets can detach the arg
-                    // local from it, so bind by the parameter's register as well.
-                    int? methodInfoRegister = method.ParameterOperands.LastOrDefault() is Register register ? register.Number : null;
+                    // the helper call receives the MethodInfo* of the table's owner - which may be
+                    // a generic callee whose context is lazily initialized by the caller. When the
+                    // table belongs to this method the context is the last calling-convention
+                    // parameter - SSA renames and type resets can detach the arg local from it, so
+                    // bind by the parameter's register as well.
+                    int? methodInfoRegister = IsCurrentMethod(table.OwnerMethod, method)
+                        && method.ParameterOperands.LastOrDefault() is Register register ? register.Number : null;
                     requirement = new ContextArgumentRequirement(null, table.OwnerMethod, methodInfoRegister);
                     return true;
                 }
