@@ -39,6 +39,7 @@ public static class KeyFunctionRecovery
     public static void Run(MethodAnalysisContext method)
     {
         RewriteElementClassLoads(method);
+        RewriteInlinedClassIsInst(method);
 
         foreach (var instruction in method.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))
         {
@@ -62,6 +63,112 @@ public static class KeyFunctionRecovery
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.il2cpp_codegen_get_thread_static_data))
                 RewriteThreadStaticData(instruction, method);
         }
+    }
+
+    private static void RewriteInlinedClassIsInst(MethodAnalysisContext method)
+    {
+        if (method.AppContext.Binary.is32Bit)
+            return;
+
+        var cfg = method.ControlFlowGraph!;
+        var definitions = new Dictionary<LocalVariable, Instruction>();
+        var ambiguous = new HashSet<LocalVariable>();
+        foreach (var instruction in cfg.Instructions)
+            if (instruction.Destination is LocalVariable destination
+                && (!definitions.TryAdd(destination, instruction) || ambiguous.Contains(destination)))
+            {
+                definitions.Remove(destination);
+                ambiguous.Add(destination);
+            }
+
+        foreach (var instruction in cfg.Instructions)
+        {
+            if (instruction is not { OpCode: OpCode.CheckEqual, Operands: [var result, var left, var right] })
+                continue;
+
+            if (!TryMatch(left, right, out var value, out var target)
+                && !TryMatch(right, left, out value, out target))
+                continue;
+
+            instruction.OpCode = OpCode.CheckNotEqual;
+            instruction.SetOperands(result, new ReferenceCast(value, target, nullOnFailure: true), new Immediate(0));
+        }
+
+        bool TryMatch(IOperand hierarchyEntry, IOperand targetOperand,
+            out LocalVariable value, out TypeAnalysisContext target)
+        {
+            value = null!;
+            target = null!;
+            if (hierarchyEntry is not MemoryOperand
+                {
+                    Base: LocalVariable address, Index: null, Scale: 0, Addend: -8
+                }
+                || !definitions.TryGetValue(address, out var addressDefinition)
+                || addressDefinition is not { OpCode: OpCode.Add, Operands: [_, var addLeft, var addRight] }
+                || !TrySplitHierarchyAdd(addLeft, addRight, out var runtimeClass, out var shiftedDepth)
+                || !definitions.TryGetValue(shiftedDepth, out var shiftDefinition)
+                || shiftDefinition is not
+                {
+                    OpCode: OpCode.ShiftLeft,
+                    Operands:
+                    [_, MemoryOperand
+                        {
+                            Base: LocalVariable targetClass, Index: null, Scale: 0, Addend: 0x130
+                        }, Immediate { Value: 3 }]
+                }
+                || !definitions.TryGetValue(runtimeClass, out var classDefinition)
+                || classDefinition is not
+                {
+                    OpCode: OpCode.Move,
+                    Operands: [_, MemoryOperand
+                        {
+                            Base: LocalVariable instance, Index: null, Scale: 0, Addend: 0
+                        }]
+                })
+                return false;
+
+            var comparedTarget = IsInstTarget(ResolveMoveSource(cfg, targetOperand), cfg, false);
+            var indexedTarget = IsInstTarget(ResolveMoveSource(cfg, targetClass), cfg, false);
+            if (comparedTarget == null || indexedTarget == null || comparedTarget.IsInterface
+                || !SameType(comparedTarget, indexedTarget))
+                return false;
+
+            value = instance;
+            target = comparedTarget;
+            return true;
+        }
+
+        static bool TrySplitHierarchyAdd(IOperand left, IOperand right,
+            out LocalVariable runtimeClass, out LocalVariable shiftedDepth)
+        {
+            runtimeClass = shiftedDepth = null!;
+            if (left is MemoryOperand
+                {
+                    Base: LocalVariable klass, Index: null, Scale: 0, Addend: 0xC8
+                }
+                && right is LocalVariable shift)
+            {
+                runtimeClass = klass;
+                shiftedDepth = shift;
+                return true;
+            }
+            if (right is MemoryOperand
+                {
+                    Base: LocalVariable otherKlass, Index: null, Scale: 0, Addend: 0xC8
+                }
+                && left is LocalVariable otherShift)
+            {
+                runtimeClass = otherKlass;
+                shiftedDepth = otherShift;
+                return true;
+            }
+            return false;
+        }
+
+        static bool SameType(TypeAnalysisContext left, TypeAnalysisContext right) =>
+            ReferenceEquals(left, right)
+            || left.FullName == right.FullName
+            && ReferenceEquals(left.DeclaringAssembly, right.DeclaringAssembly);
     }
 
     private static void RewriteElementClassLoads(MethodAnalysisContext method)
