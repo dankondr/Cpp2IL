@@ -162,6 +162,30 @@ public class KeyFunctionRecoveryTests
     }
 
     [Test]
+    public void OrdinaryClassElementLoadPreservesRepresentedType()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var klass = new LocalVariable("klass", new Register(null, "klass"))
+        {
+            Type = new RuntimeClassTypeAnalysisContext(app.SystemTypes.SystemStringType,
+                app.SystemTypes.SystemStringType.DeclaringAssembly),
+        };
+        var elementClass = new LocalVariable("elementClass", new Register(null, "element"));
+        var load = new Instruction(0, OpCode.Move, elementClass,
+            new MemoryOperand(klass, addend: app.Binary.is32Bit ? 0 : 0x40));
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([load, new(1, OpCode.Return)]),
+        };
+
+        KeyFunctionRecovery.Run(method);
+
+        Assert.That(((RuntimeClassTypeAnalysisContext)load.Operands[1]).RepresentedType,
+            Is.SameAs(app.SystemTypes.SystemStringType));
+    }
+
+    [Test]
     public void Unity6DefaultsInt32ClassOffsetIsRecognized()
     {
         var types = Cpp2IlApi.CurrentAppContext!.SystemTypes;
