@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
 using LibCpp2IL.Logging;
@@ -9,12 +10,18 @@ namespace LibCpp2IL.Elf;
 public abstract class ElfStyleRelocationsBinary(Stream input) : Il2CppBinary(input)
 {
     protected readonly List<(ulong start, ulong end)> relocationBlocks = [];
+    private readonly Dictionary<ulong, string> _symbolsByPointerSlot = [];
+
+    public override bool TryGetRelocatedSymbolNameAtPointerSlot(ulong slot,
+        [NotNullWhen(true)] out string? name)
+        => _symbolsByPointerSlot.TryGetValue(slot, out name);
 
     protected void ApplyRelocations(IDictionary<ElfDynamicType, ulong> dynamicEntries, ulong loadBias, ElfMachine machine)
     {
         // The android bionic linker only verifies the DT_SYMENT entry if it exists, so we just skip checking
         if (!dynamicEntries.TryGetValue(ElfDynamicType.DT_SYMTAB, out var symtabAddress))
             return;
+        dynamicEntries.TryGetValue(ElfDynamicType.DT_STRTAB, out var strtabAddress);
 
         var symtabEntrySize = (ulong)(is32Bit
             ? ElfDynamicSymbol32.StructSize
@@ -131,6 +138,14 @@ public abstract class ElfStyleRelocationsBinary(Stream input) : Il2CppBinary(inp
                     || (machine == ElfMachine.EM_AARCH64 && type == ElfRelocationType.R_AARCH64_NONE))
                 {
                     continue;
+                }
+
+                if (strtabAddress != 0
+                    && type is ElfRelocationType.R_AARCH64_GLOB_DAT or ElfRelocationType.R_AARCH64_JUMP_SLOT)
+                {
+                    var name = ReadStringToNull(loadBias + strtabAddress + symbolEntry.NameOffset);
+                    if (name.Length > 0)
+                        _symbolsByPointerSlot.TryAdd(relocationAddress, name);
                 }
 
                 var (value, handled) = machine switch

@@ -34,6 +34,26 @@ public class KeyFunctionRecoveryTests
     }
 
     [Test]
+    public void NativeEndCatchBookkeepingIsRemoved()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var end = new Instruction(0, OpCode.CallVoid, new StringLiteral("__cxa_end_catch"));
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([end, new(1, OpCode.Return)])
+        };
+
+        KeyFunctionRecovery.Run(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(end.OpCode, Is.EqualTo(OpCode.Nop));
+            Assert.That(end.Operands, Is.Empty);
+        });
+    }
+
+    [Test]
     public void IsInstHelperBecomesManagedReferenceCast()
     {
         var app = Cpp2IlApi.CurrentAppContext!;

@@ -48,6 +48,11 @@ public static class KeyFunctionRecovery
 
             if (ObjectNewFunctions.Contains(keyFunction))
                 RewriteObjectNew(instruction);
+            else if (keyFunction == "__cxa_end_catch")
+            {
+                instruction.OpCode = OpCode.Nop;
+                instruction.SetOperands();
+            }
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.il2cpp_codegen_write_barrier))
                 RemoveWriteBarrier(instruction, method);
             else if (RaiseExceptionFunctions.Contains(keyFunction))
