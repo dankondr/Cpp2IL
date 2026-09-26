@@ -149,4 +149,76 @@ public class InaccessibleFieldAccessorTests
             Assert.That(load.Operands[1], Is.TypeOf<FieldReference>());
         });
     }
+
+    [Test]
+    public void UniqueGetterReadingADifferentFieldStaysInaccessibleFieldRead()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        // ArrayList._version @0x1C is a private int; the only public parameterless int getter is
+        // get_Count, whose body reads _size @0x18. Uniqueness + return type alone must not
+        // rewrite a _version read into a get_Count() call - the inaccessible-field diagnostic is
+        // the honest result.
+        var arrayList = Mscorlib.GetTypeByFullName("System.Collections.ArrayList")!;
+        var caller = CallerIn(App.AssembliesByName["System.Core"]);
+        var (method, load) = FieldRead(caller, arrayList, 0x1C);
+
+        MetadataResolver.ResolveFieldOffsets(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(load.OpCode, Is.EqualTo(OpCode.Move));
+            Assert.That(load.Operands[1], Is.TypeOf<FieldReference>());
+            Assert.That(((FieldReference)load.Operands[1]).Field.Name, Is.EqualTo("_version"));
+        });
+    }
+
+    [Test]
+    public void ProvenGetterReadingTheSameFieldSubstitutes()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        // ArrayList.get_Count's body is `mov eax, [rcx+0x18]; ret` - structurally proven to
+        // return _size @0x18, so the substitution is sound.
+        var arrayList = Mscorlib.GetTypeByFullName("System.Collections.ArrayList")!;
+        var caller = CallerIn(App.AssembliesByName["System.Core"]);
+        var (method, load) = FieldRead(caller, arrayList, 0x18);
+
+        MetadataResolver.ResolveFieldOffsets(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(load.OpCode, Is.EqualTo(OpCode.Call));
+            Assert.That(load.Operands[0], Is.TypeOf<MethodAnalysisContext>());
+            Assert.That(((MethodAnalysisContext)load.Operands[0]).Name, Is.EqualTo("get_Count"));
+        });
+    }
+
+    [Test]
+    public void GetterWithoutProvableBodyStaysUnresolvedDirectRead()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        // private int fieldA + unique public int get_Value with no body to prove against: the
+        // getter may return a different field, so the read keeps the inaccessible-field operand.
+        var owner = new InjectedTypeAnalysisContext(Mscorlib, "Tests", "Pair",
+            App.SystemTypes.SystemObjectType, TypeAttributes.Public);
+        owner.Fields.Add(new InjectedFieldAnalysisContext("fieldA",
+            App.SystemTypes.SystemInt32Type, FieldAttributes.Private, owner, 16));
+        owner.Fields.Add(new InjectedFieldAnalysisContext("fieldB",
+            App.SystemTypes.SystemInt32Type, FieldAttributes.Private, owner, 24));
+        owner.Methods.Add(new InjectedMethodAnalysisContext(owner, "get_Value",
+            App.SystemTypes.SystemInt32Type, MethodAttributes.Public, []));
+        var caller = CallerIn(App.AssembliesByName["System.Core"]);
+        var (method, load) = FieldRead(caller, owner, 16);
+
+        MetadataResolver.ResolveFieldOffsets(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(load.OpCode, Is.EqualTo(OpCode.Move));
+            Assert.That(load.Operands[1], Is.TypeOf<FieldReference>());
+            Assert.That(((FieldReference)load.Operands[1]).Field.Name, Is.EqualTo("fieldA"));
+        });
+    }
 }

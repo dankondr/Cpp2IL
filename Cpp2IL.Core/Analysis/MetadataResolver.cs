@@ -5,6 +5,7 @@ using System.Reflection;
 using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.Il2CppApiFunctions;
+using Cpp2IL.Core.InstructionSets;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
@@ -259,10 +260,12 @@ public static class MetadataResolver
 
                 // A private cross-assembly field read is an inlined accessor (e.g.
                 // String._stringLength behind get_Length) and cannot be named from the caller -
-                // emit the public accessor call the inline came from instead.
+                // emit the public accessor call the inline came from instead, but only when the
+                // candidate's own body is structurally proven to return that exact field.
                 if (i == 1 && instruction.OpCode == OpCode.Move
                     && instruction.Operands[0] is LocalVariable destination
-                    && TryRecoverFieldAccessor(method, field, local) is { } accessor)
+                    && instruction.Operands[1] is FieldReference fieldRef
+                    && TryRecoverFieldAccessor(method, fieldRef, local) is { } accessor)
                 {
                     instruction.OpCode = OpCode.Call;
                     instruction.SetOperands(accessor, destination, local);
@@ -290,13 +293,22 @@ public static class MetadataResolver
 
     // The honest public equivalent of a cross-assembly private field read: IL2CPP inlines managed
     // accessors (String.get_Length => _stringLength, List<T>.get_Count => _size), leaving a direct
-    // read of a field the emitted assembly cannot name. When the declaring type exposes exactly one
-    // public parameterless instance getter of the field's type, that accessor is what the inline
-    // came from.
+    // read of a field the emitted assembly cannot name. A read is rewritten to an accessor call
+    // only when the candidate is structurally proven to read that exact field: the declaring type
+    // exposes exactly one public parameterless instance getter of the field's type, AND the
+    // getter's own native body is just `return this.<field>` - a single load from
+    // [this + accessOffset] into the return register followed by ret. Uniqueness, return type, or
+    // naming alone are never proof: a type could have a second private field of the same type
+    // whose only getter returns the other field, so an unproven candidate leaves the
+    // inaccessible-field read in place as the diagnostic.
     private static MethodAnalysisContext? TryRecoverFieldAccessor(
-        MethodAnalysisContext caller, FieldAnalysisContext field, LocalVariable receiver)
+        MethodAnalysisContext caller, FieldReference fieldRef, LocalVariable receiver)
     {
-        if (!NeedsAccessor(field, caller) || receiver.Type is { IsValueType: true })
+        var field = fieldRef.Field;
+
+        // A container path is a nested member access (this.a.b) - no simple getter produces that.
+        if (fieldRef.Containers.Count > 0 || !NeedsAccessor(field, caller)
+            || receiver.Type is { IsValueType: true })
             return null;
 
         var genericInstance = field.DeclaringType as GenericInstanceTypeAnalysisContext;
@@ -317,7 +329,132 @@ public static class MetadataResolver
             ? (MethodAnalysisContext)new ConcreteGenericMethodAnalysisContext(candidates[0],
                 genericInstance.GenericArguments, [])
             : candidates[0];
-        return InaccessibleCalleeRecovery.IsVisibleFrom(accessor, caller) ? accessor : null;
+        return GetterProvablyReadsField(caller.AppContext, accessor, fieldRef.Offset)
+            && InaccessibleCalleeRecovery.IsVisibleFrom(accessor, caller) ? accessor : null;
+    }
+
+    // Disassemble the candidate's native body and require it to be a pure field projection:
+    // a single load from [this + fieldOffset] into the return register, then ret, with no
+    // stores, calls, branches, or arithmetic in between. This is the only acceptable proof that
+    // the getter returns this field - anything else is not sound to substitute.
+    private static bool GetterProvablyReadsField(ApplicationAnalysisContext app,
+        MethodAnalysisContext accessor, long fieldOffset)
+    {
+        // Shared generic methods carry their code on the definition's method pointer.
+        var pointer = accessor.UnderlyingPointer;
+        if (pointer == 0 && accessor is ConcreteGenericMethodAnalysisContext generic)
+            pointer = generic.BaseMethodContext.UnderlyingPointer;
+        if (pointer == 0)
+            return false;
+        return app.InstructionSet switch
+        {
+            NewArmV8InstructionSet => GetterProvablyReadsFieldArm64(app, pointer, fieldOffset),
+            X86InstructionSet => GetterProvablyReadsFieldX86(app, pointer, fieldOffset),
+            _ => false,
+        };
+    }
+
+    private static bool GetterProvablyReadsFieldArm64(ApplicationAnalysisContext app,
+        ulong pointer, long fieldOffset)
+    {
+        List<Disarm.Arm64Instruction> body;
+        try
+        {
+            body = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(app, pointer);
+        }
+        catch
+        {
+            return false;
+        }
+
+        var loaded = false;
+        var thisRegister = Disarm.InternalDisassembly.Arm64Register.X0; // instance method: `this` is the first argument
+        foreach (var insn in body)
+        {
+            switch (insn.Mnemonic)
+            {
+                case Disarm.Arm64Mnemonic.NOP or Disarm.Arm64Mnemonic.HINT
+                    or Disarm.Arm64Mnemonic.PRFM or Disarm.Arm64Mnemonic.PRFUM:
+                    continue;
+                case Disarm.Arm64Mnemonic.MOV
+                    when insn.Op0Kind == Disarm.Arm64OperandKind.Register
+                        && insn.Op1Kind == Disarm.Arm64OperandKind.Register
+                        && insn.Op1Reg == thisRegister:
+                    thisRegister = insn.Op0Reg; // a `this` alias (mov x8, x0)
+                    continue;
+                case Disarm.Arm64Mnemonic.LDR or Disarm.Arm64Mnemonic.LDRB
+                    or Disarm.Arm64Mnemonic.LDRH or Disarm.Arm64Mnemonic.LDRSB
+                    or Disarm.Arm64Mnemonic.LDRSH or Disarm.Arm64Mnemonic.LDRSW
+                    or Disarm.Arm64Mnemonic.LDUR or Disarm.Arm64Mnemonic.LDURB
+                    or Disarm.Arm64Mnemonic.LDURH or Disarm.Arm64Mnemonic.LDURSB
+                    or Disarm.Arm64Mnemonic.LDURSH or Disarm.Arm64Mnemonic.LDURSW
+                    when !loaded && insn.MemBase == thisRegister
+                        && insn.MemOffset == fieldOffset && insn.MemAddendReg == Disarm.InternalDisassembly.Arm64Register.INVALID
+                        && insn.MemIndexMode == Disarm.Arm64MemoryIndexMode.Offset
+                        && insn.Op0Reg is Disarm.InternalDisassembly.Arm64Register.W0 or Disarm.InternalDisassembly.Arm64Register.X0
+                            or Disarm.InternalDisassembly.Arm64Register.S0 or Disarm.InternalDisassembly.Arm64Register.D0
+                            or Disarm.InternalDisassembly.Arm64Register.B0 or Disarm.InternalDisassembly.Arm64Register.H0
+                            or Disarm.InternalDisassembly.Arm64Register.V0:
+                    loaded = true;
+                    continue;
+                case Disarm.Arm64Mnemonic.RET or Disarm.Arm64Mnemonic.RETAA
+                    or Disarm.Arm64Mnemonic.RETAB:
+                    return loaded;
+                default:
+                    return false; // any other memory traffic, arithmetic, or control flow
+            }
+        }
+        return false;
+    }
+
+    private static bool GetterProvablyReadsFieldX86(ApplicationAnalysisContext app,
+        ulong pointer, long fieldOffset)
+    {
+        Iced.Intel.InstructionList body;
+        try
+        {
+            body = X86Utils.GetMethodBodyAtVirtAddressNew(pointer, true, app);
+        }
+        catch
+        {
+            return false;
+        }
+
+        var loaded = false;
+        var thisRegisters = new HashSet<Iced.Intel.Register>
+            { Iced.Intel.Register.RCX, Iced.Intel.Register.RDI }; // win64 / sysv `this`
+        foreach (var insn in body)
+        {
+            switch (insn.Mnemonic)
+            {
+                case Iced.Intel.Mnemonic.Nop or Iced.Intel.Mnemonic.Int3:
+                    continue;
+                case Iced.Intel.Mnemonic.Mov
+                    when insn.Op0Kind == Iced.Intel.OpKind.Register
+                        && insn.Op1Kind == Iced.Intel.OpKind.Register
+                        && thisRegisters.Contains(insn.Op1Register):
+                    thisRegisters.Add(insn.Op0Register); // a `this` alias (mov rbx, rcx)
+                    continue;
+                case Iced.Intel.Mnemonic.Mov or Iced.Intel.Mnemonic.Movzx
+                    or Iced.Intel.Mnemonic.Movsx or Iced.Intel.Mnemonic.Movsxd
+                    or Iced.Intel.Mnemonic.Movss or Iced.Intel.Mnemonic.Movsd
+                    or Iced.Intel.Mnemonic.Movd or Iced.Intel.Mnemonic.Movq
+                    or Iced.Intel.Mnemonic.Movaps or Iced.Intel.Mnemonic.Movups
+                    when !loaded && insn.Op1Kind == Iced.Intel.OpKind.Memory
+                        && thisRegisters.Contains(insn.MemoryBase)
+                        && insn.MemoryIndex == Iced.Intel.Register.None
+                        && insn.MemoryDisplacement64 == (ulong)fieldOffset
+                        && insn.Op0Register is Iced.Intel.Register.EAX or Iced.Intel.Register.RAX
+                            or Iced.Intel.Register.XMM0 or Iced.Intel.Register.AL:
+                    loaded = true;
+                    continue;
+                case Iced.Intel.Mnemonic.Ret:
+                    return loaded;
+                default:
+                    return false;
+            }
+        }
+        return false;
     }
 
     private static bool NeedsAccessor(FieldAnalysisContext field, MethodAnalysisContext caller)
