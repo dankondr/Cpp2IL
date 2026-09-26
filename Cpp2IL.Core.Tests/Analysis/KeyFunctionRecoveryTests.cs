@@ -93,7 +93,13 @@ public class KeyFunctionRecoveryTests
         var hierarchyAddress = new LocalVariable("hierarchyAddress", new Register(null, "hierarchyAddress"));
         var result = new LocalVariable("result", new Register(null, "result"))
             { Type = app.SystemTypes.SystemBooleanType };
-        var check = new Instruction(4, OpCode.CheckEqual, result,
+        var depthResult = new LocalVariable("depthResult", new Register(null, "depthResult"))
+            { Type = app.SystemTypes.SystemBooleanType };
+        var failure = new Instruction(8, OpCode.Return);
+        var depthCheck = new Instruction(2, OpCode.CheckLess, depthResult,
+            new MemoryOperand(runtimeClass, addend: 0x130),
+            new MemoryOperand(targetClass, addend: 0x130));
+        var check = new Instruction(6, OpCode.CheckEqual, result,
             new MemoryOperand(hierarchyAddress, addend: -8), app.SystemTypes.SystemStringType);
         var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
             app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
@@ -101,12 +107,15 @@ public class KeyFunctionRecoveryTests
             ControlFlowGraph = new ISILControlFlowGraph([
                 new(0, OpCode.Move, runtimeClass, new MemoryOperand(value)),
                 new(1, OpCode.Move, targetClass, app.SystemTypes.SystemStringType),
-                new(2, OpCode.ShiftLeft, shiftedDepth,
+                depthCheck,
+                new(3, OpCode.ConditionalJump, failure, depthResult),
+                new(4, OpCode.ShiftLeft, shiftedDepth,
                     new MemoryOperand(targetClass, addend: 0x130), new Immediate(3)),
-                new(3, OpCode.Add, hierarchyAddress,
+                new(5, OpCode.Add, hierarchyAddress,
                     new MemoryOperand(runtimeClass, addend: 0xC8), shiftedDepth),
                 check,
-                new(5, OpCode.Return)]),
+                new(7, OpCode.Return),
+                failure]),
         };
 
         KeyFunctionRecovery.Run(method);
@@ -116,6 +125,8 @@ public class KeyFunctionRecoveryTests
         var cast = (ReferenceCast)check.Operands[1];
         Assert.Multiple(() =>
         {
+            Assert.That(depthCheck.OpCode, Is.EqualTo(OpCode.Move));
+            Assert.That(((Immediate)depthCheck.Operands[1]).Value, Is.Zero);
             Assert.That(cast.Value, Is.SameAs(value));
             Assert.That(cast.Type, Is.SameAs(app.SystemTypes.SystemStringType));
             Assert.That(cast.NullOnFailure, Is.True);

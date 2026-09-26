@@ -71,6 +71,8 @@ public static class KeyFunctionRecovery
             return;
 
         var cfg = method.ControlFlowGraph!;
+        var home = cfg.Blocks.SelectMany(block => block.Instructions.Select(instruction => (instruction, block)))
+            .ToDictionary(pair => pair.instruction, pair => pair.block);
         var definitions = new Dictionary<LocalVariable, Instruction>();
         var ambiguous = new HashSet<LocalVariable>();
         foreach (var instruction in cfg.Instructions)
@@ -86,26 +88,29 @@ public static class KeyFunctionRecovery
             if (instruction is not { OpCode: OpCode.CheckEqual, Operands: [var result, var left, var right] })
                 continue;
 
-            if (!TryMatch(left, right, out var value, out var target)
-                && !TryMatch(right, left, out value, out target))
+            if (!TryMatch(left, right, out var value, out var target, out var runtimeClass, out var targetClass)
+                && !TryMatch(right, left, out value, out target, out runtimeClass, out targetClass))
                 continue;
 
             instruction.OpCode = OpCode.CheckNotEqual;
             instruction.SetOperands(result, new ReferenceCast(value, target, nullOnFailure: true), new Immediate(0));
+            RemoveDepthPrecheck(instruction, runtimeClass, targetClass);
         }
 
         bool TryMatch(IOperand hierarchyEntry, IOperand targetOperand,
-            out LocalVariable value, out TypeAnalysisContext target)
+            out LocalVariable value, out TypeAnalysisContext target,
+            out LocalVariable runtimeClass, out LocalVariable targetClass)
         {
             value = null!;
             target = null!;
+            runtimeClass = targetClass = null!;
             if (hierarchyEntry is not MemoryOperand
                 {
                     Base: LocalVariable address, Index: null, Scale: 0, Addend: -8
                 }
                 || !definitions.TryGetValue(address, out var addressDefinition)
                 || addressDefinition is not { OpCode: OpCode.Add, Operands: [_, var addLeft, var addRight] }
-                || !TrySplitHierarchyAdd(addLeft, addRight, out var runtimeClass, out var shiftedDepth)
+                || !TrySplitHierarchyAdd(addLeft, addRight, out runtimeClass, out var shiftedDepth)
                 || !definitions.TryGetValue(shiftedDepth, out var shiftDefinition)
                 || shiftDefinition is not
                 {
@@ -113,7 +118,7 @@ public static class KeyFunctionRecovery
                     Operands:
                     [_, MemoryOperand
                         {
-                            Base: LocalVariable targetClass, Index: null, Scale: 0, Addend: 0x130
+                            Base: LocalVariable indexedClass, Index: null, Scale: 0, Addend: 0x130
                         }, Immediate { Value: 3 }]
                 }
                 || !definitions.TryGetValue(runtimeClass, out var classDefinition)
@@ -128,14 +133,74 @@ public static class KeyFunctionRecovery
                 return false;
 
             var comparedTarget = IsInstTarget(ResolveMoveSource(cfg, targetOperand), cfg, false);
-            var indexedTarget = IsInstTarget(ResolveMoveSource(cfg, targetClass), cfg, false);
+            var indexedTarget = IsInstTarget(ResolveMoveSource(cfg, indexedClass), cfg, false);
             if (comparedTarget == null || indexedTarget == null || comparedTarget.IsInterface
                 || !SameType(comparedTarget, indexedTarget))
                 return false;
 
             value = instance;
             target = comparedTarget;
+            targetClass = indexedClass;
             return true;
+        }
+
+        void RemoveDepthPrecheck(Instruction hierarchyCheck, LocalVariable runtimeClass,
+            LocalVariable targetClass)
+        {
+            if (!home.TryGetValue(hierarchyCheck, out var hierarchyBlock))
+                return;
+
+            foreach (var guardBlock in hierarchyBlock.Predecessors)
+            {
+                if (guardBlock.Successors.Count != 2
+                    || guardBlock.Instructions.LastOrDefault() is not
+                    {
+                        OpCode: OpCode.ConditionalJump,
+                        Operands: [_, LocalVariable branchCondition]
+                    })
+                    continue;
+
+                var depthCheck = guardBlock.Instructions.LastOrDefault(candidate => candidate is
+                {
+                    OpCode: OpCode.CheckLess,
+                    Operands:
+                    [LocalVariable,
+                        MemoryOperand
+                        {
+                            Base: var runtimeDepthClass, Index: null, Scale: 0, Addend: 0x130
+                        },
+                        MemoryOperand
+                        {
+                            Base: var targetDepthClass, Index: null, Scale: 0, Addend: 0x130
+                        }]
+                }
+                && ReferenceEquals(runtimeDepthClass, runtimeClass)
+                && ReferenceEquals(targetDepthClass, targetClass));
+                if (depthCheck?.Destination is not LocalVariable depthCondition
+                    || !IsBooleanProjection(branchCondition, depthCondition, []))
+                    continue;
+
+                depthCheck.OpCode = OpCode.Move;
+                depthCheck.SetOperands(depthCondition, new Immediate(0));
+                return;
+            }
+        }
+
+        bool IsBooleanProjection(LocalVariable value, LocalVariable source, HashSet<LocalVariable> visited)
+        {
+            if (ReferenceEquals(value, source))
+                return true;
+            if (!visited.Add(value) || !definitions.TryGetValue(value, out var definition))
+                return false;
+            return definition switch
+            {
+                { OpCode: OpCode.Move or OpCode.Not, Operands: [_, LocalVariable input] }
+                    => IsBooleanProjection(input, source, visited),
+                { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual,
+                    Operands: [_, LocalVariable input, Immediate { Value: 0 or 1 }] }
+                    => IsBooleanProjection(input, source, visited),
+                _ => false,
+            };
         }
 
         static bool TrySplitHierarchyAdd(IOperand left, IOperand right,
