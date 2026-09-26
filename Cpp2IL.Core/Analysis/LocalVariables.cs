@@ -99,10 +99,6 @@ public static class LocalVariables
                 thisLocal.IsThis = true;
                 paramLocals.Add(thisLocal);
             }
-            else
-            {
-                method.AddWarning($"'this' local not found (operand: {thisOperand})");
-            }
         }
 
         // Check if method has MethodInfo*
