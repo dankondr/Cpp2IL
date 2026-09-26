@@ -453,9 +453,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Fix float literals
         FloatLiteralRecovery.Run(this);
 
-        // Runs late so the array type and length reach the allocation call as operands after copy propagation has inlined them
+        // Runs late so array and runtime-class operands reach their helpers after copy propagation has inlined them.
         ArrayRecovery.Run(this);
         LocalVariables.ResolveLateGeneratedTypes(this);
+        KeyFunctionRecovery.Run(this);
 
         LocalVariables.TypeAddressedLocals(this);
 

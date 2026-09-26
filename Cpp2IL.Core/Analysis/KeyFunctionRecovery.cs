@@ -224,6 +224,7 @@ public static class KeyFunctionRecovery
 
         return operand switch
         {
+            RuntimeClassTypeAnalysisContext runtimeClass => runtimeClass.RepresentedType,
             TypeAnalysisContext type => type,
             LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: var type } } => type,
             MemoryOperand
