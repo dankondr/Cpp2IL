@@ -253,13 +253,20 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
             return true;
         }
         if (GetImportSymbolName(binary, slotVa) is { } relocated
-            && relocated is "__cxa_allocate_exception" or "__cxa_throw" or "__cxa_end_catch")
+            && IsAllowedVeneerImportName(relocated))
         {
             name = relocated;
             return true;
         }
         return false;
     }
+
+    // Import symbols that provably name generic C++/IL2CPP runtime scaffolding.
+    // Anything else keeps its address operand even when the slot is named.
+    internal static bool IsAllowedVeneerImportName(string symbol) => symbol is
+        "__cxa_allocate_exception" or "__cxa_throw" or "__cxa_end_catch"
+        or "__cxa_begin_catch" or "__cxa_get_exception_ptr"
+        or "__cxa_rethrow" or "_Unwind_Resume" or "_ZSt9terminatev";
 
     // The pointer slot a GOT veneer reads names its import through the dynamic
     // relocation on the slot: JUMP_SLOT/GLOB_DAT relocations carry the imported
@@ -286,6 +293,80 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
         return true;
     }
 
+    internal const string CallTerminateThunkName = "__clang_call_terminate";
+
+    // The __clang_call_terminate comdat thunk clang emits for noexcept violations
+    // and other catch-and-terminate sites: an optional frame setup, then
+    // `bl __cxa_begin_catch` and `bl std::terminate`, noreturn. The whole function
+    // extent must be exactly that sequence (plus an optional trap word) so a real
+    // function that merely opens with the same calls is never renamed.
+    private bool TryResolveCallTerminateThunk(ulong address, IReadOnlyDictionary<ulong, string> addressToName)
+    {
+        var binary = _appContext.Binary;
+        var disassembly = DisassembleTextSection();
+        var index = IndexOfAddress(disassembly, address);
+        if (index < 0)
+            return false;
+        var end = index + 1;
+        while (end < disassembly.Count && !IsFunctionStart(disassembly, end))
+            end++;
+        return TryMatchCallTerminateThunk(disassembly, index, end, CallTargets, TryReadWord,
+            target => TryResolveGotVeneerImportName(binary, target, out var importName) ? importName
+                : addressToName.TryGetValue(target, out var resolved) ? resolved : null);
+    }
+
+    private static int IndexOfAddress(List<Arm64Instruction> disassembly, ulong address)
+    {
+        var lo = 0;
+        var hi = disassembly.Count - 1;
+        while (lo <= hi)
+        {
+            var mid = lo + (hi - lo) / 2;
+            if (disassembly[mid].Address == address)
+                return mid;
+            if (disassembly[mid].Address < address)
+                lo = mid + 1;
+            else
+                hi = mid - 1;
+        }
+        return -1;
+    }
+
+    internal static bool TryMatchCallTerminateThunk(List<Arm64Instruction> disassembly,
+        int startIndex, int endIndexExclusive, IReadOnlySet<ulong> callTargets,
+        System.Func<ulong, uint?> read, System.Func<ulong, string?> resolveCallTarget)
+    {
+        if (!IsFunctionStart(disassembly, startIndex, callTargets))
+            return false;
+
+        var i = startIndex;
+        if (i < endIndexExclusive && IsFramePairStore(read(disassembly[i].Address)))
+            i++;
+        if (i < endIndexExclusive && read(disassembly[i].Address) == MovFpSp)
+            i++;
+        if (i >= endIndexExclusive || !IsCallTo(disassembly[i], "__cxa_begin_catch", resolveCallTarget))
+            return false;
+        if (++i >= endIndexExclusive || !IsCallTo(disassembly[i], "_ZSt9terminatev", resolveCallTarget))
+            return false;
+        if (++i < endIndexExclusive && IsTrap(read(disassembly[i].Address)))
+            i++;
+        return i == endIndexExclusive;
+    }
+
+    private static bool IsCallTo(Arm64Instruction instruction, string name,
+        System.Func<ulong, string?> resolveCallTarget)
+        => instruction.Mnemonic == Arm64Mnemonic.BL
+            && resolveCallTarget(instruction.BranchTarget) == name;
+
+    // stp x29, x30, [sp, #-N]! — the frame pair prologue; imm7 varies with the frame size.
+    private static bool IsFramePairStore(uint? word)
+        => word is { } w && (w & 0xffc07fff) == 0xa9807bfd;
+
+    private const uint MovFpSp = 0x910003fd; // mov x29, sp
+
+    // brk #imm — a trap word some noreturn functions carry after their tail call.
+    private static bool IsTrap(uint? word) => word is { } w && (w & 0xffe0001f) == 0xd4200000;
+
     private readonly HashSet<ulong> _rejectedAliasTargets = [];
 
     protected override bool TryResolveVeneerAlias(ulong address)
@@ -309,6 +390,11 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
             else if (TryResolveGotVeneer(address, addressToName, Read, out var gotName))
             {
                 AddResolvedAlias(gotName, address);
+                resolved = true;
+            }
+            else if (TryResolveCallTerminateThunk(address, addressToName))
+            {
+                AddResolvedAlias(CallTerminateThunkName, address);
                 resolved = true;
             }
         }
