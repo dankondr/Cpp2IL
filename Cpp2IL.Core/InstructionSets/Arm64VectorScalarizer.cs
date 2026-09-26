@@ -562,22 +562,38 @@ internal sealed class Arm64VectorScalarizer
         or Arm64Mnemonic.FADDP;
 
     /// <summary>
-    /// Whether a lane window is an honest floating-point carrier: a real
-    /// element local or a constant (a ShiftRight of either extracts a window
-    /// whose bits are genuinely that lane), or the low window of its operand
-    /// — the register local itself, which by convention holds the low scalar.
-    /// A high window reached by shifting a whole-register local is refused:
-    /// a narrow write such as LDR D may leave a managed aggregate
-    /// (Vector2/3) in the register local, and slicing it by bit offset treats
-    /// the aggregate as an integer lane carrier.
+    /// The low window of a whole-register local is honest only when the
+    /// register provably carries nothing beyond the low scalar — every upper
+    /// slot a constant, the shape left by scalar-width writes. Wider carriers
+    /// (LDR D/Q, vector copies) keep real provenance in the upper slots, where
+    /// a managed aggregate (Vector2/3) may live.
     /// </summary>
-    private static bool IsFloatCarrier(LaneSlice slice)
-        => slice.Operand is Immediate
-            || slice.BitOffset == 0
-            || slice.Operand is Register { Name: { } name } && name.Contains('.');
+    private static bool IsScalarWholeWindow(VectorState state, int slot, LaneSlice slice)
+        => slot == 0
+            && slice.BitOffset == 0
+            && slice.Operand is Register { Name: { } name } && !name.Contains('.')
+            && state.Slots[1] is { Operand: Immediate }
+            && state.Slots[2] is { Operand: Immediate }
+            && state.Slots[3] is { Operand: Immediate };
 
-    private IOperand? FloatSlotOperand(VectorState state, int slot)
-        => state.Slots[slot] is { } slice && IsFloatCarrier(slice) ? SlotOperand(state, slot) : null;
+    /// <summary>
+    /// Whether a lane window is an honest floating-point carrier: an element
+    /// local (V6.S0-style — provably one lane's bits), a constant, or the low
+    /// window of a scalar-carrying register. A whole-register local in any
+    /// other shape is refused — an LDR S/D may leave a managed aggregate
+    /// (Vector2/Vector3) in the register local, and slicing or reading that
+    /// as lane bits fabricates lane values out of managed semantics.
+    /// </summary>
+    private static bool IsFloatCarrier(VectorState state, int slot)
+    {
+        if (state.Slots[slot] is not { } slice)
+            return false;
+        if (slice.Operand is Immediate)
+            return true;
+        if (slice.Operand is Register { Name: { } name } && name.Contains('.'))
+            return true; // element local — extracting any of its windows reads a proven lane
+        return IsScalarWholeWindow(state, slot, slice);
+    }
 
     /// <summary>
     /// Pure check that the lane is an honest float carrier — reads slot
@@ -590,9 +606,8 @@ internal sealed class Arm64VectorScalarizer
         if (state == null)
             return false;
         if (laneBits == 32)
-            return state.Slots[lane] is { } slice && IsFloatCarrier(slice);
-        return state.Slots[2 * lane] is { } lo && IsFloatCarrier(lo)
-            && state.Slots[2 * lane + 1] is { } hi && IsFloatCarrier(hi);
+            return IsFloatCarrier(state, lane);
+        return IsFloatCarrier(state, 2 * lane) && IsFloatCarrier(state, 2 * lane + 1);
     }
 
     /// <summary>
@@ -605,12 +620,45 @@ internal sealed class Arm64VectorScalarizer
         if (state == null)
             return null;
         if (laneBits == 32)
-            return FloatSlotOperand(state, lane);
-        var lo = state.Slots[2 * lane];
-        var hi = state.Slots[2 * lane + 1];
-        if (lo == null || hi == null || !IsFloatCarrier(lo.Value) || !IsFloatCarrier(hi.Value))
+            return IsFloatCarrier(state, lane) ? SlotOperand(state, lane) : null;
+        if (!IsFloatCarrier(state, 2 * lane) || !IsFloatCarrier(state, 2 * lane + 1))
             return null;
         return Lane64Operand(state, lane);
+    }
+
+    /// <summary>
+    /// Whether a scalar FCM* register operand provably carries a scalar: an
+    /// element local spanning the compare width, a constant, the low scalar
+    /// of a scalar-carrying register (S-width compares only), or an untracked
+    /// local (parameter/copy — typed by the signature, no aggregate ambiguity).
+    /// A D-width carrier is always ambiguous — LDR D and a double result are
+    /// indistinguishable here — so scalar FCMGT D folds only on operands with
+    /// no provenance or element-local lanes.
+    /// </summary>
+    private bool ScalarCompareOperandHonest(Arm64Register reg, int width)
+    {
+        var state = LaneState(reg);
+        if (state == null)
+            return true;
+        if (state.Slots[0] is not { BitOffset: 0 } slice)
+            return false;
+        if (slice.Operand is Immediate)
+            return true;
+        if (slice.Operand is Register { Name: { } n } && n.Contains('.'))
+            return width == 32 || n.Contains(".D");
+        return width == 32 && IsScalarWholeWindow(state, 0, slice);
+    }
+
+    /// <summary>
+    /// Whether the register operands of a scalar FCM* are honest scalars —
+    /// see ScalarCompareOperandHonest.
+    /// </summary>
+    public bool ScalarCompareOperandsHonest(Arm64Instruction insn)
+    {
+        var width = insn.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31 ? 64 : 32;
+        if (insn.Op1Kind == Arm64OperandKind.Register && !ScalarCompareOperandHonest(insn.Op1Reg, width))
+            return false;
+        return insn.Op2Kind != Arm64OperandKind.Register || ScalarCompareOperandHonest(insn.Op2Reg, width);
     }
 
     private bool TryConvertCore(Arm64Instruction insn, Func<Arm64Instruction, int, IOperand> convertOperand)
@@ -839,7 +887,24 @@ internal sealed class Arm64VectorScalarizer
     ///   BSL: d = (n &amp; d) | (m &amp; ~d) — mask is the old destination
     /// The ops are pure bit logic, so window granularity is exact; the old
     /// destination windows are read before its slots are claimed.
+    ///
+    /// Every consumed window must already hold a value readable as-is: an
+    /// Immediate, an element local at offset 0, or the low window of a
+    /// scalar-carrying register. Whole-register locals carrying wider data and
+    /// shifted extractions are refused — consuming a managed-aggregate local
+    /// through an integer op materializes reinterpret loads downstream, and a
+    /// partial fold trades one honest diagnostic for several.
     /// </summary>
+    private static bool CanBitWindow(VectorState state, int w)
+    {
+        if (state.Slots[w] is not { BitOffset: 0 } slice)
+            return false;
+        if (slice.Operand is Immediate)
+            return true;
+        if (slice.Operand is Register { Name: { } n })
+            return n.Contains('.') || IsScalarWholeWindow(state, w, slice);
+        return false;
+    }
     public bool TryBitSelect(Arm64Instruction insn,
         Func<ulong, OpCode, List<IOperand>, Instruction> add,
         Func<Arm64Instruction, int, IOperand> convertOperand)
@@ -868,7 +933,7 @@ internal sealed class Arm64VectorScalarizer
         if (stateD == null || stateA == null || stateB == null)
             return false;
         for (var w = 0; w < slots; w++)
-            if (stateA.Slots[w] == null || stateB.Slots[w] == null || stateD.Slots[w] == null)
+            if (!CanBitWindow(stateA, w) || !CanBitWindow(stateB, w) || !CanBitWindow(stateD, w))
                 return false;
 
         var aOps = new IOperand?[slots];

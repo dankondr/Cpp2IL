@@ -782,7 +782,15 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.FCMEQ:
                 if (IsScalarFloatRegister(instruction.Op0Reg))
                 {
-                    EmitScalarCompareMask();
+                    // the compare is emitted only when its operands provably
+                    // carry scalars — a register holding wider data may be a
+                    // managed aggregate, and comparing that fabricates float
+                    // semantics for managed bits
+                    if (scalarizer.ScalarCompareOperandsHonest(instruction))
+                        EmitScalarCompareMask();
+                    else
+                        Add(address, OpCode.NotImplemented,
+                            new StringLiteral($"Instruction {instruction.Mnemonic} operand provenance is not supported."));
                     break;
                 }
                 var recordsVector4Compare = instruction.Op0Arrangement == Arm64ArrangementSpecifier.FourS
