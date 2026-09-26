@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Linq;
+using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -30,8 +31,9 @@ public static class DelegateInvokeRecovery
             if (instruction.OpCode is not (OpCode.IndirectCall or OpCode.IndirectJump))
                 continue;
 
-            if (GetDelegate(instruction, definitions, invokeImplOffset) is not { } delegateLocal
-                || delegateLocal.Type is not { IsDelegate: true } delegateType)
+            var delegateLocal = GetDelegate(instruction, definitions, invokeImplOffset);
+            var delegateType = delegateLocal != null ? DelegateTypeOf(delegateLocal, definitions) : null;
+            if (delegateLocal == null || delegateType == null)
                 continue;
 
             // Generic instances carry no Methods of their own - resolve Invoke on the generic
@@ -82,16 +84,24 @@ public static class DelegateInvokeRecovery
 
     // A delegate's invoke frame is (method_code, params..., method): the receiver register
     // carries a delegate-internal field, each declared parameter gets a real argument - an
-    // address for byref/pointer params - and the slot after the params is the delegate's
-    // MethodInfo. Anything else stays indirect.
+    // address for byref/pointer params - and the last argument slot is the delegate's
+    // MethodInfo. Arguments are located by register so float/HFA params (which consume
+    // V-registers) don't shift the integer-register positions. Anything else stays indirect.
     private static bool VerifyInvokeOperands(Instruction call, MethodAnalysisContext invoke,
         LocalVariable delegateLocal, Dictionary<LocalVariable, Instruction> definitions, int invokeImplOffset)
     {
         var parameters = invoke.Parameters;
-        if (call.Operands.Count < 4 + parameters.Count)
+        if (call.Operands.Count < 4 + parameters.Count
+            || invoke.AppContext.InstructionSet.CallingConventionResolver is not { } resolver)
             return false;
 
-        if (!IsDelegateFieldLoad(call.Operands[2], delegateLocal, definitions, invokeImplOffset))
+        var arguments = resolver.ResolveForManaged(invoke); // receiver, params..., MethodInfo
+        if (arguments.Length != 1 + parameters.Count + 1)
+            return false;
+
+        var receiverIndex = RawOperandIndex(call, arguments[0]);
+        if (receiverIndex < 0
+            || !IsDelegateFieldLoad(call.Operands[receiverIndex], delegateLocal, definitions, invokeImplOffset))
             return false;
 
         for (var i = 0; i < parameters.Count; i++)
@@ -99,7 +109,11 @@ public static class DelegateInvokeRecovery
             if (parameters[i].ParameterType is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext))
                 continue;
 
-            var argument = call.Operands[3 + i];
+            var argumentIndex = RawOperandIndex(call, arguments[1 + i]);
+            if (argumentIndex < 0)
+                return false;
+
+            var argument = call.Operands[argumentIndex];
             var address = argument is AddressOf
                           || argument is LocalVariable local
                               && InterfaceDispatchRecovery.ChaseCopies(definitions, local) is
@@ -108,8 +122,68 @@ public static class DelegateInvokeRecovery
                 return false;
         }
 
-        return IsDelegateFieldLoad(call.Operands[3 + parameters.Count], delegateLocal, definitions, invokeImplOffset);
+        var methodInfoIndex = RawOperandIndex(call, arguments[^1]);
+        return methodInfoIndex >= 0
+            && IsDelegateFieldLoad(call.Operands[methodInfoIndex], delegateLocal, definitions, invokeImplOffset);
     }
+
+    // The index, within a raw-register operand list, of the register the managed argument
+    // was passed in. -1 when it doesn't land in a register (e.g. spilled to the stack).
+    private static int RawOperandIndex(Instruction call, IOperand argument)
+    {
+        var name = argument switch
+        {
+            Register { Name: var registerName } => registerName,
+            LocalVariable { Register.Name: var registerName } => registerName,
+            _ => null,
+        };
+        if (name == null)
+            return -1;
+
+        for (var i = 2; i < call.Operands.Count; i++)
+            if (RegisterName(call.Operands[i]) == name)
+                return i;
+        return -1;
+    }
+
+    private static string? RegisterName(IOperand operand) => operand switch
+    {
+        Register register => register.Name,
+        LocalVariable { Register.Name: var name } => name,
+        _ => null,
+    };
+
+    // The local holding the delegate may itself be a copy, or loaded from a field, while the
+    // delegate type only shows on its definition. Generic instances report no base type of their
+    // own, so the check has to look through to the generic definition.
+    private static TypeAnalysisContext? DelegateTypeOf(LocalVariable local,
+        Dictionary<LocalVariable, Instruction> definitions)
+    {
+        var visited = new HashSet<LocalVariable>();
+        var current = local;
+        while (visited.Add(current))
+        {
+            if (IsDelegateType(current.Type))
+                return current.Type!;
+            if (!definitions.TryGetValue(current, out var definition)
+                || definition.OpCode != OpCode.Move)
+                return null;
+            switch (definition.Operands[1])
+            {
+                case LocalVariable source:
+                    current = source;
+                    break;
+                case FieldReference { Field.FieldType: { } fieldType }:
+                    return IsDelegateType(fieldType) ? fieldType : null;
+                default:
+                    return null;
+            }
+        }
+        return null;
+    }
+
+    private static bool IsDelegateType(TypeAnalysisContext? type) =>
+        type is { IsDelegate: true } or GenericInstanceTypeAnalysisContext { GenericType.IsDelegate: true };
 
     private static bool IsDelegateFieldLoad(IOperand operand, LocalVariable delegateLocal,
         Dictionary<LocalVariable, Instruction> definitions, int invokeImplOffset)
@@ -133,8 +207,10 @@ public static class DelegateInvokeRecovery
         LocalVariable delegateLocal, MethodAnalysisContext invoke)
     {
         var isTailCall = call.OpCode == OpCode.IndirectJump;
-        if (isTailCall && (method.IsVoid != invoke.IsVoid
-            || !method.IsVoid && method.ReturnType.FullName != invoke.ReturnType.FullName))
+        // A void caller may tail-jump an invoke with a return value - CallVoid lowers to
+        // call+pop, the discarded result. A non-void caller needs an assignable return.
+        if (isTailCall && !method.IsVoid
+            && (invoke.IsVoid || !invoke.ReturnType.IsAssignableTo(method.ReturnType)))
             return;
 
         if (invoke.AppContext.InstructionSet.CallingConventionResolver is not { } callingConventions
@@ -143,19 +219,20 @@ public static class DelegateInvokeRecovery
 
         if (isTailCall)
         {
+            var yieldsResult = !method.IsVoid && !invoke.IsVoid;
             var operands = new List<IOperand> { invoke };
-            if (!invoke.IsVoid)
+            if (yieldsResult)
                 operands.Add(new LocalVariable("delegateTailCallResult", callingConventions.ReturnRegister(invoke), invoke.ReturnType));
             operands.AddRange(call.Operands.Skip(2));
             call.SetOperands(operands);
-            call.OpCode = invoke.IsVoid ? OpCode.CallVoid : OpCode.Call;
+            call.OpCode = yieldsResult ? OpCode.Call : OpCode.CallVoid;
             callingConventions.RemapRawArguments(call, invoke);
 
             // The native receiver register holds invoke_impl_this rather than the managed delegate.
-            call.SetOperand(invoke.IsVoid ? 1 : 2, delegateLocal);
+            call.SetOperand(yieldsResult ? 2 : 1, delegateLocal);
 
             block.AddInstruction(new Instruction(-1, OpCode.Return,
-                invoke.IsVoid ? [] : [call.Operands[1]]));
+                yieldsResult ? [call.Operands[1]] : []));
             block.CalculateBlockType();
         }
         else
