@@ -3264,6 +3264,17 @@ public static class IlGenerator
             case DoubleLiteral d:
                 instructions.Add(CilOpCodes.Ldc_R8, d.Value);
                 break;
+            case Vector128Literal vector when literalType?.FullName == "System.Single":
+                instructions.Add(CilOpCodes.Ldc_R4, vector.X);
+                break;
+            case Vector128Literal vector when literalType?.FullName is "System.Int32" or "System.UInt32":
+                instructions.Add(CilOpCodes.Ldc_I4, System.BitConverter.SingleToInt32Bits(vector.X));
+                break;
+            case Vector128Literal vector when literalType?.FullName == "System.Double":
+                var lowDoubleBits = (long)(uint)System.BitConverter.SingleToInt32Bits(vector.X)
+                    | (long)System.BitConverter.SingleToInt32Bits(vector.Y) << 32;
+                instructions.Add(CilOpCodes.Ldc_R8, System.BitConverter.Int64BitsToDouble(lowDoubleBits));
+                break;
             case Vector128Literal vector:
                 var componentCount = literalType?.DefaultFullName switch
                 {
