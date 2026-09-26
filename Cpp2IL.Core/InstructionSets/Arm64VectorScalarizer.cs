@@ -580,10 +580,25 @@ internal sealed class Arm64VectorScalarizer
         => state.Slots[slot] is { } slice && IsFloatCarrier(slice) ? SlotOperand(state, slot) : null;
 
     /// <summary>
+    /// Pure check that the lane is an honest float carrier — reads slot
+    /// provenance only, emits nothing. Every caller probes all lanes with this
+    /// first and materializes operands only once the whole vector checks out,
+    /// so a failed fold leaves no orphaned shift temps behind.
+    /// </summary>
+    private static bool CanFloatLane(VectorState? state, int laneBits, int lane)
+    {
+        if (state == null)
+            return false;
+        if (laneBits == 32)
+            return state.Slots[lane] is { } slice && IsFloatCarrier(slice);
+        return state.Slots[2 * lane] is { } lo && IsFloatCarrier(lo)
+            && state.Slots[2 * lane + 1] is { } hi && IsFloatCarrier(hi);
+    }
+
+    /// <summary>
     /// A floating-point lane operand, or null when the lane cannot be read
     /// without pretending a whole-register local is an integer lane carrier.
-    /// For 64-bit lanes both windows are checked before any operand is
-    /// materialized, so a dishonest carrier leaves nothing emitted.
+    /// Call only after CanFloatLane passed — it may emit extraction temps.
     /// </summary>
     private IOperand? FloatLaneOperand(VectorState? state, int laneBits, int lane)
     {
@@ -764,15 +779,20 @@ internal sealed class Arm64VectorScalarizer
         if (sourceA == null && sourceB == null)
             return false; // fully opaque chain: caller's normal path
 
-        // a mask is only meaningful whole — resolve every lane before emitting
+        // all-or-nothing: probe every lane before emitting anything — a
+        // partially proven mask must leave the instruction unimplemented, not
+        // trade it for a fold plus orphaned extraction temps.
+        for (var lane = 0; lane < laneCount; lane++)
+            if (!CanFloatLane(sourceA, laneBits, lane)
+                || (zero == null && !CanFloatLane(sourceB, laneBits, lane)))
+                return false;
+
         var aOps = new IOperand?[laneCount];
         var bOps = new IOperand?[laneCount];
         for (var lane = 0; lane < laneCount; lane++)
         {
             aOps[lane] = FloatLaneOperand(sourceA, laneBits, lane);
             bOps[lane] = zero ?? FloatLaneOperand(sourceB, laneBits, lane);
-            if (aOps[lane] == null || bOps[lane] == null)
-                return false;
         }
 
         var primary = insn.Mnemonic switch
@@ -797,8 +817,11 @@ internal sealed class Arm64VectorScalarizer
                 _add(_address, OpCode.CheckEqual, [equal, aOps[lane]!, bOps[lane]!]);
                 _add(_address, OpCode.Or, [laneReg, laneReg, equal]);
             }
-            // Check* yields 0/1; negating it produces the mask's all-ones
-            _add(_address, OpCode.Negate, [laneReg, laneReg]);
+            // Check* yields a boolean 0/1; negating it produces the mask's
+            // all-ones. The lane is pinned Int32 — the comparison seed would
+            // otherwise type the mask Boolean, whose stack value is 1, and a
+            // downstream `and` would compute 1 & n instead of ~0 & n.
+            _add(_address, OpCode.Negate, [laneReg, laneReg]).NativeIntegerWidthBits = 32;
             _emitted = true;
         }
 
@@ -840,42 +863,30 @@ internal sealed class Arm64VectorScalarizer
         if (stateD == null && stateA == null && stateB == null)
             return false; // fully opaque chain: caller's normal path
 
+        // all-or-nothing: a partially proven select would swap the honest
+        // diagnostic for a fold plus unknown windows — refuse instead
+        if (stateD == null || stateA == null || stateB == null)
+            return false;
+        for (var w = 0; w < slots; w++)
+            if (stateA.Slots[w] == null || stateB.Slots[w] == null || stateD.Slots[w] == null)
+                return false;
+
         var aOps = new IOperand?[slots];
         var bOps = new IOperand?[slots];
         var dOps = new IOperand?[slots];
-        var anyProven = false;
         for (var w = 0; w < slots; w++)
         {
-            aOps[w] = stateA == null ? null : SlotOperand(stateA, w);
-            bOps[w] = stateB == null ? null : SlotOperand(stateB, w);
-            dOps[w] = stateD == null ? null : SlotOperand(stateD, w);
-            anyProven |= aOps[w] != null && bOps[w] != null && dOps[w] != null;
+            aOps[w] = SlotOperand(stateA, w);
+            bOps[w] = SlotOperand(stateB, w);
+            dOps[w] = SlotOperand(stateD, w);
         }
 
         var dest = Ensure(insn.Op0Reg);
         ClaimDest(insn.Op0Reg);
         var destName = Normalize(insn.Op0Reg);
 
-        if (!anyProven)
-        {
-            for (var w = 0; w < slots; w++)
-                dest.Slots[w] = null;
-            for (var w = slots; w < 4; w++)
-                dest.Slots[w] = new LaneSlice(Zero, 0);
-            Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarization skipped.");
-            return true;
-        }
-
-        var unproven = 0;
         for (var w = 0; w < slots; w++)
         {
-            if (aOps[w] == null || bOps[w] == null || dOps[w] == null)
-            {
-                dest.Slots[w] = null;
-                unproven++;
-                continue;
-            }
-
             Register left, right;
             if (insn.Mnemonic == Arm64Mnemonic.BSL)
             {
@@ -907,8 +918,6 @@ internal sealed class Arm64VectorScalarizer
         for (var w = slots; w < 4; w++)
             dest.Slots[w] = new LaneSlice(Zero, 0); // the 8B form zeroes the upper half
         SyncScalarView(dest, destName);
-        if (unproven > 0)
-            Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarized {slots - unproven} of {slots} windows.");
         return true;
     }
 
@@ -943,12 +952,13 @@ internal sealed class Arm64VectorScalarizer
             return false;
 
         var state = LaneState(insn.Op1Reg);
-        var first = FloatLaneOperand(state, laneBits, 0);
-        var second = FloatLaneOperand(state, laneBits, 1);
-        if (first == null || second == null)
+        // probe before materializing: a refused reduction must not leave
+        // orphaned extraction temps behind
+        if (!CanFloatLane(state, laneBits, 0) || !CanFloatLane(state, laneBits, 1))
             return false;
 
-        _add(_address, OpCode.Add, [convertOperand(insn, 0), first, second]);
+        _add(_address, OpCode.Add,
+            [convertOperand(insn, 0), FloatLaneOperand(state, laneBits, 0)!, FloatLaneOperand(state, laneBits, 1)!]);
         _emitted = true;
         return true;
     }
@@ -1332,6 +1342,19 @@ internal sealed class Arm64VectorScalarizer
 
         if (sourceA == null && sourceB == null && sourceD == null && elementA == null && elementB == null)
             return false; // fully opaque chain: caller's normal path
+
+        // FADDP is all-or-nothing: a partially proven pairwise fold trades the
+        // honest diagnostic for lane ops plus unknown windows — refuse before
+        // the destination is claimed or any operand is materialized.
+        if (insn.Mnemonic == Arm64Mnemonic.FADDP && laneBits is 32 or 64)
+            for (var lane = 0; lane < laneCount; lane++)
+            {
+                var pairSource = lane < laneCount / 2 ? sourceA : sourceB;
+                var pair = lane < laneCount / 2 ? lane : lane - laneCount / 2;
+                if (!CanFloatLane(pairSource, laneBits, 2 * pair)
+                    || !CanFloatLane(pairSource, laneBits, 2 * pair + 1))
+                    return false;
+            }
 
         var dest = Ensure(insn.Op0Reg);
         ClaimDest(insn.Op0Reg);

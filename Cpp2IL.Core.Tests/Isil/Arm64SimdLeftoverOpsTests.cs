@@ -294,6 +294,32 @@ public class Arm64SimdLeftoverOpsTests
     }
 
     [Test]
+    public void PartiallyProvenBitSelectLeavesSingleDiagnostic()
+    {
+        // only the mask operand is proven — a partial fold would trade one
+        // honest diagnostic for lane ops plus unknown windows, so nothing but
+        // the diagnostic may be emitted
+        var il = Lift(
+            0x0E040C42, // dup v2.2s, w2 — the only proven input
+            0x2EA21C01, // bit v1.8b, v0.8b, v2.8b — v0/v1 unproven
+            0xD65F03C0);
+        Assert.That(il.Count(i => i.OpCode == OpCode.NotImplemented), Is.EqualTo(1));
+        Assert.That(il.Any(i => i.OpCode is OpCode.And or OpCode.Not or OpCode.ShiftRight), Is.False,
+            "refused fold must not leave orphaned lane ops behind");
+    }
+
+    [Test]
+    public void PartiallyProvenVectorCompareLeavesSingleDiagnostic()
+    {
+        var il = Lift(
+            0x0E040C42, // dup v2.2s, w2 — proven
+            0x2EA3E446, // fcmgt v6.2s, v2.2s, v3.2s — v3 unproven
+            0xD65F03C0);
+        Assert.That(il.Count(i => i.OpCode == OpCode.NotImplemented), Is.EqualTo(1));
+        Assert.That(il.Any(i => i.OpCode is OpCode.CheckGreater or OpCode.Negate or OpCode.ShiftRight), Is.False);
+    }
+
+    [Test]
     public void UnsupportedCompareAndPairwiseShapesStayDiagnostic()
     {
         foreach (var word in new uint[]

@@ -686,7 +686,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 Add(address, OpCode.CheckEqual, equal, left, right);
                 Add(address, OpCode.Or, mask, mask, equal);
             }
-            Add(address, OpCode.Negate, compareDest, mask);
+            // Pin the mask Int32: the Check* seed types its 0/1 result
+            // Boolean, and a Boolean-typed mask would evaluate `and` as
+            // 1 & n where the hardware mask is all-ones.
+            Add(address, OpCode.Negate, compareDest, mask).NativeIntegerWidthBits = 32;
         }
 
         var preserveAdrpOffset = false;
