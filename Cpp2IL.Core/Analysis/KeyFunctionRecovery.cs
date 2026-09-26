@@ -38,7 +38,7 @@ public static class KeyFunctionRecovery
 
     public static void Run(MethodAnalysisContext method)
     {
-        RewriteArrayElementClassLoads(method);
+        RewriteElementClassLoads(method);
 
         foreach (var instruction in method.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))
         {
@@ -64,7 +64,7 @@ public static class KeyFunctionRecovery
         }
     }
 
-    private static void RewriteArrayElementClassLoads(MethodAnalysisContext method)
+    private static void RewriteElementClassLoads(MethodAnalysisContext method)
     {
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
@@ -77,11 +77,7 @@ public static class KeyFunctionRecovery
                         {
                             Base: LocalVariable
                             {
-                                Type: RuntimeClassTypeAnalysisContext
-                                {
-                                    RepresentedType: WrappedTypeAnalysisContext array
-                                        and (SzArrayTypeAnalysisContext or ArrayTypeAnalysisContext)
-                                }
+                                Type: RuntimeClassTypeAnalysisContext { RepresentedType: var represented }
                             },
                             Index: null,
                             Scale: 0,
@@ -91,8 +87,21 @@ public static class KeyFunctionRecovery
                 || !Il2CppClassUsefulOffsets.IsElementTypePtr((uint)offset, method.AppContext.Binary.is32Bit))
                 continue;
 
-            var elementClass = new RuntimeClassTypeAnalysisContext(array.ElementType,
-                array.ElementType.DeclaringAssembly);
+            var elementType = represented switch
+            {
+                SzArrayTypeAnalysisContext or ArrayTypeAnalysisContext
+                    => ((WrappedTypeAnalysisContext)represented).ElementType,
+                PointerTypeAnalysisContext pointer => pointer.ElementType,
+                GenericInstanceTypeAnalysisContext
+                {
+                    GenericType.FullName: "System.Nullable`1",
+                    GenericArguments: [{ } nullableElement]
+                } => nullableElement,
+                { IsEnumType: true, DefaultEnumUnderlyingType: { } underlying } => underlying,
+                _ => represented,
+            };
+            var elementClass = new RuntimeClassTypeAnalysisContext(elementType,
+                elementType.DeclaringAssembly);
             instruction.SetOperand(1, elementClass);
             destination.Type = elementClass;
         }
