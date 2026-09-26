@@ -404,7 +404,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         InjectedCheckRemover.Run(this);
 
-        InterfaceDispatchRecovery.Run(this);
+        var finishInterfaceDispatchRecovery = InterfaceDispatchRecovery.Run(this);
 
         LocalVariables.ResolveTypesAndFields(this);
         // Runtime class targets become available only after type resolution.
@@ -420,6 +420,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         DelegateInvokeRecovery.Run(this);
         BooleanFlagSimplifier.Run(this);
         DeadCodeEliminator.Run(this);
+        finishInterfaceDispatchRecovery?.Invoke();
 
         // Copy/constant propagation belongs in SSA, where one definition dominates all uses and phis
         // make joins explicit, so forwarding a value is an unconditional global substitution.
