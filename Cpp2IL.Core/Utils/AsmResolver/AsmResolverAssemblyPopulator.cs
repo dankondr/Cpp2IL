@@ -730,6 +730,5 @@ public static class AsmResolverAssemblyPopulator
                 property.SetSemanticMethods(null, setMethod);
             }
         }
-
     }
 }
