@@ -566,6 +566,23 @@ public static class IlGenerator
                     break;
                 }
 
+                // A method pointer stored into a local that no instruction ever
+                // loads is a dead store, so the whole Move drops out. Only an
+                // ldftn-spellable pointer (System.IntPtr destination, visible,
+                // non-.ctor) is dropped this way; unspellable pointers keep
+                // their documented placeholder emission. A live destination (a
+                // field, an interop argument, a read local) always keeps its
+                // ldftn - a real function pointer is never replaced by a
+                // placeholder.
+                if (instruction.Operands is [LocalVariable deadPointerLocal, RuntimeMethodInfoAnalysisContext methodPointer]
+                    && StoreContract(deadPointerLocal, context)?.FullName == "System.IntPtr"
+                    && SpellableMethodPointer(methodPointer, context) is { Name: not ".ctor" }
+                    && !LocalIsLoaded(context, deadPointerLocal))
+                {
+                    instructions.Add(CilOpCodes.Nop);
+                    break;
+                }
+
                 var moveDestinationType = StoreContract(instruction.Operands[0], context);
                 LoadOperandIntoSlot(instruction.Operands[1], moveDestinationType, context, method, locals, writeLine);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
@@ -2920,6 +2937,44 @@ public static class IlGenerator
         return false;
     }
 
+    /// <summary>
+    /// The method an ldftn/ldtoken can name for a runtime method pointer: the
+    /// represented method itself, or the accessible substitute a direct call
+    /// would have used when the original is a shared-enum-marker or otherwise
+    /// invisible callee. Null when no spellable target exists - the load then
+    /// keeps its unresolved placeholder emission.
+    /// </summary>
+    private static MethodAnalysisContext? SpellableMethodPointer(
+        RuntimeMethodInfoAnalysisContext runtimeMethod, MethodAnalysisContext? callingContext)
+    {
+        var represented = runtimeMethod.RepresentedMethod;
+        var representedVisible = !CalleeUsesSharedEnumMarker(represented)
+            && (callingContext == null
+                || Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(represented, callingContext));
+        if (representedVisible)
+            return represented;
+
+        // The same invisible corlib helpers show up as function pointers; the honest
+        // substitutes are the ones a direct call would use.
+        var substitute = Analysis.InaccessibleCalleeRecovery.TrySubstitute(represented);
+        if (substitute == null
+            || CalleeUsesSharedEnumMarker(substitute)
+            || (callingContext != null
+                && !Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(substitute, callingContext)))
+            return null;
+        return substitute;
+    }
+
+    // A local counts as loaded when any instruction's UsedLocals yields it:
+    // destinations are writes, while memory bases, field receivers, array/index
+    // and select operands all count as loads - including inside loops, so the
+    // scan covers the whole control flow graph rather than instructions after
+    // this one.
+    private static bool LocalIsLoaded(MethodAnalysisContext context, LocalVariable local) =>
+        context.ControlFlowGraph!.Blocks
+            .SelectMany(block => block.Instructions)
+            .Any(other => Analysis.DeadCodeEliminator.UsedLocals(other).Any(used => ReferenceEquals(used, local)));
+
     private static bool DerivesFromMulticastDelegate(TypeAnalysisContext type)
     {
         for (var current = type; current != null;
@@ -3541,28 +3596,17 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Throw);
                 break;
             case RuntimeMethodInfoAnalysisContext runtimeMethod:
-                // A delegate constructor takes its target as a native pointer, which is exactly ldftn.
-                // ldftn cannot name a .ctor though; the unresolved placeholder below stays
-                // verifier-legal (a native-int zero) instead of fabricating a function pointer.
-                var represented = runtimeMethod.RepresentedMethod;
-                var representedVisible = !CalleeUsesSharedEnumMarker(represented)
-                    && (callingContext == null
-                        || Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(represented, callingContext));
-                if (!representedVisible)
-                {
-                    // The same invisible corlib helpers show up as function pointers; the honest
-                    // substitutes are the ones a direct call would use.
-                    represented = Analysis.InaccessibleCalleeRecovery.TrySubstitute(represented) ?? represented;
-                    representedVisible = !CalleeUsesSharedEnumMarker(represented)
-                        && (callingContext == null
-                            || Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(represented, callingContext));
-                }
-                if (expectedType?.FullName == "System.IntPtr" && represented.Name is not ".ctor" && representedVisible)
+                // A function pointer load is exactly ldftn. ldftn cannot name a
+                // .ctor though; the unresolved placeholder below stays
+                // verifier-legal (a native-int zero) instead of fabricating a
+                // function pointer for it.
+                var represented = SpellableMethodPointer(runtimeMethod, callingContext);
+                if (expectedType?.FullName == "System.IntPtr" && represented is { Name: not ".ctor" })
                 {
                     instructions.Add(CilOpCodes.Ldftn, represented.ToMethodDescriptor());
                     break;
                 }
-                if (expectedType?.FullName == "System.RuntimeMethodHandle" && representedVisible)
+                if (expectedType?.FullName == "System.RuntimeMethodHandle" && represented != null)
                 {
                     instructions.Add(CilOpCodes.Ldtoken, represented.ToMethodDescriptor());
                     break;
