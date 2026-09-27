@@ -22,9 +22,10 @@ namespace Cpp2IL.Core.Tests.Regression;
 //    the output. Array contexts now report System.Array as their base.
 //  * A standalone `ldftn` on an instance method — recovered for a spilled
 //    method-pointer slot — is valid CIL but has no C# spelling, so it prints as
-//    `__ldftn`. ldftn now survives only where C# can spell it: static methods and
-//    the function-pointer argument of a delegate (object, native int) .ctor.
-//    Everywhere else the slot keeps the native-int zero placeholder.
+//    `__ldftn`. When the pointer lands in a local that no instruction ever
+//    loads, the store is dead and the whole Move drops out. Live destinations
+//    (fields, call arguments, locals that are read) keep their ldftn; replacing
+//    the pointer with a placeholder would silently discard a real value.
 public class CompilerGeneratedNameTests
 {
     private static TypeAnalysisContext SystemRuntimeFieldHandle(ApplicationAnalysisContext app) =>
@@ -104,7 +105,7 @@ public class CompilerGeneratedNameTests
     }
 
     [Test]
-    public void StandaloneInstanceMethodHandleKeepsNullPointerPlaceholder()
+    public void StandaloneInstanceMethodPointerStoreToUnreadLocalIsDropped()
     {
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
@@ -138,10 +139,65 @@ public class CompilerGeneratedNameTests
         Assert.Multiple(() =>
         {
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldftn), Is.False,
-                () => "an instance-method pointer outside a delegate .ctor cannot print as C#:\n"
+                () => "the dead method-pointer store drops entirely:\n"
                     + string.Join("\n", il.Select(i => i.ToString())));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Conv_I), Is.True,
-                "the slot keeps the native-int zero placeholder");
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Conv_I), Is.False,
+                "no zero placeholder is substituted for the dropped pointer");
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stloc || i.OpCode == CilOpCodes.Stloc_S
+                || i.OpCode == CilOpCodes.Stloc_0 || i.OpCode == CilOpCodes.Stloc_1
+                || i.OpCode == CilOpCodes.Stloc_2 || i.OpCode == CilOpCodes.Stloc_3), Is.False,
+                "the store itself is gone, not just the load");
+        });
+    }
+
+    [Test]
+    public void StandaloneInstanceMethodPointerFieldStoreStillEmitsLdftn()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.AssembliesByName["UnityEngine.CoreModule"];
+        var widget = new InjectedTypeAnalysisContext(assembly, "Tests", "Widget",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var target = widget.InjectMethodContext("OnEvent", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public);
+        var ptrField = widget.InjectFieldContext("Ptr", app.SystemTypes.SystemIntPtrType,
+            R.FieldAttributes.Public);
+        var methodInfo = new RuntimeMethodInfoAnalysisContext(target, assembly);
+        var holder = new LocalVariable("holder", new Register(null, "holder")) { Type = widget };
+        var readBack = new LocalVariable("readBack", new Register(null, "readBack"))
+            { Type = app.SystemTypes.SystemIntPtrType };
+        var fieldRef = new FieldReference(ptrField, holder, 8);
+        var module = new ModuleDefinition("LiveFn.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemIntPtrType,
+            app.SystemTypes.SystemVoidType, app.SystemTypes.SystemObjectType);
+        var widgetDefinition = new TypeDefinition("Tests", "Widget",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(widgetDefinition);
+        widget.PutExtraData("AsmResolverType", widgetDefinition);
+        var targetDefinition = new MethodDefinition("OnEvent", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        widgetDefinition.Methods.Add(targetDefinition);
+        target.PutExtraData("AsmResolverMethod", targetDefinition);
+        var ptrDefinition = new FieldDefinition("Ptr", FieldAttributes.Public,
+            new FieldSignature(module.CorLibTypeFactory.IntPtr));
+        widgetDefinition.Fields.Add(ptrDefinition);
+        ptrField.PutExtraData("AsmResolverField", ptrDefinition);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, fieldRef, methodInfo),
+            new(1, OpCode.Move, readBack, fieldRef),
+            new(2, OpCode.Return)], [holder, readBack]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldftn), Is.True,
+                () => "a field destination is live memory, so the pointer is kept:\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stfld), Is.True,
+                "the store into the field is emitted");
         });
     }
 

@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -71,7 +72,7 @@ public static class DeadCodeEliminator
     /// is excluded. Memory and field operands always contribute their address/object locals as
     /// reads, even when they are the destination of a store.
     /// </summary>
-    private static IEnumerable<LocalVariable> UsedLocals(Instruction instruction)
+    internal static IEnumerable<LocalVariable> UsedLocals(Instruction instruction)
     {
         var destination = instruction.Destination as LocalVariable;
 
@@ -102,6 +103,14 @@ public static class DeadCodeEliminator
                     break;
                 case ReferenceCast referenceCast:
                     yield return referenceCast.Value;
+                    break;
+                // The selector's value is read to pick a field, and each choice is
+                // a field access rooted in its own receiver local.
+                case SelectedFieldReference selected:
+                    yield return selected.Selector;
+                    foreach (var receiver in selected.Choices.Select(c => c.Field.Local))
+                        if (receiver != null)
+                            yield return receiver;
                     break;
                 case AddressOf { Target: ArrayAccess addressedElement }:
                     foreach (var used in ArrayAccessLocals(addressedElement))
