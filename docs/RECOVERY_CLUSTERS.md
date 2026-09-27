@@ -117,12 +117,14 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
 | castle-recovery#96 `internals-visible-to-key-mismatch` (compile bucket, CS0281) | metadata emission | Classification only — no Cpp2IL-owned shape: all 47 CS0281 sites are `mscorlib`-granted keyed `InternalsVisibleTo` grants meeting an unsigned recompiled consumer (System ×35, System.Core ×1 = real metadata grants + real `AssemblyKeyFile` naming a key file absent from the recovered tree → CS7027 → unsigned; Google.Protobuf ×11 = the synthetic sibling grant keyed to the friend's genuine recovered public key — keying is required for emitted-corpus ILVerify since the emitted friend claims strong-name identity). Identity fidelity verified end to end: every emitted definition's `PublicKey` is byte-identical to the il2cpp metadata (23 keyed definitions, 160 without), and all 1,079 resolvable assembly references carry the token of the definition they resolve to. Owner of the residual: the compile driver, which must public-sign each recompiled assembly with its recovered public key | `Regression/InternalsVisibleToKeyGrantTests.SyntheticGrantNamesExactlyTheEmittedFriendsKey` |
 | castle-recovery#93 `use-of-unassigned-local` (compile bucket, CS0165 throw-epilogue shape) | CFG | `MetadataResolver.LowerThrowHelperCall` (extracted from `ResolveCalls`) lowers a call to a helper proven non-returning to `OpCode.Throw` unconditionally — the old `Newobj` alternative kept the impossible fall-through edge live, so joins below it read locals that no incoming path assigns; an unproven helper whose result is read still keeps `Newobj`, and the implicit-failure equivalence check runs before the opcode is rewritten so `recoveredImplicitHelpers` marking is unchanged. A raise lowered to `Throw` while its produced local still has readers is tagged `Instruction.ThrowFromNonReturningCall` so `InjectedCheckRemover` does not fold it as an il2cpp check epilogue | `Regression/ThrowHelperEpilogueTests.*` (2 tests) |
 
+| castle-recovery#101 `decompiler-invalid-emission` (compile bucket, CS1540 generic-member reference) | metadata emission | `ContextToMethodDescriptor.ToMethodDescriptor(ConcreteGenericMethodAnalysisContext)` runs the same `MemberAccessibility.EnsureAccessible` ambient-scope widening the plain-method descriptor path already applied — the generic-instance overload (used by `ldftn`/`call`/`callvirt`/`ldtoken` member references) skipped it, so a same-assembly reference to a `protected` generic method left the member at `family` and ilspy rendered a qualifier-of-declaring-type access C# rejects (CS1540); `development` measurement: bucket 114 -> 40, CS1540 97 -> 23, `invalid_il` 474 -> 473 | `Regression/GenericMethodReferenceAccessibilityTests.*` (3 tests) |
+
 ## Summary
 
 - **84 fork PRs** merged since `b5ad444b` (#1–#79, #81–#85; no #80), plus the
   castle-recovery#NN issue rows.
 - **2 are not live recovery fixes**: #26 (reverted by #27) and #85 (CI only).
-- **94 recovery-fix clusters.** **92** carry reproducing tests (tests added or
+- **96 recovery-fix clusters.** **94** carry reproducing tests (tests added or
   strengthened in the same PR): the 80 through the backfill wave (#16 + #47,
   #38, #40, #41, #57, #58), castle-recovery#74's `UnboxEmissionTests.*`,
   castle-recovery#75's `Arm64VectorLaneLiftingTests.*`,
@@ -135,8 +137,9 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
   castle-recovery#88's `InterfaceDeclaredExplicitImplementationTests.*`,
   castle-recovery#90's `SlotDefaultDiagnosticsTests.*`,
   castle-recovery#92's `UnpairedOperatorEmissionTests.*`,
+  castle-recovery#93's `ThrowHelperEpilogueTests.*`,
   castle-recovery#96's `InternalsVisibleToKeyGrantTests.*`, and
-  castle-recovery#93's `ThrowHelperEpilogueTests.*`.
+  castle-recovery#101's `GenericMethodReferenceAccessibilityTests.*`.
 - **2 remain `none`**, both compile-only fixes: #15 (`IReadOnlySet` on
   netstandard2.0) and #20 (`AddOperands` signature fix, exercised downstream by
   `Arm64LibcMathImportTests`).
