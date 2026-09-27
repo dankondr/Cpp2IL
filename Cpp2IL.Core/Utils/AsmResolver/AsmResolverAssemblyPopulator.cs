@@ -3,8 +3,11 @@ using System.Collections.Generic;
 using System.Linq;
 using AsmResolver;
 using AsmResolver.DotNet;
+using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Signatures;
+using AsmResolver.PE.DotNet.Cil;
 using AsmResolver.PE.DotNet.Metadata.Tables;
+using Cpp2IL.Core.Logging;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Model.CustomAttributes;
 using LibCpp2IL.BinaryStructures;
@@ -225,6 +228,90 @@ public static class AsmResolverAssemblyPopulator
         return new CustomAttribute((ICustomAttributeType)ctor, signature);
     }
 
+    // il2cpp strips accessor MethodDefs the binary never calls, but a property
+    // used as an attribute named argument keeps its setter (the runtime assigns
+    // through it) while losing the getter, leaving a write-only member that C#
+    // cannot name in attribute syntax (CS0617). Restore the missing accessor
+    // only when a compiler backing field exists - that proves the original was
+    // an auto-property the accessor can read or write directly. A property
+    // without one is left unchanged and logged rather than given an invented
+    // body.
+    private static void EnsureNamedArgumentAccessors(AnalyzedCustomAttribute attribute)
+    {
+        foreach (var namedProperty in attribute.Properties)
+        {
+            var property = namedProperty.Property.GetExtraData<PropertyDefinition>("AsmResolverProperty");
+            var declaringType = property?.DeclaringType;
+            if (declaringType == null || property.Signature is not { ParameterTypes.Count: 0 })
+                continue; //Indexers can never be named arguments anyway.
+
+            //PopulateCustomAttributes runs per-assembly in parallel, and an
+            //attribute in one assembly can name a property on a typedef in
+            //another - serialize the check-and-synthesize on the property.
+            lock (property)
+            {
+                var getter = property.GetMethod;
+                var setter = property.SetMethod;
+                if (getter != null && setter != null)
+                    continue;
+
+                var backingField = declaringType.Fields.FirstOrDefault(f =>
+                    f.Name?.ToString() == $"<{property.Name}>k__BackingField");
+                if (backingField == null)
+                {
+                    Logger.WarnNewline($"Attribute named argument '{property.Name}' on '{declaringType.FullName}' has a missing accessor but no compiler backing field to restore it from; leaving the property as-is.", "Custom Attribute Restoration");
+                    continue;
+                }
+
+                getter ??= SynthesizeAccessor(property, setter, backingField, true);
+                setter ??= SynthesizeAccessor(property, getter, backingField, false);
+                property.SetSemanticMethods(getter, setter);
+            }
+        }
+    }
+
+    private static MethodDefinition SynthesizeAccessor(PropertyDefinition property, MethodDefinition? sibling, FieldDefinition backingField, bool isGetter)
+    {
+        var declaringType = property.DeclaringType!;
+        var propertyType = property.Signature!.ReturnType;
+        var corlibFactory = declaringType.DeclaringModule!.CorLibTypeFactory;
+        var returnType = isGetter ? propertyType : corlibFactory.Void;
+        IEnumerable<TypeSignature> parameterTypes = isGetter ? [] : [propertyType];
+        var accessorSignature = property.Signature.HasThis
+            ? MethodSignature.CreateInstance(returnType, parameterTypes)
+            : MethodSignature.CreateStatic(returnType, parameterTypes);
+
+        //Mirror the surviving accessor when there is one - paired accessors
+        //share visibility and dispatch flags in real metadata.
+        var attributes = (sibling?.Attributes ?? MethodAttributes.Public)
+            | MethodAttributes.HideBySig | MethodAttributes.SpecialName;
+        var accessor = new MethodDefinition((isGetter ? "get_" : "set_") + property.Name, attributes, accessorSignature);
+        declaringType.Methods.Add(accessor);
+
+        if (accessor.IsAbstract)
+            return accessor;
+
+        var body = new CilMethodBody();
+        var instructions = body.Instructions;
+        if (property.Signature.HasThis)
+        {
+            instructions.Add(CilOpCodes.Ldarg_0);
+            if (!isGetter)
+                instructions.Add(CilOpCodes.Ldarg_1);
+            instructions.Add(isGetter ? CilOpCodes.Ldfld : CilOpCodes.Stfld, backingField);
+        }
+        else
+        {
+            if (!isGetter)
+                instructions.Add(CilOpCodes.Ldarg_0);
+            instructions.Add(isGetter ? CilOpCodes.Ldsfld : CilOpCodes.Stsfld, backingField);
+        }
+        instructions.Add(CilOpCodes.Ret);
+        accessor.CilMethodBody = body;
+
+        return accessor;
+    }
+
     private static void CopyCustomAttributes(HasCustomAttributes source, IList<CustomAttribute> destination)
     {
         if (source.CustomAttributes == null)
@@ -238,7 +325,10 @@ public static class AsmResolverAssemblyPopulator
             {
                 var asmResolverCustomAttribute = ConvertCustomAttribute(analyzedCustomAttribute);
                 if (asmResolverCustomAttribute != null)
+                {
                     destination.Add(asmResolverCustomAttribute);
+                    EnsureNamedArgumentAccessors(analyzedCustomAttribute);
+                }
             }
         }
 #if !DEBUG
