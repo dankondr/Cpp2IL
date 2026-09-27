@@ -1,0 +1,21 @@
+# The upstream workflow only tests in SamboyCoding/Cpp2IL; this is the fork's gate for PRs.
+name: fork-tests
+
+on:
+  pull_request:
+    branches: [development]
+  push:
+    branches: [development]
+
+jobs:
+  test:
+    if: github.repository == 'dankondr/Cpp2IL'
+    runs-on: ubicloud-standard-4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.x
+      - run: dotnet test -c Release
