@@ -515,6 +515,8 @@ public static class AsmResolverAssemblyPopulator
 
             methodCtx.PutExtraData("AsmResolverMethod", managedMethod);
             ilTypeDefinition.Methods.Add(managedMethod);
+
+            MemberAccessibility.NormalizeEmittedOverrideAccess(methodCtx);
         }
     }
 

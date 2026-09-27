@@ -14,7 +14,7 @@ public static class ContextToMethodDescriptor
     {
         var method = context.GetExtraData<MethodDefinition>("AsmResolverMethod") ?? throw new($"AsmResolver method not found in method analysis context for {context}");
         if (!AccessibilityExtensions.IsExternalRuntimeAssembly(context.DeclaringType?.DeclaringAssembly?.Name))
-            MemberAccessibility.EnsureAccessible(method);
+            MemberAccessibility.EnsureAccessible(context);
         return method;
     }
 
