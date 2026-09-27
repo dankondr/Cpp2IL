@@ -107,7 +107,7 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
         }
     }
 
-    private static void EnsureCtorInitialized(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
+    internal static void EnsureCtorInitialized(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
     {
         //A bare-ret stub for an instance .ctor leaves this uninitialized; initialize it honestly.
         if (methodDefinition is not { IsConstructor: true, IsStatic: false, CilMethodBody: { } body })
@@ -134,6 +134,14 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
             instructions.Insert(1, CilOpCodes.Initobj, initTarget);
             return;
         }
+        //ReplaceMethodBodyWithMinimalImplementation already seeds `this` when it can
+        //bind a base .ctor: ldarg.0; call <base>::.ctor. Prepending the same call
+        //again leaves a stray second call the decompiler can only spell as
+        //base._002Ector(), so an existing .ctor call means `this` is initialized.
+        if (instructions.Any(i =>
+                (i.OpCode == CilOpCodes.Call || i.OpCode == CilOpCodes.Callvirt)
+                && i.Operand is IMethodDescriptor { Name.Value: ".ctor" }))
+            return;
         var declaringCtx = methodContext.DeclaringType;
         var baseTypeCtx = declaringCtx?.BaseType;
         var accessibleCtor = baseTypeCtx?.Methods.FirstOrDefault(m =>

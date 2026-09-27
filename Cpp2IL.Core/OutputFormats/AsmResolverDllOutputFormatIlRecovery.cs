@@ -264,6 +264,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         try { FillRecoveryBody(methodDefinition, methodContext, ref status); }
         finally
         {
+            DecompilerMemberAccessRewrites.Apply(methodDefinition);
             _recoveryEvidence[methodDefinition.DeclaringModule!.Name + ":" + methodDefinition.FullName] = new RecoveryNativeInfo(
                 methodContext.Definition == null ? null : "0x" + methodContext.UnderlyingPointer.ToString("x"),
                 methodContext.RawBytes.Length == 0 ? null : RecoveryManifest.Hash(methodContext.RawBytes.ToArray()), status);
