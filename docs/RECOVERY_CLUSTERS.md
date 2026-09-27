@@ -96,6 +96,7 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
 | #83 runtime-class boxing | semantic mismatch | 0ec7a757 | `KeyFunctionRecoveryTests.BoxRuntimeClassUsesRepresentedValueType` |
 | #84 Castle recovery baseline (roll-up) | all | d0d6c32f | full `Cpp2IL.Core.Tests` + `Cpp2IL.JitOracle.Tests` baseline suites |
 | #85 CI workflow (`fork-tests`) | infra | c9a30c51 | none — CI plumbing only, not a recovery fix |
+| #88 `type-absent-from-recovered-metadata` (compile bucket) | metadata emission | `FrameworkSurfaceTypes.EmitMissing` materializes TypeDefs for framework types referenced only via implflags/attribute surfaces | `Regression/FrameworkSurfaceTypesTests.FlagSurfacesMaterializeMissingCorlibTypeDefs`, `InjectedImplFlagsMaterializeMethodImplSurface` |
 
 ## Summary
 

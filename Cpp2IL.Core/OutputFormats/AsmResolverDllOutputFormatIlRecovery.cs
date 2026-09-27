@@ -69,6 +69,9 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
                     RelocateLargeStrings(module);
                 }
             RestoreInternalsVisibleTo(assemblies);
+            // The injected friend-assembly attributes introduce their own
+            // framework-type references; re-run the (emit-if-missing) pass.
+            FrameworkSurfaceTypes.EmitMissing(assemblies);
             return assemblies;
         }
         finally
