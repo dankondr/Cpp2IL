@@ -111,13 +111,15 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
 | castle-recovery#81 `invalid-conversion` (compile bucket) | IL emission | `EmittedOperandType` reported `IntPtr` for a `RuntimeClassTypeAnalysisContext` under an `object` contract while `LoadOperand` pushes `Type` (`ldtoken`+`GetTypeFromHandle`) — the store coerce then emitted `box System.IntPtr` over the `Type` (CS0030 `(IntPtr)typeof(T)`; also `ilverify-invalid` `StackUnexpected` on those methods); and `EmitStackCoerce`/`StackContractSatisfied` now refuse `box`/`unbox.any` on `IsByRefLike` types — a ref struct can never cross the value/reference boundary, so the operand is dropped to the honest default instead of emitting unverifiable/uncompilable IL (CS0030 `(T)(object)input`, all sites from ghost `AddEntriesFrom`-family call bindings whose `ParseContext&` operand landed in a reference-typed `this` slot); every such drop emits `Cpp2ILHelpers.NoteDecompilerIssue("Ref struct cannot cross the value/reference boundary: …")` so codeverify keeps the method `incomplete` under `decompiler-issue` rather than silently `compiles_unverified` | `Regression/InvalidConversionEmissionTests.RuntimeClassIntoObjectSlotEmitsTypeNotBoxedIntPtr`, `ByRefLikePointerIntoObjectSlotDefaultsInsteadOfBoxing` |
 | castle-recovery#88 `interface-return-type-mismatch` (compile bucket) | metadata emission | `MethodAnalysisContext.GetOverrides` also recovers `.override` rows for explicit implementations declared on an interface itself (default interface implementations) — il2cpp stores no vtable or interface offsets for interface typedefs, so the compiled member name (`Ns.IFace<T>.Member`) is matched against the transitive interface closure by source-style name, arity and signature; matches on generic instantiations are wrapped in `ConcreteGenericMethodAnalysisContext` so the MethodImpl row carries the right instantiated signature | `Regression/InterfaceDeclaredExplicitImplementationTests.*` (4 tests) |
 | castle-recovery#87 `inconsistent-accessibility` (compile bucket) | metadata emission | `MemberAccessibility` widens a referenced member only as far as the emitted reference needs: an ambient referencing type (`EmittingFrom`) is set while bodies and explicit interface impls are emitted, so in-scope references leave declared access untouched, friend-scope references stop at internal, and signature types (params/return/field type, through generic instances) plus their base types rise to cover a raised member; populate-time chain normalization no longer widens declaring types, a post-build `FixupEmittedVisibility` re-asserts the C# consistency invariant on final flags (member's effective domain covered by its signature types; types covered by bases/interfaces), and grants to public-key-named friends are treated as unbindable | `Regression/ReferenceScopeAccessibilityTests.*` (6 tests) |
+| castle-recovery#90 `default-slot-substitution` (`decompiler-issue` visibility) | IL emission | Every operand-slot substitution now emits the `NoteDecompilerIssue` diagnostic call instead of silently materializing a default: `PushDefaultOf` (the shared filler — missing/hidden call args, unusable field/array/dereference/cast/handle operands, `this`-receiver fallbacks, fall-off-end returns) reports `Operand slot of type … filled with a synthetic default value`, `CoerceOrDefault`/`EmitStackCoerceOrDefault`/`LoadOperandIntoSlot`/`EmitStackCoerce`'s `&`→pointer drop report `No legal conversion from …` (keeping the `Ref struct cannot cross the value/reference boundary` wording for byref-like drops), `EmitNullOrDefault` reports values that were never produced, and the bare `ldnull`/`ldc.i4.0`/`ldloca`/`pop` substitutions (literal→`&T`/VT, unspellable handles and metadata pointers, missing `throw` operand, untestable `brtrue` condition, `not`/`neg` on raw pointers, unemittable memory stores, fabricated struct receivers) are each noted at the site; diagnostics emitted while materializing a base `.ctor` call's operands are moved after the call (`MoveDiagnosticNotesAfterCall`) so the decompiler still folds the constructor initializer | `Regression/SlotDefaultDiagnosticsTests.*` (4 tests) |
+
 
 ## Summary
 
 - **84 fork PRs** merged since `b5ad444b` (#1–#79, #81–#85; no #80), plus the
   castle-recovery#NN issue rows.
 - **2 are not live recovery fixes**: #26 (reverted by #27) and #85 (CI only).
-- **90 recovery-fix clusters.** **88** carry reproducing tests (tests added or
+- **92 recovery-fix clusters.** **90** carry reproducing tests (tests added or
   strengthened in the same PR): the 80 through the backfill wave (#16 + #47,
   #38, #40, #41, #57, #58), castle-recovery#74's `UnboxEmissionTests.*`,
   castle-recovery#75's `Arm64VectorLaneLiftingTests.*`,
@@ -125,8 +127,10 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
   castle-recovery#79's `DecompilerMemberAccessTests.*`,
   castle-recovery#80's `CompilerGeneratedNameTests.*`,
   castle-recovery#81's `InvalidConversionEmissionTests.*`,
-  castle-recovery#86's `ManagedPointerStoreTests.*`, and
-  castle-recovery#88's `InterfaceDeclaredExplicitImplementationTests.*`.
+  castle-recovery#86's `ManagedPointerStoreTests.*`,
+  castle-recovery#87's `ReferenceScopeAccessibilityTests.*`,
+  castle-recovery#88's `InterfaceDeclaredExplicitImplementationTests.*`, and
+  castle-recovery#90's `SlotDefaultDiagnosticsTests.*`.
 - **2 remain `none`**, both compile-only fixes: #15 (`IReadOnlySet` on
   netstandard2.0) and #20 (`AddOperands` signature fix, exercised downstream by
   `Arm64LibcMathImportTests`).
