@@ -710,5 +710,39 @@ public static class AsmResolverAssemblyPopulator
                 property.SetSemanticMethods(null, setMethod);
             }
         }
+
+        // An accessor Cpp2IL restored has no il2cpp method record, so the
+        // override loop never gives it the MethodImpl rows a real explicit
+        // interface accessor carries; without them the pair no longer matches
+        // the `I.Prop`/`I.get_Prop`/`I.set_Prop` convention and the property
+        // degrades to a private member. Mirror the sibling's interface
+        // accessor where the interface declares one.
+        var contextEmitted = new HashSet<MethodDefinition>(typeContext.Methods
+            .Select(m => m.GetExtraData<MethodDefinition>("AsmResolverMethod"))
+            .Where(m => m != null)!);
+        foreach (var property in type.Properties)
+        {
+            var accessors = new[] { property.GetMethod, property.SetMethod };
+            if (accessors[0] == null || accessors[1] == null)
+                continue;
+            foreach (var accessor in accessors)
+            {
+                var sibling = accessor == accessors[0] ? accessors[1] : accessors[0];
+                if (accessor == null || contextEmitted.Contains(accessor)
+                    || type.MethodImplementations.Any(mi => mi.Body == accessor))
+                    continue;
+                foreach (var impl in type.MethodImplementations.Where(mi => mi.Body == sibling).ToList())
+                {
+                    if (impl.Declaration is not { } declRef
+                        || declRef.Resolve(runtimeContext, out var decl) != ResolutionStatus.Success
+                        || decl?.DeclaringType is null || decl.Semantics is null)
+                        continue;
+                    var interfaceProperty = decl.DeclaringType.Properties.FirstOrDefault(p => p.Semantics.Contains(decl.Semantics));
+                    var counterpart = accessor == property.GetMethod ? interfaceProperty?.GetMethod : interfaceProperty?.SetMethod;
+                    if (counterpart != null)
+                        type.MethodImplementations.Add(new MethodImplementation(counterpart, accessor));
+                }
+            }
+        }
     }
 }

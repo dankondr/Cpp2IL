@@ -169,4 +169,63 @@ public class SetterOnlyAutoPropertyTests
             Assert.That(emittedType.Methods.Any(m => m.Name == "get_Item"), Is.False);
         });
     }
+
+    // An explicit-interface property is named `I.Prop` and its accessors
+    // `I.get_Prop`/`I.set_Prop`; a restored accessor must keep the dotted
+    // prefix and carry a MethodImpl row to the interface accessor, or the
+    // property stops being an implementation of the interface member.
+    [Test]
+    public void RestoredGetterKeepsExplicitInterfaceConvention()
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2022Game();
+        var assembly = app.AssembliesByName["UnityEngine.CoreModule"];
+
+        var iface = assembly.InjectType("Tests", "IMirror", null,
+            R.TypeAttributes.Public | R.TypeAttributes.Interface | R.TypeAttributes.Abstract);
+        var ifaceGetter = iface.InjectMethodContext("get_Value",
+            app.SystemTypes.SystemInt32Type,
+            R.MethodAttributes.Public | R.MethodAttributes.Abstract | R.MethodAttributes.Virtual
+                | R.MethodAttributes.HideBySig | R.MethodAttributes.SpecialName);
+        var ifaceSetter = iface.InjectMethodContext("set_Value",
+            app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public | R.MethodAttributes.Abstract | R.MethodAttributes.Virtual
+                | R.MethodAttributes.HideBySig | R.MethodAttributes.SpecialName,
+            app.SystemTypes.SystemInt32Type);
+        iface.InjectPropertyContext("Value", app.SystemTypes.SystemInt32Type,
+            ifaceGetter, ifaceSetter, R.PropertyAttributes.None);
+
+        var impl = assembly.InjectType("Tests", "MirrorImpl",
+            app.SystemTypes.SystemObjectType,
+            R.TypeAttributes.Public | R.TypeAttributes.Class);
+        impl.InterfaceContexts.Add(iface);
+        impl.InjectFieldContext("<Tests.IMirror.Value>k__BackingField",
+            app.SystemTypes.SystemInt32Type, R.FieldAttributes.Private);
+        var setter = impl.InjectMethodContext("Tests.IMirror.set_Value",
+            app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Private | R.MethodAttributes.Final | R.MethodAttributes.Virtual
+                | R.MethodAttributes.NewSlot | R.MethodAttributes.HideBySig | R.MethodAttributes.SpecialName,
+            app.SystemTypes.SystemInt32Type);
+        setter.Overrides.Add(ifaceSetter);
+        impl.InjectPropertyContext("Tests.IMirror.Value",
+            app.SystemTypes.SystemInt32Type, null, setter, R.PropertyAttributes.None);
+
+        var assemblies = new AsmResolverDllOutputFormatEmpty().BuildAssemblies(app);
+        var module = assemblies.First(a => a.Name == assembly.Name.ToString()).ManifestModule!;
+
+        var emittedImpl = module.GetAllTypes().First(t => t.FullName == "Tests.MirrorImpl");
+        var emittedProperty = emittedImpl.Properties.Single(p => p.Name == "Tests.IMirror.Value");
+        Assert.Multiple(() =>
+        {
+            Assert.That(emittedProperty.GetMethod?.Name?.ToString(),
+                Is.EqualTo("Tests.IMirror.get_Value"),
+                "the restored getter must keep the dotted interface prefix");
+            Assert.That(emittedImpl.MethodImplementations.Any(mi =>
+                    mi.Body == emittedProperty.GetMethod
+                    && mi.Declaration?.Name?.ToString() == "get_Value"
+                    && mi.Declaration.DeclaringType?.Name?.ToString() == "IMirror"),
+                Is.True,
+                "the restored getter must get the MethodImpl row an explicit-interface accessor carries");
+        });
+    }
 }
