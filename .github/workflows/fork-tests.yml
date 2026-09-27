@@ -18,4 +18,9 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.x
-      - run: dotnet test -c Release
+      # net10.0 only: the pipeline uses the net10.0 CLI, and the fork's
+      # netstandard2.0/net472 targets do not build (net-only APIs throughout).
+      - run: dotnet build Cpp2IL/Cpp2IL.csproj -c Release -f net10.0
+      - run: dotnet test Cpp2IL.Core.Tests -c Release
+      - run: dotnet test LibCpp2ILTests -c Release
+      - run: dotnet test Cpp2IL.JitOracle.Tests -c Release
