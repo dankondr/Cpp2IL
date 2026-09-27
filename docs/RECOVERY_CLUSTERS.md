@@ -100,6 +100,7 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
 | castle-recovery#53 stray `NestedClass` row | metadata emission | c9ede488 | `Regression/NestedClassTableTests.EmittedNestedClassRowsAreInRangeAndUnique`, `NestedTypeListedUnderAnotherParentIsEmittedOnlyUnderItsDeclaringType` |
 | #90 `invalid-attribute-named-argument` (compile bucket) | metadata emission | `AsmResolverAssemblyPopulator` restores the accessor il2cpp stripped on setter-only named-argument properties via their `<Name>k__BackingField` | `Regression/AttributeNamedArgumentTests.NamedArgumentSetOnlyPropertyGetsGetterBack`, `SetOnlyPropertyWithoutBackingFieldStaysAsIs` |
 | #91 `override-accessibility-mismatch` (compile bucket, castle-recovery#62) | metadata emission | `MemberAccessibility` now normalizes a method's whole override chain (ancestors + all overriders) instead of widening single members, so emitted flags satisfy C#'s override-access rule (CS0507); populate-time pass keeps unreferenced roots at declared access | `Regression/OverrideChainAccessibilityTests.*` (7 tests) |
+| castle-recovery#70 `missing-reference-assembly` (compile bucket) | metadata emission | `AssemblyReferenceClosure.Ensure` sweeps attribute-blob type arguments and declares every emitted assembly they name (`TokenAllocator` token so serialization emits a real AssemblyRef row); `DoOutput` builds PE images with `PreserveAssemblyReferenceIndices` | `Regression/AssemblyReferenceClosureTests.BlobOnlyForeignTypeArgumentsDeclareTheirAssembly` |
 
 ## Summary
 

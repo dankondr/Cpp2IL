@@ -179,6 +179,12 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
     {
         var ret = BuildAssemblies(context);
 
+        //Attribute blobs name argument types as assembly-qualified strings, which
+        //never materializes an AssemblyRef row; close the reference table over them.
+        var blobScopeReferences = AssemblyReferenceClosure.Ensure(ret);
+        if (blobScopeReferences > 0)
+            Logger.VerboseNewline($"Declared {blobScopeReferences} assembly reference(s) named only by attribute blobs.", "DllOutput");
+
         var start = DateTime.Now;
         Logger.Verbose("Generating PE images...", "DllOutput");
 
@@ -190,8 +196,11 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
         //sharing the corlib assembly and runtime context, and concurrent
         //ToPEImage calls can emit corrupted sorted tables (e.g. a NestedClass
         //row whose enclosing index is out of range).
+        //PreserveAssemblyReferenceIndices emits AssemblyRef rows for references
+        //that hold a TokenAllocator-assigned RID — the blob-scoped ones Ensure()
+        //declared — in addition to the rows a coded index references.
         var peImagesToWrite = ret
-            .Select(a => (image: a.ManifestModule!.ToPEImage(new ManagedPEImageBuilder()), name: a.ManifestModule.Name!))
+            .Select(a => (image: a.ManifestModule!.ToPEImage(new ManagedPEImageBuilder(MetadataBuilderFlags.PreserveAssemblyReferenceIndices)), name: a.ManifestModule.Name!))
             .ToList();
 
         Logger.VerboseNewline($"{(DateTime.Now - start).TotalMilliseconds:F1}ms", "DllOutput");
