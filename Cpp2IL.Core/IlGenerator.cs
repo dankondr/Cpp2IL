@@ -605,12 +605,12 @@ public static class IlGenerator
                 }
 
                 // A method pointer stored into a local that no instruction ever
-                // loads is a dead store, so the whole Move drops out. Only an
-                // ldftn-spellable pointer (System.IntPtr destination, visible,
-                // non-.ctor) is dropped this way; unspellable pointers keep
-                // their documented placeholder emission. A live destination (a
-                // field, an interop argument, a read local) always keeps its
-                // ldftn - a real function pointer is never replaced by a
+                // loads is a dead store, so the whole Move drops out. Only a
+                // visible, non-.ctor pointer into an IntPtr local is dropped
+                // this way; unspellable pointers keep their documented
+                // placeholder emission. A live destination (a field, an
+                // interop argument, a read local) always keeps its pointer
+                // load - a real function pointer is never replaced by a
                 // placeholder.
                 if (instruction.Operands is [LocalVariable deadPointerLocal, RuntimeMethodInfoAnalysisContext methodPointer]
                     && StoreContract(deadPointerLocal, context)?.FullName == "System.IntPtr"
@@ -772,7 +772,12 @@ public static class IlGenerator
                     }
 
                     for (var i = 0; i < constructorArgs.Count; i++)
-                        LoadOperandIntoSlot(constructorArgs[i], constructor.Parameters[i].ParameterType, context, method, locals, writeLine);
+                    {
+                        if (!TryEmitDelegateCtorPointer(constructorArgs[i],
+                                constructor.Parameters[i].ParameterType, constructor, context, instructions))
+                            LoadOperandIntoSlot(constructorArgs[i],
+                                constructor.Parameters[i].ParameterType, context, method, locals, writeLine);
+                    }
 
                     instructions.Add(CilOpCodes.Newobj, constructor.ToMethodDescriptor());
                     EmitStackCoerceOrDefault(constructor.DeclaringType,
@@ -1261,7 +1266,8 @@ public static class IlGenerator
                             PushDefaultOf(parameterType, method, instructions, context,
                                 $"A hidden shared-generic argument landed in parameter slot {parameterType.FullName}; the real argument was dropped upstream.");
                         }
-                        else
+                        else if (!TryEmitDelegateCtorPointer(argumentOperand, parameterType,
+                                     targetMethod, context, instructions))
                             LoadOperandIntoSlot(argumentOperand, parameterType, context, method, locals, writeLine);
                     }
                     else
@@ -3006,6 +3012,139 @@ public static class IlGenerator
         return substitute;
     }
 
+    // ldftn only gets a C# spelling for a plain static method on a closed
+    // declaring type; the decompiler writes every other ldftn as the
+    // unnameable __ldftn pseudo-call.
+    private static bool LdftnSpellable(MethodAnalysisContext method) =>
+        method.IsStatic
+        && method is not ConcreteGenericMethodAnalysisContext
+        && method.GenericParameters.Count == 0
+        && method.DeclaringType is not GenericInstanceTypeAnalysisContext
+        && (method.DeclaringType?.GenericParameters.Count ?? 0) == 0;
+
+    // The function-pointer argument of a delegate .ctor is the one place ldftn
+    // decompiles back to a real method name: ilspy folds
+    // `ldftn M; newobj D::.ctor` into the (target, method-group) spelling
+    // `new D(obj, obj.M)`, so an instance or generic target stays ldftn here
+    // even though a standalone ldftn of it would be unspellable.
+    private static bool TryEmitDelegateCtorPointer(
+        IOperand operand, TypeAnalysisContext parameterType, MethodAnalysisContext constructor,
+        MethodAnalysisContext context, CilInstructionCollection instructions)
+    {
+        var ctorDefinition = constructor.DeclaringType is GenericInstanceTypeAnalysisContext genericCtor
+            ? genericCtor.GenericType
+            : constructor.DeclaringType;
+        if (operand is not RuntimeMethodInfoAnalysisContext pointerOperand
+            || parameterType.FullName is not ("System.IntPtr" or "System.UIntPtr")
+            || constructor.Name != ".ctor"
+            || ctorDefinition == null
+            || !DerivesFromMulticastDelegate(ctorDefinition)
+            || SpellableMethodPointer(pointerOperand, context) is not { } pointer
+            || pointer.Name is ".ctor")
+            return false;
+        instructions.Add(CilOpCodes.Ldftn, pointer.ToMethodDescriptor());
+        return true;
+    }
+
+    // A parameter type only round-trips through a typeof(...) element of a
+    // GetMethod signature lookup when it is neither byref (typeof has no &T
+    // spelling) nor mentions a generic parameter.
+    private static bool SignatureElementSpellable(TypeAnalysisContext type) => type switch
+    {
+        GenericParameterTypeAnalysisContext or ByRefTypeAnalysisContext => false,
+        WrappedTypeAnalysisContext wrapped => SignatureElementSpellable(wrapped.ElementType),
+        GenericInstanceTypeAnalysisContext generic => generic.GenericArguments.All(SignatureElementSpellable),
+        _ => CanEmitTypeToken(type),
+    };
+
+    /// <summary>
+    /// Emits the spellable equivalent of an ldftn/ldtoken method-handle load:
+    /// `typeof(D).GetMethod("M", flags[, binder, types, mods]).MethodHandle`,
+    /// followed by the handle's `Value` (the IntPtr it wraps; a minimal
+    /// emitted corlib may not carry `GetFunctionPointer`) when the slot wants
+    /// an IntPtr. The full-signature GetMethod overload is used whenever every
+    /// parameter type is expressible so overloaded lookups stay unambiguous.
+    /// </summary>
+    /// <returns>false when the method or its declaring type cannot be named;
+    /// the caller keeps its diagnosed placeholder then.</returns>
+    private static bool TryEmitMethodPointerReflection(
+        MethodAnalysisContext represented, MethodAnalysisContext? callingContext,
+        MethodDefinition method, CilInstructionCollection instructions, bool asFunctionPointer)
+    {
+        var lookup = represented is ConcreteGenericMethodAnalysisContext concrete
+            ? concrete.BaseMethodContext
+            : represented;
+        var declaringType = lookup.DeclaringType;
+        if (declaringType == null || lookup.Name is null or ".ctor" or ".cctor"
+            || !TypeTokenUsableFrom(declaringType, callingContext))
+            return false;
+
+        var corLibScope = method.DeclaringModule!.CorLibTypeFactory.CorLibScope;
+        var systemType = corLibScope.CreateTypeReference("System", "Type");
+        var typeSignature = systemType.ToTypeSignature(false);
+        var runtimeTypeHandle = corLibScope.CreateTypeReference("System", "RuntimeTypeHandle");
+        var runtimeMethodHandle = corLibScope.CreateTypeReference("System", "RuntimeMethodHandle");
+        var getTypeFromHandle = systemType.CreateMemberReference("GetTypeFromHandle",
+            MethodSignature.CreateStatic(typeSignature, [runtimeTypeHandle.ToTypeSignature(true)]));
+        var bindingFlags = corLibScope.CreateTypeReference("System.Reflection", "BindingFlags")
+            .ToTypeSignature(true);
+        var methodInfo = corLibScope.CreateTypeReference("System.Reflection", "MethodInfo")
+            .ToTypeSignature(false);
+
+        var signatureSpellable = lookup.Parameters.All(p => SignatureElementSpellable(p.ParameterType));
+        var getMethod = signatureSpellable
+            ? systemType.CreateMemberReference("GetMethod", MethodSignature.CreateInstance(methodInfo,
+                [method.DeclaringModule.CorLibTypeFactory.String, bindingFlags,
+                    corLibScope.CreateTypeReference("System.Reflection", "Binder").ToTypeSignature(false),
+                    typeSignature.MakeSzArrayType(),
+                    corLibScope.CreateTypeReference("System.Reflection", "ParameterModifier")
+                        .ToTypeSignature(true).MakeSzArrayType()]))
+            : systemType.CreateMemberReference("GetMethod", MethodSignature.CreateInstance(methodInfo,
+                [method.DeclaringModule.CorLibTypeFactory.String, bindingFlags]));
+
+        instructions.Add(CilOpCodes.Ldtoken, declaringType.ToTypeSignature().ToTypeDefOrRef());
+        instructions.Add(CilOpCodes.Call, getTypeFromHandle);
+        instructions.Add(CilOpCodes.Ldstr, lookup.Name);
+        // BindingFlags.Instance | Static | Public | NonPublic
+        instructions.Add(CilOpCodes.Ldc_I4, 60);
+        if (signatureSpellable)
+        {
+            instructions.Add(CilOpCodes.Ldnull);
+            instructions.Add(CilOpCodes.Ldc_I4, lookup.Parameters.Count);
+            instructions.Add(CilOpCodes.Newarr, systemType);
+            for (var i = 0; i < lookup.Parameters.Count; i++)
+            {
+                instructions.Add(CilOpCodes.Dup);
+                instructions.Add(CilOpCodes.Ldc_I4, i);
+                instructions.Add(CilOpCodes.Ldtoken,
+                    lookup.Parameters[i].ParameterType.ToTypeSignature().ToTypeDefOrRef());
+                instructions.Add(CilOpCodes.Call, getTypeFromHandle);
+                instructions.Add(CilOpCodes.Stelem_Ref);
+            }
+            instructions.Add(CilOpCodes.Ldnull);
+        }
+        instructions.Add(CilOpCodes.Callvirt, getMethod);
+        instructions.Add(CilOpCodes.Callvirt,
+            corLibScope.CreateTypeReference("System.Reflection", "MethodBase")
+                .CreateMemberReference("get_MethodHandle",
+                    MethodSignature.CreateInstance(runtimeMethodHandle.ToTypeSignature(true))));
+        if (!asFunctionPointer)
+            return true;
+
+        // GetFunctionPointer() is the faithful IntPtr, but a minimal corlib
+        // emitted from the binary may not carry it; Value is the IntPtr the
+        // handle wraps and is the member a bare corlib always keeps.
+        var handleLocal = new CilLocalVariable(runtimeMethodHandle.ToTypeSignature(true));
+        method.CilMethodBody!.LocalVariables.Add(handleLocal);
+        instructions.Add(CilOpCodes.Stloc, handleLocal);
+        instructions.Add(CilOpCodes.Ldloca, handleLocal);
+        instructions.Add(CilOpCodes.Call,
+            runtimeMethodHandle.CreateMemberReference("get_Value",
+                MethodSignature.CreateInstance(
+                    corLibScope.CreateTypeReference("System", "IntPtr").ToTypeSignature(true))));
+        return true;
+    }
+
     // A local counts as loaded when any instruction's UsedLocals yields it:
     // destinations are writes, while memory bases, field receivers, array/index
     // and select operands all count as loads - including inside loops, so the
@@ -3637,20 +3776,39 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Throw);
                 break;
             case RuntimeMethodInfoAnalysisContext runtimeMethod:
-                // A function pointer load is exactly ldftn. ldftn cannot name a
-                // .ctor though; the unresolved placeholder below stays
-                // verifier-legal (a native-int zero) instead of fabricating a
-                // function pointer for it.
+                // A function pointer load is exactly ldftn, but ldftn only has a
+                // C# spelling for a plain static method - the decompiler prints
+                // every other ldftn (and any ldtoken on a method) as the
+                // unnameable __ldftn/__ldtoken pseudo-call. For those the same
+                // handle value comes from reflection:
+                // typeof(D).GetMethod("M", ...).MethodHandle, plus
+                // .Value when the slot wants an IntPtr. Under IL2CPP
+                // RuntimeMethodHandle.Value is the MethodInfo* itself, which is
+                // exactly what a MethodInfo*-carrying operand loaded; an
+                // IsCodePointer operand instead loaded the code entry pointer
+                // (an il2cpp_resolve_icall result) that no spellable member
+                // reproduces, so the emission carries a decompiler-issue note.
+                // .ctor/.cctor cannot be named by either emission, so they keep
+                // the verifier-legal native-int zero placeholder rather than
+                // fabricating a handle for them.
                 var represented = SpellableMethodPointer(runtimeMethod, callingContext);
-                if (expectedType?.FullName == "System.IntPtr" && represented is { Name: not ".ctor" })
+                if (represented is { Name: not ".ctor" and not ".cctor" }
+                    && expectedType?.FullName is "System.IntPtr" or "System.RuntimeMethodHandle")
                 {
-                    instructions.Add(CilOpCodes.Ldftn, represented.ToMethodDescriptor());
-                    break;
-                }
-                if (expectedType?.FullName == "System.RuntimeMethodHandle" && represented != null)
-                {
-                    instructions.Add(CilOpCodes.Ldtoken, represented.ToMethodDescriptor());
-                    break;
+                    var wantsPointer = expectedType.FullName == "System.IntPtr";
+                    var emittedPointer = wantsPointer && LdftnSpellable(represented);
+                    if (emittedPointer)
+                        instructions.Add(CilOpCodes.Ldftn, represented.ToMethodDescriptor());
+                    else
+                        emittedPointer = TryEmitMethodPointerReflection(represented,
+                            callingContext, method, instructions, wantsPointer);
+                    if (emittedPointer)
+                    {
+                        if (runtimeMethod.IsCodePointer)
+                            EmitDecompilerNote(method, callingContext,
+                                $"the loaded value is the code entry pointer for {represented.FullName} (an il2cpp_resolve_icall result); the emitted expression is the method's handle, which no spellable member resolves back to the entry point.");
+                        break;
+                    }
                 }
 
                 //Not fully implemented, these basically shouldn't actually ever exist in the final IL.
