@@ -52,7 +52,7 @@ public class ByRefStoreTests
     [TestCase("reference", 16, 0, false)]
     [TestCase("reference", 0, 0, false)]
     [TestCase("reference", 8, 8, false)]
-    [TestCase("int", 4, 0, false)]
+    [TestCase("int", 4, 0, true)] // whole-value stores to a T& lower to stobj T
     [TestCase("struct", 8, 0, false)]
     [TestCase("pointer", 8, 0, false)]
     [TestCase("generic", 8, 0, false)]
@@ -101,7 +101,8 @@ public class ByRefStoreTests
         definition.ParameterDefinitions.Add(new ParameterDefinition(1, "destination", 0));
         IlGenerator.GenerateIl(caller, definition);
         var instructions = definition.CilMethodBody!.Instructions;
-        Assert.That(instructions.Any(i => i.OpCode == CilOpCodes.Stind_Ref), Is.EqualTo(supported));
+        Assert.That(instructions.Any(i => i.OpCode == CilOpCodes.Stind_Ref || i.OpCode == CilOpCodes.Stobj),
+            Is.EqualTo(supported));
         if (!supported)
         {
             if (kind is not ("ordinary" or "unmanaged"))
@@ -111,6 +112,8 @@ public class ByRefStoreTests
             return;
         }
         Assert.That(instructions.Any(i => i.OpCode == CilOpCodes.Stloc), Is.False, "Do not overwrite the address local");
+        if (kind != "reference")
+            return; // only the reference path is executable through an object& harness
         // Execute emitted instructions with a non-null caller slot: the write must reach that slot.
         foreach (var local in definition.CilMethodBody.LocalVariables)
             local.VariableType = module.CorLibTypeFactory.Object.MakeByReferenceType();
