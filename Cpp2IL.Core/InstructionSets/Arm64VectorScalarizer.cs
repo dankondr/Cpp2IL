@@ -218,7 +218,9 @@ internal sealed class Arm64VectorScalarizer
 
         // stores read the register rather than writing it — no invalidation
         if (insn.Mnemonic is Arm64Mnemonic.STR or Arm64Mnemonic.STUR or Arm64Mnemonic.STP
-            or Arm64Mnemonic.STRB or Arm64Mnemonic.STRH or Arm64Mnemonic.STURB or Arm64Mnemonic.STURH)
+            or Arm64Mnemonic.STRB or Arm64Mnemonic.STRH or Arm64Mnemonic.STURB or Arm64Mnemonic.STURH
+            or Arm64Mnemonic.ST1 or Arm64Mnemonic.ST2 or Arm64Mnemonic.ST3 or Arm64Mnemonic.ST4
+            or Arm64Mnemonic.STNP)
             return;
 
         var name = insn.Op0Kind is Arm64OperandKind.Register or Arm64OperandKind.VectorRegisterElement
@@ -385,9 +387,9 @@ internal sealed class Arm64VectorScalarizer
     /// Constants fold inline; a cached ShiftRight is materialized for windows
     /// above bit 32 of a wider operand.
     /// </summary>
-    private IOperand? SlotOperand(VectorState state, int slot)
+    private IOperand? SlotOperand(VectorState? state, int slot)
     {
-        if (state.Slots[slot] is not { } slice)
+        if (state == null || state.Slots[slot] is not { } slice)
             return null;
 
         var (operand, offset) = slice;
@@ -498,6 +500,8 @@ internal sealed class Arm64VectorScalarizer
         var slotOp = SlotOperand(state, slot);
         if (slotOp == null)
             return null;
+        if (slotOp is Immediate { Value: var raw })
+            return new Immediate((int)(((uint)raw >> offsetInSlot) & ((1u << bits) - 1)));
         var shifted = slotOp;
         if (offsetInSlot != 0)
         {
@@ -521,6 +525,8 @@ internal sealed class Arm64VectorScalarizer
         var slotOp = SlotOperand(state, offset / 32);
         if (slotOp == null)
             return null;
+        if (slotOp is Immediate { Value: var raw })
+            return new Immediate((int)raw << (32 - offset % 32 - bits) >> (32 - bits));
         // (value << (32 - off - bits)) >> (32 - bits): arithmetic shift sign-extends.
         var left = Temp();
         _add(_address, OpCode.ShiftLeft, [left, slotOp, new Immediate(32 - offset % 32 - bits)]);
@@ -530,16 +536,243 @@ internal sealed class Arm64VectorScalarizer
     }
 
     private void EmitLaneOp(OpCode opCode, string destName, int laneBits, int lane,
-        IOperand left, IOperand right, VectorState dest, bool isFloat = false)
+        IOperand left, IOperand right, VectorState dest, bool isFloat = false,
+        List<PendingLane>? narrow = null)
     {
         var destReg = ElementRegister(destName, laneBits, lane);
         var emitted = _add(_address, opCode, [destReg, left, right]);
         if (!isFloat && laneBits == 32)
             emitted.NativeIntegerWidthBits = 32;
         _emitted = true;
-        dest.Slots[lane * laneBits / 32] = new LaneSlice(destReg, 0);
-        if (laneBits == 64)
-            dest.Slots[lane * 2 + 1] = new LaneSlice(destReg, 32);
+        if (laneBits >= 32)
+        {
+            dest.Slots[lane * laneBits / 32] = new LaneSlice(destReg, 0);
+            if (laneBits == 64)
+                dest.Slots[lane * 2 + 1] = new LaneSlice(destReg, 32);
+            return;
+        }
+        // sub-32-bit lanes are masked to the lane width and buffered: their
+        // covering 32-bit window is composed once every lane of it is written.
+        _add(_address, OpCode.And, [destReg, destReg, new Immediate((1L << laneBits) - 1)])
+            .NativeIntegerWidthBits = 32;
+        _emitted = true;
+        narrow!.Add(new PendingLane(laneBits * lane / 32, laneBits * lane % 32, destReg));
+    }
+
+    /// <summary>A sub-32-bit lane parked for window composition.</summary>
+    private readonly record struct PendingLane(int Window, int BitOffset, IOperand Operand);
+
+    /// <summary>
+    /// A binary-op result in a fresh temporary. Width marks follow the lane
+    /// width: 32-bit lanes need the emitted CIL to truncate at int32.
+    /// </summary>
+    private IOperand EmitTempOp(OpCode opCode, IOperand left, IOperand right, int widthBits)
+    {
+        if (left is Immediate { Value: var l } && right is Immediate { Value: var r })
+        {
+            long? folded = opCode switch
+            {
+                OpCode.And => l & r,
+                OpCode.Or => l | r,
+                OpCode.Xor => l ^ r,
+                OpCode.ShiftLeft => l << (int)r,
+                // ISIL 'shr' lowers to an arithmetic shift
+                OpCode.ShiftRight => l >> (int)r,
+                OpCode.Add => l + r,
+                OpCode.Subtract => l - r,
+                _ => null
+            };
+            if (folded is { } result)
+            {
+                if (widthBits < 64)
+                    result &= (1L << widthBits) - 1;
+                return new Immediate(result);
+            }
+        }
+        var temp = Temp();
+        var emitted = _add(_address, opCode, [temp, left, right]);
+        if (widthBits == 32)
+            emitted.NativeIntegerWidthBits = 32;
+        return temp;
+    }
+
+    private IOperand EmitTempUnary(OpCode opCode, IOperand operand, int widthBits)
+    {
+        if (operand is Immediate { Value: var v })
+        {
+            long? folded = opCode switch
+            {
+                OpCode.Not => ~v,
+                OpCode.Negate => -v,
+                OpCode.SignExtend32 => (int)v,
+                _ => null
+            };
+            if (folded is { } result)
+            {
+                if (widthBits < 64)
+                    result &= (1L << widthBits) - 1;
+                return new Immediate(result);
+            }
+        }
+        var temp = Temp();
+        var emitted = _add(_address, opCode, [temp, operand]);
+        if (widthBits == 32)
+            emitted.NativeIntegerWidthBits = 32;
+        return temp;
+    }
+
+    /// <summary>
+    /// Writes a lane's value into the destination's element local and records
+    /// its provenance. 32/64-bit lanes cover whole windows; narrower lanes are
+    /// masked to the lane width and buffered for <see cref="FlushNarrowLanes"/>,
+    /// which composes every fully covered window into a 32-bit element local —
+    /// a window with any unwritten lane stays unproven.
+    /// </summary>
+    private void EmitLaneValue(VectorState dest, string destName, int laneBits, int lane,
+        IOperand value, List<PendingLane>? narrow)
+    {
+        var elementReg = ElementRegister(destName, laneBits, lane);
+        if (laneBits >= 32)
+        {
+            var emitted = _add(_address, OpCode.Move, [elementReg, value]);
+            if (laneBits == 32)
+                emitted.NativeIntegerWidthBits = 32;
+            _emitted = true;
+            dest.Slots[lane * laneBits / 32] = new LaneSlice(value, 0);
+            if (laneBits == 64)
+                dest.Slots[lane * 2 + 1] = new LaneSlice(value, 32);
+            return;
+        }
+
+        var mask = (1L << laneBits) - 1;
+        var laneOperand = value is Immediate { Value: var raw }
+            ? (IOperand)new Immediate(raw & mask)
+            : elementReg;
+        if (value is Immediate)
+            _add(_address, OpCode.Move, [elementReg, laneOperand]).NativeIntegerWidthBits = 32;
+        else
+            _add(_address, OpCode.And, [elementReg, value, new Immediate(mask)]).NativeIntegerWidthBits = 32;
+        _emitted = true;
+        narrow!.Add(new PendingLane(laneBits * lane / 32, laneBits * lane % 32, laneOperand));
+    }
+
+    /// <summary>
+    /// Composes buffered narrow lanes into their 32-bit windows. Only windows
+    /// covered by every buffered lane are proven; a partially covered window is
+    /// poisoned so consumers report it instead of reading a fabricated value.
+    /// </summary>
+    private void FlushNarrowLanes(VectorState dest, string destName, int laneBits, List<PendingLane> lanes)
+    {
+        var partsPerWindow = 32 / laneBits;
+        for (var window = 0; window < 4; window++)
+        {
+            var parts = new IOperand?[partsPerWindow];
+            var count = 0;
+            foreach (var lane in lanes)
+                if (lane.Window == window)
+                {
+                    parts[lane.BitOffset / laneBits] = lane.Operand;
+                    count++;
+                }
+            if (count == 0)
+                continue;
+            if (count < partsPerWindow)
+            {
+                dest.Slots[window] = null; // partial window: hardware wrote it, we cannot name it
+                continue;
+            }
+
+            IOperand composed = parts[0]!;
+            for (var part = 1; part < partsPerWindow; part++)
+            {
+                if (parts[part] is Immediate { Value: var raw })
+                    parts[part] = new Immediate(raw << (part * laneBits));
+                var shifted = parts[part] is Immediate
+                    ? parts[part]
+                    : EmitTempOp(OpCode.ShiftLeft, parts[part]!, new Immediate(part * laneBits), 32);
+                composed = composed is Immediate && parts[part] is Immediate
+                    ? new Immediate(((Immediate)composed).Value | ((Immediate)parts[part]!).Value)
+                    : EmitTempOp(OpCode.Or, composed, parts[part]!, 32);
+            }
+
+            var windowReg = ElementRegister(destName, 32, window);
+            _add(_address, OpCode.Move, [windowReg, composed]).NativeIntegerWidthBits = 32;
+            _emitted = true;
+            dest.Slots[window] = new LaneSlice(windowReg, 0);
+        }
+    }
+
+    /// <summary>The operand holding lane <paramref name="lane"/> of <paramref name="state"/> at any width.</summary>
+    private IOperand? LaneValueOperand(VectorState? state, int laneBits, int lane, bool signed)
+        => state == null
+            ? null
+            : laneBits == 32
+                ? SlotOperand(state, lane)
+                : laneBits == 64
+                    ? Lane64Operand(state, lane)
+                    : signed
+                        ? SignedElementOperand(state, new Arm64VectorElement(LaneWidth(laneBits), lane))
+                        : NarrowElementOperand(state, lane * laneBits / 32, lane * laneBits % 32, laneBits);
+
+    private static Arm64VectorElementWidth LaneWidth(int laneBits) => laneBits switch
+    {
+        8 => Arm64VectorElementWidth.B,
+        16 => Arm64VectorElementWidth.H,
+        32 => Arm64VectorElementWidth.S,
+        _ => Arm64VectorElementWidth.D
+    };
+
+    /// <summary>
+    /// Emit <paramref name="result"/> into scalar lane 0 of <paramref name="destReg"/>
+    /// and record the register's post-write state: the scalar in the low element,
+    /// the rest of the vector zeroed. Reduction and scalar-import results follow
+    /// this shape.
+    /// </summary>
+    private void WriteScalarElement(Arm64Register destReg, int destBits, IOperand result)
+    {
+        var destName = Normalize(destReg);
+        var elementReg = ElementRegister(destName, destBits, 0);
+        var mask = destBits < 64 ? (1L << destBits) - 1 : -1L;
+        if (result is Immediate { Value: var raw })
+            _add(_address, OpCode.Move, [elementReg, new Immediate(raw & mask)])
+                .NativeIntegerWidthBits = 32;
+        else if (destBits < 32)
+        {
+            _add(_address, OpCode.Move, [elementReg, result]).NativeIntegerWidthBits = 32;
+            _add(_address, OpCode.And, [elementReg, elementReg, new Immediate(mask)])
+                .NativeIntegerWidthBits = 32;
+        }
+        else
+            _add(_address, OpCode.Move, [elementReg, result])
+                .NativeIntegerWidthBits = destBits == 32 ? 32 : null;
+        _emitted = true;
+
+        var dest = Ensure(destReg);
+        if (destBits >= 32)
+        {
+            dest.Slots[0] = new LaneSlice(elementReg, 0);
+            dest.Slots[1] = destBits == 64 ? new LaneSlice(elementReg, 32) : new LaneSlice(Zero, 0);
+        }
+        else
+        {
+            // the scalar write zeroes the rest of the vector, so window 0 is the
+            // masked element value — materialize it for window-level consumers.
+            var windowReg = ElementRegister(destName, 32, 0);
+            _add(_address, OpCode.Move, [windowReg, elementReg]).NativeIntegerWidthBits = 32;
+            _emitted = true;
+            dest.Slots[0] = new LaneSlice(windowReg, 0);
+            dest.Slots[1] = new LaneSlice(Zero, 0);
+        }
+        dest.Slots[2] = new LaneSlice(Zero, 0);
+        dest.Slots[3] = new LaneSlice(Zero, 0);
+        SyncScalarView(dest, destName);
+    }
+
+    /// <summary>Unsigned value of the low byte of <paramref name="shiftLane"/>, sign-extended.</summary>
+    private IOperand ShiftCountOperand(IOperand shiftLane, int laneBits)
+    {
+        var shifted = EmitTempOp(OpCode.ShiftLeft, shiftLane, new Immediate(laneBits - 8), laneBits);
+        return EmitTempOp(OpCode.ShiftRight, shifted, new Immediate(laneBits - 8), laneBits);
     }
 
     private static bool IsLaneWiseBinop(Arm64Mnemonic mnemonic) => mnemonic is
@@ -713,9 +946,94 @@ internal sealed class Arm64VectorScalarizer
                 when insn.Op0Kind == Arm64OperandKind.Register
                     && IsVectorRegister(insn.Op0Reg)
                     && insn.Op0Arrangement != Arm64ArrangementSpecifier.None:
-                // unreachable until Disarm decodes shift-right-by-immediate
-                // (Task 1); meanwhile exercised via manual fixtures
                 return LowerShiftImmediate(insn, OpCode.ShiftRight);
+
+            case Arm64Mnemonic.MOV
+                when insn.Op0Kind == Arm64OperandKind.Register
+                    && insn.Op1Kind == Arm64OperandKind.Register
+                    && IsVectorRegister(insn.Op0Reg) && IsVectorRegister(insn.Op1Reg)
+                    && insn.Op0Arrangement != Arm64ArrangementSpecifier.None:
+                return LowerVectorCopy(insn);
+
+            case Arm64Mnemonic.MVN
+                when insn.Op0Kind == Arm64OperandKind.Register
+                    && insn.Op1Kind == Arm64OperandKind.Register
+                    && IsVectorRegister(insn.Op0Reg) && IsVectorRegister(insn.Op1Reg)
+                    && insn.Op0Arrangement != Arm64ArrangementSpecifier.None:
+                return LowerVectorNot(insn);
+
+            case Arm64Mnemonic.USHLL or Arm64Mnemonic.USHLL2
+                or Arm64Mnemonic.SSHLL or Arm64Mnemonic.SSHLL2
+                when insn.Op0Kind == Arm64OperandKind.Register
+                    && IsVectorRegister(insn.Op0Reg)
+                    && insn.Op1Kind == Arm64OperandKind.Register
+                    && IsVectorRegister(insn.Op1Reg)
+                    && insn.Op2Kind == Arm64OperandKind.Immediate:
+                return LowerShiftLong(insn);
+
+            case Arm64Mnemonic.XTN or Arm64Mnemonic.XTN2
+                when insn.Op0Kind == Arm64OperandKind.Register
+                    && IsVectorRegister(insn.Op0Reg)
+                    && insn.Op1Kind == Arm64OperandKind.Register
+                    && IsVectorRegister(insn.Op1Reg):
+                return LowerNarrow(insn);
+
+            case Arm64Mnemonic.CMEQ or Arm64Mnemonic.CMGE or Arm64Mnemonic.CMGT
+                or Arm64Mnemonic.CMHS or Arm64Mnemonic.CMHI
+                or Arm64Mnemonic.CMLE or Arm64Mnemonic.CMLT
+                when insn.Op0Kind == Arm64OperandKind.Register
+                    && IsVectorRegister(insn.Op0Reg)
+                    && insn.Op0Arrangement != Arm64ArrangementSpecifier.None
+                    && insn.Op1Kind == Arm64OperandKind.Register
+                    && (insn.Op2Kind == Arm64OperandKind.Register
+                        || insn.Op2Kind == Arm64OperandKind.Immediate):
+                return LowerVectorCompare(insn);
+
+            case Arm64Mnemonic.SMIN or Arm64Mnemonic.SMAX
+                or Arm64Mnemonic.UMIN or Arm64Mnemonic.UMAX
+                when insn.Op0Kind == Arm64OperandKind.Register
+                    && IsVectorRegister(insn.Op0Reg)
+                    && insn.Op0Arrangement != Arm64ArrangementSpecifier.None
+                    && insn.Op1Kind == Arm64OperandKind.Register
+                    && insn.Op2Kind == Arm64OperandKind.Register:
+                return LowerVectorMinMax(insn);
+
+            case Arm64Mnemonic.USHL or Arm64Mnemonic.SSHL
+                when insn.Op0Kind == Arm64OperandKind.Register
+                    && IsVectorRegister(insn.Op0Reg)
+                    && insn.Op0Arrangement != Arm64ArrangementSpecifier.None
+                    && insn.Op1Kind == Arm64OperandKind.Register
+                    && insn.Op2Kind == Arm64OperandKind.Register:
+                return LowerVectorShift(insn);
+
+            case Arm64Mnemonic.ADDV or Arm64Mnemonic.SMINV or Arm64Mnemonic.SMAXV
+                or Arm64Mnemonic.UMINV or Arm64Mnemonic.UMAXV
+                when insn.Op0Kind == Arm64OperandKind.Register
+                    && insn.Op0Arrangement == Arm64ArrangementSpecifier.None
+                    && insn.Op1Kind == Arm64OperandKind.Register
+                    && IsVectorRegister(insn.Op1Reg)
+                    && insn.Op1Arrangement != Arm64ArrangementSpecifier.None:
+                return LowerReduction(insn);
+
+            case Arm64Mnemonic.UCVTF or Arm64Mnemonic.SCVTF
+                or Arm64Mnemonic.FCVTZS or Arm64Mnemonic.FCVTZU
+                or Arm64Mnemonic.FCVTMS or Arm64Mnemonic.FCVTMU
+                or Arm64Mnemonic.FCVTNS or Arm64Mnemonic.FCVTNU
+                or Arm64Mnemonic.FCVTPS or Arm64Mnemonic.FCVTPU
+                or Arm64Mnemonic.FCVTAS or Arm64Mnemonic.FCVTAU
+                when insn.Op0Kind == Arm64OperandKind.Register
+                    && insn.Op1Kind == Arm64OperandKind.Register
+                    && IsVectorRegister(insn.Op0Reg) && IsVectorRegister(insn.Op1Reg)
+                    && insn.Op0Arrangement != Arm64ArrangementSpecifier.None
+                    && insn.Op0Arrangement == insn.Op1Arrangement:
+                return LowerConvert(insn);
+
+            case Arm64Mnemonic.ST1
+                when insn.Op0Kind == Arm64OperandKind.VectorRegisterElement
+                    && insn.MemIndexMode == Arm64MemoryIndexMode.Offset
+                    && insn.MemAddendReg == Arm64Register.INVALID
+                    && insn.MemBase != Arm64Register.INVALID:
+                return LowerElementStore(insn);
 
             case Arm64Mnemonic.STR or Arm64Mnemonic.STUR or Arm64Mnemonic.STP
                 when insn.Op0Kind == Arm64OperandKind.Register
@@ -1218,8 +1536,8 @@ internal sealed class Arm64VectorScalarizer
             var value = insn.Mnemonic == Arm64Mnemonic.MVNI ? ~insn.Op1Imm : insn.Op1Imm;
             _add(_address, OpCode.Move, [convertOperand(insn, 0), new Immediate(value)]);
             _emitted = true;
-            dest.Slots[0] = new LaneSlice(Reg(insn.Op0Reg), 0);
-            dest.Slots[1] = new LaneSlice(Reg(insn.Op0Reg), 32);
+            dest.Slots[0] = new LaneSlice(new Immediate(value), 0);
+            dest.Slots[1] = new LaneSlice(new Immediate(value), 32);
             dest.Slots[2] = new LaneSlice(Zero, 0);
             dest.Slots[3] = new LaneSlice(Zero, 0);
             return true;
@@ -1254,8 +1572,8 @@ internal sealed class Arm64VectorScalarizer
                 var laneReg = ElementRegister(destName, 64, lane);
                 _add(_address, OpCode.Move, [laneReg, new Immediate(lane64)]);
                 _emitted = true;
-                dest.Slots[lane * 2] = new LaneSlice(laneReg, 0);
-                dest.Slots[lane * 2 + 1] = new LaneSlice(laneReg, 32);
+                dest.Slots[lane * 2] = new LaneSlice(new Immediate(lane64), 0);
+                dest.Slots[lane * 2 + 1] = new LaneSlice(new Immediate(lane64), 32);
             }
         }
         else
@@ -1275,7 +1593,7 @@ internal sealed class Arm64VectorScalarizer
                 var laneReg = ElementRegister(destName, 32, slot);
                 _add(_address, OpCode.Move, [laneReg, new Immediate(window)]);
                 _emitted = true;
-                dest.Slots[slot] = new LaneSlice(laneReg, 0);
+                dest.Slots[slot] = new LaneSlice(new Immediate(window), 0);
             }
         }
         for (var slot = slotsUsed; slot < 4; slot++)
@@ -1343,27 +1661,34 @@ internal sealed class Arm64VectorScalarizer
         return true;
     }
 
-    /// <summary>SHL/USHR/SSHR Vd.T, Vn.T, #imm: a per-lane shift at the element width.</summary>
+    /// <summary>
+    /// SHL/USHR/SSHR Vd.T, Vn.T, #imm: a per-lane shift at the element width.
+    /// USHR masks the bits shifted in from the left — the emitted `shr` is
+    /// arithmetic, so an unmasked fold would sign-extend unsigned lanes. Narrow
+    /// lanes shift on their extracted element and compose back into windows.
+    /// </summary>
     private bool LowerShiftImmediate(Arm64Instruction insn, OpCode op)
     {
         var (laneBits, laneCount) = Arrangement(insn.Op0Arrangement);
+        if (laneBits == 0)
+            return false;
         var source = LaneState(insn.Op1Reg);
         if (source == null)
             return false;
+
+        var signed = insn.Mnemonic == Arm64Mnemonic.SSHR;
+        var operands = new IOperand?[laneCount];
+        var proven = true;
+        for (var lane = 0; lane < laneCount; lane++)
+        {
+            operands[lane] = LaneValueOperand(source, laneBits, lane, signed);
+            proven &= operands[lane] != null;
+        }
 
         var dest = Ensure(insn.Op0Reg);
         ClaimDest(insn.Op0Reg);
         var destName = Normalize(insn.Op0Reg);
         var slotsUsed = laneCount * laneBits / 32;
-
-        var proven = laneBits is 32 or 64;
-        var operands = new IOperand?[laneCount];
-        if (proven)
-            for (var lane = 0; lane < laneCount; lane++)
-            {
-                operands[lane] = laneBits == 32 ? SlotOperand(source, lane) : Lane64Operand(source, lane);
-                proven &= operands[lane] != null;
-            }
 
         if (!proven)
         {
@@ -1375,8 +1700,30 @@ internal sealed class Arm64VectorScalarizer
             return true;
         }
 
+        var narrow = laneBits < 32 ? new List<PendingLane>() : null;
         for (var lane = 0; lane < laneCount; lane++)
-            EmitLaneOp(op, destName, laneBits, lane, operands[lane]!, new Immediate(insn.Op2Imm), dest);
+        {
+            // narrow lanes read zero/sign-extended elements whose high bits are
+            // already clear, so a plain `shr` is exact; on 32/64-bit lanes the
+            // emitted `shr` is arithmetic and USHR must mask the fill bits.
+            EmitLaneOp(op, destName, laneBits, lane, operands[lane]!, new Immediate(insn.Op2Imm), dest,
+                narrow: narrow);
+            if (insn.Mnemonic == Arm64Mnemonic.USHR && laneBits >= 32)
+            {
+                // (1 << (laneBits - imm)) - 1 in unchecked lane-width arithmetic
+                var mask = unchecked((1L << (int)(laneBits - insn.Op2Imm)) - 1);
+                var laneReg = ElementRegister(destName, laneBits, lane);
+                _add(_address, OpCode.And, [laneReg, laneReg, new Immediate(mask)])
+                    .NativeIntegerWidthBits = laneBits == 32 ? 32 : null;
+                _emitted = true;
+            }
+        }
+        if (narrow != null)
+        {
+            for (var slot = 0; slot < slotsUsed; slot++)
+                dest.Slots[slot] = null; // FlushNarrowLanes re-proves covered windows
+            FlushNarrowLanes(dest, destName, laneBits, narrow);
+        }
         for (var slot = slotsUsed; slot < 4; slot++)
             dest.Slots[slot] = new LaneSlice(Zero, 0);
         SyncScalarView(dest, destName);
@@ -1425,8 +1772,9 @@ internal sealed class Arm64VectorScalarizer
         ClaimDest(insn.Op0Reg);
         var destName = Normalize(insn.Op0Reg);
 
-        var supported = bitwise || laneBits is 32 or 64;
+        var supported = bitwise || laneBits is 32 or 64 || !isFloat;
         var rows = bitwise ? vectorSlots : laneCount;
+        var narrow = !bitwise && laneBits < 32 ? new List<PendingLane>() : null;
         var aOps = new IOperand?[rows];
         var bOps = new IOperand?[rows];
         var dOps = new IOperand?[rows];
@@ -1487,7 +1835,7 @@ internal sealed class Arm64VectorScalarizer
                 // no local describes it: leave the window unproven and report.
                 if (bitwise)
                     dest.Slots[lane] = null;
-                else
+                else if (narrow == null)
                     for (var w = lane * laneBits / 32; w < (lane + 1) * laneBits / 32; w++)
                         dest.Slots[w] = null;
                 unprovenLanes++;
@@ -1506,7 +1854,7 @@ internal sealed class Arm64VectorScalarizer
                 var product = Temp();
                 _add(_address, OpCode.Multiply, [product, a, b]);
                 EmitLaneOp(insn.Mnemonic == Arm64Mnemonic.MLA ? OpCode.Add : OpCode.Subtract,
-                    destName, laneBits, lane, dOps[lane]!, product, dest);
+                    destName, laneBits, lane, dOps[lane]!, product, dest, narrow: narrow);
                 continue;
             }
             var op = insn.Mnemonic switch
@@ -1519,7 +1867,13 @@ internal sealed class Arm64VectorScalarizer
                 Arm64Mnemonic.FDIV => OpCode.Divide,
                 _ => OpCode.Add
             };
-            EmitLaneOp(op, destName, bitwise ? 32 : laneBits, lane, a, b, dest, isFloat);
+            EmitLaneOp(op, destName, bitwise ? 32 : laneBits, lane, a, b, dest, isFloat, narrow);
+        }
+        if (narrow != null)
+        {
+            for (var slot = 0; slot < vectorSlots; slot++)
+                dest.Slots[slot] = null; // FlushNarrowLanes re-proves covered windows
+            FlushNarrowLanes(dest, destName, laneBits, narrow);
         }
         for (var slot = vectorSlots; slot < 4; slot++)
             dest.Slots[slot] = new LaneSlice(Zero, 0);
@@ -1530,7 +1884,702 @@ internal sealed class Arm64VectorScalarizer
     }
 
     private IOperand? LaneOperand(VectorState? state, int laneBits, int lane)
-        => state == null ? null : laneBits == 32 ? SlotOperand(state, lane) : Lane64Operand(state, lane);
+        => state == null ? null
+            : laneBits < 32
+                ? NarrowElementOperand(state, lane * laneBits / 32, lane * laneBits % 32, laneBits)
+                : laneBits == 32 ? SlotOperand(state, lane) : Lane64Operand(state, lane);
+
+    /// <summary>
+    /// MOV Vd.T, Vn.T — the whole-vector register copy (ORR alias). The
+    /// normal-path Move is reproduced so the register local keeps its meaning,
+    /// and each proven window additionally copies into the destination's own
+    /// element local: without that, lane state would reference the source's
+    /// element locals, which a later write to the source would silently reuse.
+    /// </summary>
+    private bool LowerVectorCopy(Arm64Instruction insn)
+    {
+        var source = State(insn.Op1Reg);
+        if (source == null)
+            return false; // untracked: caller's plain Move stands on its own
+
+        _add(_address, OpCode.Move, [Reg(insn.Op0Reg), Reg(insn.Op1Reg)]);
+        _emitted = true;
+
+        var dest = Ensure(insn.Op0Reg);
+        ClaimDest(insn.Op0Reg);
+        var destName = Normalize(insn.Op0Reg);
+        var (laneBits, laneCount) = Arrangement(insn.Op0Arrangement);
+        var slotsUsed = laneBits * laneCount / 32;
+        for (var slot = 0; slot < slotsUsed; slot++)
+        {
+            var op = SlotOperand(source, slot);
+            if (op == null)
+            {
+                dest.Slots[slot] = null;
+                continue;
+            }
+            var laneReg = ElementRegister(destName, 32, slot);
+            _add(_address, OpCode.Move, [laneReg, op]).NativeIntegerWidthBits = 32;
+            _emitted = true;
+            dest.Slots[slot] = new LaneSlice(laneReg, 0);
+        }
+        for (var slot = slotsUsed; slot < 4; slot++)
+            dest.Slots[slot] = new LaneSlice(Zero, 0);
+        dest.Whole = source.Whole;
+        return true;
+    }
+
+    /// <summary>MVN Vd.T, Vn.T — bitwise NOT, exact at 32-bit window granularity.</summary>
+    private bool LowerVectorNot(Arm64Instruction insn)
+    {
+        var source = LaneState(insn.Op1Reg);
+
+        var dest = Ensure(insn.Op0Reg);
+        ClaimDest(insn.Op0Reg);
+        var destName = Normalize(insn.Op0Reg);
+        var slotsUsed = insn.Op0Arrangement == Arm64ArrangementSpecifier.SixteenB ? 4 : 2;
+
+        var unproven = 0;
+        for (var slot = 0; slot < slotsUsed; slot++)
+        {
+            var op = SlotOperand(source, slot);
+            if (op == null)
+            {
+                dest.Slots[slot] = null;
+                unproven++;
+                continue;
+            }
+            var laneReg = ElementRegister(destName, 32, slot);
+            _add(_address, OpCode.Not, [laneReg, op]).NativeIntegerWidthBits = 32;
+            _emitted = true;
+            dest.Slots[slot] = new LaneSlice(laneReg, 0);
+        }
+        for (var slot = slotsUsed; slot < 4; slot++)
+            dest.Slots[slot] = new LaneSlice(Zero, 0);
+        SyncScalarView(dest, destName);
+        if (unproven > 0)
+            Diagnostic($"ARM64 SIMD MVN has unproven lane provenance; scalarized {slotsUsed - unproven} of {slotsUsed} lanes.");
+        return true;
+    }
+
+    /// <summary>
+    /// USHLL/USHLL2/SSHLL/SSHLL2: each destination lane is the zero- or
+    /// sign-extended source lane shifted left by the immediate — the *2 forms
+    /// read the source's high half.
+    /// </summary>
+    private bool LowerShiftLong(Arm64Instruction insn)
+    {
+        var (destBits, destLanes) = Arrangement(insn.Op0Arrangement);
+        var (srcBits, srcLanes) = Arrangement(insn.Op1Arrangement);
+        var unsigned = insn.Mnemonic is Arm64Mnemonic.USHLL or Arm64Mnemonic.USHLL2;
+        var high = insn.Mnemonic is Arm64Mnemonic.USHLL2 or Arm64Mnemonic.SSHLL2;
+        // *2 forms expose the wide source arrangement and read its high half
+        if (srcBits == 0 || destBits != 2 * srcBits
+            || srcLanes != (high ? 2 : 1) * destLanes)
+            return false;
+
+        var source = LaneState(insn.Op1Reg);
+
+        var operands = new IOperand?[destLanes];
+        var proven = true;
+        for (var lane = 0; lane < destLanes; lane++)
+        {
+            var op = LaneValueOperand(source, srcBits, high ? destLanes + lane : lane,
+                signed: !unsigned);
+            if (op != null && srcBits == 32)
+                op = unsigned
+                    ? EmitTempOp(OpCode.And, op, new Immediate(0xFFFFFFFFL), 64)
+                    : EmitTempUnary(OpCode.SignExtend32, op, 64);
+            operands[lane] = op;
+            proven &= op != null;
+        }
+
+        var dest = Ensure(insn.Op0Reg);
+        ClaimDest(insn.Op0Reg);
+        var destName = Normalize(insn.Op0Reg);
+        var slotsUsed = destLanes * destBits / 32;
+
+        if (!proven)
+        {
+            for (var slot = 0; slot < slotsUsed; slot++)
+                dest.Slots[slot] = null;
+            for (var slot = slotsUsed; slot < 4; slot++)
+                dest.Slots[slot] = new LaneSlice(Zero, 0);
+            Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarization skipped.");
+            return true;
+        }
+
+        var narrow = destBits < 32 ? new List<PendingLane>() : null;
+        for (var lane = 0; lane < destLanes; lane++)
+        {
+            var value = operands[lane]!;
+            if (insn.Op2Imm != 0)
+                value = EmitTempOp(OpCode.ShiftLeft, value, new Immediate(insn.Op2Imm), destBits);
+            EmitLaneValue(dest, destName, destBits, lane, value, narrow);
+        }
+        if (narrow != null)
+        {
+            for (var slot = 0; slot < slotsUsed; slot++)
+                dest.Slots[slot] = null;
+            FlushNarrowLanes(dest, destName, destBits, narrow);
+        }
+        for (var slot = slotsUsed; slot < 4; slot++)
+            dest.Slots[slot] = new LaneSlice(Zero, 0);
+        SyncScalarView(dest, destName);
+        return true;
+    }
+
+    /// <summary>
+    /// XTN/XTN2: each written destination lane is the low half of the source
+    /// lane — a plain mask. XTN2 writes the destination's high lanes and leaves
+    /// the low half (and its provenance) untouched.
+    /// </summary>
+    private bool LowerNarrow(Arm64Instruction insn)
+    {
+        var (destBits, destLanes) = Arrangement(insn.Op0Arrangement);
+        var (srcBits, srcLanes) = Arrangement(insn.Op1Arrangement);
+        if (destBits == 0 || srcBits != 2 * destBits || srcLanes > destLanes)
+            return false;
+
+        var upper = insn.Mnemonic == Arm64Mnemonic.XTN2;
+        var source = LaneState(insn.Op1Reg);
+        var destState = Ensure(insn.Op0Reg);
+
+        var operands = new IOperand?[srcLanes];
+        var proven = true;
+        for (var lane = 0; lane < srcLanes; lane++)
+        {
+            operands[lane] = LaneValueOperand(source, srcBits, lane, signed: false);
+            proven &= operands[lane] != null;
+        }
+
+        ClaimDest(insn.Op0Reg);
+        var destName = Normalize(insn.Op0Reg);
+        var slotsUsed = destLanes * destBits / 32;
+        var firstWritten = upper ? srcLanes : 0;
+
+        if (!proven)
+        {
+            for (var slot = firstWritten * destBits / 32; slot < slotsUsed; slot++)
+                destState.Slots[slot] = null;
+            Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarization skipped.");
+            return true;
+        }
+
+        var narrow = new List<PendingLane>();
+        var mask = (1L << destBits) - 1;
+        for (var lane = 0; lane < srcLanes; lane++)
+        {
+            var value = operands[lane]! is Immediate { Value: var raw }
+                ? new Immediate(raw & mask)
+                : EmitTempOp(OpCode.And, operands[lane]!, new Immediate(mask), 32);
+            EmitLaneValue(destState, destName, destBits, firstWritten + lane, value, narrow);
+        }
+        FlushNarrowLanes(destState, destName, destBits, narrow);
+        if (!upper)
+            for (var slot = slotsUsed; slot < 4; slot++)
+                destState.Slots[slot] = new LaneSlice(Zero, 0);
+        SyncScalarView(destState, destName);
+        return true;
+    }
+
+    /// <summary>
+    /// ADDV/SMINV/SMAXV/UMINV/UMAXV: a whole-vector reduction into a scalar
+    /// register. Every lane must be proven — a partial fold cannot name the
+    /// remaining addends. Unsigned min/max compares are only expressible on
+    /// zero-extended lanes (8/16-bit); wider unsigned lanes stay diagnostic.
+    /// </summary>
+    private bool LowerReduction(Arm64Instruction insn)
+    {
+        var (srcBits, srcLanes) = Arrangement(insn.Op1Arrangement);
+        var destBits = RegisterBytes(insn.Op0Reg) * 8;
+        if (srcBits == 0 || destBits == 0)
+            return false;
+
+        var unsigned = insn.Mnemonic is Arm64Mnemonic.UMINV or Arm64Mnemonic.UMAXV;
+        if (unsigned && srcBits > 16)
+        {
+            // CIL clt/cgt are signed; on zero-extended <=16-bit lanes they are
+            // exact, but on wider lanes an unsigned compare cannot be emitted.
+            Diagnostic($"ARM64 SIMD {insn.Mnemonic} on {srcBits}-bit lanes is an unsigned compare CIL cannot express; scalarization skipped.");
+            return true;
+        }
+
+        var source = LaneState(insn.Op1Reg);
+
+        var operands = new IOperand?[srcLanes];
+        var proven = true;
+        for (var lane = 0; lane < srcLanes; lane++)
+        {
+            operands[lane] = LaneValueOperand(source, srcBits, lane,
+                insn.Mnemonic is Arm64Mnemonic.SMINV or Arm64Mnemonic.SMAXV);
+            proven &= operands[lane] != null;
+        }
+
+        var dest = Ensure(insn.Op0Reg);
+        ClaimDest(insn.Op0Reg);
+        if (!proven)
+        {
+            // a scalar write zeroes the vector above the scalar; the scalar
+            // itself cannot be named, so only window 0 loses provenance.
+            dest.Slots[0] = null;
+            for (var slot = 1; slot < 4; slot++)
+                dest.Slots[slot] = new LaneSlice(Zero, 0);
+            Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarization skipped.");
+            return true;
+        }
+
+        var acc = operands[0]!;
+        var width = srcBits < 32 ? 32 : srcBits;
+        for (var lane = 1; lane < srcLanes; lane++)
+        {
+            if (insn.Mnemonic == Arm64Mnemonic.ADDV)
+            {
+                acc = EmitTempOp(OpCode.Add, acc, operands[lane]!, width);
+                continue;
+            }
+            // min(a,b) = b ^ ((a^b) & -(a<b)); unsigned lanes are zero-extended
+            // so the signed CIL compare is exact.
+            var cmp = insn.Mnemonic is Arm64Mnemonic.SMINV or Arm64Mnemonic.UMINV
+                ? OpCode.CheckLess
+                : OpCode.CheckGreater;
+            var diff = EmitTempOp(OpCode.Xor, acc, operands[lane]!, width);
+            var mask = EmitTempUnary(OpCode.Negate,
+                EmitTempOp(cmp, acc, operands[lane]!, width), width);
+            var sel = EmitTempOp(OpCode.And, diff, mask, width);
+            acc = EmitTempOp(OpCode.Xor, operands[lane]!, sel, width);
+        }
+
+        WriteScalarElement(insn.Op0Reg, destBits, acc);
+        return true;
+    }
+
+    /// <summary>
+    /// CMEQ/CMGE/CMGT/CMHS/CMHI/CMLT/CMLE lane-wise integer compares: each lane
+    /// folds to a Check* op negated into the hardware's all-ones/zero mask.
+    /// CMHI/CMHS are unsigned and only expressible on zero-extended lanes
+    /// (&lt;=16-bit); wider unsigned compares stay explicit diagnostics.
+    /// </summary>
+    private bool LowerVectorCompare(Arm64Instruction insn)
+    {
+        var (laneBits, laneCount) = Arrangement(insn.Op0Arrangement);
+        if (laneBits == 0)
+            return false;
+
+        var unsigned = insn.Mnemonic is Arm64Mnemonic.CMHI or Arm64Mnemonic.CMHS;
+        if (unsigned && laneBits > 16)
+        {
+            Diagnostic($"ARM64 SIMD {insn.Mnemonic} on {laneBits}-bit lanes is an unsigned compare CIL cannot express; scalarization skipped.");
+            return true;
+        }
+
+        var sourceA = LaneState(insn.Op1Reg);
+        VectorState? sourceB = null;
+        var zeroCompare = false;
+        if (insn.Op2Kind == Arm64OperandKind.Register)
+            sourceB = LaneState(insn.Op2Reg);
+        else if (insn.Op2Kind == Arm64OperandKind.Immediate && insn.Op2Imm == 0)
+            zeroCompare = true;
+        else
+            return false;
+
+        // signed compares read sign-extended elements so a lane's sign bit is
+        // real; unsigned and equality compare the raw lane value.
+        var signed = !unsigned && insn.Mnemonic != Arm64Mnemonic.CMEQ;
+        var aOps = new IOperand?[laneCount];
+        var bOps = new IOperand?[laneCount];
+        for (var lane = 0; lane < laneCount; lane++)
+        {
+            aOps[lane] = LaneValueOperand(sourceA, laneBits, lane, signed);
+            bOps[lane] = zeroCompare ? new Immediate(0) : LaneValueOperand(sourceB, laneBits, lane, signed);
+        }
+
+        var dest = Ensure(insn.Op0Reg);
+        ClaimDest(insn.Op0Reg);
+        var destName = Normalize(insn.Op0Reg);
+        var slotsUsed = laneCount * laneBits / 32;
+        var narrow = laneBits < 32 ? new List<PendingLane>() : null;
+
+        var primary = insn.Mnemonic switch
+        {
+            Arm64Mnemonic.CMGT or Arm64Mnemonic.CMHI => OpCode.CheckGreater,
+            Arm64Mnemonic.CMGE or Arm64Mnemonic.CMHS => OpCode.CheckGreaterOrEqual,
+            Arm64Mnemonic.CMEQ => OpCode.CheckEqual,
+            Arm64Mnemonic.CMLE => OpCode.CheckLessOrEqual,
+            _ => OpCode.CheckLess
+        };
+
+        var unprovenLanes = 0;
+        for (var lane = 0; lane < laneCount; lane++)
+        {
+            if (aOps[lane] == null || bOps[lane] == null)
+            {
+                unprovenLanes++;
+                if (narrow == null)
+                    for (var w = lane * laneBits / 32; w < (lane + 1) * laneBits / 32; w++)
+                        dest.Slots[w] = null;
+                continue;
+            }
+            var laneReg = ElementRegister(destName, laneBits, lane);
+            // Check* yields boolean 0/1; Negate produces the all-ones mask.
+            _add(_address, primary, [laneReg, aOps[lane]!, bOps[lane]!]);
+            var negated = _add(_address, OpCode.Negate, [laneReg, laneReg]);
+            if (laneBits == 32)
+                negated.NativeIntegerWidthBits = 32;
+            _emitted = true;
+            if (laneBits >= 32)
+            {
+                dest.Slots[lane * laneBits / 32] = new LaneSlice(laneReg, 0);
+                if (laneBits == 64)
+                    dest.Slots[lane * 2 + 1] = new LaneSlice(laneReg, 32);
+            }
+            else
+            {
+                _add(_address, OpCode.And, [laneReg, laneReg, new Immediate((1L << laneBits) - 1)])
+                    .NativeIntegerWidthBits = 32;
+                narrow!.Add(new PendingLane(laneBits * lane / 32, laneBits * lane % 32, laneReg));
+            }
+        }
+        if (narrow != null)
+        {
+            for (var slot = 0; slot < slotsUsed; slot++)
+                dest.Slots[slot] = null;
+            FlushNarrowLanes(dest, destName, laneBits, narrow);
+        }
+        for (var slot = slotsUsed; slot < 4; slot++)
+            dest.Slots[slot] = new LaneSlice(Zero, 0);
+        SyncScalarView(dest, destName);
+        if (unprovenLanes > 0)
+            Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarized {laneCount - unprovenLanes} of {laneCount} lanes.");
+        return true;
+    }
+
+    /// <summary>
+    /// SMIN/SMAX/UMIN/UMAX lane-wise: a branchless select per lane,
+    /// b ^ ((a^b) &amp; -(a&lt;b)). Unsigned forms compare exactly only on
+    /// zero-extended &lt;=16-bit lanes; wider unsigned lanes stay diagnostic.
+    /// </summary>
+    private bool LowerVectorMinMax(Arm64Instruction insn)
+    {
+        var (laneBits, laneCount) = Arrangement(insn.Op0Arrangement);
+        if (laneBits == 0)
+            return false;
+
+        var unsigned = insn.Mnemonic is Arm64Mnemonic.UMIN or Arm64Mnemonic.UMAX;
+        if (unsigned && laneBits > 16)
+        {
+            Diagnostic($"ARM64 SIMD {insn.Mnemonic} on {laneBits}-bit lanes is an unsigned compare CIL cannot express; scalarization skipped.");
+            return true;
+        }
+
+        var sourceA = LaneState(insn.Op1Reg);
+        var sourceB = LaneState(insn.Op2Reg);
+
+        var signed = !unsigned;
+        var aOps = new IOperand?[laneCount];
+        var bOps = new IOperand?[laneCount];
+        for (var lane = 0; lane < laneCount; lane++)
+        {
+            aOps[lane] = LaneValueOperand(sourceA, laneBits, lane, signed);
+            bOps[lane] = LaneValueOperand(sourceB, laneBits, lane, signed);
+        }
+
+        var dest = Ensure(insn.Op0Reg);
+        ClaimDest(insn.Op0Reg);
+        var destName = Normalize(insn.Op0Reg);
+        var slotsUsed = laneCount * laneBits / 32;
+        var narrow = laneBits < 32 ? new List<PendingLane>() : null;
+        var compare = insn.Mnemonic is Arm64Mnemonic.SMIN or Arm64Mnemonic.UMIN
+            ? OpCode.CheckLess
+            : OpCode.CheckGreater;
+        var width = laneBits < 32 ? 32 : laneBits;
+
+        var unprovenLanes = 0;
+        for (var lane = 0; lane < laneCount; lane++)
+        {
+            if (aOps[lane] == null || bOps[lane] == null)
+            {
+                unprovenLanes++;
+                if (narrow == null)
+                    for (var w = lane * laneBits / 32; w < (lane + 1) * laneBits / 32; w++)
+                        dest.Slots[w] = null;
+                continue;
+            }
+            var diff = EmitTempOp(OpCode.Xor, aOps[lane]!, bOps[lane]!, width);
+            var mask = EmitTempUnary(OpCode.Negate,
+                EmitTempOp(compare, aOps[lane]!, bOps[lane]!, width), width);
+            var sel = EmitTempOp(OpCode.And, diff, mask, width);
+            var value = EmitTempOp(OpCode.Xor, bOps[lane]!, sel, width);
+            EmitLaneValue(dest, destName, laneBits, lane, value, narrow);
+        }
+        if (narrow != null)
+        {
+            for (var slot = 0; slot < slotsUsed; slot++)
+                dest.Slots[slot] = null;
+            FlushNarrowLanes(dest, destName, laneBits, narrow);
+        }
+        for (var slot = slotsUsed; slot < 4; slot++)
+            dest.Slots[slot] = new LaneSlice(Zero, 0);
+        SyncScalarView(dest, destName);
+        if (unprovenLanes > 0)
+            Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarized {laneCount - unprovenLanes} of {laneCount} lanes.");
+        return true;
+    }
+
+    /// <summary>
+    /// USHL/SSHL Vd.T, Vn.T, Vm.T — variable per-lane shifts. The shift amount
+    /// is the sign-extended low byte of each Vm lane: a positive amount is a
+    /// truncating left shift (result 0 past the lane width), a negative amount
+    /// is a truncating right shift — logical for USHL (the fill bits are masked
+    /// since `shr` is arithmetic), arithmetic for SSHL with the count clamped
+    /// to lane width so a magnitude at/over the width still sign-fills.
+    /// Each side is emitted unconditionally and selected with the branchless
+    /// mask -(count&lt;0) / -(count&gt;=0).
+    /// </summary>
+    private bool LowerVectorShift(Arm64Instruction insn)
+    {
+        var (laneBits, laneCount) = Arrangement(insn.Op0Arrangement);
+        if (laneBits == 0)
+            return false;
+
+        var sourceV = LaneState(insn.Op1Reg);
+        var sourceS = LaneState(insn.Op2Reg);
+
+        var signed = insn.Mnemonic == Arm64Mnemonic.SSHL;
+        var width = laneBits < 32 ? 32 : laneBits;
+        var vOps = new IOperand?[laneCount];
+        var sOps = new IOperand?[laneCount];
+        for (var lane = 0; lane < laneCount; lane++)
+        {
+            vOps[lane] = LaneValueOperand(sourceV, laneBits, lane, signed);
+            // the count is the lane's low byte regardless of provenance flavour
+            sOps[lane] = LaneValueOperand(sourceS, laneBits, lane, signed: false);
+        }
+
+        var dest = Ensure(insn.Op0Reg);
+        ClaimDest(insn.Op0Reg);
+        var destName = Normalize(insn.Op0Reg);
+        var slotsUsed = laneCount * laneBits / 32;
+        var narrow = laneBits < 32 ? new List<PendingLane>() : null;
+
+        var unprovenLanes = 0;
+        for (var lane = 0; lane < laneCount; lane++)
+        {
+            if (vOps[lane] == null || sOps[lane] == null)
+            {
+                unprovenLanes++;
+                if (narrow == null)
+                    for (var w = lane * laneBits / 32; w < (lane + 1) * laneBits / 32; w++)
+                        dest.Slots[w] = null;
+                continue;
+            }
+            var value = EmitVectorShiftLane(vOps[lane]!, sOps[lane]!, laneBits, signed);
+            EmitLaneValue(dest, destName, laneBits, lane, value, narrow);
+        }
+        if (narrow != null)
+        {
+            for (var slot = 0; slot < slotsUsed; slot++)
+                dest.Slots[slot] = null;
+            FlushNarrowLanes(dest, destName, laneBits, narrow);
+        }
+        for (var slot = slotsUsed; slot < 4; slot++)
+            dest.Slots[slot] = new LaneSlice(Zero, 0);
+        SyncScalarView(dest, destName);
+        if (unprovenLanes > 0)
+            Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarized {laneCount - unprovenLanes} of {laneCount} lanes.");
+        return true;
+    }
+
+    private IOperand EmitVectorShiftLane(IOperand value, IOperand shiftLane, int laneBits, bool signed)
+    {
+        var w = laneBits < 32 ? 32 : laneBits;
+        var s = ShiftCountOperand(shiftLane, w);
+        var zero = new Immediate(0);
+        var negative = EmitTempUnary(OpCode.Negate,
+            EmitTempOp(OpCode.CheckLess, s, zero, w), w);
+        var nonnegative = EmitTempUnary(OpCode.Negate,
+            EmitTempOp(OpCode.CheckGreaterOrEqual, s, zero, w), w);
+        var negated = EmitTempUnary(OpCode.Negate, s, w);
+        // magnitude |s| without a branch: s<0 ? -s : s
+        var magnitude = EmitTempOp(OpCode.Xor, s,
+            EmitTempOp(OpCode.And, EmitTempOp(OpCode.Xor, s, negated, w), negative, w), w);
+
+        // left shift by min(s, w), gated by s in [0, w)
+        var mL = MinOp(magnitude, w);
+        var lft = EmitTempOp(OpCode.And,
+            EmitTempOp(OpCode.ShiftLeft, value, mL, w),
+            EmitTempOp(OpCode.And, nonnegative,
+                EmitTempUnary(OpCode.Negate, EmitTempOp(OpCode.CheckLess, s, new Immediate(w), w), w), w), w);
+
+        // right shift by min(|s|, bound): bound is w for a logical shift (a
+        // count of w must produce 0 through the mask) and w-1 for SSHL (the
+        // arithmetic shift by w-1 keeps sign-filling).
+        var bound = signed ? w - 1 : w;
+        var nC = MinOp(magnitude, bound);
+        var shifted = EmitTempOp(OpCode.ShiftRight, value, nC, w);
+        IOperand rgt;
+        if (signed)
+        {
+            rgt = EmitTempOp(OpCode.And, shifted, negative, w);
+        }
+        else
+        {
+            var wc = EmitTempOp(OpCode.Subtract, new Immediate(w), nC, w);
+            var dm = EmitTempOp(OpCode.Subtract,
+                EmitTempOp(OpCode.ShiftLeft, new Immediate(1), wc, w), new Immediate(1), w);
+            rgt = EmitTempOp(OpCode.And, EmitTempOp(OpCode.And, shifted, dm, w), negative, w);
+        }
+        return EmitTempOp(OpCode.Or, lft, rgt, w);
+
+        IOperand MinOp(IOperand x, long hi) => EmitTempOp(OpCode.Xor, new Immediate(hi),
+            EmitTempOp(OpCode.And, EmitTempOp(OpCode.Xor, x, new Immediate(hi), w),
+                EmitTempUnary(OpCode.Negate, EmitTempOp(OpCode.CheckLess, x, new Immediate(hi), w), w), w), w);
+    }
+
+    /// <summary>
+    /// Same-width lane-wise conversions (UCVTF/SCVTF/FCVT*): each lane's write
+    /// is a Move into the destination's element local — the same convention the
+    /// scalar path applies to its converts.
+    /// </summary>
+    private bool LowerConvert(Arm64Instruction insn)
+    {
+        var (laneBits, laneCount) = Arrangement(insn.Op0Arrangement);
+        if (laneBits is not (32 or 64))
+            return false;
+
+        var source = LaneState(insn.Op1Reg);
+
+        var operands = new IOperand?[laneCount];
+        var proven = true;
+        for (var lane = 0; lane < laneCount; lane++)
+        {
+            operands[lane] = LaneOperand(source, laneBits, lane);
+            proven &= operands[lane] != null;
+        }
+
+        var dest = Ensure(insn.Op0Reg);
+        ClaimDest(insn.Op0Reg);
+        var destName = Normalize(insn.Op0Reg);
+        var slotsUsed = laneCount * laneBits / 32;
+
+        if (!proven)
+        {
+            for (var slot = 0; slot < slotsUsed; slot++)
+                dest.Slots[slot] = null;
+            for (var slot = slotsUsed; slot < 4; slot++)
+                dest.Slots[slot] = new LaneSlice(Zero, 0);
+            Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarization skipped.");
+            return true;
+        }
+
+        for (var lane = 0; lane < laneCount; lane++)
+            EmitLaneValue(dest, destName, laneBits, lane, operands[lane]!, null);
+        for (var slot = slotsUsed; slot < 4; slot++)
+            dest.Slots[slot] = new LaneSlice(Zero, 0);
+        SyncScalarView(dest, destName);
+        return true;
+    }
+
+    /// <summary>
+    /// Lane-wise floating-point ops (FMAXNM/FMINNM, FABD, FRINT*/FSQRT/FABS
+    /// vector forms): the caller supplies the per-lane emission — a resolved
+    /// managed Math call — and this pass handles provenance, the element-local
+    /// writes and the partial-fold diagnostic.
+    /// </summary>
+    public bool TryLaneWiseFloatMath(Arm64Instruction insn,
+        Func<ulong, OpCode, List<IOperand>, Instruction> add,
+        Action<IOperand, IOperand, IOperand?> emitLane)
+    {
+        _add = add;
+        _address = insn.Address;
+        _emitted = false;
+
+        var (laneBits, laneCount) = Arrangement(insn.Op0Arrangement);
+        if (laneBits is not (32 or 64)
+            || insn.Op0Kind != Arm64OperandKind.Register
+            || !IsVectorRegister(insn.Op0Reg)
+            || insn.Op1Kind != Arm64OperandKind.Register
+            || insn.Op2Kind is not (Arm64OperandKind.Register or Arm64OperandKind.None))
+            return false;
+
+        var binary = insn.Op2Kind == Arm64OperandKind.Register;
+        var sourceA = LaneState(insn.Op1Reg);
+        var sourceB = binary ? LaneState(insn.Op2Reg) : null;
+
+        var provenLanes = 0;
+        for (var lane = 0; lane < laneCount; lane++)
+            if (CanFloatLane(sourceA, laneBits, lane)
+                && (!binary || CanFloatLane(sourceB, laneBits, lane)))
+                provenLanes++;
+        if (provenLanes == 0)
+        {
+            var poison = Ensure(insn.Op0Reg);
+            ClaimDest(insn.Op0Reg);
+            var used = laneCount * laneBits / 32;
+            for (var slot = 0; slot < used; slot++)
+                poison.Slots[slot] = null;
+            for (var slot = used; slot < 4; slot++)
+                poison.Slots[slot] = new LaneSlice(Zero, 0);
+            Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarization skipped.");
+            return true;
+        }
+
+        var dest = Ensure(insn.Op0Reg);
+        ClaimDest(insn.Op0Reg);
+        var destName = Normalize(insn.Op0Reg);
+        var slotsUsed = laneCount * laneBits / 32;
+
+        for (var lane = 0; lane < laneCount; lane++)
+        {
+            var a = FloatLaneOperand(sourceA, laneBits, lane);
+            var b = binary ? FloatLaneOperand(sourceB, laneBits, lane) : null;
+            if (a == null || (binary && b == null))
+            {
+                for (var w = lane * laneBits / 32; w < (lane + 1) * laneBits / 32; w++)
+                    dest.Slots[w] = null;
+                continue;
+            }
+            var laneReg = ElementRegister(destName, laneBits, lane);
+            emitLane(laneReg, a, b);
+            _emitted = true;
+            dest.Slots[lane * laneBits / 32] = new LaneSlice(laneReg, 0);
+            if (laneBits == 64)
+                dest.Slots[lane * 2 + 1] = new LaneSlice(laneReg, 32);
+        }
+        for (var slot = slotsUsed; slot < 4; slot++)
+            dest.Slots[slot] = new LaneSlice(Zero, 0);
+        SyncScalarView(dest, destName);
+        if (provenLanes < laneCount)
+            Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarized {provenLanes} of {laneCount} lanes.");
+        return true;
+    }
+
+    /// <summary>
+    /// ST1 (single element form): the source lane must be proven — its value
+    /// moves to memory verbatim. Other ST* structure forms are left for the
+    /// caller's normal path.
+    /// </summary>
+    private bool LowerElementStore(Arm64Instruction insn)
+    {
+        var source = LaneState(insn.Op0Reg);
+
+        var element = insn.Op0VectorElement;
+        var bits = ElementBits(element);
+        var op = LaneValueOperand(source, bits, element.Index, signed: false);
+        if (op == null)
+        {
+            Diagnostic($"ARM64 SIMD lane {Normalize(insn.Op0Reg)}.{ElementLetter(bits)}{element.Index} is unproven; store is not safe.");
+            return true;
+        }
+
+        var bytes = bits / 8;
+        IOperand mem = insn.MemBase == Arm64Register.X31
+            ? new StackOffset((int)insn.MemOffset)
+            : new MemoryOperand(Reg(insn.MemBase), addend: insn.MemOffset, accessSize: bytes);
+        _add(_address, OpCode.Move, [mem, op]).NativeMemoryAccessSize = bytes;
+        _emitted = true;
+        return true;
+    }
 
     /// <summary>
     /// STR/STUR/STP of a vector register: a fully proven vector is stored as

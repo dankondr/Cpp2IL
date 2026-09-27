@@ -702,54 +702,75 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         {
             case Arm64Mnemonic.FRINTM:
             case Arm64Mnemonic.FRINTP:
+            case Arm64Mnemonic.FRINTN:
+            case Arm64Mnemonic.FRINTZ:
             case Arm64Mnemonic.FSQRT:
             case Arm64Mnemonic.FABS:
                 {
-                    var destination = ConvertOperand(instruction, 0);
-                    var source = ConvertOperand(instruction, 1);
-                    if (!IsScalarFloatRegister(instruction.Op0Reg))
-                    {
-                        Add(address, OpCode.NotImplemented, new StringLiteral($"Instruction {instruction.Mnemonic} vector form is not supported."));
-                        break;
-                    }
-
                     var name = instruction.Mnemonic switch
                     {
                         Arm64Mnemonic.FRINTM => "Floor",
                         Arm64Mnemonic.FRINTP => "Ceiling",
+                        Arm64Mnemonic.FRINTN => "Round",
+                        Arm64Mnemonic.FRINTZ => "Truncate",
                         Arm64Mnemonic.FSQRT => "Sqrt",
                         _ => "Abs"
                     };
-                    EmitMathUnary(name, destination, source, instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31);
+                    if (IsScalarFloatRegister(instruction.Op0Reg))
+                    {
+                        EmitMathUnary(name, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1),
+                            instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31);
+                        break;
+                    }
+                    // vector form: every proven lane calls the managed function
+                    var unaryLanesAreDouble = instruction.Op0Arrangement == Arm64ArrangementSpecifier.TwoD;
+                    if (ResolveMathMethod(name, unaryLanesAreDouble, 1) == null
+                        || !scalarizer.TryLaneWiseFloatMath(instruction, Add,
+                            (laneDest, laneSource, _) => EmitMathUnary(name, laneDest, laneSource, unaryLanesAreDouble)))
+                        Add(address, OpCode.NotImplemented,
+                            new StringLiteral($"Instruction {instruction.Mnemonic} vector form is not supported."));
                     break;
                 }
             case Arm64Mnemonic.FABD:
                 {
-                    var destination = ConvertOperand(instruction, 0);
-                    if (!IsScalarFloatRegister(instruction.Op0Reg))
+                    if (IsScalarFloatRegister(instruction.Op0Reg))
                     {
-                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction FABD vector form is not supported."));
+                        var difference = new Register(null, "TEMP_FABD");
+                        Add(address, OpCode.Subtract, difference, ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                        EmitMathUnary("Abs", ConvertOperand(instruction, 0), difference,
+                            instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31);
                         break;
                     }
-
-                    var difference = new Register(null, "TEMP_FABD");
-                    Add(address, OpCode.Subtract, difference, ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
-                    EmitMathUnary("Abs", destination, difference, instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31);
+                    var fabdLanesAreDouble = instruction.Op0Arrangement == Arm64ArrangementSpecifier.TwoD;
+                    if (ResolveMathMethod("Abs", fabdLanesAreDouble, 1) == null
+                        || !scalarizer.TryLaneWiseFloatMath(instruction, Add, (laneDest, a, b) =>
+                        {
+                            var difference = new Register(null, "TEMP_FABD");
+                            Add(address, OpCode.Subtract, difference, a, b!)
+                                .NativeFloatWidthBits = fabdLanesAreDouble ? 64 : 32;
+                            EmitMathUnary("Abs", laneDest, difference, fabdLanesAreDouble);
+                        }))
+                        Add(address, OpCode.NotImplemented, new StringLiteral("Instruction FABD vector form is not supported."));
                     break;
                 }
             case Arm64Mnemonic.FMAXNM:
             case Arm64Mnemonic.FMINNM:
                 {
-                    if (!IsScalarFloatRegister(instruction.Op0Reg))
+                    if (IsScalarFloatRegister(instruction.Op0Reg))
                     {
-                        Add(address, OpCode.NotImplemented,
-                            new StringLiteral($"Instruction {instruction.Mnemonic} vector form is not supported."));
+                        EmitMathBinary(instruction.Mnemonic == Arm64Mnemonic.FMAXNM ? "Max" : "Min",
+                            ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2),
+                            instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31);
                         break;
                     }
 
-                    EmitMathBinary(instruction.Mnemonic == Arm64Mnemonic.FMAXNM ? "Max" : "Min",
-                        ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2),
-                        instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31);
+                    var laneMath = instruction.Mnemonic == Arm64Mnemonic.FMAXNM ? "Max" : "Min";
+                    var lanesAreDouble = instruction.Op0Arrangement == Arm64ArrangementSpecifier.TwoD;
+                    if (ResolveMathMethod(laneMath, lanesAreDouble, 2) == null
+                        || !scalarizer.TryLaneWiseFloatMath(instruction, Add,
+                            (laneDest, a, b) => EmitMathBinary(laneMath, laneDest, a, b!, lanesAreDouble)))
+                        Add(address, OpCode.NotImplemented,
+                            new StringLiteral($"Instruction {instruction.Mnemonic} vector form is not supported."));
                     break;
                 }
             case Arm64Mnemonic.DUP:
