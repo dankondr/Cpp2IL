@@ -232,6 +232,40 @@ public class OverrideChainAccessibilityTests
         });
     }
 
+    // Injected contexts have no il2cpp Definition and no vtable, so the
+    // slot-based base lookup cannot run; the signature fallback must still
+    // link the chain. Promotion reaching the base proves the link.
+    [Test]
+    public void OverridesLinkBySignatureWhenMetadataIsAbsent()
+    {
+        var app = LoadApp();
+        var module = new ModuleDefinition("Game.dll");
+        var asm = app.InjectAssembly("Recovered.Game");
+        var (baseType, baseEmitted) = AddType(asm, module, "MetaBase", app.SystemTypes.SystemObjectType);
+        var (derivedType, derivedEmitted) = AddType(asm, module, "MetaDerived", baseType, baseEmitted);
+
+        const R.MethodAttributes flags = R.MethodAttributes.Family | R.MethodAttributes.Virtual
+            | R.MethodAttributes.HideBySig;
+        var (baseCtx, baseMethod) = AddMethod(baseType, baseEmitted, module, "Ping",
+            flags | R.MethodAttributes.NewSlot);
+        var (derived, derivedMethod) = AddMethod(derivedType, derivedEmitted, module, "Ping", flags);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(baseCtx.Definition, Is.Null);
+            Assert.That(derived.Definition, Is.Null, "no metadata - slot resolution cannot run");
+        });
+
+        MemberAccessibility.EnsureAccessible(derived);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(AccessOf(baseMethod), Is.EqualTo(MethodAttributes.Public),
+                "the signature fallback found the base without a vtable");
+            AssertLegalOverrideAccess(derivedMethod, baseMethod);
+        });
+    }
+
     // A newslot method with the same name starts a new chain and must not be
     // dragged along when a neighbouring chain is promoted.
     [Test]

@@ -4,6 +4,7 @@ using System.Runtime.CompilerServices;
 using AsmResolver.DotNet;
 using AsmResolver.PE.DotNet.Metadata.Tables;
 using Cpp2IL.Core.Extensions;
+using Cpp2IL.Core.Logging;
 using Cpp2IL.Core.Model.Contexts;
 
 namespace Cpp2IL.Core.Utils.AsmResolver;
@@ -181,10 +182,12 @@ internal static class MemberAccessibility
                 if (Canonical(method.BaseMethod) is { } baseMethod)
                     return baseMethod;
             }
-            catch
+            // LibCpp2IL's metadata-usage casts throw plain Exception on damaged
+            // vtables, so a narrower filter cannot isolate them; the signature
+            // fallback below still finds the base the override binds to.
+            catch (Exception e)
             {
-                // Damaged vtables can defeat slot-based resolution; the signature
-                // fallback below still finds the base the override binds to.
+                Logger.WarnNewline($"Slot-based override resolution failed for {method.FullName}: {e.Message}", "Member Accessibility");
             }
         }
 
@@ -238,8 +241,11 @@ internal static class MemberAccessibility
                 {
                     actual = GenericInstantiation.Instantiate(actual, substitutions[s], []);
                 }
-                catch
+                catch (Exception e) when (e is IndexOutOfRangeException or ArgumentOutOfRangeException)
                 {
+                    // A corrupted generic argument count cannot be substituted;
+                    // treat the pair as not matching.
+                    Logger.VerboseNewline($"Generic substitution failed while matching {method.FullName}: {e.Message}", "Member Accessibility");
                     return false;
                 }
             }
