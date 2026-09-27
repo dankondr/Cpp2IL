@@ -332,7 +332,10 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
             {
                 var managedMethod = methodCtx.GetExtraData<MethodDefinition>("AsmResolverMethod") ?? throw new($"AsmResolver method not found in method analysis context for {typeContext.FullName}.{methodCtx.Name}");
 
-                FillMethodBody(managedMethod, methodCtx);
+                // Member references the body emits only need the access this
+                // type's scope can actually see, not a blanket public widening.
+                using (MemberAccessibility.EmittingFrom(typeContext))
+                    FillMethodBody(managedMethod, methodCtx);
             }
 #if !DEBUG
             catch (System.Exception e)

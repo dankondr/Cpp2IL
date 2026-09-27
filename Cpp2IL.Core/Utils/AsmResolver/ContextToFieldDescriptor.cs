@@ -9,7 +9,7 @@ public static class ContextToFieldDescriptor
     private static FieldDefinition GetFieldDefinition(this FieldAnalysisContext context)
     {
         var field = context.GetExtraData<FieldDefinition>("AsmResolverField") ?? throw new($"AsmResolver field not found in method analysis context for {context}");
-        MemberAccessibility.EnsureAccessible(field);
+        MemberAccessibility.EnsureAccessible(field, context);
         return field;
     }
 
@@ -29,7 +29,7 @@ public static class ContextToFieldDescriptor
     {
         var field = context.BaseFieldContext.GetExtraData<FieldDefinition>("AsmResolverField")
             ?? throw new($"AsmResolver field not found in method analysis context for {context.BaseFieldContext}");
-        MemberAccessibility.EnsureAccessible(field);
+        MemberAccessibility.EnsureAccessible(field, context.BaseFieldContext);
 
         return new MemberReference(
             context.DeclaringType.ToTypeSignature().ToTypeDefOrRef(),
