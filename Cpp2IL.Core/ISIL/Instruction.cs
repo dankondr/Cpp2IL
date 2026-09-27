@@ -35,6 +35,12 @@ public class Instruction : IOperand
     // method (for example base.M()) must not acquire this flag.
     public bool IsVirtualDispatch;
 
+    // Set when a call to a proven non-returning throw helper is lowered to Throw
+    // while the value it produced still has readers. The block then ends an explicit
+    // raise, not an il2cpp-injected check epilogue, so passes that fold implicit
+    // null/bounds checks must leave it (and its guarding branches) alone.
+    public bool ThrowFromNonReturningCall;
+
     // Native integer arithmetic can carry a width that register normalization erases.
     public int? NativeIntegerWidthBits;
 
@@ -296,7 +302,8 @@ public class Instruction : IOperand
         if (other is null)
             return false;
 
-        if (OpCode != other.OpCode || IsVirtualDispatch != other.IsVirtualDispatch)
+        if (OpCode != other.OpCode || IsVirtualDispatch != other.IsVirtualDispatch
+            || ThrowFromNonReturningCall != other.ThrowFromNonReturningCall)
             return false;
 
         if (Index != other.Index)

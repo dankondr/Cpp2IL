@@ -794,23 +794,8 @@ public static class MetadataResolver
                 // type, which either throw it themselves or build it and hand it back for the caller to raise.
                 if (ThrowHelperRecovery.GetThrownException(method.AppContext, target) is { } thrown)
                 {
-                    if (NonReturningHelperRecovery.IsProven(method.AppContext, target)
-                        && InjectedCheckRemover.HasEquivalentImplicitFailure(method, block, thrown.FullName, recoveredImplicitHelpers))
-                    {
-                        callInstruction.OpCode = OpCode.Throw;
-                        callInstruction.SetOperands(thrown);
-                        recoveredImplicitHelpers.Add(block);
-                    }
-                    else if (callInstruction.Destination is LocalVariable produced && method.ControlFlowGraph!.Instructions.Any(i => i.Sources.Any(s => ReferenceEquals(s, produced))))
-                    {
-                        callInstruction.OpCode = OpCode.Newobj;
-                        callInstruction.SetOperands(produced, thrown);
-                    }
-                    else
-                    {
-                        callInstruction.OpCode = OpCode.Throw;
-                        callInstruction.SetOperands(thrown);
-                    }
+                    LowerThrowHelperCall(method, block, callInstruction, thrown,
+                        NonReturningHelperRecovery.IsProven(method.AppContext, target), recoveredImplicitHelpers);
 
                     continue;
                 }
@@ -838,6 +823,44 @@ public static class MetadataResolver
         }
 
         method.ControlFlowGraph.MergeCallBlocks();
+    }
+
+    // A helper built around an exception type either raises it (proven non-returning, or
+    // its result is never read) or hands the constructed exception back for the caller to
+    // raise. A proven non-returning helper always lowers to Throw: keeping the call's
+    // fall-through edge alive via Newobj lets downstream joins read locals that no path
+    // to them assigns (CS0165 in decompiled output), while every real reader of the
+    // produced value is unreachable anyway because the call cannot return.
+    internal static void LowerThrowHelperCall(MethodAnalysisContext method, Block block,
+        Instruction callInstruction, TypeAnalysisContext thrown, bool isProvenNonReturning,
+        HashSet<Block> recoveredImplicitHelpers)
+    {
+        var produced = callInstruction.Destination as LocalVariable;
+        var hasReader = produced != null
+            && method.ControlFlowGraph!.Instructions.Any(i => i.Sources.Any(s => ReferenceEquals(s, produced)));
+
+        // Implicit-failure equivalence must be evaluated before the opcode mutates:
+        // it expects the block's last instruction to still be the call.
+        var implicitFailure = isProvenNonReturning
+            && InjectedCheckRemover.HasEquivalentImplicitFailure(method, block, thrown.FullName, recoveredImplicitHelpers);
+
+        if (isProvenNonReturning || !hasReader)
+        {
+            callInstruction.OpCode = OpCode.Throw;
+            callInstruction.SetOperands(thrown);
+            if (implicitFailure)
+                recoveredImplicitHelpers.Add(block);
+            else if (hasReader)
+                // A bare Throw block reads to the injected-check remover as an il2cpp
+                // check epilogue; a raise whose result was still consumed is not one,
+                // so tag the instruction to keep its guarding branches intact.
+                callInstruction.ThrowFromNonReturningCall = true;
+        }
+        else
+        {
+            callInstruction.OpCode = OpCode.Newobj;
+            callInstruction.SetOperands(produced!, thrown);
+        }
     }
 
     /// <summary>
