@@ -108,3 +108,38 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
 - **2 remain `none`**, both compile-only fixes: #15 (`IReadOnlySet` on
   netstandard2.0) and #20 (`AddOperands` signature fix, exercised downstream by
   `Arm64LibcMathImportTests`).
+
+## Open clusters (pinned)
+
+Minimal synthetic fixtures for the three largest open r241 clusters whose root
+cause is in Cpp2IL recovery or lifting (`decompiler-issue:*` clusters are
+excluded by the taxonomy). Counts are baseline method counts from
+`baselines/r241/codeverify-summary.json.gz` and `baselines/r241/ilverify/`. Each
+test asserts the explicit diagnostic the pipeline emits today; the assertion is
+expected to flip when the cluster is fixed.
+
+| Cluster | r241 methods | Pinning test | Suspected root cause |
+|---|---|---|---|
+| `stub:intentional-stub` | 99,048 | `OpenClusterPinningTests.FrameworkModuleMethodIsMarkedIntentionalStub` | The emitted-module name gate (`UnityEngine.`/`Unity.`/`System`/`mscorlib`) in `AsmResolverDllOutputFormatIlRecovery.FillRecoveryBody` marks every managed framework method an intentional stub before recovery evidence is consulted. |
+| `ilverify:StackUnexpected` | 885 | `OpenClusterPinningTests.ReturnValueDroppedByVoidSignatureLeavesStackInvalidDiagnosed` | Emitted bodies whose eval-stack contract the verifier rejects (e.g. a recovered return value under a void signature leaves an unpopped value at `ret`); today they are only marked by the "Invalid reconstructed IL stack" diagnostic. |
+| `stub:injected-stub` | 732 | `OpenClusterPinningTests.InjectedMethodIsMarkedInjectedStub` | `InjectedMethodAnalysisContext` members always take the minimal-stub path in `FillRecoveryBody`; nothing separates injectable scaffolding from methods a real body could be recovered for. |
+
+Larger open clusters deliberately not pinned:
+
+- `stub-shape:default-return-candidate` (54,742), `stub-shape:no-op-candidate`
+  (30,399), `stub-shape:throw-null-placeholder` (1,528): shape heuristics over
+  the same emitted bodies — they overlap `stub:intentional-stub` /
+  `stub:injected-stub` rather than being an independent recovery or lifting
+  root cause.
+- `ilverify:partial-no-managed-body` (7,714): abstract, extern and runtime
+  methods are legitimately bodiless — root cause outside Cpp2IL recovery.
+- `ilverify:partial-verifier-failure` (2,389): umbrella over verifier crashes;
+  its dominant member is `ilverify:NullReferenceException`.
+- `ilverify:NullReferenceException` (2,376): already fixed on `development` —
+  re-verifying the assemblies rebuilt from `development` produces zero
+  `NullReferenceException` verifier crashes. The residual 13
+  `ilverify:FileNotFoundException` crashes are the verifier failing to resolve
+  the injected `CastleRecovery.Runtime` helper assembly.
+- `ilverify:ReturnPtrToStack` (379): emits stack-valid (`ldloca`/`ret`) bodies
+  with no Cpp2IL-side diagnostic to assert; smaller than the pinned stub
+  cluster. Next in line if a third `ilverify` pin is wanted.
