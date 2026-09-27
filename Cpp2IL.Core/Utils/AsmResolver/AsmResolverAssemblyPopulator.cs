@@ -623,7 +623,11 @@ public static class AsmResolverAssemblyPopulator
                 if (overrideContext.Name == methodContext.Name && !isPrivate)
                     continue;
 
-                var interfaceMethod = (IMethodDefOrRef)overrideContext.ToMethodDescriptor();
+                // The emitted MethodImpl sits on typeContext, so the operand
+                // only needs the access visible from there.
+                IMethodDefOrRef interfaceMethod;
+                using (MemberAccessibility.EmittingFrom(typeContext))
+                    interfaceMethod = (IMethodDefOrRef)overrideContext.ToMethodDescriptor();
                 var method = methodContext.GetExtraData<MethodDefinition>("AsmResolverMethod") ?? throw new($"AsmResolver method not found in method analysis context for {methodContext}");
                 type.MethodImplementations.Add(new MethodImplementation(interfaceMethod, method));
                 var resolutionStatus = interfaceMethod.Resolve(runtimeContext, out var interfaceMethodResolved);

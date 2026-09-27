@@ -72,6 +72,9 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             // The injected friend-assembly attributes introduce their own
             // framework-type references; re-run the (emit-if-missing) pass.
             FrameworkSurfaceTypes.EmitMissing(assemblies);
+            // After every widening the references above applied, re-assert the
+            // accessibility-consistency invariants on the final emitted flags.
+            MemberAccessibility.FixupEmittedVisibility(context);
             return assemblies;
         }
         finally

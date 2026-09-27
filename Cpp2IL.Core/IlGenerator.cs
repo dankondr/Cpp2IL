@@ -6999,7 +6999,7 @@ public static class IlGenerator
             return field.ToFieldDescriptor();
         if (field.GetExtraData<FieldDefinition>("AsmResolverField") is not { } definition)
             return field.ToFieldDescriptor();
-        MemberAccessibility.EnsureAccessible(definition);
+        MemberAccessibility.EnsureAccessible(definition, field);
         return new MemberReference(receiverInstance.ToTypeSignature().ToTypeDefOrRef(),
             field.Name, new FieldSignature(field.ToTypeSignature()));
     }
