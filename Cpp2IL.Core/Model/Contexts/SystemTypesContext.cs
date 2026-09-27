@@ -25,6 +25,7 @@ public class SystemTypesContext
     public TypeAnalysisContext SystemUIntPtrType { get; }
     public TypeAnalysisContext SystemExceptionType { get; }
     public TypeAnalysisContext SystemStringType { get; }
+    public TypeAnalysisContext? SystemArrayType { get; }
     public TypeAnalysisContext SystemTypedReferenceType { get; }
     public TypeAnalysisContext SystemTypeType { get; }
     public TypeAnalysisContext SystemAttributeType { get; }
@@ -63,6 +64,7 @@ public class SystemTypesContext
         SystemUIntPtrType = systemAssembly.GetTypeByFullName("System.UIntPtr")!;
 
         SystemStringType = systemAssembly.GetTypeByFullName("System.String")!;
+        SystemArrayType = systemAssembly.GetTypeByFullName("System.Array");
         SystemTypedReferenceType = systemAssembly.GetTypeByFullName("System.TypedReference")!;
         SystemTypeType = systemAssembly.GetTypeByFullName("System.Type")!;
 

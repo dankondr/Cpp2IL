@@ -466,13 +466,16 @@ public static class IlGenerator
 
                 if (instruction.Operands[0] is MemoryOperand
                     { Index: null, Addend: 0, Scale: 0, Base: LocalVariable
-                        { Type: ByRefTypeAnalysisContext { ElementType: { IsValueType: false } referent } } address } store
-                    && referent is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext or GenericParameterTypeAnalysisContext)
-                    && store.AccessSize == context.AppContext.Binary.PointerSizeBytes)
+                        { Type: ByRefTypeAnalysisContext { ElementType: { } referent } } address } store
+                    && referent is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext)
+                    && ManagedPointerStoreWritable(store, instruction.Operands[1], referent, context))
                 {
                     LoadLocal(address, method, locals, context);
                     LoadOperandIntoSlot(instruction.Operands[1], referent, context, method, locals, writeLine);
-                    instructions.Add(CilOpCodes.Stind_Ref);
+                    if (referent is { IsValueType: true } or GenericParameterTypeAnalysisContext)
+                        instructions.Add(CilOpCodes.Stobj, referent.ToTypeSignature().ToTypeDefOrRef());
+                    else
+                        instructions.Add(CilOpCodes.Stind_Ref);
                     break;
                 }
 
@@ -560,6 +563,23 @@ public static class IlGenerator
                     else
                         EmitUnrecoverableOperation(method, writeLine,
                             $"Inaccessible array element type: {stored.FullName}");
+                    break;
+                }
+
+                // A method pointer stored into a local that no instruction ever
+                // loads is a dead store, so the whole Move drops out. Only an
+                // ldftn-spellable pointer (System.IntPtr destination, visible,
+                // non-.ctor) is dropped this way; unspellable pointers keep
+                // their documented placeholder emission. A live destination (a
+                // field, an interop argument, a read local) always keeps its
+                // ldftn - a real function pointer is never replaced by a
+                // placeholder.
+                if (instruction.Operands is [LocalVariable deadPointerLocal, RuntimeMethodInfoAnalysisContext methodPointer]
+                    && StoreContract(deadPointerLocal, context)?.FullName == "System.IntPtr"
+                    && SpellableMethodPointer(methodPointer, context) is { Name: not ".ctor" }
+                    && !LocalIsLoaded(context, deadPointerLocal))
+                {
+                    instructions.Add(CilOpCodes.Nop);
                     break;
                 }
 
@@ -2917,6 +2937,44 @@ public static class IlGenerator
         return false;
     }
 
+    /// <summary>
+    /// The method an ldftn/ldtoken can name for a runtime method pointer: the
+    /// represented method itself, or the accessible substitute a direct call
+    /// would have used when the original is a shared-enum-marker or otherwise
+    /// invisible callee. Null when no spellable target exists - the load then
+    /// keeps its unresolved placeholder emission.
+    /// </summary>
+    private static MethodAnalysisContext? SpellableMethodPointer(
+        RuntimeMethodInfoAnalysisContext runtimeMethod, MethodAnalysisContext? callingContext)
+    {
+        var represented = runtimeMethod.RepresentedMethod;
+        var representedVisible = !CalleeUsesSharedEnumMarker(represented)
+            && (callingContext == null
+                || Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(represented, callingContext));
+        if (representedVisible)
+            return represented;
+
+        // The same invisible corlib helpers show up as function pointers; the honest
+        // substitutes are the ones a direct call would use.
+        var substitute = Analysis.InaccessibleCalleeRecovery.TrySubstitute(represented);
+        if (substitute == null
+            || CalleeUsesSharedEnumMarker(substitute)
+            || (callingContext != null
+                && !Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(substitute, callingContext)))
+            return null;
+        return substitute;
+    }
+
+    // A local counts as loaded when any instruction's UsedLocals yields it:
+    // destinations are writes, while memory bases, field receivers, array/index
+    // and select operands all count as loads - including inside loops, so the
+    // scan covers the whole control flow graph rather than instructions after
+    // this one.
+    private static bool LocalIsLoaded(MethodAnalysisContext context, LocalVariable local) =>
+        context.ControlFlowGraph!.Blocks
+            .SelectMany(block => block.Instructions)
+            .Any(other => Analysis.DeadCodeEliminator.UsedLocals(other).Any(used => ReferenceEquals(used, local)));
+
     private static bool DerivesFromMulticastDelegate(TypeAnalysisContext type)
     {
         for (var current = type; current != null;
@@ -3538,28 +3596,17 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Throw);
                 break;
             case RuntimeMethodInfoAnalysisContext runtimeMethod:
-                // A delegate constructor takes its target as a native pointer, which is exactly ldftn.
-                // ldftn cannot name a .ctor though; the unresolved placeholder below stays
-                // verifier-legal (a native-int zero) instead of fabricating a function pointer.
-                var represented = runtimeMethod.RepresentedMethod;
-                var representedVisible = !CalleeUsesSharedEnumMarker(represented)
-                    && (callingContext == null
-                        || Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(represented, callingContext));
-                if (!representedVisible)
-                {
-                    // The same invisible corlib helpers show up as function pointers; the honest
-                    // substitutes are the ones a direct call would use.
-                    represented = Analysis.InaccessibleCalleeRecovery.TrySubstitute(represented) ?? represented;
-                    representedVisible = !CalleeUsesSharedEnumMarker(represented)
-                        && (callingContext == null
-                            || Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(represented, callingContext));
-                }
-                if (expectedType?.FullName == "System.IntPtr" && represented.Name is not ".ctor" && representedVisible)
+                // A function pointer load is exactly ldftn. ldftn cannot name a
+                // .ctor though; the unresolved placeholder below stays
+                // verifier-legal (a native-int zero) instead of fabricating a
+                // function pointer for it.
+                var represented = SpellableMethodPointer(runtimeMethod, callingContext);
+                if (expectedType?.FullName == "System.IntPtr" && represented is { Name: not ".ctor" })
                 {
                     instructions.Add(CilOpCodes.Ldftn, represented.ToMethodDescriptor());
                     break;
                 }
-                if (expectedType?.FullName == "System.RuntimeMethodHandle" && representedVisible)
+                if (expectedType?.FullName == "System.RuntimeMethodHandle" && represented != null)
                 {
                     instructions.Add(CilOpCodes.Ldtoken, represented.ToMethodDescriptor());
                     break;
@@ -5533,28 +5580,44 @@ public static class IlGenerator
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
         bool convertByRef = false)
     {
-        operand = RuntimeFieldHandleSource(operand, contract, context);
-        if (operand is FieldReference container
+        if (TryResolveSlotLoad(operand, contract, context, convertByRef, out var resolved, out var emitted))
+        {
+            LoadOperand(resolved, method, locals, writeLine, contract, context);
+            EmitStackCoerce(emitted, contract, method, context, convertByRef);
+            return;
+        }
+        PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context);
+    }
+
+    // Resolves the operand form a slot load emits and whether its emitted type
+    // satisfies the contract - false means the slot would receive a synthetic
+    // default instead of the operand's real value.
+    private static bool TryResolveSlotLoad(IOperand operand, TypeAnalysisContext? contract,
+        MethodAnalysisContext context, bool convertByRef,
+        out IOperand resolved, out TypeAnalysisContext? emitted)
+    {
+        resolved = RuntimeFieldHandleSource(operand, contract, context);
+        if (resolved is FieldReference container
             && NestedValueFieldForContract(container, contract) is { } nested)
-            operand = nested;
-        if (operand is FieldReference nestedField
+            resolved = nested;
+        if (resolved is FieldReference nestedField
             && WholeValueContainerReference(nestedField, contract) is { } wholeValue)
-            operand = wholeValue;
+            resolved = wholeValue;
         // A bare type operand into a value-type slot has no honest emission except
         // runtime handles and native-int class handles, which have real token values.
-        if (operand is TypeAnalysisContext and not RuntimeMethodInfoAnalysisContext
+        if (resolved is TypeAnalysisContext and not RuntimeMethodInfoAnalysisContext
             && contract is { IsValueType: true }
             && contract.FullName is not ("System.RuntimeTypeHandle" or "System.RuntimeMethodHandle" or "System.RuntimeFieldHandle"
                 or "System.IntPtr" or "System.UIntPtr"))
         {
-            PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context);
-            return;
+            emitted = null;
+            return false;
         }
-        var emitted = operand is MemoryOperand memory
+        emitted = resolved is MemoryOperand memory
             && TryRecoverLateFieldReference(memory, context, out var lateField)
                 ? lateField.Field.FieldType
-                : EmittedOperandType(operand, context, contract);
-        if (operand is LocalVariable { IsThis: true }
+                : EmittedOperandType(resolved, context, contract);
+        if (resolved is LocalVariable { IsThis: true }
             && contract is { IsValueType: true }
             && emitted is { IsValueType: false } and not PointerTypeAnalysisContext and not ByRefTypeAnalysisContext)
         {
@@ -5562,16 +5625,24 @@ public static class IlGenerator
             // `this` is never a boxed value, so even after initialization the load
             // has no honest managed form; before the base .ctor runs it is also an
             // uninitialized read.
-            PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context);
-            return;
+            return false;
         }
-        if (contract == null || StackContractSatisfied(emitted, contract, context, convertByRef))
-        {
-            LoadOperand(operand, method, locals, writeLine, contract, context);
-            EmitStackCoerce(emitted, contract, method, context, convertByRef);
-            return;
-        }
-        PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context);
+        return contract == null || StackContractSatisfied(emitted, contract, context, convertByRef);
+    }
+
+    // A store through a managed pointer is honest only when the value's emitted
+    // form satisfies the pointee contract on its own - a slot that would take
+    // LoadOperandIntoSlot's default filler keeps the explicit diagnostic rather
+    // than writing a value the source never had. Reference referents keep the
+    // pointer-size store gate; value types and generic parameters store whole
+    // values via stobj, so the source must match the pointee.
+    private static bool ManagedPointerStoreWritable(MemoryOperand store, IOperand source,
+        TypeAnalysisContext referent, MethodAnalysisContext context)
+    {
+        if (referent is { IsValueType: true } or GenericParameterTypeAnalysisContext)
+            return TypeTokenUsableFrom(referent, context)
+                && TryResolveSlotLoad(source, referent, context, false, out _, out _);
+        return store.AccessSize == context.AppContext.Binary.PointerSizeBytes;
     }
 
     private static FieldReference? NestedValueFieldForContract(FieldReference field,
