@@ -149,7 +149,7 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
     private bool IsFunctionStart(List<Arm64Instruction> disassembly, int index)
         => IsFunctionStart(disassembly, index, CallTargets);
 
-    internal static bool IsFunctionStart(List<Arm64Instruction> disassembly, int index, IReadOnlySet<ulong> callTargets)
+    internal static bool IsFunctionStart(List<Arm64Instruction> disassembly, int index, HashSet<ulong> callTargets)
     {
         if (callTargets.Contains(disassembly[index].Address))
             return true;
@@ -169,7 +169,7 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
     /// pairs; the same blob scanned at any image base yields the same set.
     /// </summary>
     internal static List<KeyValuePair<ulong, string>> FindTailCallVeneerAliases(
-        List<Arm64Instruction> disassembly, IReadOnlyDictionary<ulong, string> addressToName, IReadOnlySet<ulong> callTargets)
+        List<Arm64Instruction> disassembly, IReadOnlyDictionary<ulong, string> addressToName, HashSet<ulong> callTargets)
     {
         var aliases = new List<KeyValuePair<ulong, string>>();
         for (var index = 0; index < disassembly.Count; index++)
