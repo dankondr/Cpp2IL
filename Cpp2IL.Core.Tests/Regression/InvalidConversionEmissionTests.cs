@@ -15,7 +15,8 @@ namespace Cpp2IL.Core.Tests.Regression;
 // IntPtr made the store coercion emit box IntPtr over the Type, which ilspy
 // decompiles to the invalid cast (IntPtr)typeof(T). A ref struct (IsByRefLike)
 // can never be boxed, so an unbridgeable coercion defaults the slot instead of
-// emitting box <ref struct>.
+// emitting box <ref struct> - and emits a decompiler-issue diagnostic so the
+// dropped operand stays measured.
 public class InvalidConversionEmissionTests
 {
     [Test]
@@ -91,6 +92,10 @@ public class InvalidConversionEmissionTests
                 "the managed pointer is dropped before any dereference is emitted");
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldnull), Is.True,
                 () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text
+                    && text.Contains("Ref struct cannot cross")), Is.True,
+                "the dropped ref struct must stay an explicit diagnostic");
         });
     }
 }
