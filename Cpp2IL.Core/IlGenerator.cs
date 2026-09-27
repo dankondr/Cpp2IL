@@ -6177,21 +6177,28 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Initblk);
                 break;
             case OpCode.MemoryMove:
-                // Buffer.MemoryCopy(void* source, void* destination, ulong destinationSizeInBytes,
-                // ulong sourceBytesToCopy): sourceBytesToCopy <= destinationSizeInBytes always
-                // holds when both are the same byte count.
+                // Buffer.MemoryCopy is the runtime's overlap-safe move, but the
+                // memberref may only name a member the recovered corlib actually
+                // carries; where it does not, the op stays an explicit
+                // diagnostic rather than a dangling reference.
+                var memoryCopy = context.AppContext.SystemTypes.SystemObjectType.DeclaringAssembly
+                    .GetTypeByFullName("System.Buffer")?.Methods
+                    .FirstOrDefault(candidate => candidate is { IsStatic: true }
+                        && candidate.Name == "MemoryCopy"
+                        && candidate.Parameters.Count == 4
+                        && candidate.Parameters[0].ParameterType is PointerTypeAnalysisContext
+                        && candidate.Parameters[1].ParameterType is PointerTypeAnalysisContext);
+                if (memoryCopy == null)
+                {
+                    EmitUnrecoverableOperation(method, writeLine,
+                        $"Unrecoverable block memory move without System.Buffer.MemoryCopy: {instruction}");
+                    break;
+                }
                 EmitBlockPointerOperand(content, true, context, method, locals, writeLine);
                 EmitBlockPointerOperand(destination, true, context, method, locals, writeLine);
-                EmitBlockLengthOperand(count, context, method, locals, writeLine);
-                EmitBlockLengthOperand(count, context, method, locals, writeLine);
-                instructions.Add(CilOpCodes.Call, module.CorLibTypeFactory.CorLibScope
-                    .CreateTypeReference("System", "Buffer")
-                    .CreateMemberReference("MemoryCopy", MethodSignature.CreateStatic(
-                        module.CorLibTypeFactory.Void,
-                        [module.CorLibTypeFactory.Void.MakePointerType(),
-                            module.CorLibTypeFactory.Void.MakePointerType(),
-                            module.CorLibTypeFactory.UInt64,
-                            module.CorLibTypeFactory.UInt64])));
+                EmitBlockSizeOperandAs(count, memoryCopy.Parameters[2].ParameterType, context, method, locals, writeLine);
+                EmitBlockSizeOperandAs(count, memoryCopy.Parameters[3].ParameterType, context, method, locals, writeLine);
+                instructions.Add(CilOpCodes.Call, memoryCopy.ToMethodDescriptor());
                 break;
         }
 
@@ -6231,12 +6238,17 @@ public static class IlGenerator
             method.CilMethodBody!.Instructions.Add(CilOpCodes.Conv_U);
     }
 
-    // Buffer.MemoryCopy's sizes are ulong.
-    private static void EmitBlockLengthOperand(IOperand operand, MethodAnalysisContext context,
-        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    // A Buffer.MemoryCopy size operand, converted to the width and signedness
+    // the recovered typedef actually declares.
+    private static void EmitBlockSizeOperandAs(IOperand operand, TypeAnalysisContext parameter,
+        MethodAnalysisContext context, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
     {
         LoadOperand(operand, method, locals, writeLine, null, context);
-        method.CilMethodBody!.Instructions.Add(CilOpCodes.Conv_U8);
+        var unsigned = parameter.DefaultFullName.StartsWith("System.U");
+        method.CilMethodBody!.Instructions.Add(IntegralStackWidth(parameter) == 8
+            ? unsigned ? CilOpCodes.Conv_U8 : CilOpCodes.Conv_I8
+            : unsigned ? CilOpCodes.Conv_U4 : CilOpCodes.Conv_I4);
     }
 
     // Integer ops on operands that cannot legally sit in an integer slot are
@@ -6536,6 +6548,13 @@ public static class IlGenerator
         return true;
     }
 
+    // VectorN.Min/Max carry no MethodDef rows in il2cpp metadata - managed game
+    // code never reaches them, so il2cpp folds them away - and a memberref to
+    // them would dangle. Unity implements them as the component-wise Mathf call,
+    // so emit that shape: Mathf.Min/Max(float, float) when the typedef carries
+    // the member, else the `a > b ? a : b` compare it inlines to, constructing
+    // the result through the vector's field-wise .ctor. Both paths name only
+    // members the recovered metadata carries.
     private static bool TryEmitUnityVectorMinMax(Instruction instruction, MethodAnalysisContext context,
         MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
     {
@@ -6547,13 +6566,63 @@ public static class IlGenerator
         if (!IsUnityVector(vector))
             return false;
 
-        LoadVectorOperand(instruction.Operands[1], vector!, context, method, locals, writeLine);
-        LoadVectorOperand(instruction.Operands[2], vector!, context, method, locals, writeLine);
-        var signature = vector!.ToTypeSignature();
-        var target = new MemberReference(signature.ToTypeDefOrRef(),
-            instruction.OpCode == OpCode.VectorMin ? "Min" : "Max",
-            MethodSignature.CreateStatic(signature, [signature, signature]));
-        method.CilMethodBody!.Instructions.Add(CilOpCodes.Call, target);
+        var components = new[] { "x", "y", "z", "w" }
+            .Select(name => vector!.Fields.FirstOrDefault(field =>
+                field.Name == name && field.FieldType.DefaultFullName == "System.Single"))
+            .TakeWhile(field => field != null)
+            .Cast<FieldAnalysisContext>()
+            .ToArray();
+        var constructor = vector!.Methods.FirstOrDefault(candidate => candidate is { IsStatic: false }
+            && candidate.Name == ".ctor"
+            && candidate.Parameters.Count == components.Length
+            && candidate.Parameters.All(parameter =>
+                parameter.ParameterType.DefaultFullName == "System.Single"));
+        if (components.Length < 2 || constructor == null)
+            return false;
+
+        var mathf = vector.DeclaringAssembly.GetTypeByFullName("UnityEngine.Mathf")
+            ?.Methods.FirstOrDefault(candidate => candidate is { IsStatic: true }
+                && candidate.Name == (instruction.OpCode == OpCode.VectorMin ? "Min" : "Max")
+                && candidate.ReturnType.DefaultFullName == "System.Single"
+                && candidate.Parameters.Count == 2
+                && candidate.Parameters.All(parameter =>
+                    parameter.ParameterType.DefaultFullName == "System.Single"));
+
+        var instructions = method.CilMethodBody!.Instructions;
+        var lhsLocal = new CilLocalVariable(vector.ToTypeSignature());
+        var rhsLocal = new CilLocalVariable(vector.ToTypeSignature());
+        method.CilMethodBody.LocalVariables.Add(lhsLocal);
+        method.CilMethodBody.LocalVariables.Add(rhsLocal);
+
+        LoadVectorOperand(instruction.Operands[1], vector, context, method, locals, writeLine);
+        instructions.Add(CilOpCodes.Stloc, lhsLocal);
+        LoadVectorOperand(instruction.Operands[2], vector, context, method, locals, writeLine);
+        instructions.Add(CilOpCodes.Stloc, rhsLocal);
+
+        foreach (var component in components)
+        {
+            instructions.Add(CilOpCodes.Ldloca, lhsLocal);
+            instructions.Add(CilOpCodes.Ldfld, component.ToFieldDescriptor());
+            instructions.Add(CilOpCodes.Ldloca, rhsLocal);
+            instructions.Add(CilOpCodes.Ldfld, component.ToFieldDescriptor());
+            if (mathf != null)
+            {
+                instructions.Add(CilOpCodes.Call, mathf.ToMethodDescriptor());
+                continue;
+            }
+            var keepLhs = new CilInstruction(CilOpCodes.Ldloca, lhsLocal);
+            var done = new CilInstruction(CilOpCodes.Nop);
+            instructions.Add(instruction.OpCode == OpCode.VectorMin ? CilOpCodes.Blt : CilOpCodes.Bgt,
+                new CilInstructionLabel(keepLhs));
+            instructions.Add(CilOpCodes.Ldloca, rhsLocal);
+            instructions.Add(CilOpCodes.Ldfld, component.ToFieldDescriptor());
+            instructions.Add(CilOpCodes.Br, new CilInstructionLabel(done));
+            instructions.Add(keepLhs);
+            instructions.Add(CilOpCodes.Ldfld, component.ToFieldDescriptor());
+            instructions.Add(done);
+        }
+
+        instructions.Add(CilOpCodes.Newobj, constructor.ToMethodDescriptor());
         StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
         return true;
     }
