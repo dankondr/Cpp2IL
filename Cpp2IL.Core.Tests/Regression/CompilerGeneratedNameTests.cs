@@ -151,7 +151,7 @@ public class CompilerGeneratedNameTests
     }
 
     [Test]
-    public void StandaloneInstanceMethodPointerFieldStoreStillEmitsLdftn()
+    public void InstanceMethodPointerStoreToLiveLocalEmitsReflectionLookup()
     {
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
@@ -161,6 +161,115 @@ public class CompilerGeneratedNameTests
             app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
         var target = widget.InjectMethodContext("OnEvent", app.SystemTypes.SystemVoidType,
             R.MethodAttributes.Public);
+        var methodInfo = new RuntimeMethodInfoAnalysisContext(target, assembly);
+        var slot = new LocalVariable("slot", new Register(null, "slot"))
+            { Type = app.SystemTypes.SystemIntPtrType };
+        var readBack = new LocalVariable("readBack", new Register(null, "readBack"))
+            { Type = app.SystemTypes.SystemIntPtrType };
+
+        var module = new ModuleDefinition("LiveLocalFn.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemIntPtrType,
+            app.SystemTypes.SystemVoidType, app.SystemTypes.SystemObjectType);
+        var widgetDefinition = new TypeDefinition("Tests", "Widget",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(widgetDefinition);
+        widget.PutExtraData("AsmResolverType", widgetDefinition);
+        var targetDefinition = new MethodDefinition("OnEvent", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        widgetDefinition.Methods.Add(targetDefinition);
+        target.PutExtraData("AsmResolverMethod", targetDefinition);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, slot, methodInfo),
+            new(1, OpCode.Move, readBack, slot),
+            new(2, OpCode.Return)], [slot, readBack]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        var calledNames = il.Where(i => i.OpCode == CilOpCodes.Call || i.OpCode == CilOpCodes.Callvirt)
+            .Select(i => (i.Operand as IMethodDescriptor)?.Name?.ToString())
+            .ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldftn), Is.False,
+                () => "an instance-method ldftn has no C# spelling (__ldftn):\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldtoken), Is.True,
+                "the lookup starts from typeof(D)");
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                && i.Operand?.ToString() == "OnEvent"), Is.True,
+                "the method name reaches GetMethod as a string");
+            Assert.That(calledNames, Has.Member("GetMethod"));
+            Assert.That(calledNames, Has.Member("get_MethodHandle"));
+            Assert.That(calledNames, Has.Member("get_Value"),
+                "the IntPtr slot takes the wrapped pointer via RuntimeMethodHandle.Value");
+        });
+    }
+
+    [Test]
+    public void MethodPointerToRuntimeMethodHandleEmitsReflectionLookup()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.AssembliesByName["UnityEngine.CoreModule"];
+        var runtimeMethodHandle = app.AssembliesByName["mscorlib"]
+            .GetTypeByFullName("System.RuntimeMethodHandle")!;
+        var widget = new InjectedTypeAnalysisContext(assembly, "Tests", "Widget",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var target = widget.InjectMethodContext("OnEvent", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public);
+        var methodInfo = new RuntimeMethodInfoAnalysisContext(target, assembly);
+        var slot = new LocalVariable("slot", new Register(null, "slot")) { Type = runtimeMethodHandle };
+        var readBack = new LocalVariable("readBack", new Register(null, "readBack"))
+            { Type = runtimeMethodHandle };
+
+        var module = new ModuleDefinition("HandleFn.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemIntPtrType,
+            app.SystemTypes.SystemVoidType, app.SystemTypes.SystemObjectType, runtimeMethodHandle);
+        var widgetDefinition = new TypeDefinition("Tests", "Widget",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(widgetDefinition);
+        widget.PutExtraData("AsmResolverType", widgetDefinition);
+        var targetDefinition = new MethodDefinition("OnEvent", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        widgetDefinition.Methods.Add(targetDefinition);
+        target.PutExtraData("AsmResolverMethod", targetDefinition);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, slot, methodInfo),
+            new(1, OpCode.Move, readBack, slot),
+            new(2, OpCode.Return)], [slot, readBack]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        var calledNames = il.Where(i => i.OpCode == CilOpCodes.Call || i.OpCode == CilOpCodes.Callvirt)
+            .Select(i => (i.Operand as IMethodDescriptor)?.Name?.ToString())
+            .ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldtoken
+                && i.Operand is IMethodDescriptor), Is.False,
+                () => "ldtoken on a method has no C# spelling (__ldtoken):\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(calledNames, Has.Member("GetMethod"));
+            Assert.That(calledNames, Has.Member("get_MethodHandle"));
+            Assert.That(calledNames, Has.No.Member("get_Value"),
+                "a RuntimeMethodHandle slot stops at .MethodHandle");
+        });
+    }
+
+    [Test]
+    public void StandaloneStaticMethodPointerFieldStoreStillEmitsLdftn()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.AssembliesByName["UnityEngine.CoreModule"];
+        var widget = new InjectedTypeAnalysisContext(assembly, "Tests", "Widget",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var target = widget.InjectMethodContext("OnEvent", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public | R.MethodAttributes.Static);
         var ptrField = widget.InjectFieldContext("Ptr", app.SystemTypes.SystemIntPtrType,
             R.FieldAttributes.Public);
         var methodInfo = new RuntimeMethodInfoAnalysisContext(target, assembly);
@@ -175,8 +284,9 @@ public class CompilerGeneratedNameTests
             TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
         module.TopLevelTypes.Add(widgetDefinition);
         widget.PutExtraData("AsmResolverType", widgetDefinition);
-        var targetDefinition = new MethodDefinition("OnEvent", MethodAttributes.Public,
-            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        var targetDefinition = new MethodDefinition("OnEvent",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
         widgetDefinition.Methods.Add(targetDefinition);
         target.PutExtraData("AsmResolverMethod", targetDefinition);
         var ptrDefinition = new FieldDefinition("Ptr", FieldAttributes.Public,
