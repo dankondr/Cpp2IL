@@ -132,6 +132,7 @@ public class Instruction : IOperand
             case OpCode.CheckLessOrEqual:
             case OpCode.Newobj:
             case OpCode.Box:
+            case OpCode.Unbox:
                 if (newDestination != null)
                     SetOperand(0, newDestination);
                 return IsConstantValue(_operands[0]) ? null : _operands[0];
@@ -185,6 +186,8 @@ public class Instruction : IOperand
                 => [_operands[1]],
 
             OpCode.Box => [_operands[2]],
+
+            OpCode.Unbox => [_operands[2]],
 
             OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.VectorMin or OpCode.VectorMax
                 or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight
