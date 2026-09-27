@@ -114,13 +114,14 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
 | castle-recovery#90 `default-slot-substitution` (`decompiler-issue` visibility) | IL emission | Every operand-slot substitution now emits the `NoteDecompilerIssue` diagnostic call instead of silently materializing a default: `PushDefaultOf` (the shared filler — missing/hidden call args, unusable field/array/dereference/cast/handle operands, `this`-receiver fallbacks, fall-off-end returns) reports `Operand slot of type … filled with a synthetic default value`, `CoerceOrDefault`/`EmitStackCoerceOrDefault`/`LoadOperandIntoSlot`/`EmitStackCoerce`'s `&`→pointer drop report `No legal conversion from …` (keeping the `Ref struct cannot cross the value/reference boundary` wording for byref-like drops), `EmitNullOrDefault` reports values that were never produced, and the bare `ldnull`/`ldc.i4.0`/`ldloca`/`pop` substitutions (literal→`&T`/VT, unspellable handles and metadata pointers, missing `throw` operand, untestable `brtrue` condition, `not`/`neg` on raw pointers, unemittable memory stores, fabricated struct receivers) are each noted at the site; diagnostics emitted while materializing a base `.ctor` call's operands are moved after the call (`MoveDiagnosticNotesAfterCall`) so the decompiler still folds the constructor initializer | `Regression/SlotDefaultDiagnosticsTests.*` (4 tests) |
 | castle-recovery#92 `unpaired-operator` (compile bucket, CS0216) | metadata emission | Classification only — no Cpp2IL-owned shape: all 91 CS0216 sites trace to IL2CPP managed-code stripping removing the partner of a required operator pair from `global-metadata.dat` (87 partner names absent from the typedef entirely, 4 `BigInteger` overload-level absences where sibling overloads survive). Emission is verbatim: every metadata-declared `op_*` is emitted with `specialname` intact, and no partner is fabricated | `Regression/UnpairedOperatorEmissionTests.*` (3 tests) |
 | castle-recovery#91 `auto-property-without-getter` (compile bucket) | metadata emission | `CopyPropertiesInType` restores the getter il2cpp stripped on any setter-only property whose declaring type carries `<X>k__BackingField` — the same evidence rule as #90's named-argument path, generalized to all properties (a setter-only property decompiles to `{ set; }`, CS8051); indexers, explicit-interface properties (C# forbids those as auto-properties) and properties with no backing field are untouched; on generic types the emitted `ldfld`/`stfld` operand is the type's own generic instance (`C<T>` TypeSpec), not the bare typedef | `Regression/SetterOnlyAutoPropertyTests.*` (6 tests) |
+| castle-recovery#96 `internals-visible-to-key-mismatch` (compile bucket, CS0281) | metadata emission | Classification only — no Cpp2IL-owned shape: all 47 CS0281 sites are `mscorlib`-granted keyed `InternalsVisibleTo` grants meeting an unsigned recompiled consumer (System ×35, System.Core ×1 = real metadata grants + real `AssemblyKeyFile` naming a key file absent from the recovered tree → CS7027 → unsigned; Google.Protobuf ×11 = the synthetic sibling grant keyed to the friend's genuine recovered public key — keying is required for emitted-corpus ILVerify since the emitted friend claims strong-name identity). Identity fidelity verified end to end: every emitted definition's `PublicKey` is byte-identical to the il2cpp metadata (23 keyed definitions, 160 without), and all 1,079 resolvable assembly references carry the token of the definition they resolve to. Owner of the residual: the compile driver, which must public-sign each recompiled assembly with its recovered public key | `Regression/InternalsVisibleToKeyGrantTests.SyntheticGrantNamesExactlyTheEmittedFriendsKey` |
 
 ## Summary
 
 - **84 fork PRs** merged since `b5ad444b` (#1–#79, #81–#85; no #80), plus the
   castle-recovery#NN issue rows.
 - **2 are not live recovery fixes**: #26 (reverted by #27) and #85 (CI only).
-- **93 recovery-fix clusters.** **91** carry reproducing tests (tests added or
+- **94 recovery-fix clusters.** **92** carry reproducing tests (tests added or
   strengthened in the same PR): the 80 through the backfill wave (#16 + #47,
   #38, #40, #41, #57, #58), castle-recovery#74's `UnboxEmissionTests.*`,
   castle-recovery#75's `Arm64VectorLaneLiftingTests.*`,
@@ -131,8 +132,9 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
   castle-recovery#86's `ManagedPointerStoreTests.*`,
   castle-recovery#87's `ReferenceScopeAccessibilityTests.*`,
   castle-recovery#88's `InterfaceDeclaredExplicitImplementationTests.*`,
-  castle-recovery#90's `SlotDefaultDiagnosticsTests.*`, and
-  castle-recovery#92's `UnpairedOperatorEmissionTests.*`.
+  castle-recovery#90's `SlotDefaultDiagnosticsTests.*`,
+  castle-recovery#92's `UnpairedOperatorEmissionTests.*`, and
+  castle-recovery#96's `InternalsVisibleToKeyGrantTests.*`.
 - **2 remain `none`**, both compile-only fixes: #15 (`IReadOnlySet` on
   netstandard2.0) and #20 (`AddOperands` signature fix, exercised downstream by
   `Arm64LibcMathImportTests`).
