@@ -822,7 +822,8 @@ public static class IlGenerator
 
             case OpCode.Unbox:
                 if (instruction.Operands is not [_, TypeAnalysisContext unboxedType, var boxedObject]
-                    || !unboxedType.IsValueType)
+                    || (!unboxedType.IsValueType
+                        && unboxedType is not GenericParameterTypeAnalysisContext))
                 {
                     EmitUnrecoverableOperation(method, writeLine, $"Malformed unbox: {instruction}");
                     break;
@@ -836,12 +837,17 @@ public static class IlGenerator
                         $"Inaccessible unbox type: {unboxedType.FullName}");
                     break;
                 }
-                // Object::Unbox returns void* into the boxed data; `unbox` produces the
-                // same managed pointer, so the result slot carries &T and whole-value
-                // reads of it lower to ldobj T (unbox.any semantics).
+                // Object::Unbox returns void* into the boxed data. `unbox` produces a
+                // readonly &T, which cannot be stored or stored through, so the value
+                // goes through unbox.any into a scratch local whose address - a
+                // writable &T - is what the result slot carries.
                 LoadOperandIntoSlot(boxedObject, context.AppContext.SystemTypes.SystemObjectType,
                     context, method, locals, writeLine);
-                instructions.Add(CilOpCodes.Unbox, unboxedType.ToTypeSignature().ToTypeDefOrRef());
+                instructions.Add(CilOpCodes.Unbox_Any, unboxedType.ToTypeSignature().ToTypeDefOrRef());
+                var unboxTemp = new CilLocalVariable(unboxedType.ToTypeSignature());
+                method.CilMethodBody!.LocalVariables.Add(unboxTemp);
+                instructions.Add(CilOpCodes.Stloc, unboxTemp);
+                instructions.Add(CilOpCodes.Ldloca, unboxTemp);
                 EmitStackCoerceOrDefault(new ByRefTypeAnalysisContext(unboxedType),
                     StoreContract(instruction.Operands[0], context), method, context);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);

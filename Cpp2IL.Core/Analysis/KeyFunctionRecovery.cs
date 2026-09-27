@@ -547,8 +547,11 @@ public static class KeyFunctionRecovery
         // helper, result, boxed object, then the raw argument registers. The class
         // operand only sometimes holds the expected class - Object::Unbox never reads
         // it - so a slot that is a stale copy of the boxed object is ignored.
+        // An unresolvable call is left untouched so a later recovery pass retries it
+        // once more operand types are known; if none resolves it, emission keeps the
+        // usual unknown-call diagnostic.
         if (instruction.OpCode != OpCode.Call
-            || instruction.Operands is not [var helper, var result, var boxedObject, ..])
+            || instruction.Operands is not [_, var result, var boxedObject, ..])
             return;
 
         var cfg = method.ControlFlowGraph!;
@@ -558,23 +561,20 @@ public static class KeyFunctionRecovery
             ? UnboxClassOperand(cfg, instruction.Operands[3], is32Bit)
             : null;
         var guardedTypes = GuardedUnboxTypes(method, instruction, boxedObject);
-
         var valueType = argumentType switch
         {
-            // The class operand names a value type and no guard disagrees.
-            { IsValueType: true } when guardedTypes.All(guarded => SameFullName(guarded, argumentType))
+            // The class operand names a value type (or a method generic parameter,
+            // which `unbox.any` handles at runtime) and no guard disagrees.
+            { IsValueType: true } or GenericParameterTypeAnalysisContext
+                when guardedTypes.All(guarded => SameFullName(guarded, argumentType))
                 => argumentType,
             // The class operand was junk; the wrapper's element_class check is the only evidence.
-            null or { IsValueType: false } when guardedTypes.Count == 1 => guardedTypes[0],
+            not ({ IsValueType: true } or GenericParameterTypeAnalysisContext)
+                when guardedTypes.Count == 1 => guardedTypes[0],
             _ => null,
         };
         if (valueType == null)
-        {
-            instruction.OpCode = OpCode.NotImplemented;
-            instruction.SetOperands(new StringLiteral(
-                $"{((StringLiteral)helper).Value} without a resolvable value type"));
             return;
-        }
 
         instruction.OpCode = OpCode.Unbox;
         instruction.SetOperands(result, valueType, boxedObject);
@@ -593,6 +593,10 @@ public static class KeyFunctionRecovery
     {
         if (depth > 4)
             return null;
+        // A local already typed Il2CppClass<T> (e.g. by element-class load rewriting)
+        // names T even when its definition moves through unrelated memory.
+        if (operand is LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { } typed } })
+            return typed;
         operand = ResolveMoveSource(cfg, operand);
         return operand switch
         {
@@ -621,7 +625,21 @@ public static class KeyFunctionRecovery
             .GroupBy(i => (LocalVariable)i.Destination!)
             .Where(group => group.Count() == 1)
             .ToDictionary(group => group.Key, group => group.Single());
+        // The call sees the boxed object through SSA register copies (`v71 = v9`,
+        // `v9 = obj`), while a guard compares aliases that share the same root.
+        var boxedAliases = new HashSet<IOperand>();
         var declaredType = boxedObject is LocalVariable { Type: { } type } ? type : null;
+        var cursor = boxedObject;
+        while (cursor is { }
+               && boxedAliases.Add(cursor)
+               && cursor is LocalVariable local
+               && definitions.TryGetValue(local, out var move)
+               && move is { OpCode: OpCode.Move, Operands: [_, var source] })
+        {
+            if (source is LocalVariable { Type: { } sourceType })
+                declaredType = sourceType;
+            cursor = source;
+        }
 
         var candidates = new List<TypeAnalysisContext>();
         var visited = new HashSet<Graphs.Block>();
@@ -644,15 +662,15 @@ public static class KeyFunctionRecovery
             {
                 if (CheckedComparison(condition, definitions) is not { Operands: [_, var left, var right] })
                     continue;
+                var leftRefs = ReferencesBoxedObject(left, boxedAliases, declaredType, definitions, []);
+                var rightRefs = ReferencesBoxedObject(right, boxedAliases, declaredType, definitions, []);
                 var candidate =
-                    ReferencesBoxedObject(left, boxedObject, declaredType, definitions, [])
-                    && !ReferencesBoxedObject(right, boxedObject, declaredType, definitions, [])
+                    leftRefs && !rightRefs
                         ? UnboxClassOperand(cfg, right, is32Bit)
-                    : ReferencesBoxedObject(right, boxedObject, declaredType, definitions, [])
-                      && !ReferencesBoxedObject(left, boxedObject, declaredType, definitions, [])
+                    : rightRefs && !leftRefs
                         ? UnboxClassOperand(cfg, left, is32Bit)
                         : null;
-                if (candidate is { IsValueType: true })
+                if (candidate is { IsValueType: true } or GenericParameterTypeAnalysisContext)
                     candidates.Add(candidate);
             }
         }
@@ -691,27 +709,26 @@ public static class KeyFunctionRecovery
     // Whether an operand denotes the boxed object or a slot derived from it: the object
     // itself, [obj] / &obj dereferences, an `obj->klass` move chain, or the class the
     // object's declared type resolves to.
-    private static bool ReferencesBoxedObject(IOperand operand, IOperand boxedObject,
+    private static bool ReferencesBoxedObject(IOperand operand, HashSet<IOperand> boxedAliases,
         TypeAnalysisContext? declaredType,
         IReadOnlyDictionary<LocalVariable, Instruction> definitions,
-        HashSet<LocalVariable> visited)
+        HashSet<IOperand> visited)
     {
-        if (ReferenceEquals(operand, boxedObject))
-            return true;
-        return operand switch
+        if (!visited.Add(operand))
+            return false;
+        return boxedAliases.Contains(operand) || operand switch
         {
-            LocalVariable local => visited.Add(local)
-                && definitions.TryGetValue(local, out var definition)
+            LocalVariable local => definitions.TryGetValue(local, out var definition)
                 && definition is { OpCode: OpCode.Move, Operands: [_, var source] }
-                && ReferencesBoxedObject(source, boxedObject, declaredType, definitions, visited),
+                && ReferencesBoxedObject(source, boxedAliases, declaredType, definitions, visited),
             MemoryOperand memory =>
                 memory.Base is { } baseOperand
-                && ReferencesBoxedObject(baseOperand, boxedObject, declaredType, definitions, visited)
+                && ReferencesBoxedObject(baseOperand, boxedAliases, declaredType, definitions, visited)
                 || memory.Index is { } index
-                && ReferencesBoxedObject(index, boxedObject, declaredType, definitions, visited),
-            AddressOf address => ReferencesBoxedObject(address.Target, boxedObject, declaredType,
+                && ReferencesBoxedObject(index, boxedAliases, declaredType, definitions, visited),
+            AddressOf address => ReferencesBoxedObject(address.Target, boxedAliases, declaredType,
                 definitions, visited),
-            FieldReference field => ReferencesBoxedObject(field.Local, boxedObject, declaredType,
+            FieldReference field => ReferencesBoxedObject(field.Local, boxedAliases, declaredType,
                 definitions, visited),
             RuntimeClassTypeAnalysisContext { RepresentedType: { } represented } => declaredType != null
                 && represented.FullName == declaredType.FullName,
