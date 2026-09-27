@@ -574,7 +574,12 @@ public static class AsmResolverAssemblyPopulator
             // was `{ get; set; }`, so the getter can be restored from it. A
             // normal setter's only parameter is `value`; a setter with more is
             // an indexer, which can never be an auto-property.
-            if (managedGetter == null && managedSetter is { Parameters.Count: 1 })
+            // A dotted property name is an explicit interface implementation;
+            // C# forbids those as auto-properties, so the interface's own
+            // stripped getter cannot be evidenced by a backing field and the
+            // surviving accessor pair already decompiles legally — leave it.
+            if (managedGetter == null && managedSetter is { Parameters.Count: 1 }
+                && !managedProperty.Name!.ToString().Contains('.'))
             {
                 var backingField = ilTypeDefinition.Fields.FirstOrDefault(f =>
                     f.Name?.ToString() == $"<{managedProperty.Name}>k__BackingField");
@@ -711,38 +716,5 @@ public static class AsmResolverAssemblyPopulator
             }
         }
 
-        // An accessor Cpp2IL restored has no il2cpp method record, so the
-        // override loop never gives it the MethodImpl rows a real explicit
-        // interface accessor carries; without them the pair no longer matches
-        // the `I.Prop`/`I.get_Prop`/`I.set_Prop` convention and the property
-        // degrades to a private member. Mirror the sibling's interface
-        // accessor where the interface declares one.
-        var contextEmitted = new HashSet<MethodDefinition>(typeContext.Methods
-            .Select(m => m.GetExtraData<MethodDefinition>("AsmResolverMethod"))
-            .Where(m => m != null)!);
-        foreach (var property in type.Properties)
-        {
-            var accessors = new[] { property.GetMethod, property.SetMethod };
-            if (accessors[0] == null || accessors[1] == null)
-                continue;
-            foreach (var accessor in accessors)
-            {
-                var sibling = accessor == accessors[0] ? accessors[1] : accessors[0];
-                if (accessor == null || contextEmitted.Contains(accessor)
-                    || type.MethodImplementations.Any(mi => mi.Body == accessor))
-                    continue;
-                foreach (var impl in type.MethodImplementations.Where(mi => mi.Body == sibling).ToList())
-                {
-                    if (impl.Declaration is not { } declRef
-                        || declRef.Resolve(runtimeContext, out var decl) != ResolutionStatus.Success
-                        || decl?.DeclaringType is null || decl.Semantics is null)
-                        continue;
-                    var interfaceProperty = decl.DeclaringType.Properties.FirstOrDefault(p => p.Semantics.Contains(decl.Semantics));
-                    var counterpart = accessor == property.GetMethod ? interfaceProperty?.GetMethod : interfaceProperty?.SetMethod;
-                    if (counterpart != null)
-                        type.MethodImplementations.Add(new MethodImplementation(counterpart, accessor));
-                }
-            }
-        }
     }
 }

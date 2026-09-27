@@ -170,12 +170,13 @@ public class SetterOnlyAutoPropertyTests
         });
     }
 
-    // An explicit-interface property is named `I.Prop` and its accessors
-    // `I.get_Prop`/`I.set_Prop`; a restored accessor must keep the dotted
-    // prefix and carry a MethodImpl row to the interface accessor, or the
-    // property stops being an implementation of the interface member.
+    // An explicit-interface property is named `I.Prop`; C# forbids explicit
+    // implementations as auto-properties, so a stripped getter on one can
+    // never be evidenced by a backing field (the interface holds none) and
+    // the surviving accessor pair already decompiles legally. Restoration
+    // must leave it alone.
     [Test]
-    public void RestoredGetterKeepsExplicitInterfaceConvention()
+    public void ExplicitInterfacePropertyStaysSetterOnly()
     {
         Cpp2IlApi.ResetInternalState();
         var app = TestGameLoader.LoadSimple2022Game();
@@ -217,15 +218,15 @@ public class SetterOnlyAutoPropertyTests
         var emittedProperty = emittedImpl.Properties.Single(p => p.Name == "Tests.IMirror.Value");
         Assert.Multiple(() =>
         {
-            Assert.That(emittedProperty.GetMethod?.Name?.ToString(),
-                Is.EqualTo("Tests.IMirror.get_Value"),
-                "the restored getter must keep the dotted interface prefix");
+            Assert.That(emittedProperty.GetMethod, Is.Null,
+                "an explicit-interface property can never be an auto-property, so no getter may be invented");
+            Assert.That(emittedImpl.Methods.Any(m =>
+                    m.Name?.ToString() == "Tests.IMirror.get_Value"), Is.False);
             Assert.That(emittedImpl.MethodImplementations.Any(mi =>
-                    mi.Body == emittedProperty.GetMethod
-                    && mi.Declaration?.Name?.ToString() == "get_Value"
-                    && mi.Declaration.DeclaringType?.Name?.ToString() == "IMirror"),
+                    mi.Body == emittedProperty.SetMethod
+                    && mi.Declaration?.Name?.ToString() == "set_Value"),
                 Is.True,
-                "the restored getter must get the MethodImpl row an explicit-interface accessor carries");
+                "the surviving setter must keep its interface implementation row");
         });
     }
 }
