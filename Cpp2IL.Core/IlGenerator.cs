@@ -4464,6 +4464,11 @@ public static class IlGenerator
                 || candidate.GenericArguments.Any(argument =>
                     ContainsUnusableSharpenedArgument(argument, context)))
                 return true;
+            // A contract that is erased at every argument carries no concrete
+            // instantiation evidence; accepting it would echo the same erased
+            // instantiation through the move chain in a loop.
+            if (candidate.GenericArguments.All(ContainsErasedSharedArgument))
+                return true;
             if (useContract != null && !ThisConstructorCallPlan.SameTypeIdentity(useContract, candidate))
                 return false;
             useContract = candidate;
@@ -4502,7 +4507,16 @@ public static class IlGenerator
         Instruction instruction, MethodAnalysisContext context, HashSet<LocalVariable> visited)
     {
         if (instruction.Operands is [MethodAnalysisContext callee, ..] && !callee.IsVoid)
-            yield return callee.ReturnType;
+        {
+            // `get_Current`-style defs bind to the open shared instantiation
+            // (KeyValuePair<!0,!1>); retarget through the receiver evidence to
+            // recover the concrete produced instantiation.
+            var resolved = !callee.IsStatic && instruction.Operands.Count > 2
+                ? ThisConstructorCallPlan.RetargetToDestinationInstantiation(callee,
+                      DirectSharedGenericEvidenceType(instruction.Operands[2], context)) ?? callee
+                : callee;
+            yield return EffectiveCallReturnType(resolved);
+        }
         foreach (var operand in instruction.Operands.Skip(1))
         {
             switch (operand)
@@ -4511,19 +4525,25 @@ public static class IlGenerator
                     yield return producedType;
                     break;
                 case ReferenceCast referenceCast:
-                    yield return EmittedOperandType(referenceCast.Value, context);
+                    // The produced value has the cast's target type, not the
+                    // pre-cast operand's type.
+                    yield return referenceCast.Type;
                     break;
                 case LocalVariable source:
                     // EmittedOperandType would recurse through the same sharpening
                     // with a fresh visited-set; keep the cycle guard instead.
-                    yield return DirectCallDefinedLocalType(source, context)
-                        ?? (source.Type is GenericInstanceTypeAnalysisContext sourceInstance
-                        && sourceInstance.GenericArguments.Any(ContainsErasedSharedArgument)
-                        ? SharpenedLocalInstanceType(source, sourceInstance, context, visited)
-                        : source.Type);
+                    if ((DirectCallDefinedLocalType(source, context)
+                            ?? (source.Type is GenericInstanceTypeAnalysisContext sourceInstance
+                                && sourceInstance.GenericArguments.Any(ContainsErasedSharedArgument)
+                                ? SharpenedLocalInstanceType(source, sourceInstance, context, visited)
+                                : null)
+                            ?? source.Type)
+                        is { } producedLocal)
+                        yield return producedLocal;
                     break;
                 default:
-                    yield return EmittedOperandType(operand, context);
+                    if (EmittedOperandType(operand, context) is { } producedOperand)
+                        yield return producedOperand;
                     break;
             }
         }
