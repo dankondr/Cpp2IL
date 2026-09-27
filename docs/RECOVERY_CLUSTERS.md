@@ -119,13 +119,15 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
 | castle-recovery#95 `member-signature-mismatch` (compile bucket) | metadata emission | Classification only for two of three shapes — dominating mid-body base-`.ctor` calls are ilspy's, and zero-`.ctor` typedefs are IL2CPP-stripped metadata (the metadata can't show whether the source had an implicit or an explicit stripped `.ctor`, so restoring one invents a member — pinned by `ZeroCtorClassIsEmittedWithoutConstructor`). Fixed shape: `FromAnalyzedAttributeArgument` now writes a `typeof(x)` value into an `object`-typed attribute parameter as a `BoxedArgument`, so the blob carries the `SERIALIZATION_TYPE_TYPE` tag instead of a bare `SerString` no decoder can read | `Regression/ImplicitConstructorRestorationTests.*` (2 tests) |
 
 | castle-recovery#101 `decompiler-invalid-emission` (compile bucket, CS1540 generic-member reference) | metadata emission | `ContextToMethodDescriptor.ToMethodDescriptor(ConcreteGenericMethodAnalysisContext)` runs the same `MemberAccessibility.EnsureAccessible` ambient-scope widening the plain-method descriptor path already applied — the generic-instance overload (used by `ldftn`/`call`/`callvirt`/`ldtoken` member references) skipped it, so a same-assembly reference to a `protected` generic method left the member at `family` and ilspy rendered a qualifier-of-declaring-type access C# rejects (CS1540); `development` measurement: bucket 114 -> 40, CS1540 97 -> 23, `invalid_il` 474 -> 473 | `Regression/GenericMethodReferenceAccessibilityTests.*` (3 tests) |
+| castle-recovery#97 `unmanaged-memory-store` (slot-substitution cluster) | IL emission | `Move` stores into `[base + addend]` previously fell into the catch-all `StoreToOperand` drop (`Store through unmanaged memory form … could not be emitted`). Two shapes now lower to real IL. (a) Field stores: `TryRecoverFieldStore` rebuilds the `FieldReference` the lifter never produced when the base local carries — or its call/newobj definitions infer — a managed owner type and `FindInstanceFieldPathAtOffset` (base-type chain, one-level nested container, concrete generic layouts) names an instance field at the addend whose `MinimumUnboxedSize` equals the recorded store width (`AccessSize` 0 matches only exactly-16-byte fields: vector spills); the recovered reference flows through the ordinary `stfld` emission path under the `FieldReferenceUsableFrom` + `TryResolveSlotLoad` gates. (b) Frame slots: stores through an untyped `X29`/`stack_` base with a nonzero addend are writes into native frame slots the lifter never promoted to locals; `CollectFrameSlotLocals` synthesizes one local per distinct slot typed by its first typeable store, and the `Move` arm emits `stloc` when the source emits the slot's own type (immediates resolve through the slot contract) and the recorded width covers it. Indexed/scaled/absolute forms, stores into typed bases that name no field, mismatched widths, slot-type conflicts, `sz=0` SIMD stores onto reference-typed sources, and `Call`/`CallVoid` destinations keep the explicit diagnostic — a computed native address is never expressible in verifiable IL (`stind` requires `&`, `conv.u` rejects `O`/`&`), so no `stind`-through-`conv.u` emission is attempted | `Regression/UnmanagedStoreTests.*` (7 tests) |
+(castle-recovery#97: emit real IL for field-offset and frame-slot memory stores)
 
 ## Summary
 
 - **84 fork PRs** merged since `b5ad444b` (#1–#79, #81–#85; no #80), plus the
   castle-recovery#NN issue rows.
 - **2 are not live recovery fixes**: #26 (reverted by #27) and #85 (CI only).
-- **96 recovery-fix clusters.** **94** carry reproducing tests (tests added or
+- **97 recovery-fix clusters.** **95** carry reproducing tests (tests added or
   strengthened in the same PR): the 80 through the backfill wave (#16 + #47,
   #38, #40, #41, #57, #58), castle-recovery#74's `UnboxEmissionTests.*`,
   castle-recovery#75's `Arm64VectorLaneLiftingTests.*`,
@@ -139,8 +141,9 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
   castle-recovery#90's `SlotDefaultDiagnosticsTests.*`,
   castle-recovery#92's `UnpairedOperatorEmissionTests.*`,
   castle-recovery#93's `ThrowHelperEpilogueTests.*`,
-  castle-recovery#96's `InternalsVisibleToKeyGrantTests.*`, and
-  castle-recovery#101's `GenericMethodReferenceAccessibilityTests.*`.
+  castle-recovery#96's `InternalsVisibleToKeyGrantTests.*`,
+  castle-recovery#101's `GenericMethodReferenceAccessibilityTests.*`, and
+  castle-recovery#97's `UnmanagedStoreTests.*`.
 - **2 remain `none`**, both compile-only fixes: #15 (`IReadOnlySet` on
   netstandard2.0) and #20 (`AddOperands` signature fix, exercised downstream by
   `Arm64LibcMathImportTests`).
