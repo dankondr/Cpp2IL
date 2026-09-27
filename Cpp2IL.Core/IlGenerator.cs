@@ -169,6 +169,7 @@ public static class IlGenerator
                 continue;
             }
             body.Instructions.Add(CilOpCodes.Ldarg_0);
+            var argStart = body.Instructions.Count;
             for (var i = 0; i < constructor.Parameters.Count; i++)
             {
                 if (i < arguments.Length && arguments[i] is { } argument)
@@ -176,7 +177,9 @@ public static class IlGenerator
                 else
                     PushDefaultOf(constructor.Parameters[i].ParameterType, definition, body.Instructions, context);
             }
+            var callIndex = body.Instructions.Count;
             body.Instructions.Add(CilOpCodes.Call, constructor.ToMethodDescriptor());
+            MoveDiagnosticNotesAfterCall(body.Instructions, argStart, callIndex, writeLine);
         }
 
         foreach (var block in context.ControlFlowGraph!.Blocks)
@@ -1279,6 +1282,8 @@ public static class IlGenerator
                             || directCallToVirtual)
                     ? CilOpCodes.Callvirt
                     : CilOpCodes.Call, importedMethod);
+                if (retargetedBaseConstructor != null || (isOwnThis && targetMethod.Name == ".ctor"))
+                    MoveDiagnosticNotesAfterCall(instructions, startIndex, instructions.Count - 1, writeLine);
 
                 // the lifter's guess at whether the callee returns anything can disagree with the
                 // signature we later resolved, so go by the signature and balance the stack
@@ -5214,6 +5219,32 @@ public static class IlGenerator
         var instructions = method.CilMethodBody!.Instructions;
         instructions.Add(CilOpCodes.Ldstr, Diagnostic(detail));
         instructions.Add(CilOpCodes.Call, writeLine);
+    }
+
+    // A constructor body's first C# statement can only be the constructor
+    // initializer, so diagnostics recorded while materializing a base .ctor
+    // call's operands are moved to after the call — ahead of it the decompiler
+    // renders an uncallable `base._002Ector(...)` reference.
+    private static void MoveDiagnosticNotesAfterCall(CilInstructionCollection instructions, int regionStart,
+        int callIndex, IMethodDescriptor writeLine)
+    {
+        for (var j = regionStart; j + 1 < callIndex; j++)
+        {
+            if (instructions[j].OpCode == CilOpCodes.Ldstr
+                && instructions[j + 1].OpCode == CilOpCodes.Call
+                && instructions[j + 1].Operand is IMethodDescriptor callee
+                && callee.FullName == writeLine.FullName)
+            {
+                var text = instructions[j];
+                var note = instructions[j + 1];
+                instructions.RemoveAt(j + 1);
+                instructions.RemoveAt(j);
+                callIndex -= 2;
+                instructions.Insert(instructions.Count, text);
+                instructions.Insert(instructions.Count, note);
+                j--;
+            }
+        }
     }
 
     // Reason string for a substituted slot value. The ref-struct boundary
