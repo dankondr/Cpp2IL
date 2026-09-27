@@ -98,6 +98,7 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
 | #85 CI workflow (`fork-tests`) | infra | c9a30c51 | none — CI plumbing only, not a recovery fix |
 | #88 `type-absent-from-recovered-metadata` (compile bucket) | metadata emission | `FrameworkSurfaceTypes.EmitMissing` materializes TypeDefs for framework types referenced only via implflags/attribute surfaces | `Regression/FrameworkSurfaceTypesTests.FlagSurfacesMaterializeMissingCorlibTypeDefs`, `InjectedImplFlagsMaterializeMethodImplSurface` |
 | castle-recovery#53 stray `NestedClass` row | metadata emission | c9ede488 | `Regression/NestedClassTableTests.EmittedNestedClassRowsAreInRangeAndUnique`, `NestedTypeListedUnderAnotherParentIsEmittedOnlyUnderItsDeclaringType` |
+| #90 `invalid-attribute-named-argument` (compile bucket) | metadata emission | `AsmResolverAssemblyPopulator` restores the accessor il2cpp stripped on setter-only named-argument properties via their `<Name>k__BackingField` | `Regression/AttributeNamedArgumentTests.NamedArgumentSetOnlyPropertyGetsGetterBack`, `SetOnlyPropertyWithoutBackingFieldStaysAsIs` |
 
 ## Summary
 
