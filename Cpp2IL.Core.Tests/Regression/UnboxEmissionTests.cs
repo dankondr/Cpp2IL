@@ -96,6 +96,46 @@ public class UnboxEmissionTests
     }
 
     [Test]
+    public void UnboxCallWrittenThroughKeepsExplicitDiagnostic()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var valueType = app.SystemTypes.SystemInt32Type;
+        var boxed = new LocalVariable("boxed", new Register(null, "boxed"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var unboxedPointer = new LocalVariable("unboxedPtr", new Register(null, "unboxedPtr"));
+        var value = new LocalVariable("value", new Register(null, "value")) { Type = valueType };
+        var module = new ModuleDefinition("UnboxWriteThrough.dll");
+        SeedCorLibTypes(app, module, valueType, app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemVoidType);
+        // The lowered form (unbox.any + scratch local + ldloca) exposes a *copy* of
+        // the boxed data, so a store through the pointer would silently write the
+        // copy and not the box. The call must stay unlifted and diagnosed.
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Call, new StringLiteral("il2cpp_vm_object_unbox"),
+                unboxedPointer, boxed, valueType),
+            new(1, OpCode.Move, new MemoryOperand(unboxedPointer), value),
+            new(2, OpCode.Return)], [boxed, unboxedPointer, value]);
+
+        KeyFunctionRecovery.Run(caller);
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Unbox
+                    || i.OpCode == CilOpCodes.Unbox_Any), Is.False,
+                "a store through the result must not be lowered to unbox.any");
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text
+                    && text.Contains("Unknown call target operand")
+                    && text.Contains("unbox")), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+        });
+    }
+
+    [Test]
     public void UnboxCallWithoutResolvableTypeKeepsExplicitDiagnostic()
     {
         Cpp2IlApi.ResetInternalState();

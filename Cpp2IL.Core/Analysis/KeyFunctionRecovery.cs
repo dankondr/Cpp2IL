@@ -576,10 +576,78 @@ public static class KeyFunctionRecovery
         if (valueType == null)
             return;
 
+        // unbox.any + ldloca lifts a *copy* of the boxed data, so a site that
+        // writes through the pointer would silently write the copy, not the box.
+        // Those uses keep the call unlifted - and keep its explicit diagnostic.
+        if (UnboxResultIsWrittenThrough(cfg, result))
+            return;
+
         instruction.OpCode = OpCode.Unbox;
         instruction.SetOperands(result, valueType, boxedObject);
         if (result is LocalVariable local)
             local.Type = new ByRefTypeAnalysisContext(valueType);
+    }
+
+    // Whether the pointer result is written through: a store into [result] or a
+    // field off it (or off an SSA copy of it), or the pointer handed to a call as
+    // `this` or a by-ref argument. An unresolved callee is skipped - that site is
+    // already diagnosed on its own.
+    private static bool UnboxResultIsWrittenThrough(Graphs.ISILControlFlowGraph cfg,
+        IOperand result)
+    {
+        var aliases = new HashSet<IOperand> { result };
+        var grew = true;
+        while (grew)
+        {
+            grew = false;
+            foreach (var i in cfg.Instructions)
+            {
+                if (i.OpCode == OpCode.Move
+                    && i.Destination is LocalVariable copy
+                    && !aliases.Contains(copy)
+                    && aliases.Contains(i.Operands[1]))
+                {
+                    aliases.Add(copy);
+                    grew = true;
+                }
+            }
+        }
+
+        foreach (var i in cfg.Instructions)
+        {
+            var writesThrough = i.Destination switch
+            {
+                MemoryOperand { Base: { } memoryBase } => aliases.Contains(memoryBase),
+                MemoryOperand { Index: { } memoryIndex } => aliases.Contains(memoryIndex),
+                FieldReference { Local: { } fieldOwner } => aliases.Contains(fieldOwner),
+                _ => false,
+            };
+            if (writesThrough)
+                return true;
+
+            var firstArgument = i.OpCode switch
+            {
+                OpCode.Call => 2,
+                OpCode.CallVoid => 1,
+                _ => -1,
+            };
+            if (firstArgument < 0 || i.Operands[0] is not MethodAnalysisContext callee)
+                continue;
+            var receiverOffset = callee.IsStatic ? 0 : 1;
+            for (var argument = firstArgument; argument < i.Operands.Count; argument++)
+            {
+                if (!aliases.Contains(i.Operands[argument]))
+                    continue;
+                if (receiverOffset == 1 && argument == firstArgument)
+                    return true;
+                var parameterIndex = argument - firstArgument - receiverOffset;
+                if (parameterIndex >= 0
+                    && parameterIndex < callee.Parameters.Count
+                    && callee.Parameters[parameterIndex].ParameterType is ByRefTypeAnalysisContext)
+                    return true;
+            }
+        }
+        return false;
     }
 
     private static bool SameFullName(TypeAnalysisContext a, TypeAnalysisContext b)
