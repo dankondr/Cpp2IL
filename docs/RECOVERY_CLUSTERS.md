@@ -113,13 +113,14 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
 - **84 fork PRs** merged since `b5ad444b` (#1–#79, #81–#85; no #80), plus the
   castle-recovery#NN issue rows.
 - **2 are not live recovery fixes**: #26 (reverted by #27) and #85 (CI only).
-- **87 recovery-fix clusters.** **85** carry reproducing tests (tests added or
+- **88 recovery-fix clusters.** **86** carry reproducing tests (tests added or
   strengthened in the same PR): the 80 through the backfill wave (#16 + #47,
   #38, #40, #41, #57, #58), castle-recovery#74's `UnboxEmissionTests.*`,
   castle-recovery#75's `Arm64VectorLaneLiftingTests.*`,
   castle-recovery#76's `SynthesizedMemberEvidenceTests.*`,
-  castle-recovery#79's `DecompilerMemberAccessTests.*`, and
-  castle-recovery#80's `CompilerGeneratedNameTests.*`.
+  castle-recovery#79's `DecompilerMemberAccessTests.*`,
+  castle-recovery#80's `CompilerGeneratedNameTests.*`, and
+  castle-recovery#86's `ManagedPointerStoreTests.*`.
 - **2 remain `none`**, both compile-only fixes: #15 (`IReadOnlySet` on
   netstandard2.0) and #20 (`AddOperands` signature fix, exercised downstream by
   `Arm64LibcMathImportTests`).
