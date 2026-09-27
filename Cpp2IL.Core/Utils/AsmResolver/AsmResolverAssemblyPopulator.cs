@@ -161,7 +161,10 @@ public static class AsmResolverAssemblyPopulator
                 CustomAttributeEnumParameter enumParameter when boxIfNeeded => new(systemTypes.SystemObjectType.ToTypeSignature(), new BoxedArgument(GetTypeSigFromAttributeArg(enumParameter), enumParameter.UnderlyingPrimitiveParameter.PrimitiveValue)),
                 CustomAttributeEnumParameter enumParameter => new(GetTypeSigFromAttributeArg(enumParameter), enumParameter.UnderlyingPrimitiveParameter.PrimitiveValue),
                 
-                //BaseCustomAttributeTypeParameter typeParameter when boxIfNeeded => new(systemTypes.SystemObjectType.ToTypeSignature(), new BoxedArgument(GetTypeSigFromAttributeArg(parentAssembly, typeParameter), typeParameter.TypeContext?.ToTypeSignature(parentAssembly.ManifestModule!))),
+                //A typeof(x) argument in an object-typed slot is boxed like an enum is:
+                //the blob needs the SERIALIZATION_TYPE_TYPE tag before the SerString or
+                //the attribute decodes as garbage ("Could not decode attribute arguments").
+                BaseCustomAttributeTypeParameter typeParameter when boxIfNeeded => new(systemTypes.SystemObjectType.ToTypeSignature(), new BoxedArgument(systemTypes.SystemTypeType.ToTypeSignature(), typeParameter.TypeContext?.ToTypeSignature())),
                 BaseCustomAttributeTypeParameter typeParameter => new(systemTypes.SystemTypeType.ToTypeSignature(), typeParameter.TypeContext?.ToTypeSignature()),
                 
                 CustomAttributeArrayParameter arrayParameter => BuildArrayArgument(arrayParameter),
