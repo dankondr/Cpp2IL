@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Reflection;
+using System.Text;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
@@ -209,44 +210,279 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
     private IEnumerable<MethodAnalysisContext> GetOverrides()
     {
+        foreach (var method in GetVTableOverrides())
+            yield return method;
+
+        // Interface typedefs carry no vtable or interface-offset metadata, so
+        // the walk above cannot recover the .override rows of explicit
+        // implementations declared on the interface itself (default interface
+        // implementations). Their member names encode the implemented member in
+        // source form, e.g. "Namespace.IInterface<T>.Member".
+        if (DeclaringType?.IsInterface == true)
+            foreach (var method in GetExplicitInterfaceImplementations())
+                yield return method;
+    }
+
+    private IEnumerable<MethodAnalysisContext> GetVTableOverrides()
+    {
         if (Definition == null)
-            return [];
+            yield break;
 
         var declaringTypeDefinition = DeclaringType?.Definition;
         if (declaringTypeDefinition == null)
-            return [];
+            yield break;
 
         var vtable = declaringTypeDefinition.VTable;
         if (vtable == null)
-            return [];
+            yield break;
 
-        return GetOverriddenMethods(declaringTypeDefinition, vtable);
-
-        IEnumerable<MethodAnalysisContext> GetOverriddenMethods(Il2CppTypeDefinition declaringTypeDefinition, MetadataUsage?[] vtable)
+        for (var i = 0; i < vtable.Length; ++i)
         {
-            for (var i = 0; i < vtable.Length; ++i)
+            var vtableEntry = vtable[i];
+            if (vtableEntry is null or { Type: not MetadataUsageType.MethodDef })
+                continue;
+
+            if (vtableEntry.AsMethod() != Definition)
+                continue;
+
+            // Interface inheritance
+            foreach (var interfaceOffset in declaringTypeDefinition.InterfaceOffsets)
             {
-                var vtableEntry = vtable[i];
-                if (vtableEntry is null or { Type: not MetadataUsageType.MethodDef })
-                    continue;
-
-                if (vtableEntry.AsMethod() != Definition)
-                    continue;
-
-                // Interface inheritance
-                foreach (var interfaceOffset in declaringTypeDefinition.InterfaceOffsets)
+                if (i >= interfaceOffset.offset)
                 {
-                    if (i >= interfaceOffset.offset)
+                    var interfaceTypeContext = AppContext.ResolveIl2CppType(interfaceOffset.Type);
+                    var slot = i - interfaceOffset.offset;
+                    if (TryGetMethodForSlot(interfaceTypeContext, slot, out var method) && !IsInterfaceSlot(method, slot))
                     {
-                        var interfaceTypeContext = AppContext.ResolveIl2CppType(interfaceOffset.Type);
-                        var slot = i - interfaceOffset.offset;
-                        if (TryGetMethodForSlot(interfaceTypeContext, slot, out var method) && !IsInterfaceSlot(method, slot))
-                        {
-                            yield return method;
-                        }
+                        yield return method;
                     }
                 }
             }
+        }
+    }
+
+    private IEnumerable<MethodAnalysisContext> GetExplicitInterfaceImplementations()
+    {
+        var lastDot = Name.LastIndexOf('.');
+        if (lastDot <= 0 || lastDot == Name.Length - 1)
+            yield break;
+
+        var encodedInterfaceName = Name.Substring(0, lastDot);
+        var memberName = Name.Substring(lastDot + 1);
+
+        foreach (var interfaceContext in EnumerateImplementedInterfaces(DeclaringType))
+        {
+            if (!InterfaceNameMatches(interfaceContext, encodedInterfaceName))
+                continue;
+
+            var candidates = new List<MethodAnalysisContext>();
+            var seenDefinitions = new HashSet<Il2CppMethodDefinition>();
+            foreach (var member in EnumerateInterfaceMembers(interfaceContext))
+            {
+                if (member.Name != memberName || member.Parameters.Count != Parameters.Count)
+                    continue;
+                if (member.Definition != null && !seenDefinitions.Add(member.Definition))
+                    continue;
+                candidates.Add(member);
+            }
+
+            // Overload clones reachable through multiple base interfaces (a
+            // generic interface inheriting its non-generic twin, for example)
+            // are disambiguated by signature.
+            if (candidates.Count > 1)
+                candidates.RemoveAll(candidate => !SignatureEquivalent(candidate));
+            if (candidates.Count != 1)
+                continue;
+
+            var match = candidates[0];
+            if (interfaceContext is GenericInstanceTypeAnalysisContext genericInstance
+                && match.DeclaringType?.GenericParameters.Count == genericInstance.GenericArguments.Count)
+                yield return new ConcreteGenericMethodAnalysisContext(match, genericInstance.GenericArguments, []);
+            else
+                yield return match;
+        }
+    }
+
+    private bool SignatureEquivalent(MethodAnalysisContext candidate)
+    {
+        for (var i = 0; i < Parameters.Count; i++)
+        {
+            if (!TypesEquivalent(Parameters[i].ParameterType, candidate.Parameters[i].ParameterType))
+                return false;
+        }
+
+        return TypesEquivalent(ReturnType, candidate.ReturnType);
+    }
+
+    private static bool TypesEquivalent(TypeAnalysisContext a, TypeAnalysisContext b)
+    {
+        // Generic parameters spell differently on either side of the encoded
+        // name ("IInterface<T>" declared on "IOther<T>" vs "TResult" on
+        // "IInterface<TResult>"), so compare them by position, not name.
+        if (a is GenericParameterTypeAnalysisContext || b is GenericParameterTypeAnalysisContext)
+        {
+            var aParameter = a as GenericParameterTypeAnalysisContext;
+            var bParameter = b as GenericParameterTypeAnalysisContext;
+            return aParameter?.Index == bParameter?.Index && aParameter?.Type == bParameter?.Type;
+        }
+
+        if (a is GenericInstanceTypeAnalysisContext || b is GenericInstanceTypeAnalysisContext)
+        {
+            var aInstance = a as GenericInstanceTypeAnalysisContext;
+            var bInstance = b as GenericInstanceTypeAnalysisContext;
+            return aInstance?.GenericType.FullName == bInstance?.GenericType.FullName
+                && aInstance!.GenericArguments.Count == bInstance!.GenericArguments.Count
+                && aInstance.GenericArguments.Zip(bInstance.GenericArguments).All(pair => TypesEquivalent(pair.First, pair.Second));
+        }
+
+        if (a is WrappedTypeAnalysisContext || b is WrappedTypeAnalysisContext)
+        {
+            var aWrapped = a as WrappedTypeAnalysisContext;
+            var bWrapped = b as WrappedTypeAnalysisContext;
+            return aWrapped?.GetType() == bWrapped?.GetType() && TypesEquivalent(aWrapped!.ElementType, bWrapped!.ElementType);
+        }
+
+        return a.FullName == b.FullName;
+    }
+
+    private static bool InterfaceNameMatches(TypeAnalysisContext interfaceContext, string encodedName)
+    {
+        if (StripGenericArgumentLists(encodedName) != SourceStyleName(interfaceContext))
+            return false;
+
+        var arity = interfaceContext is GenericInstanceTypeAnalysisContext genericInstance
+            ? genericInstance.GenericArguments.Count
+            : interfaceContext.GenericParameters.Count;
+        return CountEncodedGenericArguments(encodedName) == arity;
+    }
+
+    /// <summary>
+    /// The interface's name as it appears in a source-style explicit
+    /// implementation member name: dotted namespace and declaring-type chain,
+    /// each name stripped of any `` `N `` arity suffix or "&lt;...&gt;" argument list.
+    /// </summary>
+    private static string SourceStyleName(TypeAnalysisContext context)
+    {
+        var definitionContext = Unwrap(context);
+
+        var names = new Stack<string>();
+        for (var current = definitionContext; current != null; current = Unwrap(current.DeclaringType))
+        {
+            var name = current.Name;
+            var terminator = name.IndexOfAny(['`', '<']);
+            names.Push(terminator < 0 ? name : name[..terminator]);
+        }
+
+        var ns = definitionContext?.Namespace;
+        return (string.IsNullOrEmpty(ns) ? "" : ns + ".") + string.Join('.', names);
+
+        static TypeAnalysisContext? Unwrap(TypeAnalysisContext? context)
+            => context is GenericInstanceTypeAnalysisContext genericInstance ? genericInstance.GenericType : context;
+    }
+
+    private static string StripGenericArgumentLists(string name)
+    {
+        var builder = new StringBuilder(name.Length);
+        var depth = 0;
+        foreach (var c in name)
+        {
+            if (c == '<')
+                depth++;
+            else if (c == '>')
+                depth--;
+            else if (depth == 0)
+                builder.Append(c);
+        }
+
+        return builder.ToString();
+    }
+
+    private static int CountEncodedGenericArguments(string name)
+    {
+        // Encoded instantiations use source-style generics ("IFoo<A, B<C>>").
+        // Only top-level commas delimit arguments; commas inside a nested
+        // argument list or a function-pointer parameter list do not.
+        var total = 0;
+        var depth = 0;
+        var parenDepth = 0;
+        var commas = 0;
+        var inGroup = false;
+        foreach (var c in name)
+        {
+            switch (c)
+            {
+                case '<':
+                    if (depth++ == 0)
+                    {
+                        inGroup = true;
+                        commas = 0;
+                    }
+                    break;
+                case '>':
+                    if (--depth == 0 && inGroup)
+                    {
+                        total += commas + 1;
+                        inGroup = false;
+                    }
+                    break;
+                case '(':
+                    if (depth > 0)
+                        parenDepth++;
+                    break;
+                case ')':
+                    if (parenDepth > 0)
+                        parenDepth--;
+                    break;
+                case ',':
+                    if (depth == 1 && parenDepth == 0)
+                        commas++;
+                    break;
+            }
+        }
+
+        return total;
+    }
+
+    private static IEnumerable<TypeAnalysisContext> EnumerateImplementedInterfaces(TypeAnalysisContext? type)
+    {
+        var seen = new HashSet<TypeAnalysisContext>();
+        var pending = new Stack<TypeAnalysisContext>(InterfacesOf(type));
+        while (pending.Count > 0)
+        {
+            var current = pending.Pop();
+            if (!seen.Add(current))
+                continue;
+
+            yield return current;
+
+            foreach (var parent in InterfacesOf(current))
+                pending.Push(parent);
+        }
+
+        static IEnumerable<TypeAnalysisContext> InterfacesOf(TypeAnalysisContext? context)
+            => context switch
+            {
+                null => [],
+                GenericInstanceTypeAnalysisContext genericInstance => genericInstance.GenericType.InterfaceContexts,
+                _ => context.InterfaceContexts,
+            };
+    }
+
+    private static IEnumerable<MethodAnalysisContext> EnumerateInterfaceMembers(TypeAnalysisContext interfaceContext)
+    {
+        var ownMethods = interfaceContext is GenericInstanceTypeAnalysisContext genericInstance
+            ? genericInstance.GenericType.Methods
+            : interfaceContext.Methods;
+        foreach (var method in ownMethods)
+            yield return method;
+
+        foreach (var baseInterface in EnumerateImplementedInterfaces(interfaceContext))
+        {
+            var baseMethods = baseInterface is GenericInstanceTypeAnalysisContext genericBase
+                ? genericBase.GenericType.Methods
+                : baseInterface.Methods;
+            foreach (var method in baseMethods)
+                yield return method;
         }
     }
 

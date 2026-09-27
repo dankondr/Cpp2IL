@@ -107,20 +107,22 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
 | castle-recovery#79 `decompiler-generated-member` (compile bucket) | IL emission | `EnsureCtorInitialized` no longer prepends a second `call <base>::.ctor` over the one the stubber already emits (`base._002Ector()`); `DecompilerMemberAccessRewrites` re-expresses enum `value__` `ldfld`/`stfld` as `ldobj`/`stobj` and `<X>k__BackingField` access as a `call`/`callvirt` to the property accessor when one exists and is callable from the emitting method | `Regression/DecompilerMemberAccessTests.*` (7 tests) |
 | castle-recovery#86 `invalid-method-body` (compile bucket) | IL emission | `IlGenerator` lowers a `Move` into `[local]` where the local is a `T&` to `stobj T` for value-type and generic-parameter pointees (previously only reference types via `stind.ref`), gated on the source's emitted type satisfying the pointee contract (`TryResolveSlotLoad`, extracted from `LoadOperandIntoSlot`) — unsatisfiable or partial (indexed/offset) stores keep the explicit `Unsupported managed-pointer store` diagnostic instead of a synthetic default | `Regression/ManagedPointerStoreTests.*` (3 tests), `ByRefStoreTests.OnlyExactReferenceByrefStoreDereferencesDestination` (int case) |
 | castle-recovery#80 `compiler-generated-name` (compile bucket) | IL emission | `SzArrayTypeAnalysisContext`/`ArrayTypeAnalysisContext` report `System.Array` as `DefaultBaseType` (kills the spurious `castclass` that broke ilspy's `InitializeArray(array, __ldtoken(field))` fold), and a `Move` storing a method pointer into a local that no instruction ever loads drops out as a dead store (it emitted a standalone instance `ldftn` — valid CIL, no C# spelling, prints as `__ldftn`); live destinations keep the `ldftn` | `Regression/CompilerGeneratedNameTests.*` (4 tests) |
+| castle-recovery#88 `interface-return-type-mismatch` (compile bucket) | metadata emission | `MethodAnalysisContext.GetOverrides` also recovers `.override` rows for explicit implementations declared on an interface itself (default interface implementations) — il2cpp stores no vtable or interface offsets for interface typedefs, so the compiled member name (`Ns.IFace<T>.Member`) is matched against the transitive interface closure by source-style name, arity and signature; matches on generic instantiations are wrapped in `ConcreteGenericMethodAnalysisContext` so the MethodImpl row carries the right instantiated signature | `Regression/InterfaceDeclaredExplicitImplementationTests.*` (4 tests) |
 
 ## Summary
 
 - **84 fork PRs** merged since `b5ad444b` (#1–#79, #81–#85; no #80), plus the
   castle-recovery#NN issue rows.
 - **2 are not live recovery fixes**: #26 (reverted by #27) and #85 (CI only).
-- **88 recovery-fix clusters.** **86** carry reproducing tests (tests added or
+- **89 recovery-fix clusters.** **87** carry reproducing tests (tests added or
   strengthened in the same PR): the 80 through the backfill wave (#16 + #47,
   #38, #40, #41, #57, #58), castle-recovery#74's `UnboxEmissionTests.*`,
   castle-recovery#75's `Arm64VectorLaneLiftingTests.*`,
   castle-recovery#76's `SynthesizedMemberEvidenceTests.*`,
   castle-recovery#79's `DecompilerMemberAccessTests.*`,
-  castle-recovery#80's `CompilerGeneratedNameTests.*`, and
-  castle-recovery#86's `ManagedPointerStoreTests.*`.
+  castle-recovery#80's `CompilerGeneratedNameTests.*`,
+  castle-recovery#86's `ManagedPointerStoreTests.*`, and
+  castle-recovery#88's `InterfaceDeclaredExplicitImplementationTests.*`.
 - **2 remain `none`**, both compile-only fixes: #15 (`IReadOnlySet` on
   netstandard2.0) and #20 (`AddOperands` signature fix, exercised downstream by
   `Arm64LibcMathImportTests`).
