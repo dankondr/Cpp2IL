@@ -56,7 +56,8 @@ public static class InternalCallGuardRemover
         if (name == null || KeyFunctionRecovery.ResolveInternalCallName(method.AppContext, name) is not { DeclaringType.DeclaringAssembly: { } assembly } resolved)
             return false;
 
-        var pointer = new RuntimeMethodInfoAnalysisContext(resolved, assembly);
+        // il2cpp_resolve_icall returns an Il2CppMethodPointer (the code entry), not a MethodInfo*.
+        var pointer = new RuntimeMethodInfoAnalysisContext(resolved, assembly) { IsCodePointer = true };
 
         if (resolveBlock.Predecessors.Count != 1)
             return RewriteInPlace(cfg, resolve, pointer);

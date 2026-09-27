@@ -3782,7 +3782,12 @@ public static class IlGenerator
                 // unnameable __ldftn/__ldtoken pseudo-call. For those the same
                 // handle value comes from reflection:
                 // typeof(D).GetMethod("M", ...).MethodHandle, plus
-                // .Value when the slot wants an IntPtr.
+                // .Value when the slot wants an IntPtr. Under IL2CPP
+                // RuntimeMethodHandle.Value is the MethodInfo* itself, which is
+                // exactly what a MethodInfo*-carrying operand loaded; an
+                // IsCodePointer operand instead loaded the code entry pointer
+                // (an il2cpp_resolve_icall result) that no spellable member
+                // reproduces, so the emission carries a decompiler-issue note.
                 // .ctor/.cctor cannot be named by either emission, so they keep
                 // the verifier-legal native-int zero placeholder rather than
                 // fabricating a handle for them.
@@ -3791,14 +3796,19 @@ public static class IlGenerator
                     && expectedType?.FullName is "System.IntPtr" or "System.RuntimeMethodHandle")
                 {
                     var wantsPointer = expectedType.FullName == "System.IntPtr";
-                    if (wantsPointer && LdftnSpellable(represented))
-                    {
+                    var emittedPointer = wantsPointer && LdftnSpellable(represented);
+                    if (emittedPointer)
                         instructions.Add(CilOpCodes.Ldftn, represented.ToMethodDescriptor());
+                    else
+                        emittedPointer = TryEmitMethodPointerReflection(represented,
+                            callingContext, method, instructions, wantsPointer);
+                    if (emittedPointer)
+                    {
+                        if (runtimeMethod.IsCodePointer)
+                            EmitDecompilerNote(method, callingContext,
+                                $"the loaded value is the code entry pointer for {represented.FullName} (an il2cpp_resolve_icall result); the emitted expression is the method's handle, which no spellable member resolves back to the entry point.");
                         break;
                     }
-                    if (TryEmitMethodPointerReflection(represented, callingContext, method,
-                            instructions, wantsPointer))
-                        break;
                 }
 
                 //Not fully implemented, these basically shouldn't actually ever exist in the final IL.

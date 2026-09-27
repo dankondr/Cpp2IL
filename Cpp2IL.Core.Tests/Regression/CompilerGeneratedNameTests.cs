@@ -203,6 +203,66 @@ public class CompilerGeneratedNameTests
             Assert.That(calledNames, Has.Member("get_MethodHandle"));
             Assert.That(calledNames, Has.Member("get_Value"),
                 "the IntPtr slot takes the wrapped pointer via RuntimeMethodHandle.Value");
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                && i.Operand?.ToString()?.Contains("code entry pointer") == true), Is.False,
+                "a MethodInfo* load is exactly RuntimeMethodHandle.Value - no decompiler-issue note");
+        });
+    }
+
+    [Test]
+    public void CodePointerMethodPointerStoreEmitsLookupWithDecompilerNote()
+    {
+        // An il2cpp_resolve_icall result is a code entry pointer, not the
+        // MethodInfo* the handle wraps; the closest spellable value still
+        // approximates, so the method carries a decompiler-issue note.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.AssembliesByName["UnityEngine.CoreModule"];
+        var widget = new InjectedTypeAnalysisContext(assembly, "Tests", "Widget",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var target = widget.InjectMethodContext("OnEvent", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public);
+        var methodInfo = new RuntimeMethodInfoAnalysisContext(target, assembly)
+            { IsCodePointer = true };
+        var slot = new LocalVariable("slot", new Register(null, "slot"))
+            { Type = app.SystemTypes.SystemIntPtrType };
+        var readBack = new LocalVariable("readBack", new Register(null, "readBack"))
+            { Type = app.SystemTypes.SystemIntPtrType };
+
+        var module = new ModuleDefinition("CodePtrFn.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemIntPtrType,
+            app.SystemTypes.SystemVoidType, app.SystemTypes.SystemObjectType);
+        var widgetDefinition = new TypeDefinition("Tests", "Widget",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(widgetDefinition);
+        widget.PutExtraData("AsmResolverType", widgetDefinition);
+        var targetDefinition = new MethodDefinition("OnEvent", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        widgetDefinition.Methods.Add(targetDefinition);
+        target.PutExtraData("AsmResolverMethod", targetDefinition);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, slot, methodInfo),
+            new(1, OpCode.Move, readBack, slot),
+            new(2, OpCode.Return)], [slot, readBack]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        var calledNames = il.Where(i => i.OpCode == CilOpCodes.Call || i.OpCode == CilOpCodes.Callvirt)
+            .Select(i => (i.Operand as IMethodDescriptor)?.Name?.ToString())
+            .ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldftn), Is.False,
+                () => "an instance-method ldftn has no C# spelling (__ldftn):\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(calledNames, Has.Member("GetMethod"));
+            Assert.That(calledNames, Has.Member("get_MethodHandle"));
+            Assert.That(calledNames, Has.Member("get_Value"));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                && i.Operand?.ToString()?.Contains("code entry pointer") == true), Is.True,
+                "a code-pointer load keeps the method marked incomplete via a decompiler-issue note");
         });
     }
 

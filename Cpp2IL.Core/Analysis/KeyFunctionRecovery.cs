@@ -937,7 +937,8 @@ public static class KeyFunctionRecovery
         if (ResolveInternalCallName(method.AppContext, name) is not { DeclaringType.DeclaringAssembly: { } assembly } resolved)
             return;
 
-        var pointer = new RuntimeMethodInfoAnalysisContext(resolved, assembly);
+        // il2cpp_resolve_icall returns an Il2CppMethodPointer (the code entry), not a MethodInfo*.
+        var pointer = new RuntimeMethodInfoAnalysisContext(resolved, assembly) { IsCodePointer = true };
 
         instruction.OpCode = OpCode.Move;
         instruction.SetOperands(result, pointer);
