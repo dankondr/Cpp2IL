@@ -300,6 +300,21 @@ public static class AsmResolverAssemblyPopulator
         if (accessor.IsAbstract)
             return accessor;
 
+        // On a generic declaring type the field operand must be the type's own
+        // generic instance (a TypeSpec `C<T>`), not the bare typedef — that is
+        // the shape the compiler emits and the only one the verifier accepts.
+        IFieldDescriptor fieldOperand = backingField;
+        if (declaringType.GenericParameters.Count > 0)
+        {
+            var selfInstance = new GenericInstanceTypeSignature(
+                declaringType, declaringType.IsValueType,
+                declaringType.GenericParameters
+                    .Select((_, i) => (TypeSignature)new GenericParameterSignature(GenericParameterType.Type, i))
+                    .ToArray());
+            fieldOperand = new MemberReference(
+                new TypeSpecification(selfInstance), backingField.Name, backingField.Signature);
+        }
+
         var body = new CilMethodBody();
         var instructions = body.Instructions;
         if (property.Signature.HasThis)
@@ -307,13 +322,13 @@ public static class AsmResolverAssemblyPopulator
             instructions.Add(CilOpCodes.Ldarg_0);
             if (!isGetter)
                 instructions.Add(CilOpCodes.Ldarg_1);
-            instructions.Add(isGetter ? CilOpCodes.Ldfld : CilOpCodes.Stfld, backingField);
+            instructions.Add(isGetter ? CilOpCodes.Ldfld : CilOpCodes.Stfld, fieldOperand);
         }
         else
         {
             if (!isGetter)
                 instructions.Add(CilOpCodes.Ldarg_0);
-            instructions.Add(isGetter ? CilOpCodes.Ldsfld : CilOpCodes.Stsfld, backingField);
+            instructions.Add(isGetter ? CilOpCodes.Ldsfld : CilOpCodes.Stsfld, fieldOperand);
         }
         instructions.Add(CilOpCodes.Ret);
         accessor.CilMethodBody = body;

@@ -1,7 +1,10 @@
 using System.Linq;
 using AsmResolver.DotNet;
+using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
+using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.OutputFormats;
+using LibCpp2IL.BinaryStructures;
 using NUnit.Framework;
 using R = System.Reflection;
 
@@ -227,6 +230,48 @@ public class SetterOnlyAutoPropertyTests
                     && mi.Declaration?.Name?.ToString() == "set_Value"),
                 Is.True,
                 "the surviving setter must keep its interface implementation row");
+        });
+    }
+
+    // On a generic declaring type the compiler emits `ldfld` against the
+    // type's own generic instance (a TypeSpec), never the bare typedef; any
+    // other operand is invalid IL.
+    [Test]
+    public void RestoredGetterOnGenericTypeReferencesSelfInstance()
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2022Game();
+        var assembly = app.AssembliesByName["UnityEngine.CoreModule"];
+
+        var holder = assembly.InjectType("Tests", "GenericHolder`1",
+            app.SystemTypes.SystemObjectType,
+            R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var paramT = new GenericParameterTypeAnalysisContext("T", 0,
+            Il2CppTypeEnum.IL2CPP_TYPE_VAR, 0, holder);
+        holder.GenericParameters.Add(paramT);
+        var backingField = holder.InjectFieldContext("<Value>k__BackingField",
+            paramT, R.FieldAttributes.Private);
+        var setter = holder.InjectMethodContext("set_Value",
+            app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public | R.MethodAttributes.HideBySig | R.MethodAttributes.SpecialName,
+            paramT);
+        holder.InjectPropertyContext("Value", paramT, null, setter,
+            R.PropertyAttributes.None);
+
+        var assemblies = new AsmResolverDllOutputFormatEmpty().BuildAssemblies(app);
+        var module = assemblies.First(a => a.Name == assembly.Name.ToString()).ManifestModule!;
+
+        var emittedType = module.GetAllTypes().First(t => t.FullName == "Tests.GenericHolder`1");
+        var getter = emittedType.Methods.FirstOrDefault(m => m.Name == "get_Value");
+        Assert.That(getter, Is.Not.Null);
+
+        var ldfld = getter!.CilMethodBody!.Instructions.Single(i => i.OpCode == CilOpCodes.Ldfld);
+        Assert.Multiple(() =>
+        {
+            Assert.That(ldfld.Operand, Is.InstanceOf<MemberReference>());
+            var declaringType = ((MemberReference)ldfld.Operand!).DeclaringType;
+            Assert.That(declaringType, Is.InstanceOf<TypeSpecification>()
+                .With.Property("Signature").InstanceOf<GenericInstanceTypeSignature>());
         });
     }
 }
