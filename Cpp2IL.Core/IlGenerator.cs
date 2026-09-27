@@ -133,6 +133,14 @@ public static class IlGenerator
                 context.Locals.Add(local);
         }
 
+        // A Move into [fp - N] or [stack_N + K] writes a frame slot the lifter
+        // left as a raw memory operand instead of a local. Synthesize one local
+        // per touched slot before the locals signature is emitted so those
+        // stores can be a real stloc; stores whose source does not agree with
+        // the slot's type or recorded width still get the store diagnostic.
+        var frameSlotLocals = CollectFrameSlotLocals(context);
+        context.Locals.AddRange(frameSlotLocals.Values);
+
         // Map ISIL locals to IL. The declared type joins the method body's locals
         // signature, so a local whose recovered type cannot be named here is
         // declared as the closest verifier-legal placeholder instead.
@@ -192,7 +200,7 @@ public static class IlGenerator
 
             foreach (var instruction in block.Instructions)
             {
-                var generated = GenerateInstructions(instruction, context, definition, locals, writeLine, constructorPairs, thisConstructorCalls);
+                var generated = GenerateInstructions(instruction, context, definition, locals, writeLine, constructorPairs, thisConstructorCalls, frameSlotLocals);
                 instructionMap.Add(instruction, generated);
 
                 if (!blockEntryMap.ContainsKey(block) && generated.Count > 0)
@@ -421,7 +429,8 @@ public static class IlGenerator
 
     private static List<CilInstruction> GenerateInstructions(Instruction instruction, MethodAnalysisContext context,
         MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
-        IReadOnlyDictionary<Instruction, Instruction> constructorPairs, ThisConstructorCallPlan? thisConstructorCalls)
+        IReadOnlyDictionary<Instruction, Instruction> constructorPairs, ThisConstructorCallPlan? thisConstructorCalls,
+        IReadOnlyDictionary<(bool StackRelative, long Offset), LocalVariable> frameSlotLocals)
     {
         var body = method.CilMethodBody!;
         var instructions = body.Instructions;
@@ -482,7 +491,18 @@ public static class IlGenerator
                     break;
                 }
 
-                if (instruction.Operands[0] is FieldReference field) // stfld takes instance before value so LoadOperand StoreToOperand doesn't work
+                // stfld takes instance before value so LoadOperand StoreToOperand doesn't
+                // work. The memory-operand arm recovers the field store the lifter
+                // expressed as a raw [base + offset] write instead of a FieldReference;
+                // unrecoverable forms still reach the drop diagnostic in StoreToOperand.
+                var storeField = instruction.Operands[0] switch
+                {
+                    FieldReference directField => directField,
+                    MemoryOperand storeOperand when TryRecoverFieldStore(storeOperand,
+                        instruction.Operands[1], context, out var recovered) => recovered,
+                    _ => null,
+                };
+                if (storeField is { } field)
                 {
                     if (WholeValueContainerReference(field,
                             EmittedOperandType(instruction.Operands[1], context)) is { } wholeValue
@@ -548,6 +568,21 @@ public static class IlGenerator
                     instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
                         field.Field.IsStatic ? field.Field.ToFieldDescriptor()
                             : FieldDescriptorFor(field.Field, FieldReceiverType(field, context)));
+                    break;
+                }
+
+                // A frame-slot store (frame pointer or stack slot base, nonzero offset)
+                // resolves to the synthesized local for that slot. StoreToOperand can
+                // only diagnose it, so emit the stloc here where the source operand is
+                // still in scope for the slot-type check.
+                if (instruction.Operands[0] is MemoryOperand frameStore
+                    && FrameSlotKey(frameStore, context) is { } frameKey
+                    && frameSlotLocals.TryGetValue(frameKey, out var frameSlot)
+                    && FrameSlotStoreAgrees(frameStore, instruction.Operands[1], frameSlot, context))
+                {
+                    LoadOperandIntoSlot(instruction.Operands[1], frameSlot.Type, context, method,
+                        locals, writeLine);
+                    instructions.Add(CilOpCodes.Stloc, locals[frameSlot]);
                     break;
                 }
 
@@ -5770,6 +5805,159 @@ public static class IlGenerator
             return TypeTokenUsableFrom(referent, context)
                 && TryResolveSlotLoad(source, referent, context, false, out _, out _);
         return store.AccessSize == context.AppContext.Binary.PointerSizeBytes;
+    }
+
+    // A [base + addend] store the lifter left as a raw memory operand is a
+    // field store when the base local carries - or its definitions infer - a
+    // managed type and the addend names an instance field on it
+    // (FindInstanceFieldAtOffset walks the base-type chain and concrete
+    // generic layouts). Unbound frame slots with no type evidence, indexed or
+    // scaled forms, absolute addresses, and offsets that hit no field keep
+    // the explicit drop diagnostic.
+    private static bool TryRecoverFieldStore(MemoryOperand memory, IOperand source,
+        MethodAnalysisContext context, out FieldReference field)
+    {
+        field = null!;
+        if (memory.Index != null || memory.Scale != 0 || memory.Base is not LocalVariable local)
+            return false;
+
+        var systemObject = context.AppContext.SystemTypes.SystemObjectType;
+        var declared = local.Type is ByRefTypeAnalysisContext { ElementType: { } referent }
+            && referent is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext)
+            ? referent
+            : local.Type;
+        var owner = declared != null && declared != systemObject
+            ? declared
+            : CallDefinedLocalType(local, context) ?? ObjectDefinitionType(local, context);
+        if (owner == null || owner == systemObject
+            || owner is SzArrayTypeAnalysisContext or GenericParameterTypeAnalysisContext
+                or PointerTypeAnalysisContext
+            || Analysis.MetadataResolver.FindInstanceFieldPathAtOffset(owner, memory.Addend,
+                memory.AccessSize) is not { } found
+            || found.Containers.Count == 0 && !FieldStoreWidthMatches(memory, found.Field, context))
+            return false;
+
+        var resolved = found.Field;
+        if (owner is GenericInstanceTypeAnalysisContext genericOwner)
+            resolved = new ConcreteGenericFieldAnalysisContext(resolved, genericOwner);
+        field = new FieldReference(resolved, local, (int)memory.Addend, found.Containers,
+            memory.AccessSize);
+        return FieldReferenceUsableFrom(field, context, writeAccess: true)
+            && TryResolveSlotLoad(source, field.Field.FieldType, context, false, out _, out _);
+    }
+
+    // Frame-pointer- and stack-slot-relative stores ([x29 - N], [stack_N + K])
+    // write a native frame slot the lifter never promoted to a local. Each
+    // distinct slot gets one synthesized local typed by the first store that
+    // can name a concrete type; stores whose source cannot resolve into that
+    // type (or a later store of a different type) keep the diagnostic, since a
+    // coerced value would not round-trip through a differently-typed slot.
+    private static IReadOnlyDictionary<(bool StackRelative, long Offset), LocalVariable>
+        CollectFrameSlotLocals(MethodAnalysisContext context)
+    {
+        Dictionary<(bool StackRelative, long Offset), LocalVariable> slots = [];
+        var pointerSize = context.AppContext.Binary.PointerSizeBytes;
+        foreach (var instruction in context.ControlFlowGraph!.Instructions)
+        {
+            if (instruction.OpCode != OpCode.Move || instruction.Operands.Count != 2
+                || instruction.Operands[0] is not MemoryOperand memory
+                || FrameSlotKey(memory, context) is not { } key)
+                continue;
+
+            var sourceType = FrameSlotSourceType(instruction.Operands[1], context);
+            if (sourceType == null || !FrameSlotWidthMatches(memory, sourceType, pointerSize))
+                continue;
+
+            if (!slots.ContainsKey(key))
+            {
+                var name = key.StackRelative
+                    ? $"frame_sp_{key.Offset:X}"
+                    : $"frame_fp_{(key.Offset < 0 ? "-" : "")}{System.Math.Abs(key.Offset):X}";
+                slots[key] = new LocalVariable(name, new Register(null, name), sourceType);
+            }
+        }
+        return slots;
+    }
+
+    private static (bool StackRelative, long Offset)? FrameSlotKey(MemoryOperand memory,
+        MethodAnalysisContext context)
+    {
+        if (memory.Index != null || memory.Scale != 0 || memory.Addend == 0
+            || memory.Base is not LocalVariable baseLocal
+            || baseLocal.Type is { } baseType
+                && baseType != context.AppContext.SystemTypes.SystemObjectType)
+            return null;
+
+        var name = baseLocal.Register.Name;
+        if (name.StartsWith("X29", System.StringComparison.Ordinal))
+            return (false, memory.Addend);
+        if (TryParseStackSlotOffset(name) is { } stackOffset)
+            return (true, stackOffset + memory.Addend);
+        return null;
+    }
+
+    private static long? TryParseStackSlotOffset(string registerName)
+    {
+        const string Prefix = "stack_";
+        if (!registerName.StartsWith(Prefix, System.StringComparison.Ordinal))
+            return null;
+        var digits = registerName[Prefix.Length..];
+        var negative = digits.StartsWith("-", System.StringComparison.Ordinal);
+        if (negative)
+            digits = digits[1..];
+        return long.TryParse(digits, System.Globalization.NumberStyles.HexNumber,
+            System.Globalization.CultureInfo.InvariantCulture, out var value)
+            ? negative ? -value : value
+            : null;
+    }
+
+    private static TypeAnalysisContext? FrameSlotSourceType(IOperand source,
+        MethodAnalysisContext context)
+    {
+        var type = EmittedOperandType(source, context);
+        if (type == null)
+            return null;
+        return EmittableLocalType(IsNativeHandleType(type)
+                ? context.AppContext.SystemTypes.SystemIntPtrType
+                : type,
+            context);
+    }
+
+    private static bool FrameSlotStoreAgrees(MemoryOperand memory, IOperand source,
+        LocalVariable slot, MethodAnalysisContext context)
+    {
+        if (!FrameSlotWidthMatches(memory, slot.Type!, context.AppContext.Binary.PointerSizeBytes))
+            return false;
+        // A bare immediate has no inherent emitted type; it resolves through the
+        // slot's type contract. Every other source must already emit the slot's
+        // own type: a coerced value would not round-trip through the slot.
+        if (source is Immediate)
+            return TryResolveSlotLoad(source, slot.Type, context, false, out _, out _);
+        return FrameSlotSourceType(source, context) is { } sourceType
+            && ThisConstructorCallPlan.SameTypeIdentity(sourceType, slot.Type);
+    }
+
+    private static bool FrameSlotWidthMatches(MemoryOperand memory, TypeAnalysisContext slotType,
+        int pointerSize)
+    {
+        // AccessSize 0 is a SIMD-family store (str s/d/q or vector pairs): the
+        // source's emitted type is the stored width, so only a value-typed slot
+        // models it exactly.
+        if (memory.AccessSize == 0)
+            return slotType.IsValueType;
+        return TypeSizes.MinimumUnboxedSize(slotType, pointerSize) == memory.AccessSize;
+    }
+
+    // stfld stores the whole field, so it is honest only when the width the
+    // native store recorded covers the field exactly. Width-0 stores are
+    // 16-byte vector spills, so they match only fields of exactly that size;
+    // a narrower target would be clobbered and a wider one only partly
+    // written.
+    private static bool FieldStoreWidthMatches(MemoryOperand memory, FieldAnalysisContext field,
+        MethodAnalysisContext context)
+    {
+        var size = TypeSizes.MinimumUnboxedSize(field.FieldType, context.AppContext.Binary.PointerSizeBytes);
+        return memory.AccessSize == 0 ? size == 16 : size == memory.AccessSize;
     }
 
     private static FieldReference? NestedValueFieldForContract(FieldReference field,
