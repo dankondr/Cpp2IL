@@ -1929,6 +1929,23 @@ public static class IlGenerator
                     hoisted.PrologueCalls.Add((calls[0].Callee, initArguments));
                     return hoisted;
                 }
+
+                // A legal base-`this` call can still sit mid-body when one of its
+                // argument operands is only readable where the call stands - for
+                // example a field of a closure local the body populated just above
+                // the call. When the single dominating store into that field is a
+                // parameter or constant, the operand forwards to the stored value
+                // and the call can run in the initializer position.
+                if (calls.Count == 1 && hasLegalInitialization
+                    && context.ControlFlowGraph.FindBlockByInstruction(calls[0].Instruction) is { } legalCallBlock
+                    && ForwardedPrologueArguments(calls[0].Instruction, calls[0].Callee, legalCallBlock, context) is { } forwardedArguments
+                    && SafeToHoistBefore(calls[0].Instruction, legalCallBlock, context, forwardedArguments))
+                {
+                    var hoisted = new ThisConstructorCallPlan();
+                    hoisted.Skip.Add(calls[0].Instruction);
+                    hoisted.PrologueCalls.Add((calls[0].Callee, forwardedArguments));
+                    return hoisted;
+                }
                 return null;
             }
 
@@ -2013,6 +2030,25 @@ public static class IlGenerator
                 return plan;
             }
 
+            // IL2CPP inlines the base .ctor into the derived body: the surviving
+            // distant-ancestor call keeps only `this`, and the callee's own
+            // `this.F = parameter` stores trail right behind it. Matching that
+            // store trail against each accessible base .ctor's own parameter-fed
+            // stores identifies the inlined callee and recovers its arguments.
+            // Trail stores consumed as call arguments drop out - the emitted
+            // base call performs the write; ones that do not resolve stay and the
+            // parameter slot gets the same diagnosed default an in-place call
+            // would have materialized.
+            if (resolved.Count == 1
+                && RecoveredPrologueCall(resolved[0].Instruction, immediateBase, context) is { } recovered)
+            {
+                plan.Skip.Add(resolved[0].Instruction);
+                foreach (var consumed in recovered.ConsumedStores)
+                    plan.Skip.Add(consumed);
+                plan.PrologueCalls.Add((recovered.Constructor, recovered.Arguments));
+                return plan;
+            }
+
             foreach (var (instruction, method) in resolved)
                 plan.Retarget[instruction] = method;
             return plan;
@@ -2034,6 +2070,338 @@ public static class IlGenerator
                     _ => null,
                 }).ToArray();
             return allowDefaults || arguments.All(a => a != null) ? arguments : null;
+        }
+
+        // Same contract as PrologueArguments, but each operand is normalized
+        // through PrologueOperand so a field read can forward to the entry-live
+        // value its dominating store placed there. Strict: every parameter must
+        // resolve, there is no defaulting.
+        private static IOperand?[]? ForwardedPrologueArguments(Instruction call,
+            MethodAnalysisContext callee, Block callBlock, MethodAnalysisContext context)
+        {
+            var receiver = ConstructorReceiverIndex(call);
+            if (call.Operands.Count < receiver + 1 + callee.Parameters.Count)
+                return null;
+
+            var arguments = new IOperand?[callee.Parameters.Count];
+            for (var i = 0; i < arguments.Length; i++)
+            {
+                if (PrologueOperand(call.Operands[receiver + 1 + i], call, callBlock, context) is { } argument)
+                    arguments[i] = argument;
+                else
+                    return null;
+            }
+            return arguments;
+        }
+
+        // An operand usable in the constructor-initializer position: parameters,
+        // constants and type operands are live at entry; a field read forwards to
+        // the operand its last dominating store in the call's block placed there
+        // when that source is itself prologue-safe. Anything else stays unreadable
+        // at entry and the caller decides between a diagnosed default and keeping
+        // the call in place.
+        private static IOperand? PrologueOperand(IOperand operand, Instruction call, Block callBlock,
+            MethodAnalysisContext context, int depth = 0)
+        {
+            var thisLocal = context.ParameterLocals.FirstOrDefault();
+            return operand switch
+            {
+                Immediate or StringLiteral or FloatLiteral or DoubleLiteral or TypeAnalysisContext => operand,
+                LocalVariable { IsThis: false, IsMethodInfo: false } local
+                    when context.ParameterLocals.Contains(local) => operand,
+                FieldReference { Local: { } holder } field
+                    when depth < 4 && !IsThisLocal(holder, thisLocal)
+                        && ForwardedStoreSource(field, call, callBlock) is { } source
+                    => PrologueOperand(source, call, callBlock, context, depth + 1),
+                _ => null,
+            };
+        }
+
+        // The value a field read provably holds: the source operand of the last
+        // store into that field within the call's block. Any other write to the
+        // holder (or to the probed field by a non-Move) invalidates it.
+        private static IOperand? ForwardedStoreSource(FieldReference read, Instruction call, Block callBlock)
+        {
+            Instruction? store = null;
+            foreach (var instruction in callBlock.Instructions)
+            {
+                if (ReferenceEquals(instruction, call))
+                    break;
+
+                switch (instruction.OpCode == OpCode.Move ? instruction.Operands[0] : instruction.Destination)
+                {
+                    case FieldReference destination
+                        when ReferenceEquals(destination.Local, read.Local)
+                            && SameFieldIdentity(destination.Field, read.Field)
+                            && destination.Containers.Count == read.Containers.Count:
+                        store = instruction.OpCode == OpCode.Move ? instruction : null;
+                        break;
+                    case LocalVariable holder
+                        when ReferenceEquals(holder, read.Local):
+                    case MemoryOperand { Base: LocalVariable memoryHolder }
+                        when ReferenceEquals(memoryHolder, read.Local):
+                        store = null;
+                        break;
+                }
+            }
+            return store?.Operands[1];
+        }
+
+        // The contiguous run of `this.F = v` stores immediately after a call is
+        // the tail of an inlined constructor body: the callee's `this` writes
+        // were emitted inline behind the surviving call. The run may straddle
+        // blocks (the CFG splits on call boundaries) so it continues through
+        // the linear single-predecessor chain, stopping at the first
+        // instruction that is not a `this` store, Nop or the linking Jump.
+        private static List<(FieldAnalysisContext Field, IOperand Source, Instruction Instruction)> InlinedFieldStores(
+            Instruction call, Block callBlock, LocalVariable? thisLocal)
+        {
+            var stores = new List<(FieldAnalysisContext, IOperand, Instruction)>();
+            var visited = new HashSet<Block>();
+            Block? block = callBlock;
+            var index = callBlock.Instructions.IndexOf(call) + 1;
+            while (block != null && visited.Add(block))
+            {
+                var instructions = block.Instructions;
+                var advanced = false;
+                for (; index < instructions.Count; index++)
+                {
+                    var instruction = instructions[index];
+                    if (instruction.OpCode == OpCode.Nop)
+                        continue;
+                    if (instruction.OpCode == OpCode.Move
+                        && instruction.Operands.Count >= 2
+                        && instruction.Operands[0] is FieldReference { Local: { } holder } destination
+                        && IsThisLocal(holder, thisLocal))
+                    {
+                        stores.Add((destination.Field, instruction.Operands[1], instruction));
+                        continue;
+                    }
+                    if (instruction.OpCode == OpCode.Jump)
+                    {
+                        advanced = true;
+                        break;
+                    }
+                    return stores;
+                }
+                if (!advanced && index < instructions.Count)
+                    return stores;
+                if (block.Successors.Count != 1 || block.Successors[0].Predecessors.Count != 1)
+                    return stores;
+                block = block.Successors[0];
+                index = 0;
+            }
+            return stores;
+        }
+
+        // The .ctor's own `this.F = parameter_i` stores - the signature its inlined
+        // body leaves in a derived method. Null when the body cannot be read.
+        private static Dictionary<FieldAnalysisContext, int>? ParameterFieldStores(
+            MethodAnalysisContext constructor)
+        {
+            var instructions = constructor.ControlFlowGraph?.Instructions ?? constructor.ConvertedIsil;
+            if (instructions == null)
+            {
+                try { constructor.Analyze(); }
+                catch { return null; }
+                instructions = constructor.ControlFlowGraph?.Instructions ?? constructor.ConvertedIsil;
+            }
+            if (instructions == null)
+                return null;
+
+            var thisLocal = constructor.ParameterLocals.FirstOrDefault();
+            var stores = new Dictionary<FieldAnalysisContext, int>(FieldIdentityComparer.Instance);
+            foreach (var instruction in instructions)
+            {
+                if (instruction.OpCode != OpCode.Move
+                    || instruction.Operands.Count < 2
+                    || instruction.Operands[0] is not FieldReference { Local: { } holder } destination
+                    || !IsThisLocal(holder, thisLocal)
+                    || instruction.Operands[1] is not LocalVariable source)
+                    continue;
+                var parameterIndex = constructor.ParameterLocals.IndexOf(source);
+                if (parameterIndex >= 1)
+                    stores[destination.Field] = parameterIndex - 1;
+            }
+            return stores;
+        }
+
+        // Picks the immediate-base .ctor whose own parameter-feeding stores are all
+        // reproduced by the store trail behind the call - that is the callee the
+        // inlining erased - and rebuilds its argument list from the trail (or from
+        // operands the surviving call still carries). Candidates with a larger
+        // evidenced-parameter set win; unevidenced parameters keep their diagnosed
+        // defaults. Returns null when the best candidate is ambiguous or the call
+        // cannot move without reordering observable `this` state.
+        private static (MethodAnalysisContext Constructor, IOperand?[] Arguments, List<Instruction> ConsumedStores)?
+            RecoveredPrologueCall(Instruction call, TypeAnalysisContext immediateBase, MethodAnalysisContext context)
+        {
+            if (context.ControlFlowGraph?.FindBlockByInstruction(call) is not { } callBlock)
+                return null;
+            var trail = InlinedFieldStores(call, callBlock, context.ParameterLocals.FirstOrDefault());
+            if (trail.Count == 0)
+                return null;
+
+            var genericInstance = immediateBase as GenericInstanceTypeAnalysisContext;
+            var definition = genericInstance?.GenericType ?? immediateBase;
+            var receiver = ConstructorReceiverIndex(call);
+
+            (MethodAnalysisContext Constructor, IOperand?[] Arguments, List<Instruction> ConsumedStores)? best = null;
+            var bestMapped = -1;
+            var bestUnmapped = int.MaxValue;
+            var bestArity = int.MaxValue;
+            var ambiguous = false;
+            foreach (var candidate in definition.Methods)
+            {
+                if (candidate is not { IsStatic: false, Name: ".ctor" } || ReferenceEquals(candidate, context))
+                    continue;
+                var concrete = genericInstance != null
+                    ? new ConcreteGenericMethodAnalysisContext(candidate, genericInstance.GenericArguments, [])
+                    : candidate;
+                if (!IsAccessibleBaseConstructor(concrete, context)
+                    || !CalleeUsableFrom(concrete, context))
+                    continue;
+
+                var parameterStores = ParameterFieldStores(concrete);
+                if (parameterStores == null
+                    || parameterStores.Keys.Any(field => !trail.Any(s => SameFieldIdentity(s.Field, field))))
+                    continue;
+                var parameterField = new FieldAnalysisContext?[concrete.Parameters.Count];
+                foreach (var (field, index) in parameterStores)
+                    if (index < parameterField.Length)
+                        parameterField[index] = field;
+
+                var arguments = new IOperand?[concrete.Parameters.Count];
+                var consumed = new List<Instruction>();
+                var mapped = 0;
+                var unmapped = 0;
+                for (var i = 0; i < arguments.Length; i++)
+                {
+                    if (receiver + 1 + i < call.Operands.Count
+                        && PrologueOperand(call.Operands[receiver + 1 + i], call, callBlock, context) is { } carried)
+                    {
+                        arguments[i] = carried;
+                        mapped++;
+                    }
+                    else if (parameterField[i] is { } field
+                        && trail.FirstOrDefault(s => SameFieldIdentity(s.Field, field)) is { Field: not null } store
+                        && PrologueOperand(store.Source, call, callBlock, context) is { } stored)
+                    {
+                        arguments[i] = stored;
+                        consumed.Add(store.Instruction);
+                        mapped++;
+                    }
+                    else
+                        unmapped++;
+                }
+
+                if (mapped < bestMapped
+                    || (mapped == bestMapped && unmapped > bestUnmapped)
+                    || (mapped == bestMapped && unmapped == bestUnmapped && arguments.Length >= bestArity))
+                {
+                    if (mapped == bestMapped && unmapped == bestUnmapped && arguments.Length == bestArity)
+                        ambiguous = true;
+                    continue;
+                }
+                ambiguous = false;
+                best = (concrete, arguments, consumed);
+                bestMapped = mapped;
+                bestUnmapped = unmapped;
+                bestArity = arguments.Length;
+            }
+
+            if (ambiguous || best == null
+                || !SafeToHoistBefore(call, callBlock, context, best.Value.Arguments))
+            {
+                return null;
+            }
+            return best;
+        }
+
+        // Instructions the lifted body runs before the call may not slide behind a
+        // hoisted initializer: nothing before the call may write `this` or its
+        // fields (the base call would overwrite the store), read `this` state
+        // (it would observe initialized fields where the lifted code saw none), or
+        // rewrite a local a recovered argument reads.
+        private static bool SafeToHoistBefore(Instruction call, Block callBlock, MethodAnalysisContext context,
+            IReadOnlyList<IOperand?> arguments)
+        {
+            var thisLocal = context.ParameterLocals.FirstOrDefault();
+            var argLocals = arguments.OfType<LocalVariable>().ToHashSet();
+
+            var blocks = context.DominatorInfo?.Dominators.TryGetValue(callBlock, out var dominating) == true
+                ? dominating
+                : [callBlock];
+            foreach (var block in blocks)
+            {
+                var limit = ReferenceEquals(block, callBlock)
+                    ? block.Instructions.IndexOf(call)
+                    : block.Instructions.Count;
+                for (var i = 0; i < limit; i++)
+                {
+                    var instruction = block.Instructions[i];
+                    if (instruction.OpCode == OpCode.Move)
+                    {
+                        // A `this` value copy (captured into a closure field or
+                        // local) reads the same object reference before and after
+                        // init - only writes into `this` or reads of its state are
+                        // order-sensitive. Any other opcode reading `this` stays a
+                        // hard stop: a call on `this` can observe field state.
+                        if (instruction.Operands[0] is { } moveTarget
+                            && (ReferencesThisState(moveTarget, thisLocal)
+                                || moveTarget is LocalVariable targetLocal
+                                    && argLocals.Contains(targetLocal)))
+                            return false;
+                        if (instruction.Operands.Skip(1).Any(operand => ReferencesThisField(operand, thisLocal)))
+                            return false;
+                        continue;
+                    }
+                    if (instruction.Destination is LocalVariable destination
+                        && (IsThisLocal(destination, thisLocal) || argLocals.Contains(destination)))
+                        return false;
+                    if (instruction.Operands.Any(operand => ReferencesThisState(operand, thisLocal)))
+                        return false;
+                }
+            }
+            return true;
+        }
+
+        // Field/state of `this` reads (a this-rooted field or memory access) but not
+        // the bare `this` reference: the object identity is the same value before
+        // and after the base call.
+        private static bool ReferencesThisField(IOperand operand, LocalVariable? thisLocal) =>
+            operand is not LocalVariable && ReferencesThisState(operand, thisLocal);
+
+        private static bool ReferencesThisState(IOperand operand, LocalVariable? thisLocal) => operand switch
+        {
+            LocalVariable local => IsThisLocal(local, thisLocal),
+            FieldReference field => ReferencesThisState(field.Local, thisLocal),
+            SelectedFieldReference selected => ReferencesThisState(selected.Selector, thisLocal)
+                || selected.Choices.Any(choice => ReferencesThisState(choice.Field, thisLocal)),
+            ArrayElementFieldReference element => ReferencesThisState(element.Array, thisLocal),
+            ArrayAccess access => ReferencesThisState(access.Array, thisLocal)
+                || (access.Index is { } index && ReferencesThisState(index, thisLocal)),
+            ArrayLength length => ReferencesThisState(length.Array, thisLocal),
+            MemoryOperand memory => (memory.Base != null && ReferencesThisState(memory.Base, thisLocal))
+                || (memory.Index != null && ReferencesThisState(memory.Index, thisLocal)),
+            AddressOf address => ReferencesThisState(address.Target, thisLocal),
+            ReferenceCast cast => ReferencesThisState(cast.Value, thisLocal),
+            _ => false,
+        };
+
+        private static bool IsThisLocal(LocalVariable local, LocalVariable? thisLocal) =>
+            local.IsThis || ReferenceEquals(local, thisLocal);
+
+        private static bool SameFieldIdentity(FieldAnalysisContext? a, FieldAnalysisContext? b) =>
+            a != null && b != null
+            && (ReferenceEquals(a, b)
+                || (a.Name == b.Name && SameTypeIdentity(a.DeclaringType, b.DeclaringType)));
+
+        private sealed class FieldIdentityComparer : IEqualityComparer<FieldAnalysisContext>
+        {
+            public static readonly FieldIdentityComparer Instance = new();
+            public bool Equals(FieldAnalysisContext? x, FieldAnalysisContext? y) => SameFieldIdentity(x, y);
+            public int GetHashCode(FieldAnalysisContext obj) => obj.Name.GetHashCode();
         }
 
         // A base-init call the verifier honours only covers the `ret`s its block
