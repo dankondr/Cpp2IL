@@ -46,7 +46,14 @@ internal static class RecoveryManifest
                 .ToArray() ?? [];
             var calls = body?.Instructions.Where(i => i.OpCode.Code is CilCode.Call or CilCode.Callvirt or CilCode.Newobj or CilCode.Ldftn or CilCode.Ldvirtftn or CilCode.Jmp)
                 .Select(i => i.Operand).OfType<IMethodDescriptor>().Select(c => c.FullName).Distinct().OrderBy(s => s, StringComparer.Ordinal).ToArray() ?? [];
-            evidence.TryGetValue(module.Name + ":" + m.FullName, out var native);
+            //Methods synthesized during emission (bare-allocation constructors,
+            //restored attribute accessors, framework-surface and string-blob
+            //helpers) never pass through the lifter, so they have no evidence
+            //entry: give them the injected-member status the manifest vocabulary
+            //already uses for pipeline-created bodies, with no address, instead
+            //of a null row.
+            if (!evidence.TryGetValue(module.Name + ":" + m.FullName, out var native))
+                native = new RecoveryNativeInfo(null, null, "injected-stub");
             return new RecoveryMethodInfo("0x" + m.MetadataToken.ToUInt32().ToString("x8"), m.FullName, native,
                 diagnostics, calls, body?.MaxStack, computed, failure, "unverified");
         }).ToArray();
