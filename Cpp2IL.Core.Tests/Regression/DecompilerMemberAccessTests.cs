@@ -221,8 +221,9 @@ public class DecompilerMemberAccessTests
                 new[] { derived.ToTypeSignature(module.RuntimeContext), corlib.Int32 }));
         run.CilMethodBody!.Instructions.Add(new CilInstruction(CilOpCodes.Ldarg_0));
         run.CilMethodBody.Instructions.Add(new CilInstruction(CilOpCodes.Ldarg_1));
-        run.CilMethodBody.Instructions.Add(new CilInstruction(CilOpCodes.Stfld,
-            derived.CreateMemberReference(backingField.Name!, backingField.Signature!)));
+        // The field reference names the declaring base type even though the
+        // receiver (the state machine's <>4__this field) is typed at DerivedHolder.
+        run.CilMethodBody.Instructions.Add(new CilInstruction(CilOpCodes.Stfld, backingField));
         run.CilMethodBody.Instructions.Add(new CilInstruction(CilOpCodes.Ret));
 
         DecompilerMemberAccessRewrites.Apply(run);

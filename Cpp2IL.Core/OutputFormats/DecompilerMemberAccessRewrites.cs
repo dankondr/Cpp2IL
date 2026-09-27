@@ -100,7 +100,7 @@ internal static class DecompilerMemberAccessRewrites
             // recurse; a static/instance mismatch means the property does not
             // describe this field.
             if (accessor != null && accessor != method && accessor.IsStatic == staticAccess
-                && AccessorCallableFrom(accessor, method, declaringType, field.DeclaringType, runtimeContext))
+                && AccessorCallableFrom(accessor, method, declaringType, runtimeContext))
             {
                 instruction.OpCode = accessor.IsStatic || declaringType.IsValueType
                     ? CilOpCodes.Call : CilOpCodes.Callvirt;
@@ -125,9 +125,12 @@ internal static class DecompilerMemberAccessRewrites
 
     // IsAccessibleFromType does not model the C# widening that lets a type
     // nested inside a derived class call a protected member through a receiver
-    // typed at that derived class or below, so check that case here.
+    // typed at that derived class or below. The field reference's scope names
+    // the field's declaring type, not the receiver's static type, so it cannot
+    // discriminate that rule — but the recovered program compiled originally,
+    // so an enclosing derived type is evidence the receiver shape was legal.
     private static bool AccessorCallableFrom(MethodDefinition accessor, MethodDefinition caller,
-        TypeDefinition declaringType, ITypeDescriptor? scope, RuntimeContext? runtimeContext)
+        TypeDefinition declaringType, RuntimeContext? runtimeContext)
     {
         if (accessor.DeclaringType == null || caller.DeclaringType == null)
             return false;
@@ -139,17 +142,8 @@ internal static class DecompilerMemberAccessRewrites
         if (!family)
             return false;
         for (var enclosing = caller.DeclaringType; enclosing != null; enclosing = enclosing.DeclaringType)
-        {
-            if (!DerivesFrom(enclosing, declaringType, runtimeContext))
-                continue;
-            // The receiver must be typed at the derived class or below; the
-            // field reference's scope is the best static type we have for it.
-            if (scope is not ITypeDefOrRef scopeRef)
+            if (DerivesFrom(enclosing, declaringType, runtimeContext))
                 return true;
-            if (!TryResolveType(scopeRef, runtimeContext, out var scopeDef) || scopeDef == null)
-                return false;
-            return DerivesFrom(scopeDef, enclosing, runtimeContext) || Equals(scopeDef, enclosing);
-        }
         return false;
     }
 
