@@ -285,7 +285,16 @@ public static class AsmResolverAssemblyPopulator
         //share visibility and dispatch flags in real metadata.
         var attributes = (sibling?.Attributes ?? MethodAttributes.Public)
             | MethodAttributes.HideBySig | MethodAttributes.SpecialName;
-        var accessor = new MethodDefinition((isGetter ? "get_" : "set_") + property.Name, attributes, accessorSignature);
+        // Accessor names embed the property's name: for an explicit interface
+        // implementation like `I.Prop` the pair is `I.get_Prop`/`I.set_Prop`, so
+        // keep the dotted prefix or the pair stops matching the interface
+        // convention.
+        var propertyName = property.Name.ToString();
+        var lastDot = propertyName.LastIndexOf('.');
+        var accessorName = lastDot < 0
+            ? (isGetter ? "get_" : "set_") + propertyName
+            : propertyName.Substring(0, lastDot + 1) + (isGetter ? "get_" : "set_") + propertyName.Substring(lastDot + 1);
+        var accessor = new MethodDefinition(accessorName, attributes, accessorSignature);
         declaringType.Methods.Add(accessor);
 
         if (accessor.IsAbstract)
