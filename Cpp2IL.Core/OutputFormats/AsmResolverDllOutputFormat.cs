@@ -268,6 +268,15 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
 
         Logger.VerboseNewline($"{(DateTime.Now - start).TotalMilliseconds:F1}ms", "DllOutput");
 
+        //Emit TypeDefs for framework types that the emitted flag/attribute
+        //surface references but no recovered typedef defines (implflag
+        //attributes like MethodImplAttribute, StructLayout/LayoutKind,
+        //IndexerNameAttribute, AssemblyVersionAttribute).
+        start = DateTime.Now;
+        Logger.Verbose("Emitting framework surface typedefs...", "DllOutput");
+        var frameworkSurfaceTypes = FrameworkSurfaceTypes.EmitMissing(ret);
+        Logger.VerboseNewline($"{(DateTime.Now - start).TotalMilliseconds:F1}ms ({frameworkSurfaceTypes} typedefs)", "DllOutput");
+
         //Fill method bodies - this should always be done last
         start = DateTime.Now;
         Logger.Verbose($"Filling method bodies (in parallel)...", "DllOutput");
