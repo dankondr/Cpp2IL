@@ -281,6 +281,7 @@ public static class InjectedCheckRemover
                     continue;
 
                 case OpCode.Throw when thrown == null
+                    && !instruction.ThrowFromNonReturningCall
                     && instruction.Operands is [TypeAnalysisContext { FullName: "System.NullReferenceException" or "System.IndexOutOfRangeException" } exception]:
                     thrown = exception.FullName;
                     continue;
