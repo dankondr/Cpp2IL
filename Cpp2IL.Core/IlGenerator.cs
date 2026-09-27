@@ -169,6 +169,7 @@ public static class IlGenerator
                 continue;
             }
             body.Instructions.Add(CilOpCodes.Ldarg_0);
+            var argStart = body.Instructions.Count;
             for (var i = 0; i < constructor.Parameters.Count; i++)
             {
                 if (i < arguments.Length && arguments[i] is { } argument)
@@ -176,7 +177,9 @@ public static class IlGenerator
                 else
                     PushDefaultOf(constructor.Parameters[i].ParameterType, definition, body.Instructions, context);
             }
+            var callIndex = body.Instructions.Count;
             body.Instructions.Add(CilOpCodes.Call, constructor.ToMethodDescriptor());
+            MoveDiagnosticNotesAfterCall(body.Instructions, argStart, callIndex, writeLine);
         }
 
         foreach (var block in context.ControlFlowGraph!.Blocks)
@@ -612,13 +615,16 @@ public static class IlGenerator
                         // The element type cannot be named here (e.g. a shared-generic
                         // instantiation over a corlib-internal marker); the honest array
                         // value is a default of the slot type.
-                        instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Inaccessible array element type: {newArrayElement.FullName}"));
-                        instructions.Add(CilOpCodes.Call, writeLine);
-                        EmitNullOrDefault(newArrayDestination, method, instructions, context);
+                        EmitNullOrDefault(newArrayDestination, method, instructions, context,
+                            $"Inaccessible array element type: {newArrayElement.FullName}");
                     }
                 }
                 else if (newArrayDestination is { IsValueType: true } && CanEmitTypeToken(newArrayDestination))
+                {
+                    instructions.Add(CilOpCodes.Ldstr, Diagnostic($"NewArr result cannot be stored into a {newArrayDestination.FullName} slot; substituting a synthetic default value."));
+                    instructions.Add(CilOpCodes.Call, writeLine);
                     EmitDefaultValueLocal(newArrayDestination, method, instructions, context);
+                }
                 else
                     EmitNullOrDefault(StoreContract(instruction.Operands[0], context), method, instructions, context);
 
@@ -685,10 +691,8 @@ public static class IlGenerator
                                 : null);
                         if (concreteCtor == null)
                         {
-                            instructions.Add(CilOpCodes.Ldstr, Diagnostic(
-                                $"Cannot construct abstract type {constructor.DeclaringType.FullName}: allocation's concrete type could not be recovered"));
-                            instructions.Add(CilOpCodes.Call, writeLine);
-                            EmitNullOrDefault(allocatedDestination, method, instructions, context);
+                            EmitNullOrDefault(allocatedDestination, method, instructions, context,
+                                $"Cannot construct abstract type {constructor.DeclaringType.FullName}: allocation's concrete type could not be recovered");
                             StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
 
                             constructorCall.OpCode = OpCode.Nop;
@@ -713,9 +717,7 @@ public static class IlGenerator
                         constructor = delegateConstructor;
                     else if (delegateFailure != null)
                     {
-                        instructions.Add(CilOpCodes.Ldstr, Diagnostic(delegateFailure));
-                        instructions.Add(CilOpCodes.Call, writeLine);
-                        EmitNullOrDefault(allocatedDestination, method, instructions, context);
+                        EmitNullOrDefault(allocatedDestination, method, instructions, context, delegateFailure);
                         StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
 
                         constructorCall.OpCode = OpCode.Nop;
@@ -765,10 +767,8 @@ public static class IlGenerator
                             parameterlessCtor = reanchored;
                         else
                         {
-                            instructions.Add(CilOpCodes.Ldstr, Diagnostic(
-                                $"Cannot construct abstract type {parameterlessCtor.DeclaringType.FullName}: allocation's concrete type could not be recovered"));
-                            instructions.Add(CilOpCodes.Call, writeLine);
-                            EmitNullOrDefault(allocatedDestination, method, instructions, context);
+                            EmitNullOrDefault(allocatedDestination, method, instructions, context,
+                                $"Cannot construct abstract type {parameterlessCtor.DeclaringType.FullName}: allocation's concrete type could not be recovered");
                             StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                             break;
                         }
@@ -798,9 +798,8 @@ public static class IlGenerator
                         // The boxed type cannot be named here (e.g. a shared-generic
                         // instantiation over a corlib-internal marker); the honest
                         // value is a default of the slot type.
-                        instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Inaccessible box type: {boxedType.FullName}"));
-                        instructions.Add(CilOpCodes.Call, writeLine);
-                        EmitNullOrDefault(StoreContract(instruction.Operands[0], context), method, instructions, context);
+                        EmitNullOrDefault(StoreContract(instruction.Operands[0], context), method, instructions, context,
+                            $"Inaccessible box type: {boxedType.FullName}");
                     }
                     else
                     {
@@ -827,9 +826,8 @@ public static class IlGenerator
                             else
                             {
                                 instructions.Add(CilOpCodes.Pop);
-                                instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Inaccessible cast target: {boxContract.FullName}"));
-                                instructions.Add(CilOpCodes.Call, writeLine);
-                                PushDefaultOf(boxContract, method, instructions, context);
+                                PushDefaultOf(boxContract, method, instructions, context,
+                                    $"Inaccessible cast target: {boxContract.FullName}");
                             }
                         }
                     }
@@ -903,7 +901,11 @@ public static class IlGenerator
                         context.AppContext.SystemTypes.SystemExceptionType, method, context);
                 }
                 else
+                {
+                    instructions.Add(CilOpCodes.Ldstr, Diagnostic("Throw operand could not be loaded as an exception; throwing null."));
+                    instructions.Add(CilOpCodes.Call, writeLine);
                     instructions.Add(CilOpCodes.Ldnull);
+                }
 
                 instructions.Add(CilOpCodes.Throw);
                 break;
@@ -1145,10 +1147,8 @@ public static class IlGenerator
                     }
                     else
                     {
-                        instructions.Add(CilOpCodes.Ldstr, Diagnostic(
-                            $"Cannot construct abstract type {targetMethod.DeclaringType.FullName}: receiver's concrete type could not be recovered"));
-                        instructions.Add(CilOpCodes.Call, writeLine);
-                        EmitNullOrDefault(StoreContract(ctorReinitReceiver, context), method, instructions, context);
+                        EmitNullOrDefault(StoreContract(ctorReinitReceiver, context), method, instructions, context,
+                            $"Cannot construct abstract type {targetMethod.DeclaringType.FullName}: receiver's concrete type could not be recovered");
                         StoreToOperand(ctorReinitReceiver, method, locals, writeLine, context);
                         if (instruction.OpCode == OpCode.Call)
                         {
@@ -1178,8 +1178,7 @@ public static class IlGenerator
                     }
                     else if (callDelegateFailure != null)
                     {
-                        instructions.Add(CilOpCodes.Ldstr, Diagnostic(callDelegateFailure));
-                        instructions.Add(CilOpCodes.Call, writeLine);
+                        EmitDecompilerNote(method, context, callDelegateFailure);
                         if (ctorReinitReceiver != null)
                         {
                             EmitNullOrDefault(StoreContract(ctorReinitReceiver, context), method, instructions, context);
@@ -1224,7 +1223,8 @@ public static class IlGenerator
                             // A hidden shared-generic argument (MethodInfo*/klass*/rgctx) landed in a
                             // real parameter slot; the actual argument was dropped upstream. Stub the
                             // slot rather than emit a wrongly-typed placeholder.
-                            PushDefaultOf(parameterType, method, instructions, context);
+                            PushDefaultOf(parameterType, method, instructions, context,
+                                $"A hidden shared-generic argument landed in parameter slot {parameterType.FullName}; the real argument was dropped upstream.");
                         }
                         else
                             LoadOperandIntoSlot(argumentOperand, parameterType, context, method, locals, writeLine);
@@ -1282,6 +1282,8 @@ public static class IlGenerator
                             || directCallToVirtual)
                     ? CilOpCodes.Callvirt
                     : CilOpCodes.Call, importedMethod);
+                if (retargetedBaseConstructor != null || (isOwnThis && targetMethod.Name == ".ctor"))
+                    MoveDiagnosticNotesAfterCall(instructions, startIndex, instructions.Count - 1, writeLine);
 
                 // the lifter's guess at whether the callee returns anything can disagree with the
                 // signature we later resolved, so go by the signature and balance the stack
@@ -1356,6 +1358,8 @@ public static class IlGenerator
                     // condition is unrecoverable, so default it to false rather than
                     // leave a struct on the stack.
                     instructions.Add(CilOpCodes.Pop);
+                    instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Branch condition of type {conditionType.FullName} cannot be tested; substituting constant false."));
+                    instructions.Add(CilOpCodes.Call, writeLine);
                     instructions.Add(CilOpCodes.Ldc_I4_0);
                 }
                 instructions.Add(CilOpCodes.Brtrue, new CilInstructionLabel());
@@ -1644,6 +1648,8 @@ public static class IlGenerator
                 {
                     // `not`/`neg` on a raw pointer: the pointer is lost, keep the
                     // operation on a native-int placeholder instead of an invalid `*`.
+                    instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Operand of {instruction.OpCode} is a raw pointer that cannot be negated; substituting a native-int zero placeholder."));
+                    instructions.Add(CilOpCodes.Call, writeLine);
                     instructions.Add(CilOpCodes.Ldc_I4_0);
                     instructions.Add(CilOpCodes.Conv_I);
                 }
@@ -3329,6 +3335,9 @@ public static class IlGenerator
             // because the temp's declared type is a signature token too.
             case Immediate when literalType is ByRefTypeAnalysisContext byRefLiteral
                     && CanEmitTypeToken(byRefLiteral.ElementType):
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic(
+                    $"Literal operand cannot fill a {byRefLiteral.FullName} slot; substituting the address of a zero-initialized local."));
+                instructions.Add(CilOpCodes.Call, writeLine);
                 var byRefLocal = new CilLocalVariable(
                     EmittableLocalType(byRefLiteral.ElementType, callingContext).ToTypeSignature());
                 method.CilMethodBody!.LocalVariables.Add(byRefLocal);
@@ -3347,6 +3356,9 @@ public static class IlGenerator
             // dropped operand, not a real value; default(T) is the only honest filler.
             case Immediate when literalType is { IsValueType: true } or GenericParameterTypeAnalysisContext
                     && CanEmitTypeToken(literalType):
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic(
+                    $"Literal operand cannot fill a {literalType.FullName} slot; substituting default({literalType.Name})."));
+                instructions.Add(CilOpCodes.Call, writeLine);
                 EmitDefaultValueLocal(literalType, method, instructions, callingContext);
                 break;
             case Immediate { Value: >= int.MinValue and <= int.MaxValue } immediate:
@@ -3385,11 +3397,9 @@ public static class IlGenerator
                     && candidate.Parameters.All(parameter => parameter.ParameterType.FullName == "System.Single"));
                 if (vectorConstructor == null)
                 {
-                    instructions.Add(CilOpCodes.Ldstr, Diagnostic(
-                        $"Cannot construct 128-bit constant as {literalType?.FullName ?? "unknown type"}"));
-                    instructions.Add(CilOpCodes.Call, writeLine);
                     PushDefaultOf(literalType ?? callingContext.AppContext.SystemTypes.SystemObjectType,
-                        method, instructions, callingContext);
+                        method, instructions, callingContext,
+                        $"Cannot construct 128-bit constant as {literalType?.FullName ?? "unknown type"}");
                     break;
                 }
                 instructions.Add(CilOpCodes.Ldc_R4, vector.X);
@@ -3423,9 +3433,8 @@ public static class IlGenerator
                     // instantiation over a corlib-internal marker); a cast token for it
                     // would fail access checks, so the honest value is a default of the
                     // target type.
-                    instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Inaccessible cast target: {referenceCast.Type.FullName}"));
-                    instructions.Add(CilOpCodes.Call, writeLine);
-                    PushDefaultOf(castTarget, method, instructions, callingContext);
+                    PushDefaultOf(castTarget, method, instructions, callingContext,
+                        $"Inaccessible cast target: {referenceCast.Type.FullName}");
                     break;
                 }
                 LoadLocal(referenceCast.Value, method, locals, callingContext);
@@ -3462,9 +3471,8 @@ public static class IlGenerator
                 var elementAddressType = ((SzArrayTypeAnalysisContext)elementAddress.Array.Type!).ElementType;
                 if (!TypeTokenUsableFrom(elementAddressType, callingContext))
                 {
-                    instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Inaccessible array element type: {elementAddressType.FullName}"));
-                    instructions.Add(CilOpCodes.Call, writeLine);
-                    PushDefaultOf(new ByRefTypeAnalysisContext(elementAddressType), method, instructions, callingContext);
+                    PushDefaultOf(new ByRefTypeAnalysisContext(elementAddressType), method, instructions,
+                        callingContext, $"Inaccessible array element type: {elementAddressType.FullName}");
                     break;
                 }
                 LoadArrayBase(elementAddress.Array, method, locals, callingContext);
@@ -3493,9 +3501,8 @@ public static class IlGenerator
                 var arrayElementType = ((SzArrayTypeAnalysisContext)arrayAccess.Array.Type!).ElementType;
                 if (!TypeTokenUsableFrom(arrayElementType, callingContext))
                 {
-                    instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Inaccessible array element type: {arrayElementType.FullName}"));
-                    instructions.Add(CilOpCodes.Call, writeLine);
-                    PushDefaultOf(arrayElementType, method, instructions, callingContext);
+                    PushDefaultOf(arrayElementType, method, instructions, callingContext,
+                        $"Inaccessible array element type: {arrayElementType.FullName}");
                     break;
                 }
                 LoadArrayBase(arrayAccess.Array, method, locals, callingContext);
@@ -3572,9 +3579,8 @@ public static class IlGenerator
                     // that an arbitrary native address or offset names a managed field.
                     if (referent is { IsValueType: true } && !TypeTokenUsableFrom(referent, callingContext))
                     {
-                        instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Inaccessible dereference type: {referent.FullName}"));
-                        instructions.Add(CilOpCodes.Call, writeLine);
-                        PushDefaultOf(referent, method, instructions, callingContext);
+                        PushDefaultOf(referent, method, instructions, callingContext,
+                            $"Inaccessible dereference type: {referent.FullName}");
                         break;
                     }
                     LoadLocal((LocalVariable)memory.Base!, method, locals, callingContext);
@@ -3620,6 +3626,9 @@ public static class IlGenerator
                     PushDefaultOf(expectedType, method, instructions, callingContext);
                 else
                 {
+                    instructions.Add(CilOpCodes.Ldstr, Diagnostic(
+                        $"Method pointer for {runtimeMethod} cannot be spelled; substituting the native-int zero the handle wrapper lowers to."));
+                    instructions.Add(CilOpCodes.Call, writeLine);
                     instructions.Add(CilOpCodes.Ldc_I4_0);
                     instructions.Add(CilOpCodes.Conv_I);
                 }
@@ -3635,6 +3644,9 @@ public static class IlGenerator
                     break;
                 }
 
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic(
+                    $"Field handle for {runtimeField.RepresentedField} cannot be spelled as a {expectedType?.FullName ?? "non-handle"} value; substituting a native-int zero."));
+                instructions.Add(CilOpCodes.Call, writeLine);
                 instructions.Add(CilOpCodes.Ldc_I4_0);
                 instructions.Add(CilOpCodes.Conv_I);
                 break;
@@ -3662,6 +3674,11 @@ public static class IlGenerator
                 break;
             case RuntimeClassTypeAnalysisContext or RgctxTableTypeAnalysisContext
                 or MethodRgctxTableTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext:
+                // A klass*/rgctx*/statics-table operand names a native pointer that has
+                // no managed spelling; the null address is the honest stand-in.
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic(
+                    $"Operand {operand} names a native metadata pointer that cannot be emitted; substituting a native-int zero."));
+                instructions.Add(CilOpCodes.Call, writeLine);
                 instructions.Add(CilOpCodes.Ldc_I4_0);
                 instructions.Add(CilOpCodes.Conv_I);
                 break;
@@ -3684,6 +3701,9 @@ public static class IlGenerator
                     if (!TypeTokenUsableFrom(type, callingContext))
                     {
                         // The honest value of an unnameable handle is the null address.
+                        instructions.Add(CilOpCodes.Ldstr, Diagnostic(
+                            $"Type {type.FullName} cannot be named from {callingContext.Name}; substituting a native-int zero for its handle value."));
+                        instructions.Add(CilOpCodes.Call, writeLine);
                         instructions.Add(CilOpCodes.Ldc_I4_0);
                         instructions.Add(CilOpCodes.Conv_I);
                         break;
@@ -3712,7 +3732,12 @@ public static class IlGenerator
                     instructions.Add(CilOpCodes.Call, typeFromHandle);
                 }
                 else
+                {
+                    instructions.Add(CilOpCodes.Ldstr, Diagnostic(
+                        $"Type {type.FullName} cannot be named from {callingContext.Name}; substituting null for typeof()."));
+                    instructions.Add(CilOpCodes.Call, writeLine);
                     instructions.Add(CilOpCodes.Ldnull);
+                }
                 break;
             default:
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unknown operand: " + operand));
@@ -4025,11 +4050,21 @@ public static class IlGenerator
                 : getter;
     }
 
+    // Every caller reaches this helper only because the recovered operand cannot
+    // be produced for the slot - the synthetic default is a substitution, not a
+    // real value, so the substitution is reported as a codeverify diagnostic and
+    // the method stops counting as clean output.
     private static void PushDefaultOf(TypeAnalysisContext type, MethodDefinition method, CilInstructionCollection instructions,
+        MethodAnalysisContext? context, string? detail = null)
+    {
+        EmitDecompilerNote(method, context,
+            detail ?? $"Operand slot of type {type.FullName} filled with a synthetic default value.");
+        PushDefaultValue(type, method, instructions, context);
+    }
+
+    private static void PushDefaultValue(TypeAnalysisContext type, MethodDefinition method, CilInstructionCollection instructions,
         MethodAnalysisContext? context)
     {
-        //TODO Remove this, we should be handling arguments correctly in ISIL resolution, this is a hack to emit balanced stacks.
-        //TODO At the *very* least we should emit a console.writeline saying that we did this.
         if (type is ByRefTypeAnalysisContext byRefParameter)
         {
             // ref/out/in slots need a managed pointer; a fresh local is the only
@@ -4105,7 +4140,7 @@ public static class IlGenerator
             // initobj would name a type the caller cannot see, and the temp local
             // would carry the same invalid signature; the sanitized placeholder
             // keeps the same shape (int32 for marker structs, ldnull for references).
-            PushDefaultOf(EmittableLocalType(type, context), method, instructions, context);
+            PushDefaultValue(EmittableLocalType(type, context), method, instructions, context);
             return;
         }
         var signature = type.ToTypeSignature();
@@ -5186,15 +5221,39 @@ public static class IlGenerator
         instructions.Add(CilOpCodes.Call, writeLine);
     }
 
-    // A dropped operand only earns the note when a ref struct was the reason
-    // no legal coercion existed - other unbridgeable pairs keep their silence.
-    private static void NoteByRefLikeDrop(MethodDefinition method, MethodAnalysisContext? context,
-        TypeAnalysisContext? from, TypeAnalysisContext? contract)
+    // A constructor body's first C# statement can only be the constructor
+    // initializer, so diagnostics recorded while materializing a base .ctor
+    // call's operands are moved to after the call — ahead of it the decompiler
+    // renders an uncallable `base._002Ector(...)` reference.
+    private static void MoveDiagnosticNotesAfterCall(CilInstructionCollection instructions, int regionStart,
+        int callIndex, IMethodDescriptor writeLine)
     {
-        if (IsByRefLikeOrElement(from) || IsByRefLikeOrElement(contract))
-            EmitDecompilerNote(method, context,
-                $"Ref struct cannot cross the value/reference boundary: dropped {from?.FullName ?? "unknown"} operand for {contract?.FullName ?? "unknown"} slot");
+        for (var j = regionStart; j + 1 < callIndex; j++)
+        {
+            if (instructions[j].OpCode == CilOpCodes.Ldstr
+                && instructions[j + 1].OpCode == CilOpCodes.Call
+                && instructions[j + 1].Operand is IMethodDescriptor callee
+                && callee.FullName == writeLine.FullName)
+            {
+                var text = instructions[j];
+                var note = instructions[j + 1];
+                instructions.RemoveAt(j + 1);
+                instructions.RemoveAt(j);
+                callIndex -= 2;
+                instructions.Insert(instructions.Count, text);
+                instructions.Insert(instructions.Count, note);
+                j--;
+            }
+        }
     }
+
+    // Reason string for a substituted slot value. The ref-struct boundary
+    // wording is preserved verbatim so diagnostics emitted before the note
+    // became unconditional keep their cluster text.
+    private static string SlotDefaultReason(TypeAnalysisContext? from, TypeAnalysisContext? contract)
+        => IsByRefLikeOrElement(from) || IsByRefLikeOrElement(contract)
+            ? $"Ref struct cannot cross the value/reference boundary: dropped {from?.FullName ?? "unknown"} operand for {contract?.FullName ?? "unknown"} slot"
+            : $"No legal conversion from {from?.FullName ?? "unavailable"} operand to {contract?.FullName ?? "unknown"} slot; substituting a synthetic default value.";
 
     // Native width of the type's evaluation-stack representation: 4 for anything
     // narrowing to i32, 8 for 64-bit primitives, -1 for native-int/pointer/byref
@@ -5292,8 +5351,7 @@ public static class IlGenerator
             && to is PointerTypeAnalysisContext or { FullName: "System.IntPtr" or "System.UIntPtr" })
         {
             instructions.Add(CilOpCodes.Pop);
-            NoteByRefLikeDrop(method, context, from, to);
-            PushDefaultOf(to, method, instructions, context);
+            PushDefaultOf(to, method, instructions, context, SlotDefaultReason(from, to));
             return true;
         }
 
@@ -5448,8 +5506,7 @@ public static class IlGenerator
             return;
         var instructions = method.CilMethodBody!.Instructions;
         instructions.Add(CilOpCodes.Pop);
-        NoteByRefLikeDrop(method, context, from, to);
-        PushDefaultOf(to, method, instructions, context);
+        PushDefaultOf(to, method, instructions, context, SlotDefaultReason(from, to));
     }
 
     // True when the operand's emitted stack type is already a pointer to the struct a
@@ -5480,6 +5537,8 @@ public static class IlGenerator
         if (!CanEmitTypeToken(structType))
             return false;
 
+        EmitDecompilerNote(method, context,
+            $"Receiver instance of type {structType.FullName} could not be recovered; a zero-initialized local stands in for it.");
         var defaultReceiver = new CilLocalVariable(structType.ToTypeSignature());
         method.CilMethodBody!.LocalVariables.Add(defaultReceiver);
         method.CilMethodBody.Instructions.Add(CilOpCodes.Ldloca, defaultReceiver);
@@ -5642,22 +5701,19 @@ public static class IlGenerator
         if (TryResolveSlotLoad(operand, contract, context, convertByRef, out var resolved, out var emitted))
         {
             LoadOperand(resolved, method, locals, writeLine, contract, context);
-            // The contract pre-check can still pass a `&` operand whose deref
-            // fails inside the coerce (a ref-struct element has no legal
-            // crossing). Then the loaded operand must not leak into the slot.
-            if (!EmitStackCoerce(emitted, contract, method, context, convertByRef)
-                && (IsByRefLikeOrElement(emitted) || IsByRefLikeOrElement(contract)))
+            // The contract pre-check can still pass an operand whose coercion
+            // then fails (e.g. a ref-struct element has no legal crossing).
+            // Whatever its kind, an uncoercible value must not leak into the
+            // slot - it is dropped and the default substitution is diagnosed.
+            if (!EmitStackCoerce(emitted, contract, method, context, convertByRef))
             {
                 var instructions = method.CilMethodBody!.Instructions;
                 instructions.Add(CilOpCodes.Pop);
-                EmitDecompilerNote(method, context,
-                    $"Ref struct cannot cross the value/reference boundary: dropped {emitted?.FullName ?? "unknown"} operand for {contract.FullName} slot");
-                PushDefaultOf(contract, method, instructions, context);
+                PushDefaultOf(contract, method, instructions, context, SlotDefaultReason(emitted, contract));
             }
             return;
         }
-        NoteByRefLikeDrop(method, context, emitted, contract);
-        PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context);
+        PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context, SlotDefaultReason(emitted, contract));
     }
 
     // Resolves the operand form a slot load emits and whether its emitted type
@@ -5767,17 +5823,19 @@ public static class IlGenerator
             return;
         }
         instructions.Add(CilOpCodes.Pop);
-        NoteByRefLikeDrop(method, context, from, contract);
-        PushDefaultOf(contract, method, instructions, context);
+        PushDefaultOf(contract, method, instructions, context, SlotDefaultReason(from, contract));
     }
 
     // A missing value for a value-type or generic-parameter slot is default(T);
-    // everything else gets the usual null.
+    // everything else gets the usual null. Either way the slot was never fed a
+    // real operand, so the substitution is diagnosed.
     private static void EmitNullOrDefault(TypeAnalysisContext? contract, MethodDefinition method,
-        CilInstructionCollection instructions, MethodAnalysisContext? context)
+        CilInstructionCollection instructions, MethodAnalysisContext? context, string? detail = null)
     {
+        EmitDecompilerNote(method, context,
+            detail ?? $"Operand slot of type {contract?.FullName ?? "unknown"} filled with a synthetic default value: the operand's value was never produced.");
         if (contract is { IsValueType: true } or GenericParameterTypeAnalysisContext)
-            PushDefaultOf(contract, method, instructions, context);
+            PushDefaultValue(contract, method, instructions, context);
         else
             instructions.Add(CilOpCodes.Ldnull);
     }
@@ -7387,6 +7445,8 @@ public static class IlGenerator
                     break;
                 }
                 instructions.Add(CilOpCodes.Pop);
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Store through unmanaged memory form {memory} could not be emitted; the value was dropped."));
+                instructions.Add(CilOpCodes.Call, writeLine);
                 break;
 
             default:

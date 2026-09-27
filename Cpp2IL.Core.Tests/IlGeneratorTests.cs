@@ -2207,10 +2207,13 @@ public class IlGeneratorTests
         var il = definition.CilMethodBody!.Instructions;
         Assert.Multiple(() =>
         {
-            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldloca));
-            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Initobj));
-            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
-            Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.Call));
+            // ldstr+call are the substitution diagnostic emitted before the default.
+            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldstr));
+            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Call));
+            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Ldloca));
+            Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.Initobj));
+            Assert.That(il[4].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+            Assert.That(il[5].OpCode, Is.EqualTo(CilOpCodes.Call));
         });
     }
 
@@ -2253,10 +2256,12 @@ public class IlGeneratorTests
         var il = definition.CilMethodBody!.Instructions;
         Assert.Multiple(() =>
         {
-            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldloca));
-            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Initobj));
-            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
-            Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.Call));
+            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldstr));
+            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Call));
+            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Ldloca));
+            Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.Initobj));
+            Assert.That(il[4].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+            Assert.That(il[5].OpCode, Is.EqualTo(CilOpCodes.Call));
         });
     }
 
@@ -2342,8 +2347,10 @@ public class IlGeneratorTests
         var il = definition.CilMethodBody!.Instructions;
         Assert.Multiple(() =>
         {
-            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldloca));
+            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldstr));
             Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Call));
+            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Ldloca));
+            Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.Call));
         });
     }
 
@@ -2385,10 +2392,12 @@ public class IlGeneratorTests
         var il = definition.CilMethodBody!.Instructions;
         Assert.Multiple(() =>
         {
-            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldloca));
-            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Initobj));
-            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
-            Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.Call));
+            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldstr));
+            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Call));
+            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Ldloca));
+            Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.Initobj));
+            Assert.That(il[4].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+            Assert.That(il[5].OpCode, Is.EqualTo(CilOpCodes.Call));
         });
     }
 
@@ -2632,10 +2641,13 @@ public class IlGeneratorTests
         IlGenerator.GenerateIl(caller, definition);
 
         var il = definition.CilMethodBody!.Instructions;
-        // The int local can never occupy the Vector3 slot; default(Vector3) is emitted instead.
-        var callIndex = il.Select((i, idx) => (i, idx)).First(t => t.i.OpCode == CilOpCodes.Call).idx;
+        // The int local can never occupy the Vector3 slot; default(Vector3) is emitted instead,
+        // preceded by the substitution diagnostic (ldstr + call).
+        var callIndex = il.Select((i, idx) => (i, idx)).Last(t => t.i.OpCode == CilOpCodes.Call).idx;
         Assert.Multiple(() =>
         {
+            Assert.That(il[callIndex - 5].OpCode, Is.EqualTo(CilOpCodes.Ldstr));
+            Assert.That(il[callIndex - 4].OpCode, Is.EqualTo(CilOpCodes.Call));
             Assert.That(il[callIndex - 3].OpCode, Is.EqualTo(CilOpCodes.Ldloca));
             Assert.That(il[callIndex - 2].OpCode, Is.EqualTo(CilOpCodes.Initobj));
             Assert.That(il[callIndex - 1].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
@@ -3054,7 +3066,10 @@ public class IlGeneratorTests
         var stlocIndex = il.Select((i, idx) => (i, idx)).Last(t => t.i.OpCode == CilOpCodes.Stloc).idx;
         Assert.Multiple(() =>
         {
-            Assert.That(il[stlocIndex - 4].OpCode, Is.EqualTo(CilOpCodes.Pop));
+            // pop drops the uncoercible result; ldstr+call are the substitution diagnostic.
+            Assert.That(il[stlocIndex - 6].OpCode, Is.EqualTo(CilOpCodes.Pop));
+            Assert.That(il[stlocIndex - 5].OpCode, Is.EqualTo(CilOpCodes.Ldstr));
+            Assert.That(il[stlocIndex - 4].OpCode, Is.EqualTo(CilOpCodes.Call));
             Assert.That(il[stlocIndex - 3].OpCode, Is.EqualTo(CilOpCodes.Ldloca));
             Assert.That(il[stlocIndex - 2].OpCode, Is.EqualTo(CilOpCodes.Initobj));
             Assert.That(il[stlocIndex - 1].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
