@@ -2474,18 +2474,45 @@ public class IlGeneratorTests
         Assert.That(addWithResize, Is.Not.Null);
         var intType = app.SystemTypes.SystemInt32Type;
         var callee = new ConcreteGenericMethodAnalysisContext(addWithResize!, [intType], []);
-        var ptr = new LocalVariable("ptr", new Register(null, "ptr")) { Type = app.SystemTypes.SystemIntPtrType };
+        // ldftn only survives where C# can spell it: inside the (object, native int)
+        // argument pair of a delegate .ctor, which folds into newobj.
+        var actionDefinition = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Action`1")!;
+        var actionCtor = actionDefinition.Methods.First(m => m.Name == ".ctor" && m.Parameters.Count == 2);
+        var concreteCtor = new ConcreteGenericMethodAnalysisContext(actionCtor, [intType], []);
+        var list = new LocalVariable("list", new Register(null, "list"))
+            { Type = new GenericInstanceTypeAnalysisContext(listDefinition, [intType]) };
+        var handler = new LocalVariable("handler", new Register(null, "handler"))
+            { Type = new GenericInstanceTypeAnalysisContext(actionDefinition, [intType]) };
         var methodInfo = new RuntimeMethodInfoAnalysisContext(callee, app.AssembliesByName["UnityEngine.CoreModule"]);
         var module = new ModuleDefinition("AddWithResizeFtn.dll");
         var listTypeDefinition = new TypeDefinition("System.Collections.Generic", "List`1",
             TypeAttributes.Public | TypeAttributes.Class);
         listTypeDefinition.GenericParameters.Add(new GenericParameter("T"));
         listDefinition.PutExtraData("AsmResolverType", listTypeDefinition);
+        var actionTypeDefinition = new TypeDefinition("System", "Action`1",
+            TypeAttributes.Public | TypeAttributes.Class | TypeAttributes.Sealed,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "MulticastDelegate"));
+        actionTypeDefinition.GenericParameters.Add(new GenericParameter("T"));
+        module.TopLevelTypes.Add(actionTypeDefinition);
+        actionDefinition.PutExtraData("AsmResolverType", actionTypeDefinition);
+        var ctorDefinition = new MethodDefinition(".ctor", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void,
+                [module.CorLibTypeFactory.Object, module.CorLibTypeFactory.IntPtr]));
+        ctorDefinition.ParameterDefinitions.Add(new ParameterDefinition(1, "o", 0));
+        ctorDefinition.ParameterDefinitions.Add(new ParameterDefinition(2, "ptr", 0));
+        actionTypeDefinition.Methods.Add(ctorDefinition);
+        actionCtor.PutExtraData("AsmResolverMethod", ctorDefinition);
+        var add = listDefinition.Methods.First(m => m.Name == "Add" && !m.IsStatic && m.Parameters.Count == 1);
+        var addDefinition = new MethodDefinition("Add", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void,
+                [new GenericParameterSignature(GenericParameterType.Type, 0)]));
+        listTypeDefinition.Methods.Add(addDefinition);
+        add.PutExtraData("AsmResolverMethod", addDefinition);
         SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemIntPtrType,
-            app.SystemTypes.SystemVoidType);
+            app.SystemTypes.SystemVoidType, app.SystemTypes.SystemObjectType);
         var (caller, method) = ForeignCaller(app, module, [
-            new(0, OpCode.Move, ptr, methodInfo),
-            new(1, OpCode.Return)], [ptr]);
+            new(0, OpCode.CallVoid, concreteCtor, handler, list, methodInfo),
+            new(1, OpCode.Return)], [list, handler]);
 
         IlGenerator.GenerateIl(caller, method);
 

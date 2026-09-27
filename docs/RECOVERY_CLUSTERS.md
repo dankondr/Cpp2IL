@@ -106,15 +106,20 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
 | castle-recovery#75 `arm64-vector-lift` (`decompiler-issue`: USHLL, ADDV, FMAXNM vector form, FCMGE, UMINV, CMGE, USHR, ST1 element) | lifter | `Arm64VectorScalarizer` lifts lane-wise vector ops into proven per-lane ISIL: widening SSHLL/USHLL(2), XTN/XTN2, lane-wise CM*/SMIN/SMAX/UMIN/UMAX, USHL/SSHL variable shifts, ADDV/UMINV-style reductions, vector MOV/MVN, ST1 single-element stores, and vector float forms (FMAXNM/FMINNM, FRINT*, FSQRT, FABS, FABD) via per-lane managed calls; MOVI/MVNI slots now carry the constant itself so lane reads fold; unproven lanes stay explicit diagnostics | `Regression/Arm64VectorLaneLiftingTests.*` (18 tests) |
 | castle-recovery#79 `decompiler-generated-member` (compile bucket) | IL emission | `EnsureCtorInitialized` no longer prepends a second `call <base>::.ctor` over the one the stubber already emits (`base._002Ector()`); `DecompilerMemberAccessRewrites` re-expresses enum `value__` `ldfld`/`stfld` as `ldobj`/`stobj` and `<X>k__BackingField` access as a `call`/`callvirt` to the property accessor when one exists and is callable from the emitting method | `Regression/DecompilerMemberAccessTests.*` (7 tests) |
 | castle-recovery#86 `invalid-method-body` (compile bucket) | IL emission | `IlGenerator` lowers a `Move` into `[local]` where the local is a `T&` to `stobj T` for value-type and generic-parameter pointees (previously only reference types via `stind.ref`), gated on the source's emitted type satisfying the pointee contract (`TryResolveSlotLoad`, extracted from `LoadOperandIntoSlot`) — unsatisfiable or partial (indexed/offset) stores keep the explicit `Unsupported managed-pointer store` diagnostic instead of a synthetic default | `Regression/ManagedPointerStoreTests.*` (3 tests), `ByRefStoreTests.OnlyExactReferenceByrefStoreDereferencesDestination` (int case) |
+| castle-recovery#80 `compiler-generated-name` (compile bucket) | IL emission | `SzArrayTypeAnalysisContext`/`ArrayTypeAnalysisContext` report `System.Array` as `DefaultBaseType` (kills the spurious `castclass` that broke ilspy's `InitializeArray(array, __ldtoken(field))` fold), and a standalone instance-method `ldftn` outside a delegate (object, native int) .ctor keeps the native-int zero placeholder instead of the unprintable `__ldftn` | `Regression/CompilerGeneratedNameTests.*` (3 tests) |
 
 ## Summary
 
-- **84 fork PRs** merged since `b5ad444b` (#1–#79, #81–#85; no #80).
+- **84 fork PRs** merged since `b5ad444b` (#1–#79, #81–#85; no #80), plus the
+  castle-recovery#NN issue rows.
 - **2 are not live recovery fixes**: #26 (reverted by #27) and #85 (CI only).
-- **82 recovery-fix clusters.** Before this change, **73** carried reproducing
-  tests (tests added or strengthened in the same PR). **7 gained tests here**:
-  #16 + #47 (the new decoder test, 8 cases), #38 (3 tests), #40 (2), #41 (1),
-  #57 (1), #58 (1).
+- **87 recovery-fix clusters.** **85** carry reproducing tests (tests added or
+  strengthened in the same PR): the 80 through the backfill wave (#16 + #47,
+  #38, #40, #41, #57, #58), castle-recovery#74's `UnboxEmissionTests.*`,
+  castle-recovery#75's `Arm64VectorLaneLiftingTests.*`,
+  castle-recovery#76's `SynthesizedMemberEvidenceTests.*`,
+  castle-recovery#79's `DecompilerMemberAccessTests.*`, and
+  castle-recovery#80's `CompilerGeneratedNameTests.*`.
 - **2 remain `none`**, both compile-only fixes: #15 (`IReadOnlySet` on
   netstandard2.0) and #20 (`AddOperands` signature fix, exercised downstream by
   `Arm64LibcMathImportTests`).

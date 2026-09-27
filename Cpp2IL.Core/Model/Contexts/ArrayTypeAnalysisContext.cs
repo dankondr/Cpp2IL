@@ -24,5 +24,10 @@ public class ArrayTypeAnalysisContext(TypeAnalysisContext elementType, int rank)
 
     public sealed override bool IsValueType => false;
 
+    // Every array type derives from System.Array; wrapped types have no
+    // definition to read that from, so name it from the corlib context.
+    public sealed override TypeAnalysisContext? DefaultBaseType =>
+        AppContext.SystemTypes?.SystemArrayType;
+
     public int Rank { get; } = rank;
 }

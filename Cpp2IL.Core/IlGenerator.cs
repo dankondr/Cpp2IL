@@ -718,7 +718,8 @@ public static class IlGenerator
                     }
 
                     for (var i = 0; i < constructorArgs.Count; i++)
-                        LoadOperandIntoSlot(constructorArgs[i], constructor.Parameters[i].ParameterType, context, method, locals, writeLine);
+                        LoadOperandIntoSlot(constructorArgs[i], constructor.Parameters[i].ParameterType, context, method, locals, writeLine,
+                            delegateCtorArg: IsDelegateCtorFunctionPointerArgument(constructor, i));
 
                     instructions.Add(CilOpCodes.Newobj, constructor.ToMethodDescriptor());
                     EmitStackCoerceOrDefault(constructor.DeclaringType,
@@ -1210,7 +1211,8 @@ public static class IlGenerator
                             PushDefaultOf(parameterType, method, instructions, context);
                         }
                         else
-                            LoadOperandIntoSlot(argumentOperand, parameterType, context, method, locals, writeLine);
+                            LoadOperandIntoSlot(argumentOperand, parameterType, context, method, locals, writeLine,
+                                delegateCtorArg: IsDelegateCtorFunctionPointerArgument(targetMethod, i));
                     }
                     else
                         PushDefaultOf(parameterType, method, instructions, context);
@@ -2929,6 +2931,28 @@ public static class IlGenerator
         return false;
     }
 
+    // Whether slot `index` of `constructor` is the function-pointer argument of
+    // a delegate (object, native int) .ctor - the one call shape where a
+    // non-static method's ldftn still folds into a newobj the decompiler can
+    // print. Mirrors the constructor-shape gate of ResolveDelegateConstructor.
+    private static bool IsDelegateCtorFunctionPointerArgument(MethodAnalysisContext constructor, int index)
+    {
+        if (index != 1
+            || constructor.Name != ".ctor"
+            || constructor.DeclaringType is not { } delegateType
+            || constructor.Parameters.Count != 2
+            || constructor.Parameters[0].ParameterType is { IsValueType: true }
+                or ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+            || constructor.Parameters[1].ParameterType.FullName is not ("System.IntPtr" or "System.UIntPtr"))
+            return false;
+
+        var delegateDefinition = delegateType is GenericInstanceTypeAnalysisContext generic
+            ? generic.GenericType
+            : delegateType;
+        return DerivesFromMulticastDelegate(delegateDefinition)
+            || !HierarchyResolvesToNonDelegate(delegateDefinition);
+    }
+
     // Mirrors the verifier's IsDelegateAssignable plus the stack-shape checks
     // around it: an open delegate takes an ldnull target and a closed one a real
     // object, Invoke's parameters must be assignable to the target's parameters
@@ -3205,7 +3229,8 @@ public static class IlGenerator
 
     private static void LoadOperand(IOperand operand, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
-        TypeAnalysisContext? expectedType, MethodAnalysisContext callingContext)
+        TypeAnalysisContext? expectedType, MethodAnalysisContext callingContext,
+        bool delegateCtorArg = false)
     {
         var instructions = method.CilMethodBody!.Instructions;
 
@@ -3559,8 +3584,16 @@ public static class IlGenerator
                 }
                 if (expectedType?.FullName == "System.IntPtr" && represented.Name is not ".ctor" && representedVisible)
                 {
-                    instructions.Add(CilOpCodes.Ldftn, represented.ToMethodDescriptor());
-                    break;
+                    // ldftn only survives to C# where it can be spelled: a static
+                    // method's function pointer, or the (object, native int) slot of
+                    // a delegate .ctor folded into the newobj. A standalone instance
+                    // ldftn is valid CIL but prints as __ldftn, so it keeps the
+                    // native-int zero placeholder below.
+                    if (represented.IsStatic || delegateCtorArg)
+                    {
+                        instructions.Add(CilOpCodes.Ldftn, represented.ToMethodDescriptor());
+                        break;
+                    }
                 }
                 if (expectedType?.FullName == "System.RuntimeMethodHandle" && representedVisible)
                 {
@@ -5534,11 +5567,11 @@ public static class IlGenerator
     private static void LoadOperandIntoSlot(IOperand operand, TypeAnalysisContext? contract,
         MethodAnalysisContext context, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
-        bool convertByRef = false)
+        bool convertByRef = false, bool delegateCtorArg = false)
     {
         if (TryResolveSlotLoad(operand, contract, context, convertByRef, out var resolved, out var emitted))
         {
-            LoadOperand(resolved, method, locals, writeLine, contract, context);
+            LoadOperand(resolved, method, locals, writeLine, contract, context, delegateCtorArg);
             EmitStackCoerce(emitted, contract, method, context, convertByRef);
             return;
         }
