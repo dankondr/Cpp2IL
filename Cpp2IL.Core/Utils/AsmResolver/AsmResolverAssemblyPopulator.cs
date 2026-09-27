@@ -285,11 +285,35 @@ public static class AsmResolverAssemblyPopulator
         //share visibility and dispatch flags in real metadata.
         var attributes = (sibling?.Attributes ?? MethodAttributes.Public)
             | MethodAttributes.HideBySig | MethodAttributes.SpecialName;
-        var accessor = new MethodDefinition((isGetter ? "get_" : "set_") + property.Name, attributes, accessorSignature);
+        // Accessor names embed the property's name: for an explicit interface
+        // implementation like `I.Prop` the pair is `I.get_Prop`/`I.set_Prop`, so
+        // keep the dotted prefix or the pair stops matching the interface
+        // convention.
+        var propertyName = property.Name.ToString();
+        var lastDot = propertyName.LastIndexOf('.');
+        var accessorName = lastDot < 0
+            ? (isGetter ? "get_" : "set_") + propertyName
+            : propertyName.Substring(0, lastDot + 1) + (isGetter ? "get_" : "set_") + propertyName.Substring(lastDot + 1);
+        var accessor = new MethodDefinition(accessorName, attributes, accessorSignature);
         declaringType.Methods.Add(accessor);
 
         if (accessor.IsAbstract)
             return accessor;
+
+        // On a generic declaring type the field operand must be the type's own
+        // generic instance (a TypeSpec `C<T>`), not the bare typedef — that is
+        // the shape the compiler emits and the only one the verifier accepts.
+        IFieldDescriptor fieldOperand = backingField;
+        if (declaringType.GenericParameters.Count > 0)
+        {
+            var selfInstance = new GenericInstanceTypeSignature(
+                declaringType, declaringType.IsValueType,
+                declaringType.GenericParameters
+                    .Select((_, i) => (TypeSignature)new GenericParameterSignature(GenericParameterType.Type, i))
+                    .ToArray());
+            fieldOperand = new MemberReference(
+                new TypeSpecification(selfInstance), backingField.Name, backingField.Signature);
+        }
 
         var body = new CilMethodBody();
         var instructions = body.Instructions;
@@ -298,13 +322,13 @@ public static class AsmResolverAssemblyPopulator
             instructions.Add(CilOpCodes.Ldarg_0);
             if (!isGetter)
                 instructions.Add(CilOpCodes.Ldarg_1);
-            instructions.Add(isGetter ? CilOpCodes.Ldfld : CilOpCodes.Stfld, backingField);
+            instructions.Add(isGetter ? CilOpCodes.Ldfld : CilOpCodes.Stfld, fieldOperand);
         }
         else
         {
             if (!isGetter)
                 instructions.Add(CilOpCodes.Ldarg_0);
-            instructions.Add(isGetter ? CilOpCodes.Ldsfld : CilOpCodes.Stsfld, backingField);
+            instructions.Add(isGetter ? CilOpCodes.Ldsfld : CilOpCodes.Stsfld, fieldOperand);
         }
         instructions.Add(CilOpCodes.Ret);
         accessor.CilMethodBody = body;
@@ -557,6 +581,28 @@ public static class AsmResolverAssemblyPopulator
             propertyCtx.PutExtraData("AsmResolverProperty", managedProperty);
 
             ilTypeDefinition.Properties.Add(managedProperty);
+
+            // il2cpp strips accessor MethodDefs the binary never calls, so a
+            // compiler-generated auto-property can arrive with only its setter
+            // surviving. A setter-only property decompiles to `{ set; }`, which
+            // is not valid C# (CS8051). `<X>k__BackingField` proves the original
+            // was `{ get; set; }`, so the getter can be restored from it. A
+            // normal setter's only parameter is `value`; a setter with more is
+            // an indexer, which can never be an auto-property.
+            // A dotted property name is an explicit interface implementation;
+            // C# forbids those as auto-properties, so the interface's own
+            // stripped getter cannot be evidenced by a backing field and the
+            // surviving accessor pair already decompiles legally — leave it.
+            if (managedGetter == null && managedSetter is { Parameters.Count: 1 }
+                && !managedProperty.Name!.ToString().Contains('.'))
+            {
+                var backingField = ilTypeDefinition.Fields.FirstOrDefault(f =>
+                    f.Name?.ToString() == $"<{managedProperty.Name}>k__BackingField");
+                if (backingField != null)
+                    managedProperty.SetSemanticMethods(
+                        SynthesizeAccessor(managedProperty, managedSetter, backingField, true),
+                        managedSetter);
+            }
         }
     }
 
