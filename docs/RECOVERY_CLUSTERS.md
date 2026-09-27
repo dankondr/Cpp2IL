@@ -125,19 +125,20 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
 (castle-recovery#97: emit real IL for field-offset and frame-slot memory stores)
 | castle-recovery#110 `internals-visible-to-unkeyed-grant` (compile bucket, CS1726) | metadata emission | `RestoreInternalsVisibleTo` granted every recovered sibling to every assembly — keyed friends named with their recovered `PublicKey`, unkeyed friends bare. A strong-named grantor cannot name an unsigned friend: the original build could not have carried such a grant, and csc rejects it outright (CS1726) once the compile driver public-signs the output (castle-recovery#102's driver). A keyed grantor's grant list now holds only keyed friends, each with its recovered key; unkeyed grantors emit the same list as before, byte for byte. r241 measurement with the signing driver: `internals-visible-to-unkeyed-grant` 1,725 -> 0, total errors 2,663 -> 1,008, failing assemblies 92 -> 85 — 7 keyed assemblies now compile clean. Every grown bucket is a real measurement, not a regression: unkeyed friends that used a keyed grantor's internals through the illegal grant lose them (CS0122 +10, CS0507 +6), and the 23 keyed assemblies' method bodies now reach semantic analysis at all — the declaration-phase CS1726 aborted each of their compiles before bodies were checked, so their pre-existing body diagnostics surface now (they match the same assemblies' unsigned-driver counts) | `Regression/InternalsVisibleToGrantorKeyTests.KeyedGrantorGrantsOnlyKeyedFriends` |
 | castle-recovery#100 `compiler-generated-name` (compile bucket) | IL emission | Standalone method-pointer loads (`RuntimeMethodInfoAnalysisContext` into `IntPtr`/`RuntimeMethodHandle` slots) emit `typeof(D).GetMethod("M", BindingFlags.Instance|Static|Public|NonPublic[, binder, typeof(args), mods]).MethodHandle[.Value]` instead of `ldftn`/`ldtoken`, which have no C# spelling (ilspy's `__ldftn`/`__ldtoken` pseudo-calls, ~830 CS0103 on r241); `Value` is exact for `MethodInfo*` sources (metadata-usage globals, invoke/vtable hidden args, RGCTX method slots — `RuntimeMethodHandle.Value` *is* the `MethodInfo*` under IL2CPP) and is used rather than `GetFunctionPointer` because a minimal recovered corlib may not carry it; `il2cpp_resolve_icall`-derived operands load the code entry pointer instead, so they are flagged `RuntimeMethodInfoAnalysisContext.IsCodePointer` at creation and carry a `NoteDecompilerIssue` (the method stays `incomplete`). Plain-static targets keep `ldftn` (`(nint)(delegate*<void>)(&M)` is spellable), and the (object, native int) argument of a delegate `.ctor` keeps `ldftn` regardless of staticity because ilspy folds it into the `new D(obj, M)` method-group spelling; `.ctor`/`.cctor` targets keep the diagnosed native-int zero | `Regression/CompilerGeneratedNameTests.InstanceMethodPointerStoreToLiveLocalEmitsReflectionLookup`, `MethodPointerToRuntimeMethodHandleEmitsReflectionLookup`, `CodePointerMethodPointerStoreEmitsLookupWithDecompilerNote` |
+| castle-recovery#107 `member-signature-mismatch` mid-body base-ctor call (Shape I, CS1729/CS7036) | IL emission | `ThisConstructorCallPlan` now hoists a surviving mid-body `this`-ctor call onto the prologue when the code ahead of it provably writes no `this` state and reads none (`SafeToHoistBefore` over the call's dominator blocks). Two recovered shapes. (a) A *legal* call whose argument operand reads a field of a non-`this` local the body populated just above the call forwards to the single dominating store's source when that source is a parameter or literal (`ForwardedPrologueArguments`), so `base(property, descriptor)` replaces `base(property, closure.descriptor)`. (b) A *distant-ancestor* call whose real base `.ctor` IL2CPP inlined — the surviving call carries only `this` while the callee's own `this.F = parameter` stores trail behind it — is identified by matching that trail against each accessible base `.ctor`'s own parameter-fed store map (`RecoveredPrologueCall`/`ParameterFieldStores`/`InlinedFieldStores`); parameters the trail cannot evidence keep the same diagnosed synthetic default an in-place retarget would have materialized, and trail stores consumed as arguments drop out because the emitted base call performs the write. Sites whose argument computation is not prologue-safe (e.g. a conditional `unbox.any` result) keep the mid-body call and its diagnostic. r241 measurement: `member-signature-mismatch` 10 → 6 | `Regression/InlinedBaseConstructorCallTests.*` (2 tests) |
 
 ## Summary
 
 - **84 fork PRs** merged since `b5ad444b` (#1–#79, #81–#85; no #80), plus the
   castle-recovery#NN issue rows.
 - **2 are not live recovery fixes**: #26 (reverted by #27) and #85 (CI only).
-- **100 recovery-fix clusters.** **98** carry reproducing tests (tests added or
+- **101 recovery-fix clusters.** **99** carry reproducing tests (tests added or
   strengthened in the same PR): the 80 through the backfill wave (#16 + #47,
   #38, #40, #41, #57, #58), castle-recovery#74's `UnboxEmissionTests.*`,
   castle-recovery#75's `Arm64VectorLaneLiftingTests.*`,
   castle-recovery#76's `SynthesizedMemberEvidenceTests.*`,
   castle-recovery#79's `DecompilerMemberAccessTests.*`,
-  castle-recovery#80's `CompilerGeneratedNameTests.*`,
+  castle-recovery#80's and castle-recovery#100's `CompilerGeneratedNameTests.*`,
   castle-recovery#81's `InvalidConversionEmissionTests.*`,
   castle-recovery#86's `ManagedPointerStoreTests.*`,
   castle-recovery#87's `ReferenceScopeAccessibilityTests.*`,
@@ -149,8 +150,9 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
   castle-recovery#101's `GenericMethodReferenceAccessibilityTests.*`,
   castle-recovery#110's `InternalsVisibleToGrantorKeyTests.*`,
   castle-recovery#97's `UnmanagedStoreTests.*`,
-  castle-recovery#104's `ErasedReceiverSharpeningTests.*`, and
-  castle-recovery#108's `AddressTakeClobberTests.*`.
+  castle-recovery#104's `ErasedReceiverSharpeningTests.*`,
+  castle-recovery#108's `AddressTakeClobberTests.*`, and
+  castle-recovery#107's `InlinedBaseConstructorCallTests.*`.
 - **2 remain `none`**, both compile-only fixes: #15 (`IReadOnlySet` on
   netstandard2.0) and #20 (`AddOperands` signature fix, exercised downstream by
   `Arm64LibcMathImportTests`).
