@@ -5055,8 +5055,10 @@ public static class IlGenerator
                     ? ResolveSystemType(context, expectedType.FullName)
                     : context.AppContext.SystemTypes.SystemIntPtrType,
             RuntimeClassTypeAnalysisContext
-                => expectedType?.FullName is "System.RuntimeTypeHandle" or "System.Type"
-                    ? ResolveSystemType(context, expectedType.FullName == "System.Type" ? "System.Type" : "System.RuntimeTypeHandle")
+                => expectedType?.FullName is "System.RuntimeTypeHandle" or "System.Type" or "System.Object"
+                    // LoadOperand pushes Type (ldtoken + GetTypeFromHandle) for the
+                    // System.Object contract too; IntPtr would lie about the stack kind.
+                    ? ResolveSystemType(context, expectedType.FullName == "System.RuntimeTypeHandle" ? "System.RuntimeTypeHandle" : "System.Type")
                     : context.AppContext.SystemTypes.SystemIntPtrType,
             StaticFieldStorageTypeAnalysisContext or RgctxTableTypeAnalysisContext
                 or MethodRgctxTableTypeAnalysisContext
@@ -5148,6 +5150,11 @@ public static class IlGenerator
         type is RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext
             or RuntimeFieldInfoAnalysisContext or StaticFieldStorageTypeAnalysisContext
             or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext;
+
+    // Ref structs (IsByRefLike) cannot cross the value/reference boundary:
+    // box and unbox.any are illegal IL on them.
+    private static bool IsByRefLike(TypeAnalysisContext type) =>
+        type.HasCustomAttributeWithFullName("System.Runtime.CompilerServices.IsByRefLikeAttribute");
 
     // Native width of the type's evaluation-stack representation: 4 for anything
     // narrowing to i32, 8 for 64-bit primitives, -1 for native-int/pointer/byref
@@ -5336,6 +5343,10 @@ public static class IlGenerator
 
         if (from.IsValueType && !to.IsValueType)
         {
+            // box on a ref struct is not legal IL: no stack operation moves a
+            // byref-like value into a reference slot, so the caller defaults it.
+            if (IsByRefLike(from))
+                return false;
             // Primitive corlib values always have a usable signature token even when
             // a reduced analysis fixture has no AsmResolver type mapping for them.
             // Leaving their I4/I8/R value unboxed in an object slot is invalid IL.
@@ -5356,6 +5367,9 @@ public static class IlGenerator
 
         if (!from.IsValueType && to.IsValueType)
         {
+            // unbox.any on a ref struct is not legal IL either.
+            if (IsByRefLike(to))
+                return false;
             if (!CanEmitTypeToken(to))
                 return true;
             if (!TypeTokenUsableFrom(to, context))
@@ -5557,14 +5571,17 @@ public static class IlGenerator
             return from.FullName is "System.Single" or "System.Double" || fromWidth != 0;
         if (from.IsValueType && !to.IsValueType)
             // box, plus castclass when the reference target narrows - both need
-            // tokens the caller can legally name
-            return !CanEmitTypeToken(from)
-                || TypeTokenUsableFrom(from, context)
-                    && (IsAssignableToLoose(from, to) || !CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context));
+            // tokens the caller can legally name. A byref-like source cannot be
+            // boxed at all, so no coercion satisfies a reference slot.
+            return !IsByRefLike(from)
+                && (!CanEmitTypeToken(from)
+                    || TypeTokenUsableFrom(from, context)
+                        && (IsAssignableToLoose(from, to) || !CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context)));
         if (!from.IsValueType && to.FullName == "System.Boolean")
             return false;
         if (!from.IsValueType && to.IsValueType)
-            return !CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context); // unbox.any accepts any managed reference
+            // unbox.any accepts any managed reference - but not a byref-like target
+            return !IsByRefLike(to) && (!CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context));
         if (!from.IsValueType && !to.IsValueType)
             // castclass narrows any reference pair - unless the caller cannot name it
             return IsAssignableToLoose(from, to) || !CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context);
