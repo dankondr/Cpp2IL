@@ -5055,8 +5055,10 @@ public static class IlGenerator
                     ? ResolveSystemType(context, expectedType.FullName)
                     : context.AppContext.SystemTypes.SystemIntPtrType,
             RuntimeClassTypeAnalysisContext
-                => expectedType?.FullName is "System.RuntimeTypeHandle" or "System.Type"
-                    ? ResolveSystemType(context, expectedType.FullName == "System.Type" ? "System.Type" : "System.RuntimeTypeHandle")
+                => expectedType?.FullName is "System.RuntimeTypeHandle" or "System.Type" or "System.Object"
+                    // LoadOperand pushes Type (ldtoken + GetTypeFromHandle) for the
+                    // System.Object contract too; IntPtr would lie about the stack kind.
+                    ? ResolveSystemType(context, expectedType.FullName == "System.RuntimeTypeHandle" ? "System.RuntimeTypeHandle" : "System.Type")
                     : context.AppContext.SystemTypes.SystemIntPtrType,
             StaticFieldStorageTypeAnalysisContext or RgctxTableTypeAnalysisContext
                 or MethodRgctxTableTypeAnalysisContext
@@ -5148,6 +5150,51 @@ public static class IlGenerator
         type is RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext
             or RuntimeFieldInfoAnalysisContext or StaticFieldStorageTypeAnalysisContext
             or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext;
+
+    // Ref structs (IsByRefLike) cannot cross the value/reference boundary:
+    // box and unbox.any are illegal IL on them.
+    private static bool IsByRefLike(TypeAnalysisContext type) =>
+        type.HasCustomAttributeWithFullName("System.Runtime.CompilerServices.IsByRefLikeAttribute");
+
+    // `&T` dereferences to T before the boundary check below, so a ref struct
+    // counts whether it shows up as the value or as the element of a managed
+    // pointer. A dropped operand or contract on either side of the boundary is
+    // what earns the explicit diagnostic.
+    private static bool IsByRefLikeOrElement(TypeAnalysisContext? type) =>
+        type is { IsValueType: true } value && IsByRefLike(value)
+        || type is ByRefTypeAnalysisContext { ElementType: { IsValueType: true } element } && IsByRefLike(element);
+
+    // The manifest surfaces a `Cpp2ILHelpers.NoteDecompilerIssue` call as a
+    // decompiler issue, so a dropped operand stays measured instead of reading
+    // as clean output. Resolved per emit site the way GenerateIl resolves it,
+    // with the same Console.WriteLine fallback when the helpers type was never
+    // injected (synthetic fixtures).
+    private static void EmitDecompilerNote(MethodDefinition method, MethodAnalysisContext? context, string detail)
+    {
+        var module = method.DeclaringModule!;
+        var noteIssue = context?.DeclaringType?.DeclaringAssembly
+            .GetTypeByFullName($"{HelpersNamespace}.{HelpersTypeName}")
+            ?.Methods.FirstOrDefault(candidate => candidate.Name == NoteIssueMethodName);
+        var writeLine = noteIssue != null
+            ? noteIssue.ToMethodDescriptor()
+            : module.CorLibTypeFactory.CorLibScope
+                .CreateTypeReference("System", "Console")
+                .CreateMemberReference("WriteLine",
+                    MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.String]));
+        var instructions = method.CilMethodBody!.Instructions;
+        instructions.Add(CilOpCodes.Ldstr, Diagnostic(detail));
+        instructions.Add(CilOpCodes.Call, writeLine);
+    }
+
+    // A dropped operand only earns the note when a ref struct was the reason
+    // no legal coercion existed - other unbridgeable pairs keep their silence.
+    private static void NoteByRefLikeDrop(MethodDefinition method, MethodAnalysisContext? context,
+        TypeAnalysisContext? from, TypeAnalysisContext? contract)
+    {
+        if (IsByRefLikeOrElement(from) || IsByRefLikeOrElement(contract))
+            EmitDecompilerNote(method, context,
+                $"Ref struct cannot cross the value/reference boundary: dropped {from?.FullName ?? "unknown"} operand for {contract?.FullName ?? "unknown"} slot");
+    }
 
     // Native width of the type's evaluation-stack representation: 4 for anything
     // narrowing to i32, 8 for 64-bit primitives, -1 for native-int/pointer/byref
@@ -5245,6 +5292,7 @@ public static class IlGenerator
             && to is PointerTypeAnalysisContext or { FullName: "System.IntPtr" or "System.UIntPtr" })
         {
             instructions.Add(CilOpCodes.Pop);
+            NoteByRefLikeDrop(method, context, from, to);
             PushDefaultOf(to, method, instructions, context);
             return true;
         }
@@ -5336,6 +5384,10 @@ public static class IlGenerator
 
         if (from.IsValueType && !to.IsValueType)
         {
+            // box on a ref struct is not legal IL: no stack operation moves a
+            // byref-like value into a reference slot, so the caller defaults it.
+            if (IsByRefLike(from))
+                return false;
             // Primitive corlib values always have a usable signature token even when
             // a reduced analysis fixture has no AsmResolver type mapping for them.
             // Leaving their I4/I8/R value unboxed in an object slot is invalid IL.
@@ -5356,6 +5408,9 @@ public static class IlGenerator
 
         if (!from.IsValueType && to.IsValueType)
         {
+            // unbox.any on a ref struct is not legal IL either.
+            if (IsByRefLike(to))
+                return false;
             if (!CanEmitTypeToken(to))
                 return true;
             if (!TypeTokenUsableFrom(to, context))
@@ -5393,6 +5448,7 @@ public static class IlGenerator
             return;
         var instructions = method.CilMethodBody!.Instructions;
         instructions.Add(CilOpCodes.Pop);
+        NoteByRefLikeDrop(method, context, from, to);
         PushDefaultOf(to, method, instructions, context);
     }
 
@@ -5557,14 +5613,17 @@ public static class IlGenerator
             return from.FullName is "System.Single" or "System.Double" || fromWidth != 0;
         if (from.IsValueType && !to.IsValueType)
             // box, plus castclass when the reference target narrows - both need
-            // tokens the caller can legally name
-            return !CanEmitTypeToken(from)
-                || TypeTokenUsableFrom(from, context)
-                    && (IsAssignableToLoose(from, to) || !CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context));
+            // tokens the caller can legally name. A byref-like source cannot be
+            // boxed at all, so no coercion satisfies a reference slot.
+            return !IsByRefLike(from)
+                && (!CanEmitTypeToken(from)
+                    || TypeTokenUsableFrom(from, context)
+                        && (IsAssignableToLoose(from, to) || !CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context)));
         if (!from.IsValueType && to.FullName == "System.Boolean")
             return false;
         if (!from.IsValueType && to.IsValueType)
-            return !CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context); // unbox.any accepts any managed reference
+            // unbox.any accepts any managed reference - but not a byref-like target
+            return !IsByRefLike(to) && (!CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context));
         if (!from.IsValueType && !to.IsValueType)
             // castclass narrows any reference pair - unless the caller cannot name it
             return IsAssignableToLoose(from, to) || !CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context);
@@ -5583,9 +5642,21 @@ public static class IlGenerator
         if (TryResolveSlotLoad(operand, contract, context, convertByRef, out var resolved, out var emitted))
         {
             LoadOperand(resolved, method, locals, writeLine, contract, context);
-            EmitStackCoerce(emitted, contract, method, context, convertByRef);
+            // The contract pre-check can still pass a `&` operand whose deref
+            // fails inside the coerce (a ref-struct element has no legal
+            // crossing). Then the loaded operand must not leak into the slot.
+            if (!EmitStackCoerce(emitted, contract, method, context, convertByRef)
+                && (IsByRefLikeOrElement(emitted) || IsByRefLikeOrElement(contract)))
+            {
+                var instructions = method.CilMethodBody!.Instructions;
+                instructions.Add(CilOpCodes.Pop);
+                EmitDecompilerNote(method, context,
+                    $"Ref struct cannot cross the value/reference boundary: dropped {emitted?.FullName ?? "unknown"} operand for {contract.FullName} slot");
+                PushDefaultOf(contract, method, instructions, context);
+            }
             return;
         }
+        NoteByRefLikeDrop(method, context, emitted, contract);
         PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context);
     }
 
@@ -5696,6 +5767,7 @@ public static class IlGenerator
             return;
         }
         instructions.Add(CilOpCodes.Pop);
+        NoteByRefLikeDrop(method, context, from, contract);
         PushDefaultOf(contract, method, instructions, context);
     }
 
