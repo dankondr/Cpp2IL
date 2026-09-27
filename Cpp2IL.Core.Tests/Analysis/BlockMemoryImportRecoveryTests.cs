@@ -2,6 +2,7 @@ using System;
 using System.Linq;
 using AsmResolver;
 using AsmResolver.DotNet;
+using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
 using AsmResolver.PE.DotNet.Metadata.Tables;
@@ -584,6 +585,52 @@ public class BlockMemoryImportRecoveryTests
         Assert.That(dst[count], Is.EqualTo(0xCC), "trailing byte must be untouched");
     }
 
+    // memmove lowers to the recovered corlib's own Buffer.MemoryCopy MethodDef.
+    // The 2019 fixture's corlib does not declare it, so this fixture models a
+    // metadata-carried member: an injected context method bound to a runnable
+    // def that forwards to the real corlib member.
+    private MethodDefinition BindBufferMemoryCopy(ModuleDefinition module)
+    {
+        var buffer = _app.SystemTypes.SystemObjectType.DeclaringAssembly
+            .GetTypeByFullName("System.Buffer")!;
+        var voidPtr = new PointerTypeAnalysisContext(_app.SystemTypes.SystemVoidType);
+        var memoryCopy = buffer.Methods.FirstOrDefault(m => m is { IsStatic: true }
+            && m.Name == "MemoryCopy" && m.Parameters.Count == 4);
+        if (memoryCopy == null)
+        {
+            memoryCopy = new InjectedMethodAnalysisContext(buffer, "MemoryCopy",
+                _app.SystemTypes.SystemVoidType,
+                R.MethodAttributes.Public | R.MethodAttributes.Static,
+                [voidPtr, voidPtr, _int64, _int64]);
+            buffer.Methods.Add(memoryCopy);
+        }
+        var bufferDef = new TypeDefinition("System", "Buffer",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(bufferDef);
+        var definition = new MethodDefinition("MemoryCopy",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void,
+                memoryCopy.Parameters.Select(p => (TypeSignature)(p.ParameterType is PointerTypeAnalysisContext
+                    ? module.CorLibTypeFactory.Void.MakePointerType()
+                    : Sig(module, p.ParameterType))).ToArray()));
+        bufferDef.Methods.Add(definition);
+        memoryCopy.PutExtraData("AsmResolverMethod", definition);
+
+        // Trampoline body: forward every argument to the real corlib member.
+        definition.CilMethodBody = new CilMethodBody();
+        for (ushort i = 0; i < 4; i++)
+            definition.CilMethodBody.Instructions.Add(new CilInstruction(CilOpCodes.Ldarg, i));
+        var real = module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "Buffer")
+            .CreateMemberReference("MemoryCopy", MethodSignature.CreateStatic(
+                module.CorLibTypeFactory.Void,
+                [module.CorLibTypeFactory.Void.MakePointerType(),
+                    module.CorLibTypeFactory.Void.MakePointerType(),
+                    module.CorLibTypeFactory.Int64, module.CorLibTypeFactory.Int64]));
+        definition.CilMethodBody.Instructions.Add(CilOpCodes.Call, real);
+        definition.CilMethodBody.Instructions.Add(CilOpCodes.Ret);
+        return definition;
+    }
+
     [Test]
     public void MemoryMoveEmitsOverlapSafeCopy()
     {
@@ -596,13 +643,13 @@ public class BlockMemoryImportRecoveryTests
         caller.ControlFlowGraph = new ISILControlFlowGraph([move, new Instruction(1, OpCode.Return)]);
 
         var module = NewModule(_byte, _int32);
+        var copyDef = BindBufferMemoryCopy(module);
         var definition = Definition(module, "Move", _app.SystemTypes.SystemVoidType, parameters);
         var (_, method) = EmitAssembly(caller, definition, module);
 
         Assert.That(definition.CilMethodBody!.Instructions.Any(i =>
-            i.OpCode == CilOpCodes.Call && i.Operand is IMethodDescriptor descriptor
-            && descriptor.Name == "MemoryCopy"), Is.True,
-            "memmove must stay overlap-safe via Buffer.MemoryCopy");
+            i.OpCode == CilOpCodes.Call && i.Operand == (IMethodDescriptor)copyDef), Is.True,
+            "memmove must call the corlib's own Buffer.MemoryCopy MethodDef");
 
         // Forward-overlapping move: dst > src, 5 bytes of "abcde" over [4..9).
         var buf = "abcdefghij".Select(c => (byte)c).ToArray();
