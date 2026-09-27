@@ -37,6 +37,12 @@ public static class ContextToMethodDescriptor
 
     public static IMethodDescriptor ToMethodDescriptor(this ConcreteGenericMethodAnalysisContext context)
     {
+        // A generic member reference carries the same access demand as the
+        // plain-definition path above: the emitted reference resolves to the
+        // base method, so its definition widens to what the ambient scope
+        // needs (ldftn, call, callvirt and ldtoken sites alike).
+        if (!AccessibilityExtensions.IsExternalRuntimeAssembly(context.DeclaringType?.DeclaringAssembly?.Name))
+            MemberAccessibility.EnsureAccessible(context);
         var memberReference = new MemberReference(
             SatisfyingDeclaringType(context)?.ToTypeSignature().ToTypeDefOrRef(),
             context.Name,
