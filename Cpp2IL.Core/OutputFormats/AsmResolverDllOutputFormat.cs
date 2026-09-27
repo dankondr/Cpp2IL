@@ -185,9 +185,12 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
         if (!Directory.Exists(outputRoot))
             Directory.CreateDirectory(outputRoot);
 
-        //Convert assembly definitions to PE files
+        //Convert assembly definitions to PE files. This stays serial:
+        //AsmResolver's metadata buffers are not thread-safe across modules
+        //sharing the corlib assembly and runtime context, and concurrent
+        //ToPEImage calls can emit corrupted sorted tables (e.g. a NestedClass
+        //row whose enclosing index is out of range).
         var peImagesToWrite = ret
-            .AsParallel()
             .Select(a => (image: a.ManifestModule!.ToPEImage(new ManagedPEImageBuilder()), name: a.ManifestModule.Name!))
             .ToList();
 
@@ -414,12 +417,21 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
         if (typeDef != null)
             ConfigureTypeSize(typeDef, ret);
 
-        //Create nested types
-        foreach (var cppNestedType in typeContext.NestedTypes)
-            ret.NestedTypes.Add(BuildStubType(cppNestedType));
-
-        //Associate this asm resolve td with the type context
+        //Associate this asm resolve td with the type context before recursing,
+        //so a context that is also listed under another parent (or twice under
+        //this one) is never emitted as two typedefs.
         typeContext.PutExtraData("AsmResolverType", ret);
+
+        //Create nested types. A context's DeclaringType is authoritative: an
+        //entry whose context is claimed by a different parent, or is already
+        //materialized, would emit a duplicate NestedClass row for the same type.
+        foreach (var cppNestedType in typeContext.NestedTypes)
+        {
+            if (cppNestedType.DeclaringType != typeContext
+                || cppNestedType.GetExtraData<TypeDefinition>("AsmResolverType") != null)
+                continue;
+            ret.NestedTypes.Add(BuildStubType(cppNestedType));
+        }
 
         return ret;
     }
