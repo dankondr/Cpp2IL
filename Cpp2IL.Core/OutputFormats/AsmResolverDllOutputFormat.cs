@@ -293,6 +293,16 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
 
         Logger.VerboseNewline($"{(DateTime.Now - start).TotalMilliseconds:F1}ms", "DllOutput");
 
+        //Restore framework-surface members that recovered typedefs do not carry
+        //but that emitted method bodies still name (folded constants like
+        //System.Math::PI, the block helpers initblk/cpblk decompile as,
+        //stripped VectorN.Min/Max). Runs after bodies are materialized: the
+        //demand is read from the emitted IL and any live ISIL graphs.
+        start = DateTime.Now;
+        var frameworkSurfaceMembers = FrameworkSurfaceMembers.EmitMissing(context, ret);
+        if (frameworkSurfaceMembers > 0)
+            Logger.Verbose($"Restored {frameworkSurfaceMembers} framework surface members", "DllOutput");
+
         return ret;
     }
 
