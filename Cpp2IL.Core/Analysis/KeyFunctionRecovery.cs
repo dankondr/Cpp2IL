@@ -36,6 +36,16 @@ public static class KeyFunctionRecovery
         nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_box),
     ];
 
+    //void* Object::Unbox(Il2CppObject* obj) - the leaf reads only the boxed object and
+    //returns a pointer to the value data. The generated wrapper loads the expected class
+    //for its element_class check, so the register holding the class operand is real
+    //evidence only some of the time.
+    private static readonly HashSet<string> UnboxFunctions =
+    [
+        nameof(BaseKeyFunctionAddresses.il2cpp_object_unbox),
+        nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_unbox),
+    ];
+
     public static void Run(MethodAnalysisContext method)
     {
         RewriteElementClassLoads(method);
@@ -61,6 +71,8 @@ public static class KeyFunctionRecovery
                 RewriteRaiseException(instruction);
             else if (BoxFunctions.Contains(keyFunction))
                 RewriteBox(instruction, method);
+            else if (UnboxFunctions.Contains(keyFunction))
+                RewriteUnbox(instruction, method);
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_is_inst))
                 RewriteIsInst(instruction, method.ControlFlowGraph!, method.AppContext.Binary.is32Bit);
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.il2cpp_vm_reflection_get_type_object))
@@ -528,6 +540,183 @@ public static class KeyFunctionRecovery
 
         instruction.OpCode = OpCode.Box;
         instruction.SetOperands(result, boxedType, value);
+    }
+
+    internal static void RewriteUnbox(Instruction instruction, MethodAnalysisContext method)
+    {
+        // helper, result, boxed object, then the raw argument registers. The class
+        // operand only sometimes holds the expected class - Object::Unbox never reads
+        // it - so a slot that is a stale copy of the boxed object is ignored.
+        if (instruction.OpCode != OpCode.Call
+            || instruction.Operands is not [var helper, var result, var boxedObject, ..])
+            return;
+
+        var cfg = method.ControlFlowGraph!;
+        var is32Bit = method.AppContext.Binary.is32Bit;
+        var argumentType = instruction.Operands.Count > 3
+                           && !ReferenceEquals(instruction.Operands[3], boxedObject)
+            ? UnboxClassOperand(cfg, instruction.Operands[3], is32Bit)
+            : null;
+        var guardedTypes = GuardedUnboxTypes(method, instruction, boxedObject);
+
+        var valueType = argumentType switch
+        {
+            // The class operand names a value type and no guard disagrees.
+            { IsValueType: true } when guardedTypes.All(guarded => SameFullName(guarded, argumentType))
+                => argumentType,
+            // The class operand was junk; the wrapper's element_class check is the only evidence.
+            null or { IsValueType: false } when guardedTypes.Count == 1 => guardedTypes[0],
+            _ => null,
+        };
+        if (valueType == null)
+        {
+            instruction.OpCode = OpCode.NotImplemented;
+            instruction.SetOperands(new StringLiteral(
+                $"{((StringLiteral)helper).Value} without a resolvable value type"));
+            return;
+        }
+
+        instruction.OpCode = OpCode.Unbox;
+        instruction.SetOperands(result, valueType, boxedObject);
+        if (result is LocalVariable local)
+            local.Type = new ByRefTypeAnalysisContext(valueType);
+    }
+
+    private static bool SameFullName(TypeAnalysisContext a, TypeAnalysisContext b)
+        => a.FullName == b.FullName;
+
+    // Resolves an operand denoting an Il2CppClass to the type it describes. Besides the
+    // direct typeof forms this follows Move chains and the codegen's [klass + offset]
+    // dereferences, where the pointer's source names the class.
+    private static TypeAnalysisContext? UnboxClassOperand(Graphs.ISILControlFlowGraph cfg,
+        IOperand operand, bool is32Bit, int depth = 0)
+    {
+        if (depth > 4)
+            return null;
+        operand = ResolveMoveSource(cfg, operand);
+        return operand switch
+        {
+            RuntimeClassTypeAnalysisContext { RepresentedType: { } type } => type,
+            TypeAnalysisContext type => type,
+            LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { } type } } => type,
+            MemoryOperand { IsConstant: false, Base: { } klassPointer }
+                => UnboxClassOperand(cfg, klassPointer, is32Bit, depth + 1),
+            _ => IsInstTarget(operand, cfg, is32Bit),
+        };
+    }
+
+    // The inlined UnBox wrapper emits `obj->klass->element_class == expected->element_class`
+    // before the helper call; the conditional jump it feeds still sits in a transitive
+    // predecessor block, and its class operand names the expected value type.
+    private static List<TypeAnalysisContext> GuardedUnboxTypes(MethodAnalysisContext method,
+        Instruction call, IOperand boxedObject)
+    {
+        var cfg = method.ControlFlowGraph!;
+        var is32Bit = method.AppContext.Binary.is32Bit;
+        var home = cfg.Blocks
+            .SelectMany(block => block.Instructions.Select(instruction => (instruction, block)))
+            .ToDictionary(pair => pair.instruction, pair => pair.block);
+        var definitions = cfg.Instructions
+            .Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!)
+            .Where(group => group.Count() == 1)
+            .ToDictionary(group => group.Key, group => group.Single());
+        var declaredType = boxedObject is LocalVariable { Type: { } type } ? type : null;
+
+        var candidates = new List<TypeAnalysisContext>();
+        var visited = new HashSet<Graphs.Block>();
+        var queue = new Queue<Graphs.Block>();
+        if (home.TryGetValue(call, out var callBlock))
+            foreach (var predecessor in callBlock.Predecessors)
+                queue.Enqueue(predecessor);
+
+        while (queue.TryDequeue(out var block))
+        {
+            if (!visited.Add(block))
+                continue;
+            foreach (var predecessor in block.Predecessors)
+                queue.Enqueue(predecessor);
+
+            foreach (var condition in block.Instructions
+                         .Where(i => i.OpCode == OpCode.ConditionalJump)
+                         .Select(i => i.Operands.ElementAtOrDefault(1))
+                         .OfType<IOperand>())
+            {
+                if (CheckedComparison(condition, definitions) is not { Operands: [_, var left, var right] })
+                    continue;
+                var candidate =
+                    ReferencesBoxedObject(left, boxedObject, declaredType, definitions, [])
+                    && !ReferencesBoxedObject(right, boxedObject, declaredType, definitions, [])
+                        ? UnboxClassOperand(cfg, right, is32Bit)
+                    : ReferencesBoxedObject(right, boxedObject, declaredType, definitions, [])
+                      && !ReferencesBoxedObject(left, boxedObject, declaredType, definitions, [])
+                        ? UnboxClassOperand(cfg, left, is32Bit)
+                        : null;
+                if (candidate is { IsValueType: true })
+                    candidates.Add(candidate);
+            }
+        }
+
+        return candidates.DistinctBy(candidate => candidate.FullName).ToList();
+    }
+
+    // Traces a branch condition through moves, negations and `cond == 0/1` projections
+    // back to the comparison that produced it.
+    private static Instruction? CheckedComparison(IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+    {
+        var visited = new HashSet<LocalVariable>();
+        while (operand is LocalVariable local && visited.Add(local)
+               && definitions.TryGetValue(local, out var definition))
+        {
+            switch (definition)
+            {
+                case { OpCode: OpCode.Move or OpCode.Not, Operands: [_, var source] }:
+                    operand = source;
+                    continue;
+                case { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual,
+                       Operands: [_, LocalVariable inner, Immediate { Value: 0 or 1 }] }:
+                    operand = inner;
+                    continue;
+                case { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual or OpCode.CheckLess
+                           or OpCode.CheckLessOrEqual or OpCode.CheckGreater or OpCode.CheckGreaterOrEqual }:
+                    return definition;
+                default:
+                    return null;
+            }
+        }
+        return null;
+    }
+
+    // Whether an operand denotes the boxed object or a slot derived from it: the object
+    // itself, [obj] / &obj dereferences, an `obj->klass` move chain, or the class the
+    // object's declared type resolves to.
+    private static bool ReferencesBoxedObject(IOperand operand, IOperand boxedObject,
+        TypeAnalysisContext? declaredType,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        HashSet<LocalVariable> visited)
+    {
+        if (ReferenceEquals(operand, boxedObject))
+            return true;
+        return operand switch
+        {
+            LocalVariable local => visited.Add(local)
+                && definitions.TryGetValue(local, out var definition)
+                && definition is { OpCode: OpCode.Move, Operands: [_, var source] }
+                && ReferencesBoxedObject(source, boxedObject, declaredType, definitions, visited),
+            MemoryOperand memory =>
+                memory.Base is { } baseOperand
+                && ReferencesBoxedObject(baseOperand, boxedObject, declaredType, definitions, visited)
+                || memory.Index is { } index
+                && ReferencesBoxedObject(index, boxedObject, declaredType, definitions, visited),
+            AddressOf address => ReferencesBoxedObject(address.Target, boxedObject, declaredType,
+                definitions, visited),
+            FieldReference field => ReferencesBoxedObject(field.Local, boxedObject, declaredType,
+                definitions, visited),
+            RuntimeClassTypeAnalysisContext { RepresentedType: { } represented } => declaredType != null
+                && represented.FullName == declaredType.FullName,
+            _ => false,
+        };
     }
 
     internal static void RewriteIsInst(Instruction instruction, Graphs.ISILControlFlowGraph cfg, bool is32Bit)

@@ -820,6 +820,33 @@ public static class IlGenerator
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 break;
 
+            case OpCode.Unbox:
+                if (instruction.Operands is not [_, TypeAnalysisContext unboxedType, var boxedObject]
+                    || !unboxedType.IsValueType)
+                {
+                    EmitUnrecoverableOperation(method, writeLine, $"Malformed unbox: {instruction}");
+                    break;
+                }
+                if (!TypeTokenUsableFrom(unboxedType, context))
+                {
+                    // The unbox type cannot be named here (e.g. a shared-generic
+                    // instantiation over a corlib-internal marker); there is no honest
+                    // pointer to stand in for the unboxed data.
+                    EmitUnrecoverableOperation(method, writeLine,
+                        $"Inaccessible unbox type: {unboxedType.FullName}");
+                    break;
+                }
+                // Object::Unbox returns void* into the boxed data; `unbox` produces the
+                // same managed pointer, so the result slot carries &T and whole-value
+                // reads of it lower to ldobj T (unbox.any semantics).
+                LoadOperandIntoSlot(boxedObject, context.AppContext.SystemTypes.SystemObjectType,
+                    context, method, locals, writeLine);
+                instructions.Add(CilOpCodes.Unbox, unboxedType.ToTypeSignature().ToTypeDefOrRef());
+                EmitStackCoerceOrDefault(new ByRefTypeAnalysisContext(unboxedType),
+                    StoreContract(instruction.Operands[0], context), method, context);
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
+                break;
+
             case OpCode.Throw:
                 var exceptionCtor = instruction.Operands is [TypeAnalysisContext exceptionType]
                     ? exceptionType.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0)
