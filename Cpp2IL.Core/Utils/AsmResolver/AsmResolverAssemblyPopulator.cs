@@ -557,6 +557,23 @@ public static class AsmResolverAssemblyPopulator
             propertyCtx.PutExtraData("AsmResolverProperty", managedProperty);
 
             ilTypeDefinition.Properties.Add(managedProperty);
+
+            // il2cpp strips accessor MethodDefs the binary never calls, so a
+            // compiler-generated auto-property can arrive with only its setter
+            // surviving. A setter-only property decompiles to `{ set; }`, which
+            // is not valid C# (CS8051). `<X>k__BackingField` proves the original
+            // was `{ get; set; }`, so the getter can be restored from it. A
+            // normal setter's only parameter is `value`; a setter with more is
+            // an indexer, which can never be an auto-property.
+            if (managedGetter == null && managedSetter is { Parameters.Count: 1 })
+            {
+                var backingField = ilTypeDefinition.Fields.FirstOrDefault(f =>
+                    f.Name?.ToString() == $"<{managedProperty.Name}>k__BackingField");
+                if (backingField != null)
+                    managedProperty.SetSemanticMethods(
+                        SynthesizeAccessor(managedProperty, managedSetter, backingField, true),
+                        managedSetter);
+            }
         }
     }
 
