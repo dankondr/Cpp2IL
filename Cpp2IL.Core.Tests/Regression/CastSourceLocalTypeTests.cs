@@ -79,4 +79,38 @@ public class CastSourceLocalTypeTests
                 () => string.Join("\n", body.Instructions.Select(i => i.ToString())));
         });
     }
+
+    [Test]
+    public void CastToObjectTargetKeepsDeclaredType()
+    {
+        // Demoting to object would equal the cast target, so the emitter drops
+        // the redundant isinst and the null-check that consumed its result
+        // decompiles into a raw local-vs-token compare. The stale declared type
+        // keeps the isinst alive and the site compilable.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var target = app.SystemTypes.SystemObjectType;
+        var reused = new LocalVariable("reused", new Register(null, "reused"))
+            { Type = app.SystemTypes.SystemStringType };
+        var result = new LocalVariable("result", new Register(null, "result"))
+            { Type = target };
+        var module = new ModuleDefinition("CastSourceObject.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemStringType, target,
+            app.SystemTypes.SystemObjectType, app.SystemTypes.SystemVoidType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, result, new ReferenceCast(reused, target, true)),
+            new(1, OpCode.Return)], [reused, result]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var body = method.CilMethodBody!;
+        Assert.Multiple(() =>
+        {
+            Assert.That(body.LocalVariables[0].VariableType?.FullName, Is.EqualTo("System.String"),
+                () => string.Join("\n", body.LocalVariables.Select(v => v.VariableType?.FullName)));
+            Assert.That(body.Instructions.Any(i => i.OpCode == CilOpCodes.Isinst), Is.True,
+                () => string.Join("\n", body.Instructions.Select(i => i.ToString())));
+        });
+    }
 }

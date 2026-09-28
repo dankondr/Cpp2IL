@@ -4986,6 +4986,7 @@ public static class IlGenerator
     private static bool UsedOnlyAsCastSource(LocalVariable local, MethodAnalysisContext context)
     {
         var sawCastUse = false;
+        var objectType = context.AppContext.SystemTypes.SystemObjectType;
         foreach (var instruction in context.ControlFlowGraph!.Instructions)
         {
             if (ReferenceEquals(instruction.Destination, local))
@@ -4993,7 +4994,18 @@ public static class IlGenerator
             foreach (var operand in instruction.Operands)
             {
                 if (operand is ReferenceCast cast)
-                    sawCastUse |= ReferenceEquals(cast.Value, local);
+                {
+                    if (!ReferenceEquals(cast.Value, local))
+                        continue;
+                    // Demoting to object would make the operand's type equal a
+                    // cast-to-object target, and the emitter then drops the
+                    // redundant isinst; the raw local-vs-token compare that is
+                    // left behind decompiles worse than the cast did. Keep the
+                    // stale type for those locals.
+                    if (ThisConstructorCallPlan.SameTypeIdentity(cast.Type, objectType))
+                        return false;
+                    sawCastUse = true;
+                }
                 else if (OperandReferencesLocal(operand, local))
                     return false;
             }
