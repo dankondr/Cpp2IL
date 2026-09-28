@@ -314,6 +314,11 @@ public static class IlGenerator
             branchInstruction.Operand = new CilInstructionLabel(target);
         }
 
+        // A proven unwind landing pad on a finalizer is emitted as the finally clause
+        // it was compiled from: exit copies of the base call become leaves out of the
+        // try, and the handler carries base.Finalize + endfinally.
+        Analysis.FinalizerEhRecovery.Apply(context, definition, instructionMap);
+
         // Nothing may fall off the physical end of a body: a conditional branch
         // (or any other fall-through-capable opcode) as the last instruction
         // makes the verifier index a fall-through block past the code end. The
@@ -6252,9 +6257,13 @@ public static class IlGenerator
         var toWidth = IntegralStackWidth(to);
 
         // A raw pointer slot takes a native-int value: an integral/native source
-        // reaches it through conv.i, a managed pointer needs the opt-in convertByRef.
+        // reaches it through conv.i. A managed pointer never satisfies it -
+        // EmitStackCoerce has no legal & -> * coercion and drops the operand
+        // for the slot default, so loading it only emits a value the coerce
+        // immediately throws away (e.g. ldloca on a & local, which no C#
+        // spelling renders - ilspy prints it as `ref ref x`).
         if (to is PointerTypeAnalysisContext)
-            return fromWidth != 0 || from is ByRefTypeAnalysisContext && convertByRef;
+            return from is not ByRefTypeAnalysisContext && fromWidth != 0;
 
         if (from is ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
         {
@@ -6478,7 +6487,422 @@ public static class IlGenerator
                 slots[key] = new LocalVariable(name, new Register(null, name), sourceType);
             }
         }
+        TypeSlotsFromContracts(context, slots);
         return slots;
+    }
+
+    // A slot's loads, not just its stores, prove what the cell holds: a resolved
+    // callee's parameter or receiver and the method's return type name the
+    // value the slot carries - under IL2CPP shared generics the marshaled
+    // T{N} argument reads the slot as that T{N} outright. When every use
+    // position names one consistent caller-emittable type, or already
+    // rejects the untyped operand today, the slot takes it; a slot only store
+    // proven types could name, or none at all (cells written through computed
+    // pointers), is materialized from this evidence too. Each store that emits
+    // stloc today keeps agreeing only if its source can take the type: an
+    // untyped spill register adopts it when all its own uses and the other
+    // slots it feeds allow, anything else vetoes the slot so no clean store
+    // regresses to a diagnostic.
+    private static void TypeSlotsFromContracts(MethodAnalysisContext context,
+        Dictionary<(bool StackRelative, long Offset), LocalVariable> slots)
+    {
+        var objectType = context.AppContext.SystemTypes.SystemObjectType;
+        var pointerSize = context.AppContext.Binary.PointerSizeBytes;
+        var instructions = context.ControlFlowGraph!.Instructions;
+
+        var slotUses = new Dictionary<(bool StackRelative, long Offset),
+            List<(Instruction Instruction, int Index)>>();
+        var slotStores = new Dictionary<(bool StackRelative, long Offset),
+            List<(MemoryOperand Destination, IOperand Source)>>();
+        var localUses = new Dictionary<LocalVariable, List<(Instruction Instruction, int Index)>>();
+        var localStores = new Dictionary<LocalVariable,
+            List<((bool StackRelative, long Offset) Key, MemoryOperand Destination)>>();
+        var localVetoed = new HashSet<LocalVariable>();
+
+        static void Add<TKey, TValue>(Dictionary<TKey, List<TValue>> map, TKey key, TValue value)
+            where TKey : notnull
+        {
+            if (!map.TryGetValue(key, out var list))
+                map[key] = list = [];
+            list.Add(value);
+        }
+
+        foreach (var instruction in instructions)
+        {
+            var operands = instruction.Operands;
+            for (var i = 0; i < operands.Count; i++)
+            {
+                var operand = operands[i];
+                if (operand is MemoryOperand memory)
+                {
+                    if (FrameSlotKey(memory, context) is { } key)
+                    {
+                        if (instruction.OpCode == OpCode.Move && operands.Count == 2 && i == 0)
+                            Add(slotStores, key, (memory, operands[1]));
+                        else if (!ReferenceEquals(operand, instruction.Destination))
+                            Add(slotUses, key, (instruction, i));
+                    }
+                    // A local inside a memory operand stays an unmanaged address
+                    // whatever it is retyped to; nothing to record.
+                    continue;
+                }
+                if (operand is LocalVariable local)
+                {
+                    if (local.Type != null || local.IsThis
+                        || context.ParameterLocals.Contains(local))
+                        continue;
+                    if (instruction.OpCode == OpCode.Move && operands.Count == 2 && i == 1
+                        && operands[0] is MemoryOperand storeDestination
+                        && FrameSlotKey(storeDestination, context) is { } storeKey)
+                    {
+                        Add(localStores, local, (storeKey, storeDestination));
+                        continue;
+                    }
+                    if (!ReferenceEquals(local, instruction.Destination))
+                        Add(localUses, local, (instruction, i));
+                    continue;
+                }
+                // Inside any other compound (field host, array base, cast
+                // source, address target) a retyped local changes what the
+                // operand emits; veto it.
+                foreach (var nested in NestedOperandLocals(operand))
+                    if (nested is { Type: null })
+                        localVetoed.Add(nested);
+            }
+        }
+
+        if (slotUses.Count == 0 && localUses.Count == 0 && localStores.Count == 0)
+            return;
+
+        var slotTypes = new Dictionary<(bool StackRelative, long Offset), TypeAnalysisContext>();
+        var localTypes = new Dictionary<LocalVariable, TypeAnalysisContext>();
+
+        TypeAnalysisContext? ResolvedSlotType((bool StackRelative, long Offset) key,
+            (bool StackRelative, long Offset)? overrideKey = null,
+            TypeAnalysisContext? overrideType = null)
+        {
+            if (overrideKey is { } self && key == self)
+                return overrideType;
+            return slotTypes.TryGetValue(key, out var adopted) ? adopted
+                : slots.TryGetValue(key, out var existing) ? existing.Type : null;
+        }
+
+        // Only a marshaling position proves the operand's content: a resolved
+        // call's argument or receiver, or the method's return. A move's
+        // destination merely constrains what may be stored into it - storing
+        // an Int32 does not make the operand Int32.
+        static bool EvidenceBearing(Instruction instruction) =>
+            instruction.OpCode is OpCode.Call or OpCode.CallVoid or OpCode.Return;
+
+        // The one type the evidence contracts unanimously name, or null. Only
+        // caller-emittable, non-object contracts count as evidence.
+        TypeAnalysisContext? UnanimousEvidence(List<TypeAnalysisContext?> contracts)
+        {
+            TypeAnalysisContext? evidence = null;
+            foreach (var contract in contracts)
+            {
+                if (contract == null)
+                    continue;
+                var emitted = EmittableLocalType(contract, context);
+                // Only a type with an emitted form counts as evidence; an
+                // unemittable contract narrows nothing.
+                if (!CanEmitTypeToken(emitted)
+                    || ThisConstructorCallPlan.SameTypeIdentity(emitted, objectType))
+                    continue;
+                if (evidence == null)
+                    evidence = emitted;
+                else if (!ThisConstructorCallPlan.SameTypeIdentity(evidence, emitted))
+                    return null;
+            }
+            return evidence;
+        }
+
+        // Every contract the local's uses impose accepts the candidate: a use
+        // that only works while the local emits todayType vetoes the adoption.
+        bool LocalUsesAccept(LocalVariable local, TypeAnalysisContext today,
+            TypeAnalysisContext candidate)
+        {
+            if (!localUses.TryGetValue(local, out var uses))
+                return true;
+            foreach (var (instruction, index) in uses)
+            {
+                var (contract, opaque) = OperandUseContract(instruction, index, context);
+                if (opaque)
+                    return false;
+                if (contract != null && StackContractSatisfied(today, contract, context)
+                    && !StackContractSatisfied(candidate, contract, context))
+                    return false;
+            }
+            return true;
+        }
+
+        // Every other slot the local is stored into keeps agreeing once the
+        // local takes the candidate type. selfKey/selfType let the key under
+        // evaluation claim the edge before its own adoption is recorded.
+        bool LocalStoresAccept(LocalVariable local, TypeAnalysisContext candidate,
+            (bool StackRelative, long Offset)? selfKey = null,
+            TypeAnalysisContext? selfType = null)
+        {
+            if (!localStores.TryGetValue(local, out var edges))
+                return true;
+            foreach (var (key, destination) in edges)
+            {
+                if (!slots.TryGetValue(key, out var existing))
+                    continue;   // no slot: the store is a diagnostic either way
+                var resolved = ResolvedSlotType(key, selfKey, selfType);
+                if (resolved == null)
+                    continue;
+                if (FrameSlotStoreAgrees(destination, local, existing, context)
+                    && !ThisConstructorCallPlan.SameTypeIdentity(resolved, candidate))
+                    return false;
+            }
+            return true;
+        }
+
+        // The local's own evidence - position contracts plus the resolved type
+        // of every slot it is stored into - may not point at a different type.
+        bool NoConflictingEvidence(LocalVariable local, TypeAnalysisContext candidate,
+            (bool StackRelative, long Offset)? selfKey, TypeAnalysisContext? selfType)
+        {
+            var evidence = new List<TypeAnalysisContext?>();
+            if (localUses.TryGetValue(local, out var uses))
+                foreach (var (instruction, index) in uses)
+                    if (EvidenceBearing(instruction))
+                        evidence.Add(OperandUseContract(instruction, index, context).Contract);
+            if (localStores.TryGetValue(local, out var edges))
+                foreach (var (key, _) in edges)
+                    evidence.Add(ResolvedSlotType(key, selfKey, selfType));
+            var own = UnanimousEvidence(evidence);
+            return own == null
+                || ThisConstructorCallPlan.SameTypeIdentity(own, candidate);
+        }
+
+        bool CanAdopt(LocalVariable local, TypeAnalysisContext candidate,
+            (bool StackRelative, long Offset)? selfKey = null,
+            TypeAnalysisContext? selfType = null)
+        {
+            if (localVetoed.Contains(local))
+                return false;
+            var today = EmittedOperandType(local, context) ?? objectType;
+            return LocalUsesAccept(local, today, candidate)
+                && LocalStoresAccept(local, candidate, selfKey, selfType)
+                && NoConflictingEvidence(local, candidate, selfKey, selfType);
+        }
+
+        // The projected source type an agreeing store must still emit: locals
+        // take their adopted type, memory sources resolve through their slot.
+        TypeAnalysisContext? ProjectedSourceType(IOperand source) => source switch
+        {
+            LocalVariable sourceLocal when localTypes.TryGetValue(sourceLocal, out var adopted)
+                => adopted,
+            MemoryOperand sourceMemory when FrameSlotKey(sourceMemory, context) is { } sourceKey
+                => ResolvedSlotType(sourceKey),
+            _ => FrameSlotSourceType(source, context),
+        };
+
+        TypeAnalysisContext? EvaluateSlot((bool StackRelative, long Offset) key)
+        {
+            if (!slotUses.TryGetValue(key, out var uses))
+                return null;    // a store-only slot is proven by its stores alone
+            var contracts = new List<TypeAnalysisContext?>();
+            var evidence = new List<TypeAnalysisContext?>();
+            foreach (var (instruction, index) in uses)
+            {
+                var (contract, opaque) = OperandUseContract(instruction, index, context);
+                if (opaque)
+                    return null;
+                // A narrower or wider access than the proven type keeps the
+                // unmanaged-load diagnostic - it proves nothing about the cell.
+                if (contract != null && instruction.Operands[index] is MemoryOperand read
+                    && !FrameSlotWidthMatches(read, contract, pointerSize))
+                    contract = null;
+                contracts.Add(contract);
+                if (EvidenceBearing(instruction))
+                    evidence.Add(contract);
+            }
+            if (UnanimousEvidence(evidence) is not { } candidate)
+                return null;
+            if (slots.TryGetValue(key, out var existing))
+            {
+                var today = EmittableLocalType(existing.Type!, context);
+                for (var i = 0; i < uses.Count; i++)
+                    if (contracts[i] != null
+                        && FrameSlotWidthMatches((MemoryOperand)uses[i].Instruction.Operands[
+                            uses[i].Index], candidate, pointerSize)
+                        && StackContractSatisfied(today, contracts[i], context)
+                        && !StackContractSatisfied(candidate, contracts[i], context))
+                        return null;
+                if (slotStores.TryGetValue(key, out var stores))
+                    foreach (var (destination, source) in stores)
+                    {
+                        if (!FrameSlotStoreAgrees(destination, source, existing, context))
+                            continue;   // already a store diagnostic; nothing regresses
+                        var agrees = FrameSlotWidthMatches(destination, candidate, pointerSize)
+                            && (source is Immediate
+                                ? TryResolveSlotLoad(source, candidate, context, false, out _, out _)
+                                : source is LocalVariable { Type: null } sourceLocal
+                                    ? CanAdopt(sourceLocal, candidate, key, candidate)
+                                    : ProjectedSourceType(source) is { } projected
+                                        && ThisConstructorCallPlan.SameTypeIdentity(projected,
+                                            candidate));
+                        if (!agrees)
+                            return null;
+                    }
+            }
+            return candidate;
+        }
+
+        TypeAnalysisContext? EvaluateLocal(LocalVariable local)
+        {
+            if (localVetoed.Contains(local))
+                return null;
+            var evidence = new List<TypeAnalysisContext?>();
+            if (localUses.TryGetValue(local, out var uses))
+                foreach (var (instruction, index) in uses)
+                {
+                    var (contract, opaque) = OperandUseContract(instruction, index, context);
+                    if (opaque)
+                        return null;
+                    if (EvidenceBearing(instruction))
+                        evidence.Add(contract);
+                }
+            // A slot's resolved type is proven content for whatever stores
+            // into it; the store itself only checks identity.
+            if (localStores.TryGetValue(local, out var edges))
+                foreach (var (key, _) in edges)
+                    evidence.Add(ResolvedSlotType(key));
+            if (UnanimousEvidence(evidence) is not { } candidate)
+                return null;
+            var today = EmittedOperandType(local, context) ?? objectType;
+            return LocalUsesAccept(local, today, candidate)
+                && LocalStoresAccept(local, candidate) ? candidate : null;
+        }
+
+        // Slots seed locals over the store edge, locals let slots keep their
+        // stores - resolve to a fixpoint; drops only cascade, so it converges.
+        static bool Assign<TKey>(Dictionary<TKey, TypeAnalysisContext> map, TKey key,
+            TypeAnalysisContext? candidate) where TKey : notnull
+        {
+            if (candidate == null)
+                return map.Remove(key);
+            if (map.TryGetValue(key, out var current)
+                && ThisConstructorCallPlan.SameTypeIdentity(current, candidate))
+                return false;
+            map[key] = candidate;
+            return true;
+        }
+
+        var keys = new HashSet<(bool StackRelative, long Offset)>(
+            slotUses.Keys.Concat(slotStores.Keys).Concat(slots.Keys));
+        var locals = new HashSet<LocalVariable>(localUses.Keys.Concat(localStores.Keys));
+        for (var round = 0; round < 8; round++)
+        {
+            var changed = false;
+            foreach (var key in keys)
+                changed |= Assign(slotTypes, key, EvaluateSlot(key));
+            foreach (var local in locals)
+                changed |= Assign(localTypes, local, EvaluateLocal(local));
+            if (!changed)
+                break;
+        }
+
+        foreach (var (key, type) in slotTypes)
+        {
+            if (slots.TryGetValue(key, out var slot))
+                slot.Type = type;
+            else
+            {
+                var name = key.StackRelative
+                    ? $"frame_sp_{key.Offset:X}"
+                    : $"frame_fp_{(key.Offset < 0 ? "-" : "")}{System.Math.Abs(key.Offset):X}";
+                slots[key] = new LocalVariable(name, new Register(null, name), type);
+            }
+        }
+        foreach (var (local, type) in localTypes)
+            local.Type = type;
+    }
+
+    // The contract a use position applies to the operand it reads: the callee's
+    // declared parameter at a call argument, the destination's store contract
+    // on a move, the method's own return type. Null means the position imposes
+    // none - an unresolved call never loads its operand list at all. Opaque
+    // positions (arithmetic, comparisons, branches) return opaque: the operand
+    // feeds something that is not plain data, so typing by contract vetoes.
+    private static (TypeAnalysisContext? Contract, bool Opaque) OperandUseContract(
+        Instruction instruction, int index, MethodAnalysisContext context)
+    {
+        switch (instruction.OpCode)
+        {
+            case OpCode.Call or OpCode.CallVoid:
+                if (instruction.Operands[0] is not MethodAnalysisContext target)
+                    return (null, false);
+                var isCall = instruction.OpCode == OpCode.Call;
+                var firstArgument = isCall
+                    ? (target.IsStatic ? 2 : 3)
+                    : (target.IsStatic ? 1 : 2);
+                if (index >= firstArgument)
+                    return (index - firstArgument < target.Parameters.Count
+                        ? target.Parameters[index - firstArgument].ParameterType
+                        : null, false);
+                // An instance call's receiver contract is the declaring type;
+                // Call's operand 1 is the result destination, not a use.
+                return (index == firstArgument - 1 && !target.IsStatic
+                    ? target.DeclaringType : null, false);
+            case OpCode.IndirectCall:
+            case OpCode.Interrupt:
+            case OpCode.Nop:
+                return (null, false);
+            case OpCode.Move or OpCode.Phi:
+                return (index == 0 ? null : StoreContract(instruction.Operands[0], context),
+                    false);
+            case OpCode.Return:
+                return (context.ReturnType, false);
+            default:
+                return (null, true);
+        }
+    }
+
+    // Locals nested inside an operand whose emission depends on their type:
+    // field hosts, array bases and indexes, cast sources, address targets.
+    // Memory operands are skipped deliberately - a base or index register
+    // stays an unmanaged address whatever it is retyped to.
+    private static IEnumerable<LocalVariable> NestedOperandLocals(IOperand operand)
+    {
+        switch (operand)
+        {
+            case LocalVariable local:
+                yield return local;
+                break;
+            case FieldReference { Local: { } host }:
+                yield return host;
+                break;
+            case SelectedFieldReference selected:
+                yield return selected.Selector;
+                foreach (var (_, field) in selected.Choices)
+                    if (field.Local != null)
+                        yield return field.Local;
+                break;
+            case ArrayAccess { Array: var array, Index: var index }:
+                yield return array;
+                if (index is LocalVariable indexLocal)
+                    yield return indexLocal;
+                break;
+            case ArrayElementFieldReference { Array: var array, Index: var index }:
+                yield return array;
+                if (index is LocalVariable elementIndex)
+                    yield return elementIndex;
+                break;
+            case ArrayLength { Array: var lengthArray }:
+                yield return lengthArray;
+                break;
+            case ReferenceCast cast:
+                yield return cast.Value;
+                break;
+            case AddressOf { Target: not MemoryOperand } addressOf:
+                foreach (var nested in NestedOperandLocals(addressOf.Target))
+                    yield return nested;
+                break;
+        }
     }
 
     // Completes the frame-slot dataflow CollectFrameSlotLocals starts: a source
