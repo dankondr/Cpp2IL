@@ -3928,6 +3928,18 @@ public static class IlGenerator
                         $"Inaccessible cast target: {referenceCast.Type.FullName}");
                     break;
                 }
+                if (castValueType is { IsValueType: true } or PointerTypeAnalysisContext
+                    or ByRefTypeAnalysisContext)
+                {
+                    // isinst/castclass need an object reference on the stack; a
+                    // value type, pointer or managed pointer there is a lifter
+                    // mistype of the native operand (e.g. a boxed-struct test on
+                    // a scalar register). The cast result is unprovable, so the
+                    // slot takes a diagnosed default rather than invalid IL.
+                    PushDefaultOf(castTarget, method, instructions, callingContext,
+                        $"Reference cast source is not an object reference: {referenceCast.Value}");
+                    break;
+                }
                 LoadLocal(referenceCast.Value, method, locals, callingContext);
                 // A cast to the value's own type verifies without the opcode.
                 if (!ThisConstructorCallPlan.SameTypeIdentity(castValueType, castTarget))
@@ -4915,12 +4927,11 @@ public static class IlGenerator
         // `ldarg` always pushes the declared parameter type: when the lifter tagged the
         // parameter local with a different type (register reuse packs a Vector3 arg onto a
         // later parameter register) the declared signature is what the verifier sees.
-        // The match is by the parameter's own register local - a scratch local that
-        // merely shares a parameter's name (`v2 @ X8` vs parameter `v2 @ V3`) is not
-        // the argument and keeps its own type.
+        // This covers both the parameter's own register local and an argument-register
+        // local LoadLocal resolves to a parameter - a scratch local that merely shares a
+        // parameter's name (`v2 @ X8` vs `v2 @ V3`) is not the argument.
         if (!local.IsThis && !local.IsMethodInfo
-            && context.ParameterLocals.Contains(local)
-            && context.Parameters.FirstOrDefault(p => p.ParameterName == local.Name) is { } parameter)
+            && AnalysisParameterForLocal(local, context) is { } parameter)
             return IsNativeHandleType(parameter.ParameterType)
                 ? context.AppContext.SystemTypes.SystemIntPtrType
                 : parameter.ParameterType;
@@ -4979,6 +4990,12 @@ public static class IlGenerator
         if (context.DeclaringType is { } declaringType
             && !context.IsStatic && ReferenceEquals(local, context.ParameterLocals.FirstOrDefault()))
             return declaringType.IsValueType ? new ByRefTypeAnalysisContext(declaringType) : declaringType;
+        // An untyped local defined only by calls is the callee's return type;
+        // a numeric or boolean consumer is a weaker use-site view of the same
+        // value and must not smear the slot (e.g. `result & 1` does not make a
+        // `!0` call result Int32).
+        if (CallDefinedLocalType(local, context) is { } untypedCallType)
+            return untypedCallType;
         if (IsBooleanEmissionLocal(local, context))
             return context.AppContext.SystemTypes.SystemBooleanType;
         if (IsNativePointerEmissionLocal(local, context))
@@ -5798,9 +5815,12 @@ public static class IlGenerator
             or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext;
 
     // Ref structs (IsByRefLike) cannot cross the value/reference boundary:
-    // box and unbox.any are illegal IL on them.
+    // box and unbox.any are illegal IL on them. Generic instances carry no
+    // custom attributes of their own - the marker lives on the definition
+    // (e.g. ReadOnlySpan<T>), so look through it.
     private static bool IsByRefLike(TypeAnalysisContext type) =>
-        type.HasCustomAttributeWithFullName("System.Runtime.CompilerServices.IsByRefLikeAttribute");
+        (type is GenericInstanceTypeAnalysisContext { GenericType: var generic } ? generic : type)
+            .HasCustomAttributeWithFullName("System.Runtime.CompilerServices.IsByRefLikeAttribute");
 
     // `&T` dereferences to T before the boundary check below, so a ref struct
     // counts whether it shows up as the value or as the element of a managed
@@ -7928,6 +7948,7 @@ public static class IlGenerator
             LoadVectorOperand(instruction.Operands[2], @operator.Parameters[1].ParameterType,
                 context, method, locals, writeLine);
         method.CilMethodBody!.Instructions.Add(CilOpCodes.Call, @operator.ToMethodDescriptor());
+        EmitStackCoerceOrDefault(resultType, StoreContract(instruction.Operands[0], context), method, context);
         StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
         return true;
     }
@@ -8007,6 +8028,7 @@ public static class IlGenerator
         }
 
         instructions.Add(CilOpCodes.Newobj, constructor.ToMethodDescriptor());
+        EmitStackCoerceOrDefault(vector, StoreContract(instruction.Operands[0], context), method, context);
         StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
         return true;
     }
@@ -8598,16 +8620,23 @@ public static class IlGenerator
     // float[] local vs `v2 @ V3` the Single parameter). Only a local that actually
     // is the parameter's register local loads through ldarg; anything else is ldloc.
     private static AsmResolver.DotNet.Collections.Parameter? ParameterForLocal(LocalVariable local, MethodDefinition method, MethodAnalysisContext context)
+        => AnalysisParameterForLocal(local, context) is { } analysisParameter
+            ? method.Parameters.FirstOrDefault(p => p.Name == analysisParameter.ParameterName)
+            : context.ParameterLocals.Contains(local)
+                ? method.Parameters.FirstOrDefault(p => p.Name == local.Name)
+                : null;
+
+    // The declared parameter a local will be emitted as, when one can be proven:
+    // the parameter's own register local always matches by name, and copy
+    // propagation can also erase `MOV XcalleeSaved, Xarg` and leave only a later
+    // argument-register SSA local - if that local has no definition and exactly
+    // one declared parameter has its type, the parameter is its only possible
+    // managed value.
+    private static ParameterAnalysisContext? AnalysisParameterForLocal(LocalVariable local, MethodAnalysisContext context)
     {
         if (context.ParameterLocals.Contains(local))
-            return context.Parameters.FirstOrDefault(p => p.ParameterName == local.Name) is { } analysisParameter
-                ? method.Parameters.FirstOrDefault(p => p.Name == analysisParameter.ParameterName)
-                : method.Parameters.FirstOrDefault(p => p.Name == local.Name);
+            return context.Parameters.FirstOrDefault(p => p.ParameterName == local.Name);
 
-        // Copy propagation can erase `MOV XcalleeSaved, Xarg` and leave only a
-        // later argument-register SSA local. If that local has no definition and
-        // exactly one declared parameter has its type, the parameter is its only
-        // possible managed value.
         if (local is { IsThis: false, IsReturn: false, IsMethodInfo: false, Type: { } localType }
             && context.ControlFlowGraph?.Instructions.All(instruction =>
                 !ReferenceEquals(instruction.Destination, local)) == true)
@@ -8619,7 +8648,7 @@ public static class IlGenerator
                 && ThisConstructorCallPlan.SameTypeIdentity(GenericDefinition(parameter.ParameterType),
                     GenericDefinition(localType))).ToList();
             if (matches.Count == 1)
-                return method.Parameters.FirstOrDefault(p => p.Name == matches[0].ParameterName);
+                return matches[0];
         }
 
         return null;
