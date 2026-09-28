@@ -878,7 +878,12 @@ public static class LocalVariables
                     // comparison-result seeding (rather than the late flag simplifier).
                     changed |= SetTypeIfUnknown(destination, method.AppContext.SystemTypes.SystemBooleanType);
                     break;
-                case OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
+                case OpCode.Negate:
+                    changed |= PropagateArithmetic(instruction, method)
+                        || PropagateBooleanResult(instruction, method)
+                        || PropagateIntegerResult(instruction, method);
+                    break;
+                case OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not
                     or OpCode.ShiftLeft or OpCode.ShiftRight:
                     changed |= PropagateBooleanResult(instruction, method) || PropagateIntegerResult(instruction, method);
                     break;
@@ -950,7 +955,7 @@ public static class LocalVariables
             foreach (var instruction in method.ControlFlowGraph!.Instructions)
             {
                 if (instruction.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.VectorMin or OpCode.VectorMax
-                    or OpCode.Divide or OpCode.Modulo)
+                    or OpCode.Divide or OpCode.Modulo or OpCode.Negate)
                     changed |= PropagateArithmetic(instruction, method);
 
                 if (instruction.OpCode == OpCode.Move
@@ -1038,6 +1043,17 @@ public static class LocalVariables
     // Preserve numeric result types without guessing pointer arithmetic or mixed widths.
     private static bool PropagateArithmetic(Instruction instruction, MethodAnalysisContext method)
     {
+        // A negate on a whole-vector operand lowers to VectorN.op_UnaryNegation. Fill
+        // only - a seeded scalar destination is an honest lane view the operand
+        // splitter reads as vector.x.
+        if (instruction.OpCode is OpCode.Negate
+            && instruction.Operands is [LocalVariable { Type: null } negatedDestination, var negatedOperand]
+            && UnityVectorOperandType(negatedOperand) is { } negatedVectorType)
+        {
+            negatedDestination.Type = negatedVectorType;
+            return true;
+        }
+
         if (instruction.Operands is not [LocalVariable destination, var left, var right])
             return false;
 
@@ -1047,6 +1063,19 @@ public static class LocalVariables
             if (destination.Type == vectorType)
                 return false;
             destination.Type = vectorType;
+            return true;
+        }
+
+        // A binop on a whole-vector operand lowers to the vector operator
+        // (op_Addition/op_Subtraction/op_Multiply/op_Division): the result register
+        // holds the vector even when a consumer views it as a scalar. Fill only -
+        // a seeded scalar destination is an honest lane view the operand splitter
+        // reads as vector.x.
+        if (instruction.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+            && destination.Type == null
+            && (UnityVectorOperandType(left) ?? UnityVectorOperandType(right)) is { } binopVectorType)
+        {
+            destination.Type = binopVectorType;
             return true;
         }
 
