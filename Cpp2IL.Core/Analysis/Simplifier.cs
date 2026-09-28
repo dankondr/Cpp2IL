@@ -325,6 +325,16 @@ public static class Simplifier
                                 if (choice.Field.Local == local)
                                     choice.Field.Local = selectedReplacement;
                         }
+
+                        // A reference cast's operand is a managed-reference slot just like a memory
+                        // base: only a local replacement may be substituted there, so a constant
+                        // stays put and keeps its defining move alive.
+                        else if (operand is ReferenceCast cast && cast.Value == local &&
+                                 replacement is LocalVariable castReplacement)
+                        {
+                            instruction.SetOperand(j, new ReferenceCast(castReplacement, cast.Type, cast.NullOnFailure));
+                            UpdateSourceCache(currentBlock, instruction);
+                        }
                     }
                 }
 
@@ -404,6 +414,15 @@ public static class Simplifier
                         }
 
                         if (operand is AddressOf { Target: LocalVariable addressed } && addressed == local)
+                        {
+                            usedByMemory = true;
+                            return true;
+                        }
+
+                        // The operand of a reference cast is a managed-reference slot typed
+                        // LocalVariable: reading it is a use, but a constant could never be
+                        // substituted into it, same as a memory base or field receiver.
+                        if (operand is ReferenceCast cast && cast.Value == local)
                         {
                             usedByMemory = true;
                             return true;
