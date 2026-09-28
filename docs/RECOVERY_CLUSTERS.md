@@ -151,12 +151,14 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
 
 | castle-recovery#131 `invalid-method-body` (compile bucket CS0177/CS0269 — out-parameter locals re-typed positionally) | type inference | `LocalVariables.PropagateFromParameters` re-typed each `ParameterLocals` entry from `Parameters[paramIndex++]`, positionally — but `LocalsAndParameters` only creates a param local when the parameter's register produced one, so a parameter the binary never touched leaves no slot to count and every later param local shifted onto the *preceding* parameter's type. On `out object result`-style overrides (`TryX(instance, XBinder binder, out object result)`) the binder register produced no local and `result`'s local took the binder's non-byref type, so `Move [param], v` missed the managed-pointer-store arm and degraded to a `stloc` cell-write through a byref temp (`Literal operand cannot fill a System.Object& slot`) — the out parameter was never written (CS0177). Param locals already carry their true identity in `Name` — the same identity `EmittedLocalType` and `ParameterForLocal` resolve by — so propagation now matches by name. r241 measurement (control `development@a421bb98`, signed driver + ILVerify): total errors 973 → 965, `invalid-method-body` 277 → 269 (CS0177 64 → 56; all 8 cleared sites are `DynamicProxy<T>` `Try*` overrides that now emit `result = null`), failing assemblies 80 → 80, codeverify `compiles_unverified` 42,409 → 42,422 / `incomplete` 17,870 → 17,858 / `invalid_il` 446 → 445 (one per-method transition: `DOTween CirclePlugin::GetSpeedBasedDuration` invalid→valid; **0 valid→invalid**). Sidecar diagnostics: `Literal operand cannot fill Object& slot` 24 → 16, `Unmanaged memory load` −8, `No legal conversion Single→Vector*` −4, `Store through unmanaged memory form` −7, `Unsupported managed-pointer store (4 bytes)` +8 — stores that silently mis-compiled into a scratch local now carry the named diagnostic | `Regression/ParameterLocalTypingTests.OutParameterLocalKeepsItsOwnParameterType` |
 
+| castle-recovery#130 `invalid-il` (ILVerify bucket `StackObjRef`/`StackUnexpected`, `ReferenceCast` operand invisible to post-SSA `Simplifier`) | dataflow | `Simplifier` (`IsLocalUsedAfterInstruction`, `ReplaceLocalsUntilReassignment`) had the same `ReferenceCast` blind spot `SsaSimplifier`/`CopyCoalescer` carried before castle-recovery#123: the operand of `isinst`/`castclass` was not counted as a use of `cast.Value` and could not be re-bound on substitution. Both arms now descend into `ReferenceCast` like #123's passes do, with one extra gate that pass does not need: the operand slot holds a managed object reference, so the use counts — and a `LocalVariable` substitutes into a rebuilt `ReferenceCast` — only when the local's emitted signature kind lands as an object reference (`Il2CppTypeEnum` CLASS/STRING/OBJECT/SZARRAY/ARRAY/GENERICINST/BOXED, non-value-type). For a value-typed, generic-parameter (`VAR`/`MVAR`), pointer, byref or native-handle local the producer stays droppable and the operand stays put: a dead operand's local demotes to `System.Object` at emission and verifies, while a kept producer would emit a non-reference stack kind ILVerify rejects. r241 control `development@a421bb98` (973 signed errors): **0/178,273 per-method ILVerify transitions** (`invalid_il` 446 → 446); the arms evaluate a `ReferenceCast` operand in 648 methods (liveness counts the read in 252, substitution rebinds it in 233) — visible as `isinst`/`castclass`-bearing methods 8,047 → 8,045 (two operands rebind to their properly-typed local and the emitter elides the redundant `isinst`); compile total 973 → 974 (`fails_compile` 214 → 215: +1 `Google.Protobuf` CS0039 — the rebound operand types an `as` on a `sealed` type as a statically impossible conversion Roslyn rejects; the upstream register→version mis-binding is out of scope) | `Regression/SimplifierCastOperandTests.*` (4 tests) |
+
 ## Summary
 
 - **84 fork PRs** merged since `b5ad444b` (#1–#79, #81–#85; no #80), plus the
   castle-recovery#NN issue rows.
 - **2 are not live recovery fixes**: #26 (reverted by #27) and #85 (CI only).
-- **115 recovery-fix clusters.** **113** carry reproducing tests (tests added or
+- **116 recovery-fix clusters.** **114** carry reproducing tests (tests added or
   strengthened in the same PR): the 80 through the backfill wave (#16 + #47,
   #38, #40, #41, #57, #58), castle-recovery#74's `UnboxEmissionTests.*`,
   castle-recovery#75's `Arm64VectorLaneLiftingTests.*`,
@@ -191,8 +193,9 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
   castle-recovery#121's `ByRefAddressSlotTests.*`,
   castle-recovery#123's `CastOperandUseTests.*`,
   castle-recovery#125's `InternalsVisibleToEvidenceTests.*`,
-  castle-recovery#124's `KeyedFriendScopeTests.*`, and
-  castle-recovery#131's `ParameterLocalTypingTests.*`.
+  castle-recovery#124's `KeyedFriendScopeTests.*`,
+  castle-recovery#131's `ParameterLocalTypingTests.*`, and
+  castle-recovery#130's `SimplifierCastOperandTests.*`.
 - **2 remain `none`**, both compile-only fixes: #15 (`IReadOnlySet` on
   netstandard2.0) and #20 (`AddOperands` signature fix, exercised downstream by
   `Arm64LibcMathImportTests`).
