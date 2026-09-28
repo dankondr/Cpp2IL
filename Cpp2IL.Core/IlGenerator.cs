@@ -3769,15 +3769,17 @@ public static class IlGenerator
         var module = method.DeclaringModule!;
 
         // A null reference reaches us as an integer zero, which would otherwise be emitted as a literal 0
-        // and read back as a cast from a number. Runtime handle types lower to native int, where the
-        // zero is an address, not a reference.
-        // Byrefs, unmanaged pointers and generic parameters are not managed
-        // references either; their zeroes are handled inside the switch.
-        if (expectedType is { IsValueType: false } && IsZeroConstant(operand) && !IsNativeHandleType(expectedType)
-            && expectedType is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext
-                or GenericParameterTypeAnalysisContext))
+        // and read back as a cast from a number. The same literal into a
+        // value-type or generic-parameter slot is the all-zero value the slot
+        // proves: default(T) through initobj, the emission the compiler uses.
+        // Runtime handle types lower to native int, where the zero is an
+        // address, not a reference; & and * slots have no managed zero form.
+        if (IsZeroConstant(operand) && SlotTakesZeroLiteralDefault(expectedType))
         {
-            instructions.Add(CilOpCodes.Ldnull);
+            if (expectedType is { IsValueType: false } and not GenericParameterTypeAnalysisContext)
+                instructions.Add(CilOpCodes.Ldnull);
+            else
+                PushDefaultValue(expectedType!, method, instructions, callingContext);
             return;
         }
 
@@ -5561,6 +5563,16 @@ public static class IlGenerator
 
     private static bool IsZeroConstant(IOperand operand) => operand is Immediate { Value: 0 };
 
+    // A zero literal fills a slot honestly: ldnull for references, default(T)
+    // for value types and generic parameters - the same all-zero value the
+    // binary proves the slot held. Byref and unmanaged-pointer slots have no
+    // managed zero form, and runtime handles lower to a native-int address
+    // rather than a value, so they keep the usual literal handling.
+    private static bool SlotTakesZeroLiteralDefault(TypeAnalysisContext? contract) =>
+        contract != null
+        && contract is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+        && !IsNativeHandleType(contract);
+
     private static TypeAnalysisContext? NullComparisonType(Instruction instruction, int operandIndex, MethodAnalysisContext context)
     {
         if (instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual)
@@ -5692,9 +5704,9 @@ public static class IlGenerator
             // for it; only a known contract pins down its emitted width. A zero into
             // a reference contract emits ldnull, which is the contract type itself.
             Immediate immediate => expectedType is null ? null
-                : immediate.Value == 0 && expectedType is { IsValueType: false } && !IsNativeHandleType(expectedType)
-                    && expectedType is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext
-                        or GenericParameterTypeAnalysisContext)
+                : immediate.Value == 0 && SlotTakesZeroLiteralDefault(expectedType)
+                    // ldnull reports the reference contract; default(T) reports
+                    // the value-type or generic-parameter contract itself.
                     ? expectedType
                     : EmittedImmediateType(immediate, expectedType, context),
             LocalVariable local => EmittedLocalType(local, context),
@@ -6439,7 +6451,8 @@ public static class IlGenerator
     {
         if (referent is { IsValueType: true } or GenericParameterTypeAnalysisContext)
             return TypeTokenUsableFrom(referent, context)
-                && TryResolveSlotLoad(source, referent, context, false, out _, out _);
+                && TryResolveSlotLoad(source, referent, context, false, out _, out _)
+                && (!IsZeroConstant(source) || LiteralStoreCoversReferent(store, referent, context));
         return store.AccessSize == context.AppContext.Binary.PointerSizeBytes;
     }
 
@@ -7038,6 +7051,18 @@ public static class IlGenerator
             return slotType.IsValueType;
         return TypeSizes.MinimumUnboxedSize(slotType, pointerSize) == memory.AccessSize;
     }
+
+    // stobj writes the referent's full unboxed size, but a literal zero only
+    // proves the bytes the native store wrote: the whole-value store is
+    // honest only when the recorded access covers the referent - a narrower
+    // store would clobber bytes the write never zeroed. Generic parameters
+    // have no measurable unboxed size, and vector-family stores (AccessSize
+    // 0) name no exact width, so both stay unproven.
+    private static bool LiteralStoreCoversReferent(MemoryOperand store, TypeAnalysisContext referent,
+        MethodAnalysisContext context) =>
+        referent is not GenericParameterTypeAnalysisContext && store.AccessSize != 0
+            && TypeSizes.MinimumUnboxedSize(referent, context.AppContext.Binary.PointerSizeBytes)
+                <= store.AccessSize;
 
     // stfld stores the whole field, so it is honest only when the width the
     // native store recorded covers the field exactly. Width-0 stores are
