@@ -3163,7 +3163,8 @@ public static class IlGenerator
             : represented;
         var declaringType = field.DeclaringType;
         if (declaringType == null || field.Name is null
-            || !CanEmitFieldToken(field) || !TypeTokenUsableFrom(declaringType, callingContext))
+            || !CanEmitFieldToken(field) || !TypeTokenUsableFrom(declaringType, callingContext)
+            || !DeclaringTypeDeclaredInSource(declaringType))
             return false;
 
         var corLibScope = method.DeclaringModule!.CorLibTypeFactory.CorLibScope;
@@ -3204,6 +3205,15 @@ public static class IlGenerator
                     corLibScope.CreateTypeReference("System", "IntPtr").ToTypeSignature(true))));
         return true;
     }
+
+    // A field handle is spellable through typeof() only when its declaring
+    // type is declared in the decompiled source. The compiler-internal
+    // <PrivateImplementationDetails> and <Module> rows exist in metadata but
+    // decompilers never declare them, so typeof() on either is an
+    // unresolvable reference; such loads stay on the caller's diagnosed
+    // fallback.
+    private static bool DeclaringTypeDeclaredInSource(TypeAnalysisContext declaringType) =>
+        declaringType.Name is not ("<PrivateImplementationDetails>" or "<Module>");
 
     // The field argument of RuntimeHelpers.InitializeArray is the one consumer
     // that keeps ldtoken: ilspy folds that exact call shape back into the

@@ -409,9 +409,12 @@ internal static class FrameworkSurfaceTypes
 
         var name = reference.Name?.ToString() ?? "";
         var ns = reference.Namespace?.ToString() ?? "";
+        // il2cpp global-namespace types carry Namespace=null while references
+        // to them read ""; treat the two as equal or a real typedef would be
+        // missed and a shell typedef materialized on top of it.
         var existing = declaring == null
             ? module.TopLevelTypes.FirstOrDefault(t => !t.IsNested
-                && t.Name?.ToString() == name && t.Namespace?.ToString() == ns)
+                && t.Name?.ToString() == name && (t.Namespace?.ToString() ?? "") == ns)
             : declaring.NestedTypes.FirstOrDefault(t => t.Name?.ToString() == name);
         if (existing != null)
             return existing;
@@ -513,7 +516,7 @@ internal static class FrameworkSurfaceTypes
     private static TypeDefinition EnsureCorLibType(ModuleDefinition corlibModule, string ns, string name, ref int emitted)
     {
         var existing = corlibModule.TopLevelTypes.FirstOrDefault(t =>
-            t.Name?.ToString() == name && t.Namespace?.ToString() == ns);
+            t.Name?.ToString() == name && (t.Namespace?.ToString() ?? "") == ns);
         if (existing != null)
             return existing;
         var (attributes, baseName) = (ns, name) switch
@@ -535,7 +538,7 @@ internal static class FrameworkSurfaceTypes
         TypeAttributes attributes, ITypeDefOrRef? baseType, ref int emitted)
     {
         var existing = module.TopLevelTypes.FirstOrDefault(t => !t.IsNested
-            && t.Name?.ToString() == name && t.Namespace?.ToString() == ns);
+            && t.Name?.ToString() == name && (t.Namespace?.ToString() ?? "") == ns);
         if (existing != null)
             return existing;
         var type = new TypeDefinition(ns, name, attributes, baseType);

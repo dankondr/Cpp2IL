@@ -37,6 +37,11 @@ namespace Cpp2IL.Core.Tests.Regression;
 //  * Nested types that kept their own namespace were emitted into
 //    custom-attribute blobs as "Parent+Ns.Child", which nothing resolves;
 //    the blob SerString must be the ECMA-335 canonical "Ns.Parent+Child".
+//  * The reflection chain names the field's declaring type in typeof(), so it
+//    only applies where that type is actually declared in the decompiled
+//    source. Fields on the compiler-internal <PrivateImplementationDetails>
+//    (and <Module>) rows - types a decompiler never declares - keep the
+//    diagnosed placeholder instead.
 public class CompilerGeneratedNameTests
 {
     private static TypeAnalysisContext SystemRuntimeFieldHandle(ApplicationAnalysisContext app) =>
@@ -556,6 +561,64 @@ public class CompilerGeneratedNameTests
             Assert.That(calledNames, Has.Member("get_FieldHandle"));
             Assert.That(calledNames, Has.Member("get_Value"),
                 "the IntPtr slot takes the wrapped pointer via RuntimeFieldHandle.Value");
+        });
+    }
+
+    [Test]
+    public void FieldHandleOnCompilerInternalHolderStaysDiagnosed()
+    {
+        // typeof(<PrivateImplementationDetails>) cannot resolve: that typedef
+        // exists in the metadata but a decompiler never declares it, so the
+        // load keeps the diagnosed placeholder instead of the reflection
+        // chain.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.AssembliesByName["UnityEngine.CoreModule"];
+        var holder = new InjectedTypeAnalysisContext(assembly, "",
+            "<PrivateImplementationDetails>", app.SystemTypes.SystemObjectType,
+            R.TypeAttributes.NotPublic | R.TypeAttributes.Class);
+        var blob = holder.InjectFieldContext("Blob", app.SystemTypes.SystemInt32Type,
+            R.FieldAttributes.Assembly | R.FieldAttributes.Static);
+        var fieldInfo = new RuntimeFieldInfoAnalysisContext(blob, assembly);
+        var slot = new LocalVariable("slot", new Register(null, "slot"))
+            { Type = SystemRuntimeFieldHandle(app) };
+        var readBack = new LocalVariable("readBack", new Register(null, "readBack"))
+            { Type = SystemRuntimeFieldHandle(app) };
+
+        var module = new ModuleDefinition("InternalHolder.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemVoidType, app.SystemTypes.SystemObjectType,
+            SystemRuntimeFieldHandle(app));
+        var holderDefinition = new TypeDefinition("", "<PrivateImplementationDetails>",
+            TypeAttributes.NotPublic | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(holderDefinition);
+        holder.PutExtraData("AsmResolverType", holderDefinition);
+        var blobDefinition = new FieldDefinition("Blob",
+            FieldAttributes.Assembly | FieldAttributes.Static,
+            new FieldSignature(module.CorLibTypeFactory.Int32));
+        holderDefinition.Fields.Add(blobDefinition);
+        blob.PutExtraData("AsmResolverField", blobDefinition);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, slot, fieldInfo),
+            new(1, OpCode.Move, readBack, slot),
+            new(2, OpCode.Return)], [slot, readBack]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        var calledNames = il.Where(i => i.OpCode == CilOpCodes.Call || i.OpCode == CilOpCodes.Callvirt)
+            .Select(i => (i.Operand as IMethodDescriptor)?.Name?.ToString())
+            .ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldtoken), Is.False,
+                () => "no ldtoken at all - neither the field nor the undeclarable typeof():\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(calledNames, Has.No.Member("GetField"));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                && i.Operand?.ToString()?.Contains("synthetic default value") == true), Is.True,
+                "the unspellable load stays diagnosed, not silently dropped");
         });
     }
 
