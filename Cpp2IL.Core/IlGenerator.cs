@@ -3344,6 +3344,104 @@ public static class IlGenerator
     }
 
     /// <summary>
+    /// Emits the pointer-sized value a type's runtime handle wraps:
+    /// <c>ldtoken T</c> into a RuntimeTypeHandle local, then its get_Value() —
+    /// the IntPtr IL2CPP's TypeHandle.Value is. Shared by every emission whose
+    /// operand means "the runtime metadata of T".
+    /// </summary>
+    private static void EmitTypeHandleValue(TypeAnalysisContext representedType,
+        MethodDefinition method, CilInstructionCollection instructions)
+    {
+        var corLibScope = method.DeclaringModule!.CorLibTypeFactory.CorLibScope;
+        var runtimeTypeHandle = corLibScope.CreateTypeReference("System", "RuntimeTypeHandle");
+        var handleLocal = new CilLocalVariable(runtimeTypeHandle.ToTypeSignature(true));
+        method.CilMethodBody!.LocalVariables.Add(handleLocal);
+        instructions.Add(CilOpCodes.Ldtoken, representedType.ToTypeSignature().ToTypeDefOrRef());
+        instructions.Add(CilOpCodes.Stloc, handleLocal);
+        instructions.Add(CilOpCodes.Ldloca, handleLocal);
+        instructions.Add(CilOpCodes.Call, runtimeTypeHandle.CreateMemberReference("get_Value",
+            MethodSignature.CreateInstance(
+                corLibScope.CreateTypeReference("System", "IntPtr").ToTypeSignature(true))));
+    }
+
+    /// <summary>
+    /// Emits the spellable equivalent of a .ctor method-pointer load:
+    /// <c>typeof(D).GetConstructor(BindingFlags.Instance|Public|NonPublic, null, types, null).MethodHandle</c>,
+    /// followed by the handle's Value when the slot wants an IntPtr. ldftn and
+    /// GetMethod cannot name a constructor; GetConstructor is the lookup the
+    /// native MethodInfo* stands for. Mirrors <see cref="TryEmitMethodPointerReflection"/>.
+    /// </summary>
+    /// <returns>false when the constructor's signature or declaring type cannot
+    /// be named; the caller keeps its diagnosed placeholder then.</returns>
+    private static bool TryEmitConstructorPointerReflection(
+        MethodAnalysisContext represented, MethodAnalysisContext? callingContext,
+        MethodDefinition method, CilInstructionCollection instructions, bool asFunctionPointer)
+    {
+        var lookup = represented is ConcreteGenericMethodAnalysisContext concrete
+            ? concrete.BaseMethodContext
+            : represented;
+        var declaringType = lookup.DeclaringType;
+        if (declaringType == null || lookup.Name != ".ctor"
+            || !TypeTokenUsableFrom(declaringType, callingContext)
+            || !lookup.Parameters.All(p => SignatureElementSpellable(p.ParameterType)))
+            return false;
+
+        var corLibScope = method.DeclaringModule!.CorLibTypeFactory.CorLibScope;
+        var systemType = corLibScope.CreateTypeReference("System", "Type");
+        var typeSignature = systemType.ToTypeSignature(false);
+        var runtimeTypeHandle = corLibScope.CreateTypeReference("System", "RuntimeTypeHandle");
+        var runtimeMethodHandle = corLibScope.CreateTypeReference("System", "RuntimeMethodHandle");
+        var constructorInfo = corLibScope.CreateTypeReference("System.Reflection", "ConstructorInfo")
+            .ToTypeSignature(false);
+        var bindingFlags = corLibScope.CreateTypeReference("System.Reflection", "BindingFlags")
+            .ToTypeSignature(true);
+        var getTypeFromHandle = systemType.CreateMemberReference("GetTypeFromHandle",
+            MethodSignature.CreateStatic(typeSignature, [runtimeTypeHandle.ToTypeSignature(true)]));
+        var getConstructor = systemType.CreateMemberReference("GetConstructor",
+            MethodSignature.CreateInstance(constructorInfo,
+                [bindingFlags,
+                    corLibScope.CreateTypeReference("System.Reflection", "Binder").ToTypeSignature(false),
+                    typeSignature.MakeSzArrayType(),
+                    corLibScope.CreateTypeReference("System.Reflection", "ParameterModifier")
+                        .ToTypeSignature(true).MakeSzArrayType()]));
+
+        instructions.Add(CilOpCodes.Ldtoken, declaringType.ToTypeSignature().ToTypeDefOrRef());
+        instructions.Add(CilOpCodes.Call, getTypeFromHandle);
+        // BindingFlags.Instance | Public | NonPublic
+        instructions.Add(CilOpCodes.Ldc_I4, 52);
+        instructions.Add(CilOpCodes.Ldnull);
+        instructions.Add(CilOpCodes.Ldc_I4, lookup.Parameters.Count);
+        instructions.Add(CilOpCodes.Newarr, systemType);
+        for (var i = 0; i < lookup.Parameters.Count; i++)
+        {
+            instructions.Add(CilOpCodes.Dup);
+            instructions.Add(CilOpCodes.Ldc_I4, i);
+            instructions.Add(CilOpCodes.Ldtoken,
+                lookup.Parameters[i].ParameterType.ToTypeSignature().ToTypeDefOrRef());
+            instructions.Add(CilOpCodes.Call, getTypeFromHandle);
+            instructions.Add(CilOpCodes.Stelem_Ref);
+        }
+        instructions.Add(CilOpCodes.Ldnull);
+        instructions.Add(CilOpCodes.Callvirt, getConstructor);
+        instructions.Add(CilOpCodes.Callvirt,
+            corLibScope.CreateTypeReference("System.Reflection", "MethodBase")
+                .CreateMemberReference("get_MethodHandle",
+                    MethodSignature.CreateInstance(runtimeMethodHandle.ToTypeSignature(true))));
+        if (!asFunctionPointer)
+            return true;
+
+        var handleLocal = new CilLocalVariable(runtimeMethodHandle.ToTypeSignature(true));
+        method.CilMethodBody!.LocalVariables.Add(handleLocal);
+        instructions.Add(CilOpCodes.Stloc, handleLocal);
+        instructions.Add(CilOpCodes.Ldloca, handleLocal);
+        instructions.Add(CilOpCodes.Call,
+            runtimeMethodHandle.CreateMemberReference("get_Value",
+                MethodSignature.CreateInstance(
+                    corLibScope.CreateTypeReference("System", "IntPtr").ToTypeSignature(true))));
+        return true;
+    }
+
+    /// <summary>
     /// Emits the spellable equivalent of an ldtoken field-handle load:
     /// `typeof(D).GetField("F", BindingFlags.Instance|Static|Public|NonPublic).FieldHandle`,
     /// followed by the handle's `Value` (the IntPtr it wraps) when the slot
@@ -4118,26 +4216,37 @@ public static class IlGenerator
                 // unnameable __ldftn/__ldtoken pseudo-call. For those the same
                 // handle value comes from reflection:
                 // typeof(D).GetMethod("M", ...).MethodHandle, plus
-                // .Value when the slot wants an IntPtr. Under IL2CPP
-                // RuntimeMethodHandle.Value is the MethodInfo* itself, which is
-                // exactly what a MethodInfo*-carrying operand loaded; an
-                // IsCodePointer operand instead loaded the code entry pointer
-                // (an il2cpp_resolve_icall result) that no spellable member
-                // reproduces, so the emission carries a decompiler-issue note.
-                // .ctor/.cctor cannot be named by either emission, so they keep
-                // the verifier-legal native-int zero placeholder rather than
-                // fabricating a handle for them.
+                // .Value when the slot wants an IntPtr; a .ctor uses
+                // typeof(D).GetConstructor(...).MethodHandle[.Value] instead.
+                // Under IL2CPP RuntimeMethodHandle.Value is the MethodInfo*
+                // itself, which is exactly what a MethodInfo*-carrying operand
+                // loaded; an IsCodePointer operand instead loaded the code entry
+                // pointer (an il2cpp_resolve_icall result) that no spellable
+                // member reproduces, so the emission carries a decompiler-issue
+                // note. A .cctor has no metadata lookup, so it keeps the
+                // verifier-legal native-int zero placeholder rather than
+                // fabricating a handle for it.
                 var represented = SpellableMethodPointer(runtimeMethod, callingContext);
-                if (represented is { Name: not ".ctor" and not ".cctor" }
+                if (represented is { Name: not ".cctor" }
                     && expectedType?.FullName is "System.IntPtr" or "System.RuntimeMethodHandle")
                 {
                     var wantsPointer = expectedType.FullName == "System.IntPtr";
-                    var emittedPointer = wantsPointer && LdftnSpellable(represented);
-                    if (emittedPointer)
+                    bool emittedPointer;
+                    if (represented.Name == ".ctor")
+                    {
+                        emittedPointer = TryEmitConstructorPointerReflection(represented,
+                            callingContext, method, instructions, wantsPointer);
+                    }
+                    else if (wantsPointer && LdftnSpellable(represented))
+                    {
                         instructions.Add(CilOpCodes.Ldftn, represented.ToMethodDescriptor());
+                        emittedPointer = true;
+                    }
                     else
+                    {
                         emittedPointer = TryEmitMethodPointerReflection(represented,
                             callingContext, method, instructions, wantsPointer);
+                    }
                     if (emittedPointer)
                     {
                         if (runtimeMethod.IsCodePointer)
@@ -4155,8 +4264,15 @@ public static class IlGenerator
                     PushDefaultOf(expectedType, method, instructions, callingContext);
                 else
                 {
+                    var cannotSpellBecause = represented == null
+                        ? "the method it represents cannot be named here"
+                        : represented.Name == ".cctor"
+                            ? "a type initializer has no metadata lookup"
+                            : expectedType?.FullName is not ("System.IntPtr" or "System.RuntimeMethodHandle")
+                                ? $"the {expectedType?.FullName ?? "uncontracted"} slot"
+                                : "its declaring type or signature cannot be spelled";
                     instructions.Add(CilOpCodes.Ldstr, Diagnostic(
-                        $"Method pointer for {runtimeMethod} cannot be spelled; substituting the native-int zero the handle wrapper lowers to."));
+                        $"Method pointer for {runtimeMethod} cannot be spelled: {cannotSpellBecause}; substituting the native-int zero the handle wrapper lowers to."));
                     instructions.Add(CilOpCodes.Call, writeLine);
                     instructions.Add(CilOpCodes.Ldc_I4_0);
                     instructions.Add(CilOpCodes.Conv_I);
@@ -4221,12 +4337,36 @@ public static class IlGenerator
                             module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "Type").ToTypeSignature(true),
                             [module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "RuntimeTypeHandle").ToTypeSignature(true)])));
                 break;
+            case RuntimeClassTypeAnalysisContext runtimeClass
+                when expectedType?.FullName is "System.IntPtr" or "System.UIntPtr"
+                    || expectedType is PointerTypeAnalysisContext:
+                // A klass* in a native-int/pointer slot is the runtime-metadata
+                // pointer of the type it describes. The only spellable stand-in
+                // is the type's RuntimeTypeHandle.Value — under IL2CPP that is
+                // the Il2CppType*, a *different* object from the Il2CppClass*
+                // the operand loaded, so the emission carries a decompiler-issue
+                // note: the site is a named gap with plausible IL, not a silent
+                // substitution.
+                if (!TypeTokenUsableFrom(runtimeClass.RepresentedType, callingContext))
+                {
+                    instructions.Add(CilOpCodes.Ldstr, Diagnostic(
+                        $"Operand {operand} names the runtime class pointer of {runtimeClass.RepresentedType.FullName}, which cannot be named from {callingContext.Name}; substituting a native-int zero."));
+                    instructions.Add(CilOpCodes.Call, writeLine);
+                    instructions.Add(CilOpCodes.Ldc_I4_0);
+                    instructions.Add(CilOpCodes.Conv_I);
+                    break;
+                }
+                EmitTypeHandleValue(runtimeClass.RepresentedType, method, instructions);
+                EmitDecompilerNote(method, callingContext,
+                    $"the loaded value is the class pointer of {runtimeClass.RepresentedType.FullName} (an Il2CppClass*); the emitted expression is the type's RuntimeTypeHandle.Value (an Il2CppType*), which is a different runtime object.");
+                break;
             case RuntimeClassTypeAnalysisContext or RgctxTableTypeAnalysisContext
                 or MethodRgctxTableTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext:
-                // A klass*/rgctx*/statics-table operand names a native pointer that has
-                // no managed spelling; the null address is the honest stand-in.
+                // A klass*/rgctx*/statics-table operand naming a native pointer in
+                // any other slot has no managed spelling; the null address is the
+                // honest stand-in.
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic(
-                    $"Operand {operand} names a native metadata pointer that cannot be emitted; substituting a native-int zero."));
+                    $"Operand {operand} names a native metadata pointer that cannot be emitted for the {expectedType?.FullName ?? "uncontracted"} slot; substituting a native-int zero."));
                 instructions.Add(CilOpCodes.Call, writeLine);
                 instructions.Add(CilOpCodes.Ldc_I4_0);
                 instructions.Add(CilOpCodes.Conv_I);
@@ -4257,14 +4397,7 @@ public static class IlGenerator
                         instructions.Add(CilOpCodes.Conv_I);
                         break;
                     }
-                    var handleLocal = new CilLocalVariable(runtimeTypeHandle.ToTypeSignature(true));
-                    method.CilMethodBody!.LocalVariables.Add(handleLocal);
-                    var getValue = runtimeTypeHandle.CreateMemberReference("get_Value",
-                        MethodSignature.CreateInstance(corLibScope.CreateTypeReference("System", "IntPtr").ToTypeSignature(true)));
-                    instructions.Add(CilOpCodes.Ldtoken, type.ToTypeSignature().ToTypeDefOrRef());
-                    instructions.Add(CilOpCodes.Stloc, handleLocal);
-                    instructions.Add(CilOpCodes.Ldloca, handleLocal);
-                    instructions.Add(CilOpCodes.Call, getValue);
+                    EmitTypeHandleValue(type, method, instructions);
                     break;
                 }
 
