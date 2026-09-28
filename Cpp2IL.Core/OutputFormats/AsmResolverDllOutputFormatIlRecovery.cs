@@ -102,7 +102,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             // creates duplicate-type compiler errors.
             .Where(a => a.Name is not null
                 && !AccessibilityExtensions.IsExternalRuntimeAssembly(a.Name))
-            .Select(FriendName)
+            .Select(a => (Name: FriendName(a), Keyed: a.PublicKey is { Length: > 0 }))
             .Distinct()
             .ToList();
         foreach (var assembly in assemblies)
@@ -110,14 +110,21 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             var module = assembly.Modules.FirstOrDefault();
             if (module == null || assembly.Name is null)
                 continue;
+            // A strong-named grantor may only name strong-named friends - an
+            // unsigned name in InternalsVisibleTo is rejected outright when
+            // the signed output is recompiled (CS1726), and the original build
+            // could not have carried the grant either.
+            var grantorKeyed = assembly.PublicKey is { Length: > 0 };
             var factory = module.CorLibTypeFactory;
             var ivtCtor = factory.CorLibScope
                 .CreateTypeReference("System.Runtime.CompilerServices", "InternalsVisibleToAttribute")
                 .CreateMemberReference(".ctor",
                     MethodSignature.CreateInstance(factory.Void, [factory.String]));
             var self = assembly.Name.ToString() + ",";
-            foreach (var friend in friends)
+            foreach (var (friend, friendKeyed) in friends)
             {
+                if (grantorKeyed && !friendKeyed)
+                    continue;
                 if (friend.StartsWith(self, StringComparison.Ordinal))
                     continue;
                 var signature = new CustomAttributeSignature(
