@@ -374,7 +374,7 @@ public static class LocalVariables
                 {
                     var relativeOffset = slotOffset - root.Offset!.Value;
                     var nested = relativeOffset > 0
-                        ? MetadataResolver.FindNestedInstanceFieldAtOffset(root.Local.Type!, relativeOffset, accessSize)
+                        ? MetadataResolver.FindNestedInstanceFieldPathAtOffset(root.Local.Type!, relativeOffset, accessSize)
                         : null;
                     return (Root: root.Local, Offset: relativeOffset, Nested: nested);
                 })
@@ -391,7 +391,7 @@ public static class LocalVariables
                 continue;
             var match = nearest[0];
             instruction.SetOperand(operandIndex, new FieldReference(match.Nested!.Value.Field,
-                match.Root, match.Offset, [match.Nested.Value.Container], accessSize));
+                match.Root, match.Offset, match.Nested.Value.Containers, accessSize));
             if (instruction.OpCode == OpCode.Move && operandIndex == 1
                 && instruction.Destination is LocalVariable destination)
                 destination.Type = match.Nested.Value.Field.FieldType;

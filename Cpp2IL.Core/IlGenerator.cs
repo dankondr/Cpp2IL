@@ -4750,12 +4750,16 @@ public static class IlGenerator
             || (CallDefinedLocalType(local, context) ?? ObjectDefinitionType(local, context)) is not { } owner
             || owner == context.AppContext.SystemTypes.SystemObjectType)
             return false;
-        var field = Analysis.MetadataResolver.FindInstanceFieldAtOffset(owner, memory.Addend);
-        if (field == null)
+        var resolved = Analysis.MetadataResolver.FindInstanceFieldPathAtOffset(
+            owner, memory.Addend, memory.AccessSize);
+        if (resolved is not { } path)
             return false;
-        if (owner is GenericInstanceTypeAnalysisContext genericOwner)
+        var field = path.Field;
+        if (owner is GenericInstanceTypeAnalysisContext genericOwner
+            && field is not ConcreteGenericFieldAnalysisContext)
             field = new ConcreteGenericFieldAnalysisContext(field, genericOwner);
-        fieldReference = new FieldReference(field, local, (int)memory.Addend);
+        fieldReference = new FieldReference(field, local, (int)memory.Addend, path.Containers,
+            memory.AccessSize);
         return true;
     }
 

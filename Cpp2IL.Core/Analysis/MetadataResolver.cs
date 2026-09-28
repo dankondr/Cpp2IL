@@ -204,7 +204,14 @@ public static class MetadataResolver
 
                 // check if static field access
                 var staticOwner = (localType as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
-                var owner = staticOwner ?? localType;
+                // [ref-to-struct + off] is a member read of the referenced value
+                // (min.y), not pointer arithmetic - resolve it against the element
+                // type's layout. Only a byref lowers to a legal ldfld receiver; an
+                // unmanaged pointer does not, so pointer bases stay unresolved.
+                var byRefElement = staticOwner == null
+                    && localType is ByRefTypeAnalysisContext { ElementType.IsValueType: true } byRef
+                    ? byRef.ElementType : null;
+                var owner = staticOwner ?? byRefElement ?? localType;
                 var genericOwner = owner as GenericInstanceTypeAnalysisContext;
 
                 if (memory.Index is LocalVariable selector
@@ -218,7 +225,8 @@ public static class MetadataResolver
                         try { offset = checked(memory.Addend + selectorValue * scale); }
                         catch (System.OverflowException) { choices.Clear(); break; }
 
-                        if (ResolveField(owner, staticOwner, offset, memory.AccessSize) is not { } selectedField)
+                        if (ResolveField(owner, staticOwner, offset, memory.AccessSize,
+                                byRefElement != null) is not { } selectedField)
                         {
                             choices.Clear();
                             break;
@@ -245,7 +253,8 @@ public static class MetadataResolver
                 if (memory.Index != null || memory.Scale != 0)
                     continue;
 
-                var resolved = ResolveField(owner, staticOwner, memory.Addend, memory.AccessSize);
+                var resolved = ResolveField(owner, staticOwner, memory.Addend, memory.AccessSize,
+                    byRefElement != null);
                 var field = resolved?.Field;
 
                 if (field == null) // TODO: Support nested fields (Field1.Field2.Field3)
@@ -278,7 +287,8 @@ public static class MetadataResolver
     }
 
     private static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)? ResolveField(
-        TypeAnalysisContext owner, TypeAnalysisContext? staticOwner, long offset, int accessSize)
+        TypeAnalysisContext owner, TypeAnalysisContext? staticOwner, long offset, int accessSize,
+        bool sizeMatchedLeaf = false)
     {
         if (staticOwner != null)
         {
@@ -289,7 +299,7 @@ public static class MetadataResolver
             return null;
         }
 
-        return FindInstanceFieldPathAtOffset(owner, offset, accessSize);
+        return ResolveFieldPath(owner, offset, accessSize, sizeMatchedLeaf);
     }
 
     // The honest public equivalent of a cross-assembly private field read: IL2CPP inlines managed
@@ -486,11 +496,28 @@ public static class MetadataResolver
 
     internal static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)?
         FindInstanceFieldPathAtOffset(TypeAnalysisContext owner, long offset, int accessSize)
+        => ResolveFieldPath(owner, offset, accessSize, false);
+
+    // A flat hit is an exact-offset match; a nested hit additionally requires the load's
+    // width to match the leaf member's storage so a wider read is not silently narrowed
+    // to its first member. sizeMatchedLeaf applies the same width rule to a top-level
+    // leaf - needed when the base itself is a reference into a value type, where the
+    // "object" is exactly the struct body and every byte belongs to some member.
+    private static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)?
+        ResolveFieldPath(TypeAnalysisContext owner, long offset, int accessSize, bool sizeMatchedLeaf)
     {
-        if (FindNestedInstanceFieldAtOffset(owner, offset, accessSize) is { } nested)
-            return (nested.Field, [nested.Container]);
-        return FindInstanceFieldAtOffset(owner, offset) is { } field ? (field, []) : null;
+        if (FindNestedInstanceFieldPathAtOffset(owner, offset, accessSize) is { } nested)
+            return nested;
+        if (FindInstanceFieldAtOffset(owner, offset) is not { } field)
+            return null;
+        if (sizeMatchedLeaf && accessSize > 0
+            && LeafStorageSize(field.FieldType, owner.AppContext.Binary.PointerSizeBytes) != accessSize)
+            return null;
+        return (field, []);
     }
+
+    private static long LeafStorageSize(TypeAnalysisContext type, int pointerSize)
+        => PrimitiveStorageSize(type, pointerSize) ?? TypeSizes.MinimumUnboxedSize(type, pointerSize);
 
     private static (FieldAnalysisContext Container, FieldAnalysisContext Field)? FindNestedStaticFieldAtOffset(
         TypeAnalysisContext owner, long offset, int accessSize)
@@ -640,58 +667,112 @@ public static class MetadataResolver
             return memory.Index == null && memory.Scale == 0
                 && FindStaticFieldAtOffset(staticStorage.OwnerType, memory.Addend) != null;
 
+        if (owner is ByRefTypeAnalysisContext { ElementType.IsValueType: true } byRef)
+            return memory.Index == null && memory.Scale == 0
+                && ResolveFieldPath(byRef.ElementType, memory.Addend, memory.AccessSize, true) != null;
+
         return memory.Index == null && memory.Scale == 0
             && FindInstanceFieldPathAtOffset(owner, memory.Addend, memory.AccessSize) != null;
     }
 
-    internal static (FieldAnalysisContext Container, FieldAnalysisContext Field)? FindNestedInstanceFieldAtOffset(
-        TypeAnalysisContext owner, long offset, int accessSize)
+    // A load landing inside a value-typed member is a nested member access
+    // (outer.inner[.inner...]): descend through struct-typed container fields while the
+    // offset stays inside one's extent, carrying the whole container chain. A leaf is
+    // proven when a member sits exactly at the relative offset and - when the load's
+    // width is known - its storage size equals that width; without the width rule a wide
+    // read would be silently narrowed to the first member it overlaps.
+    internal static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)?
+        FindNestedInstanceFieldPathAtOffset(TypeAnalysisContext owner, long offset, int accessSize)
     {
-        if (accessSize <= 0)
-            return null;
-
-        if (owner is GenericInstanceTypeAnalysisContext genericOwner)
-        {
-            var containing = GenericInstanceFieldLayout.FindFieldContainingOffset(genericOwner, offset);
-            if (containing is not { Field.FieldType.IsValueType: true } range
-                || range.Size == accessSize)
-                return null;
-            var relativeOffset = offset - range.Offset;
-            var nested = range.Field.FieldType is GenericInstanceTypeAnalysisContext nestedGeneric
-                ? GenericInstanceFieldLayout.FindFieldContainingOffset(nestedGeneric, relativeOffset) is
-                    { Offset: var nestedFieldOffset, Size: var nestedFieldSize, Field: var concrete }
-                    && nestedFieldOffset == relativeOffset && nestedFieldSize == accessSize ? concrete : null
-                : range.Field.FieldType.Fields.FirstOrDefault(field => !field.IsStatic
-                    && (field.BackingData?.FieldOffset ?? field.Offset) == relativeOffset
-                    && PrimitiveStorageSize(field.FieldType, owner.AppContext.Binary.PointerSizeBytes) == accessSize);
-            return nested == null ? null : (range.Field, nested);
-        }
-
-        if (owner.GenericParameters.Count > 0)
-            return null;
-
+        var pointerSize = owner.AppContext.Binary.PointerSizeBytes;
         for (var candidate = owner; candidate != null; candidate = candidate.BaseType)
         {
-            // generic candidates' field offsets are layout placeholders, not real offsets
-            if (candidate is GenericInstanceTypeAnalysisContext || candidate.GenericParameters.Count > 0)
+            // a generic instance's declared offsets are layout placeholders; only a
+            // recomputed one-level path is available there
+            if (candidate is GenericInstanceTypeAnalysisContext genericCandidate)
+            {
+                if (FindGenericNestedFieldAtOffset(genericCandidate, offset, accessSize, pointerSize)
+                        is { } generic)
+                    return (generic.Field, [generic.Container]);
+                continue;
+            }
+            if (candidate.GenericParameters.Count > 0)
                 continue;
 
-            foreach (var container in candidate.Fields.Where(f => !f.IsStatic && f.FieldType.IsValueType)
-                         .OrderByDescending(f => f.Offset))
+            foreach (var container in candidate.Fields.Where(f => !f.IsStatic
+                         && (f.Attributes & FieldAttributes.Literal) == 0 && f.FieldType.IsValueType)
+                         .OrderByDescending(f => f.BackingData?.FieldOffset ?? f.Offset))
             {
-                var relativeOffset = offset - container.Offset;
-                if (relativeOffset < 0 || PrimitiveStorageSize(container.FieldType, owner.AppContext.Binary.PointerSizeBytes) == accessSize)
+                var relativeOffset = offset - (container.BackingData?.FieldOffset ?? container.Offset);
+                if (relativeOffset < 0)
                     continue;
+                var containerSize = TypeSizes.MinimumUnboxedSize(container.FieldType, pointerSize);
+                if (containerSize > 0 && relativeOffset >= containerSize)
+                    continue;
+                if (PrimitiveStorageSize(container.FieldType, pointerSize) == accessSize)
+                    continue; // the load is the whole container - the flat lookup names it
 
-                var nested = container.FieldType.Fields.FirstOrDefault(f => !f.IsStatic
-                    && f.Offset == relativeOffset
-                    && PrimitiveStorageSize(f.FieldType, owner.AppContext.Binary.PointerSizeBytes) == accessSize);
-                if (nested != null)
-                    return (container, nested);
+                if (FindFieldPathWithin(container.FieldType, relativeOffset, accessSize, pointerSize)
+                        is { } inner)
+                    return (inner.Field, new[] { container }.Concat(inner.Containers).ToList());
             }
         }
 
         return null;
+    }
+
+    private static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)?
+        FindFieldPathWithin(TypeAnalysisContext owner, long offset, int accessSize, int pointerSize,
+            int depth = 0)
+    {
+        // Structs cannot inherit fields, so one level's own members are the whole layout;
+        // a depth cap keeps degenerate self-referencing layouts from recursing forever.
+        if (depth > 8)
+            return null;
+
+        var leaf = owner.Fields.FirstOrDefault(f => !f.IsStatic
+            && (f.Attributes & FieldAttributes.Literal) == 0
+            && (f.BackingData?.FieldOffset ?? f.Offset) == offset
+            && (accessSize <= 0 || LeafStorageSize(f.FieldType, pointerSize) == accessSize));
+        if (leaf != null)
+            return (leaf, []);
+
+        foreach (var container in owner.Fields.Where(f => !f.IsStatic
+                     && (f.Attributes & FieldAttributes.Literal) == 0 && f.FieldType.IsValueType
+                     && PrimitiveStorageSize(f.FieldType, pointerSize) != accessSize)
+                     .OrderByDescending(f => f.BackingData?.FieldOffset ?? f.Offset))
+        {
+            var relativeOffset = offset - (container.BackingData?.FieldOffset ?? container.Offset);
+            if (relativeOffset < 0)
+                continue;
+            var containerSize = TypeSizes.MinimumUnboxedSize(container.FieldType, pointerSize);
+            if (containerSize > 0 && relativeOffset >= containerSize)
+                continue;
+            if (FindFieldPathWithin(container.FieldType, relativeOffset, accessSize, pointerSize,
+                    depth + 1) is { } inner)
+                return (inner.Field, new[] { container }.Concat(inner.Containers).ToList());
+        }
+
+        return null;
+    }
+
+    private static (FieldAnalysisContext Container, FieldAnalysisContext Field)?
+        FindGenericNestedFieldAtOffset(GenericInstanceTypeAnalysisContext genericOwner, long offset,
+            int accessSize, int pointerSize)
+    {
+        var containing = GenericInstanceFieldLayout.FindFieldContainingOffset(genericOwner, offset);
+        if (containing is not { Field.FieldType.IsValueType: true } range
+            || range.Size == accessSize)
+            return null;
+        var relativeOffset = offset - range.Offset;
+        var nested = range.Field.FieldType is GenericInstanceTypeAnalysisContext nestedGeneric
+            ? GenericInstanceFieldLayout.FindFieldContainingOffset(nestedGeneric, relativeOffset) is
+                { Offset: var nestedFieldOffset, Size: var nestedFieldSize, Field: var concrete }
+                && nestedFieldOffset == relativeOffset && nestedFieldSize == accessSize ? concrete : null
+            : range.Field.FieldType.Fields.FirstOrDefault(field => !field.IsStatic
+                && (field.BackingData?.FieldOffset ?? field.Offset) == relativeOffset
+                && PrimitiveStorageSize(field.FieldType, pointerSize) == accessSize);
+        return nested == null ? null : (range.Field, nested);
     }
 
     private static int? PrimitiveStorageSize(TypeAnalysisContext type, int pointerSize)
