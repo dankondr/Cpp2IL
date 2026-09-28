@@ -283,6 +283,9 @@ public static class CopyCoalescer
                     if (elementField.Index is LocalVariable addressedElementIndex)
                         yield return addressedElementIndex;
                     break;
+                case ReferenceCast cast when !ReferenceEquals(cast.Value, defined):
+                    yield return cast.Value;
+                    break;
             }
         }
     }
@@ -338,6 +341,9 @@ public static class CopyCoalescer
                             elementField.Array = groups.Find(elementField.Array);
                             if (elementField.Index is LocalVariable addressedElementIndex)
                                 elementField.Index = groups.Find(addressedElementIndex);
+                            break;
+                        case ReferenceCast cast:
+                            instruction.SetOperand(i, new ReferenceCast(groups.Find(cast.Value), cast.Type, cast.NullOnFailure));
                             break;
                     }
                 }
