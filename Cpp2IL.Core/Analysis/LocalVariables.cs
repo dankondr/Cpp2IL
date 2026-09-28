@@ -320,6 +320,7 @@ public static class LocalVariables
             changed |= MetadataResolver.ResolveVirtualCalls(method);
             changed |= PropagateFromCallParameters(method);
             changed |= MetadataResolver.ResolveFieldOffsets(method);
+            changed |= ResolveSharpenedFieldOwners(method);
             changed |= RgctxResolver.Run(method);
             changed |= PropagateStaticFieldStorage(method);
             changed |= TypeAddressedLocals(method);
@@ -389,6 +390,54 @@ public static class LocalVariables
             if (instruction.OpCode == OpCode.Move && operandIndex == 1
                 && instruction.Destination is LocalVariable destination)
                 destination.Type = match.Nested.Value.Field.FieldType;
+            changed = true;
+        }
+        return changed;
+    }
+
+    // A FieldReference materialized while its owner local still typed the erased shared
+    // instantiation (e.g. `Dictionary<K,V>.Enumerator<object,object>` under generic
+    // sharing) keeps that instantiation even though the local emits as the sharpened
+    // one (EmittedLocalType). The emitted member then disagrees with the declared
+    // slots: `Enumerator<string,...>::get_Current` returns `KeyValuePair<string,...>`
+    // into a `KeyValuePair<object,object>` local. When the local's emitted type is a
+    // different instantiation of the same generic definition, re-resolve the field
+    // path on the instantiation the local actually emits as so PropagateMove retypes
+    // the destination to match.
+    private static bool ResolveSharpenedFieldOwners(MethodAnalysisContext method)
+    {
+        var changed = false;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        for (var i = 0; i < instruction.Operands.Count; i++)
+        {
+            var (reference, addressed) = instruction.Operands[i] switch
+            {
+                FieldReference direct => (direct, false),
+                AddressOf { Target: FieldReference addressedField } => (addressedField, true),
+                _ => (null, false),
+            };
+            if (reference is not { Field: ConcreteGenericFieldAnalysisContext
+                    { DeclaringType: GenericInstanceTypeAnalysisContext owner } }
+                // Only the one-way erased -> concrete transition is safe to take:
+                // without it a sharpening that later revises would flip the owner
+                // back and forth and the fixpoint would never settle.
+                || !owner.GenericArguments.Any(IlGenerator.ContainsErasedSharedArgument))
+                continue;
+            if (IlGenerator.EmittedLocalType(reference.Local, method) is not
+                    GenericInstanceTypeAnalysisContext emitted
+                || emitted.GenericType.FullName != owner.GenericType.FullName
+                || emitted.FullName == owner.FullName
+                || emitted.GenericArguments.Any(IlGenerator.ContainsErasedSharedArgument))
+                continue;
+            if (MetadataResolver.FindInstanceFieldPathAtOffset(emitted, reference.Offset,
+                    reference.AccessSize) is not { } resolved)
+                continue;
+            var field = resolved.Field;
+            if (field is not ConcreteGenericFieldAnalysisContext)
+                field = new ConcreteGenericFieldAnalysisContext(field, emitted);
+            var replacement = new FieldReference(field, reference.Local, reference.Offset,
+                resolved.Containers, reference.AccessSize);
+            instruction.SetOperand(i, addressed ? new AddressOf(replacement) : replacement);
             changed = true;
         }
         return changed;

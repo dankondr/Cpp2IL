@@ -134,12 +134,13 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
 
 | castle-recovery#114 `invalid-conversion` (compile bucket, isinst/`as` behind an `Il2CppClass<T>` slot) | type inference / dataflow | A reference-array store emits a runtime element-class check: `LDR klass,[array]` then `LDR target,[klass + element_class]` feed `object_is_inst`. `RewriteElementClassLoads` typed the element class from the klass local's `Il2CppClass<instance.Type>` tag — but `instance.Type` can be polluted by register merging (a phi that merges the array register with an unrelated typed copy, e.g. a `params object[]` register sharing with an `Action<T>` copy), producing `isinst`/`as` against a wrong managed type (CS0039). The element type is now re-derived from the definition that produced the instance: `ProducerElementType`/`ProducedManagedType` chase the `[instance + 0]` klass load back through `Move` copies to the producer — the `NewArr`/array-`new` key-function class argument, a call return type, a field type, or unanimous phi inputs — falling back to the represented tag when no producer pins one. `RewriteIsInst` also types the `isinst` result local from the resolved target (except value types and generic parameters, whose `isinst` result is a `ref` the `value`-declared slot cannot hold). Sites whose isinst *object operand* is itself a native `Il2CppClass*` keep the #104 diagnostic — `(nint)k as object` is the closest honest spelling. r241 measurement (`development` @ `8ffdd0cd`): `invalid-conversion` 67 -> 37 (CS0039 29 -> 2, CS0030 38 -> 35); residual 37 are the vector/scalar-binop, `Quaternion*`, misc-scalar and other-isinst shapes owned elsewhere | `Regression/IsInstElementClassTests.*` (2 tests) |
 
+| castle-recovery#115 `invalid-conversion` (`Quaternion*` conversions, 9 sites, and erased-generic enumerator `current` field refs, 4 sites) | field resolution + IL emission | Two Cpp2IL-owned shapes removed from the bucket: (1) `TryEmitUnityQuaternionInternal` rewrites `Quaternion.Internal_ToEulerRad` to `get_eulerAngles * 0.017453292` but pushed the Quaternion *value* as the `get_eulerAngles` receiver - an instance member on a value type requires `Quaternion&`, so ilspy spelled it `((Quaternion*)local)->eulerAngles` (CS0030). The receiver now emits the struct's managed address (`EmitStructValueReceiver`: `ldflda`/`ldloca`/`ldarga` on the operand's container, `ldflda` leaf at the container's base for whole-struct reads resolved through an offset-0 member, direct `&T` passes through, unaddressable expressions spill to a scratch local). (2) `ResolveSharpenedFieldOwners` (fixpoint pass): a `ConcreteGenericFieldAnalysisContext` materialized while its owner local still carried the erased shared instantiation (`Enumerator<object,object>::current`) kept that instantiation while `EmittedLocalType` sharpened the local (`Enumerator<string,int>`), so the emitted `get_Current` stored `KeyValuePair<string,int>` into a `KeyValuePair<object,object>` slot (invalid IL -> ilspy cast -> CS0030). The pass re-resolves such fields onto the owner's emitted instantiation via `FindInstanceFieldPathAtOffset` - one-way erased -> concrete transitions only, so the fixpoint still settles. r241 measurement (control `08adb5f2`): `invalid-conversion` 23 -> 14 — all 9 `Quaternion*` CS0030 sites cleared; the 4 KVP sites are IL-fixed (locals now `KeyValuePair<string,List<RuleDto>>`, `HandleSegments` ilverify-valid) but are invisible to the compile bucket both before and after — Roslyn skips *all* method-body binding for an assembly once any declaration-phase error exists, and VoodooTuneSDK carries two CS0507 access-override errors | `Regression/QuaternionReceiverEmissionTests.*` (2 tests), `Regression/ErasedFieldOwnerSharpeningTests.EnumeratorCurrentFieldResolvesOnSharpenedOwner` |
 ## Summary
 
 - **84 fork PRs** merged since `b5ad444b` (#1–#79, #81–#85; no #80), plus the
   castle-recovery#NN issue rows.
 - **2 are not live recovery fixes**: #26 (reverted by #27) and #85 (CI only).
-- **106 recovery-fix clusters.** **104** carry reproducing tests (tests added or
+- **107 recovery-fix clusters.** **105** carry reproducing tests (tests added or
   strengthened in the same PR): the 80 through the backfill wave (#16 + #47,
   #38, #40, #41, #57, #58), castle-recovery#74's `UnboxEmissionTests.*`,
   castle-recovery#75's `Arm64VectorLaneLiftingTests.*`,
@@ -164,8 +165,10 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
   castle-recovery#111's `FrameSlotLoadTests.*`,
   castle-recovery#113's `VectorOperatorResultTypingTests.*`,
   castle-recovery#112's `CompilerGeneratedNameTests.*`/`FrameworkSurfaceTypesTests.*`
-  additions, and
-  castle-recovery#114's `IsInstElementClassTests.*`.
+  additions,
+  castle-recovery#114's `IsInstElementClassTests.*`, and
+  castle-recovery#115's `QuaternionReceiverEmissionTests.*` and
+  `ErasedFieldOwnerSharpeningTests.*`.
 - **2 remain `none`**, both compile-only fixes: #15 (`IReadOnlySet` on
   netstandard2.0) and #20 (`AddOperands` signature fix, exercised downstream by
   `Arm64LibcMathImportTests`).
