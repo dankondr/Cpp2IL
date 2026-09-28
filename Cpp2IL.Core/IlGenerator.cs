@@ -6095,6 +6095,13 @@ public static class IlGenerator
             AddressOf { Target: ArrayElementFieldReference addressedElementField }
                 => new ByRefTypeAnalysisContext(addressedElementField.Field.FieldType),
             AddressOf => context.AppContext.SystemTypes.SystemIntPtrType,
+            // isinst/castclass to a generic parameter lands `ref !0` on the stack
+            // (ECMA III.4.15) - a boxed-T-or-null reference, not the `value !0`
+            // the parameter's own kind declares. Reporting the raw parameter makes
+            // coercions emit `box !0` on a value that is already a reference,
+            // which the verifier rejects.
+            ReferenceCast { Type: GenericParameterTypeAnalysisContext genericCastTarget } genericCast
+                => EmittedGenericCastOperandType(genericCast, genericCastTarget, context),
             ReferenceCast cast => EmittableLocalType(cast.Type, context),
             StringLiteral => context.AppContext.SystemTypes.SystemStringType,
             FloatLiteral => context.AppContext.SystemTypes.SystemSingleType,
@@ -6138,6 +6145,22 @@ public static class IlGenerator
 
     private static TypeAnalysisContext? ResolveSystemType(MethodAnalysisContext context, string fullName) =>
         context.AppContext.GetAssemblyByName("mscorlib")?.GetTypeByFullName(fullName);
+
+    // The stack type a ReferenceCast to a generic parameter actually emits, mirroring
+    // the ReferenceCast case of LoadOperand: a replaced cast leaves a `value !0`
+    // default, an elided cast leaves the operand's own value, and a real
+    // isinst/castclass pushes `ref !0` - the boxed-T-or-null the verifier tracks.
+    private static TypeAnalysisContext? EmittedGenericCastOperandType(ReferenceCast cast,
+        GenericParameterTypeAnalysisContext castTarget, MethodAnalysisContext context)
+    {
+        var castValueType = EmittedOperandType(cast.Value, context);
+        if (castValueType is { IsValueType: true } or PointerTypeAnalysisContext or ByRefTypeAnalysisContext
+            || !TypeTokenUsableFrom(castTarget, context))
+            return EmittableLocalType(castTarget, context);
+        if (ThisConstructorCallPlan.SameTypeIdentity(castValueType, castTarget))
+            return castValueType;
+        return new BoxedTypeAnalysisContext(castTarget);
+    }
 
     // Mirrors the Immediate branch of LoadOperand: the reported stack type is whatever
     // the literal actually emits under the consumer's contract.
@@ -6317,11 +6340,33 @@ public static class IlGenerator
         if (to != null && IsNativeHandleType(to))
             to = to.AppContext.SystemTypes.SystemIntPtrType;
 
-        if (from == null || to == null || from.FullName == to.FullName)
+        if (from == null || to == null)
             return true;
 
-        // No stack op synthesizes a generic-parameter or byref value from another kind.
-        if (to is GenericParameterTypeAnalysisContext or ByRefTypeAnalysisContext)
+        // unbox.any is the canonical `ref !0` -> `value !0` conversion - and the
+        // only one: it is legal solely when the source proves `ref !0` for that
+        // same parameter (a boxed-T-or-null from isinst/castclass). A boxed type
+        // shares its element's name, so this must run before the identical-name
+        // early-out; any other source stays unbridgeable and gets diagnosed.
+        if (to is GenericParameterTypeAnalysisContext genericContract)
+        {
+            if (from is not BoxedTypeAnalysisContext && from.FullName == to.FullName)
+                return true;
+            if (from is BoxedTypeAnalysisContext { ElementType: { } boxedElement }
+                && ThisConstructorCallPlan.SameTypeIdentity(boxedElement, genericContract)
+                && TypeTokenUsableFrom(genericContract, context))
+            {
+                method.CilMethodBody!.Instructions.Add(CilOpCodes.Unbox_Any, to.ToTypeSignature().ToTypeDefOrRef());
+                return true;
+            }
+            return false;
+        }
+
+        if (from.FullName == to.FullName)
+            return true;
+
+        // No stack op synthesizes a byref value from another kind.
+        if (to is ByRefTypeAnalysisContext)
             return false;
 
         var instructions = method.CilMethodBody!.Instructions;
@@ -6660,12 +6705,24 @@ public static class IlGenerator
         if (to != null && IsNativeHandleType(to))
             to = to.AppContext.SystemTypes.SystemIntPtrType;
 
-        if (from == null || to == null || from.FullName == to.FullName)
+        if (from == null || to == null)
             return true;
 
-        // No stack op synthesizes a generic-parameter or byref destination value;
-        // only the identical type already satisfies those slots.
-        if (to is GenericParameterTypeAnalysisContext or ByRefTypeAnalysisContext)
+        // Mirrors EmitStackCoerce: only a `ref !0` proven for that parameter - a
+        // boxed-T-or-null - reaches a `!0` slot, through unbox.any. The boxed
+        // wrapper shares the parameter's name, so check it before the
+        // identical-name early-out; every other source stays unbridgeable. A
+        // byref slot still takes only the identical pointer type.
+        if (to is GenericParameterTypeAnalysisContext genericContract)
+        {
+            if (from is BoxedTypeAnalysisContext { ElementType: { } boxedElement })
+                return ThisConstructorCallPlan.SameTypeIdentity(boxedElement, genericContract)
+                    && TypeTokenUsableFrom(genericContract, context);
+            return StackAssignableTo(from, to);
+        }
+        if (from.FullName == to.FullName)
+            return true;
+        if (to is ByRefTypeAnalysisContext)
             return StackAssignableTo(from, to);
 
         // A T source fits a managed reference through box T; nothing else is legal.
