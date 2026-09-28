@@ -1195,11 +1195,29 @@ public static class LocalVariables
     // receiver produces an invalid ldflda. The destination is left at default instead. This is the
     // same bit-pattern rule SsaForm.Remove applies to phi edges; the check is symmetric so either
     // direction of the relationship is sufficient to permit the copy.
-    internal static bool NoLegalManagedCopy(LocalVariable destination, LocalVariable source) =>
+    //
+    // A copy whose destination is a pointer local (T& or T*) is exempt when the source is the
+    // same kind of pointer, whatever the element type: the copied value is an address, so
+    // forwarding it into address-position uses is representable - each use re-emits the
+    // address from the source rather than needing a typed slot - and a mismatched source
+    // reaching the IL emitter is converted into a typed scratch cell with a decompiler-issue
+    // note rather than an invalid stloc. Managed pointers are invariant in CIL (a &U slot
+    // cannot receive a &T value) so in strict form copies between pointer locals of
+    // different element types stay illegal, as does any copy from a class source, which
+    // would turn a resolvable managed-pointer access into a raw object+offset store under
+    // [dest + off] memory bases. Pass allowByRefReinterpret at every site whose outcome is
+    // forwarding (the source reaches the uses); keep the strict form where the copy itself
+    // is emitted or the local sits under an address-of or field access.
+    internal static bool NoLegalManagedCopy(LocalVariable destination, LocalVariable source, bool allowByRefReinterpret = false) =>
         destination.Type is { IsValueType: false } destinationType
         && source.Type is { IsValueType: false } sourceType
+        && !(allowByRefReinterpret && SamePointerKind(destinationType, sourceType))
         && !sourceType.IsAssignableTo(destinationType)
         && !destinationType.IsAssignableTo(sourceType);
+
+    private static bool SamePointerKind(TypeAnalysisContext destinationType, TypeAnalysisContext sourceType) =>
+        (destinationType is ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+        && destinationType.GetType() == sourceType.GetType();
 
     // An integer operand makes the result an integer. Excludes bool operands so flag logic stays boolean.
     private static bool PropagateIntegerResult(Instruction instruction, MethodAnalysisContext method)

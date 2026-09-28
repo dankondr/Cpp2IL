@@ -118,6 +118,31 @@ public class AddressOfReceiverForwardTests
             "the mismatched source is never forwarded into the field receiver position");
     }
 
+    // A register copy between two managed pointers (T& <- U&) is not an object
+    // reinterpretation: the value is the address itself, so the source forwards
+    // into &-position uses, which re-emit or resolve the address-of per use.
+    // Dropping the move would leave the &-typed slot unassigned, decompiling to
+    // `ref T x = default` (CS8172/CS1510). Element types need not match - the
+    // slot never materializes.
+    [Test]
+    public void SsaSimplifierForwardsByRefToByRefCopy()
+    {
+        var pointerA = Local("pointerA", new ByRefTypeAnalysisContext(App.SystemTypes.SystemStringType));
+        var pointerB = Local("pointerB", new ByRefTypeAnalysisContext(App.SystemTypes.SystemExceptionType));
+        var arg = Local("arg");
+
+        var move = new Instruction(0, OpCode.Move, pointerB, pointerA);
+        var call = new Instruction(1, OpCode.CallVoid, new StringLiteral("Store"), pointerB, arg);
+        var graph = new ISILControlFlowGraph([move, call, new Instruction(2, OpCode.Return)]);
+
+        SsaSimplifier.Run(graph, [pointerA, arg]);
+
+        Assert.That(call.Operands[1], Is.SameAs(pointerA),
+            "a T& <- T& copy forwards the pointer source into the call's & argument");
+        Assert.That(move.OpCode, Is.EqualTo(OpCode.Nop),
+            "the forwarded copy's move is consumed");
+    }
+
     // The post-SSA form of the same bit-pattern copy.
     [Test]
     public void SimplifierDropsTypeIncompatibleCopy()

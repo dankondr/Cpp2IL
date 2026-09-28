@@ -113,9 +113,10 @@ public static class Simplifier
                         // merging unrelated references across paths - has no legal managed
                         // store. The destination stays at default rather than emitting an
                         // invalid stloc (the non-phi form of the rule SsaForm.Remove applies
-                        // to phi edges).
+                        // to phi edges). Copies between managed pointers (T& or T* on both
+                        // sides) are exempt - the value is the address itself.
                         if (instruction.Operands[1] is LocalVariable incompatibleSource
-                            && LocalVariables.NoLegalManagedCopy(local, incompatibleSource))
+                            && LocalVariables.NoLegalManagedCopy(local, incompatibleSource, allowByRefReinterpret: true))
                         {
                             instruction.OpCode = OpCode.Nop;
                             instruction.SetOperands();
@@ -229,8 +230,10 @@ public static class Simplifier
                     if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable local, LocalVariable source] })
                     {
                         // A copy between locals that cannot hold each other's value has no legal
-                        // managed store - leave the destination at default instead.
-                        if (LocalVariables.NoLegalManagedCopy(local, source))
+                        // managed store - leave the destination at default instead. Copies between
+                        // managed pointers (T& or T* on both sides) are exempt - the value is the
+                        // address itself.
+                        if (LocalVariables.NoLegalManagedCopy(local, source, allowByRefReinterpret: true))
                         {
                             instruction.OpCode = OpCode.Nop;
                             instruction.SetOperands();

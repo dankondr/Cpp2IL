@@ -29,9 +29,10 @@ public static class SsaSimplifier
                     // non-phi form of the rule SsaForm.Remove applies to phi edges). The
                     // destination stays at default: the store cannot be emitted legally, and
                     // forwarding the source into a typed position such as an address-of field
-                    // receiver would emit an invalid ldflda.
+                    // receiver would emit an invalid ldflda. Copies between managed pointers
+                    // (T& or T* on both sides) are exempt - the value is the address itself.
                     if (instruction.Operands[1] is LocalVariable copySource
-                        && LocalVariables.NoLegalManagedCopy(dest, copySource))
+                        && LocalVariables.NoLegalManagedCopy(dest, copySource, allowByRefReinterpret: true))
                     {
                         instruction.OpCode = OpCode.Nop;
                         instruction.SetOperands();
