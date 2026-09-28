@@ -4339,9 +4339,12 @@ public static class IlGenerator
                 when expectedType?.FullName is "System.IntPtr" or "System.UIntPtr"
                     || expectedType is PointerTypeAnalysisContext:
                 // A klass* in a native-int/pointer slot is the runtime-metadata
-                // pointer of the type it describes; the honest value is the same
-                // handle RuntimeTypeHandle.Value wraps (IL2CPP's TypeHandle.Value
-                // is the corresponding Il2CppType*).
+                // pointer of the type it describes. The only spellable stand-in
+                // is the type's RuntimeTypeHandle.Value — under IL2CPP that is
+                // the Il2CppType*, a *different* object from the Il2CppClass*
+                // the operand loaded, so the emission carries a decompiler-issue
+                // note: the site is a named gap with plausible IL, not a silent
+                // substitution.
                 if (!TypeTokenUsableFrom(runtimeClass.RepresentedType, callingContext))
                 {
                     instructions.Add(CilOpCodes.Ldstr, Diagnostic(
@@ -4352,6 +4355,8 @@ public static class IlGenerator
                     break;
                 }
                 EmitTypeHandleValue(runtimeClass.RepresentedType, method, instructions);
+                EmitDecompilerNote(method, callingContext,
+                    $"the loaded value is the class pointer of {runtimeClass.RepresentedType.FullName} (an Il2CppClass*); the emitted expression is the type's RuntimeTypeHandle.Value (an Il2CppType*), which is a different runtime object.");
                 break;
             case RuntimeClassTypeAnalysisContext or RgctxTableTypeAnalysisContext
                 or MethodRgctxTableTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext:

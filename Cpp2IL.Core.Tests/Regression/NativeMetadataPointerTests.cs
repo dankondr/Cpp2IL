@@ -12,14 +12,16 @@ namespace Cpp2IL.Core.Tests.Regression;
 
 // Recovery cluster: IL emission — native metadata pointers into pointer slots
 // (castle-recovery#134). An Il2CppClass<T> operand feeding a System.IntPtr slot
-// is the type's runtime-metadata pointer: the honest emission is ldtoken +
-// RuntimeTypeHandle::get_Value (what TypeHandle.Value is under IL2CPP), not a
-// diagnosed native-int zero. An Il2CppMethodInfo operand for a .ctor names a
-// constructor handle: ldftn/GetMethod cannot spell it, but GetConstructor can.
+// is the type's runtime-metadata pointer: the spellable stand-in is ldtoken +
+// RuntimeTypeHandle::get_Value, but under IL2CPP that is the Il2CppType*, a
+// different object from the Il2CppClass* the operand loaded — so the emission
+// must keep a decompiler-issue note, not substitute silently. An
+// Il2CppMethodInfo operand for a .ctor names a constructor handle:
+// ldftn/GetMethod cannot spell it, but GetConstructor can.
 public class NativeMetadataPointerTests
 {
     [Test]
-    public void RuntimeClassOperandIntoIntPtrSlotEmitsHandleValue()
+    public void RuntimeClassOperandIntoIntPtrSlotEmitsHandleValueButStaysDiagnosed()
     {
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
@@ -48,8 +50,10 @@ public class NativeMetadataPointerTests
                     && i.Operand?.ToString()?.Contains("get_Value") == true),
                 Is.True, "the pointer slot carries the type's handle value");
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
-                    && i.Operand?.ToString()?.Contains("native metadata pointer") == true),
-                Is.False, "the slot is recovered, not diagnosed");
+                    && i.Operand?.ToString()?.Contains("Il2CppType*") == true),
+                Is.True, "Il2CppType* != Il2CppClass*: the stand-in stays diagnosed");
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Conv_I),
+                Is.False, "the site emits plausible IL, not the native-int zero");
         });
     }
 
