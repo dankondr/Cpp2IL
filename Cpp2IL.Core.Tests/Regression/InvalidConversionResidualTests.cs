@@ -241,6 +241,101 @@ public class InvalidConversionResidualTests
     }
 
     [Test]
+    public void BoxOfByRefLikeTypeEmitsDiagnosedDefault()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var mscorlib = app.AssembliesByName["mscorlib"];
+        var attribute = new InjectedTypeAnalysisContext(mscorlib,
+            "System.Runtime.CompilerServices", "IsByRefLikeAttribute",
+            app.SystemTypes.SystemObjectType,
+            R.TypeAttributes.Public | R.TypeAttributes.Class | R.TypeAttributes.Sealed);
+        var attributeCtor = attribute.InjectMethodContext(".ctor", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public | R.MethodAttributes.HideBySig
+                | R.MethodAttributes.SpecialName | R.MethodAttributes.RTSpecialName);
+        var refStructDef = new InjectedTypeAnalysisContext(mscorlib, "Tests", "ByRefBuffer`1",
+            app.SystemTypes.SystemValueTypeType,
+            R.TypeAttributes.Public | R.TypeAttributes.Sealed | R.TypeAttributes.SequentialLayout);
+        refStructDef.CustomAttributes = [new AnalyzedCustomAttribute(attributeCtor)];
+        var instance = new GenericInstanceTypeAnalysisContext(refStructDef,
+            [app.SystemTypes.SystemByteType]);
+        var span = new LocalVariable("span", new Register(null, "span")) { Type = instance };
+        var slot = new LocalVariable("slot", new Register(null, "slot"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var module = new ModuleDefinition("RefStruct.dll");
+        SeedCorLibTypes(app, module, refStructDef, app.SystemTypes.SystemByteType,
+            app.SystemTypes.SystemObjectType, app.SystemTypes.SystemVoidType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Box, slot, instance, span),
+            new(1, OpCode.Return)], [span, slot]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Box), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldnull), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text
+                    && text.Contains("Ref struct cannot cross")), Is.True,
+                "the dropped ref struct must stay an explicit diagnostic");
+        });
+    }
+
+    [Test]
+    public void EqualityOfByRefLikeAndReferenceEmitsDiagnosedDefault()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var mscorlib = app.AssembliesByName["mscorlib"];
+        var attribute = new InjectedTypeAnalysisContext(mscorlib,
+            "System.Runtime.CompilerServices", "IsByRefLikeAttribute",
+            app.SystemTypes.SystemObjectType,
+            R.TypeAttributes.Public | R.TypeAttributes.Class | R.TypeAttributes.Sealed);
+        var attributeCtor = attribute.InjectMethodContext(".ctor", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public | R.MethodAttributes.HideBySig
+                | R.MethodAttributes.SpecialName | R.MethodAttributes.RTSpecialName);
+        var refStructDef = new InjectedTypeAnalysisContext(mscorlib, "Tests", "ByRefBuffer`1",
+            app.SystemTypes.SystemValueTypeType,
+            R.TypeAttributes.Public | R.TypeAttributes.Sealed | R.TypeAttributes.SequentialLayout);
+        refStructDef.CustomAttributes = [new AnalyzedCustomAttribute(attributeCtor)];
+        var instance = new GenericInstanceTypeAnalysisContext(refStructDef,
+            [app.SystemTypes.SystemByteType]);
+        var span = new LocalVariable("span", new Register(null, "span")) { Type = instance };
+        var held = new LocalVariable("held", new Register(null, "held"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var flag = new LocalVariable("flag", new Register(null, "flag"))
+            { Type = app.SystemTypes.SystemBooleanType };
+        var module = new ModuleDefinition("RefStruct.dll");
+        SeedCorLibTypes(app, module, refStructDef, app.SystemTypes.SystemByteType,
+            app.SystemTypes.SystemBooleanType, app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemVoidType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.CheckNotEqual, flag, span, held),
+            new(1, OpCode.Return)], [span, held, flag]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            // Reference equality needs a box the ref struct cannot satisfy;
+            // the comparison drops to an unrecoverable-operation diagnostic.
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Box), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text
+                    && text.Contains("Unrecoverable operation")), Is.True,
+                "the inexpressible comparison stays an explicit diagnostic");
+        });
+    }
+
+    [Test]
     public void VectorOpResultIntoScalarSlotEmitsDiagnosedDefault()
     {
         Cpp2IlApi.ResetInternalState();

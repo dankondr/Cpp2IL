@@ -852,6 +852,11 @@ public static class IlGenerator
                         EmitNullOrDefault(StoreContract(instruction.Operands[0], context), method, instructions, context,
                             $"Inaccessible box type: {boxedType.FullName}");
                     }
+                    else if (boxedType is { IsValueType: true } && IsByRefLike(boxedType))
+                    {
+                        EmitNullOrDefault(StoreContract(instruction.Operands[0], context), method, instructions, context,
+                            SlotDefaultReason(boxedType, StoreContract(instruction.Operands[0], context)));
+                    }
                     else
                     {
                         // il2cpp_value_box takes the value by address, but IL boxes it by value
@@ -7238,6 +7243,8 @@ public static class IlGenerator
             if ((emittedType.IsValueType || emittedType is GenericParameterTypeAnalysisContext)
                 && !TypeTokenUsableFrom(emittedType, context))
                 return false; // a value side that cannot box cannot become a reference either
+            if (emittedType is { IsValueType: true } && IsByRefLike(emittedType))
+                return false; // a ref struct can never become a reference either
             emitted.Add(emittedType);
         }
 
