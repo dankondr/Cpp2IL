@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
@@ -184,7 +185,7 @@ public static class LocalVariables
 
     // Every local an operand can reach, through any nesting the emitter walks:
     // field receivers, array bases and indices, addressed targets, casts.
-    private static IEnumerable<LocalVariable> OperandLocals(IOperand operand)
+    internal static IEnumerable<LocalVariable> OperandLocals(IOperand operand)
     {
         switch (operand)
         {
@@ -1158,6 +1159,12 @@ public static class LocalVariables
     {
         var changed = false;
 
+        var definitions = method.ControlFlowGraph!.Instructions
+            .Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!)
+            .Where(g => g.Count() == 1)
+            .ToDictionary(g => g.Key, g => g.Single());
+
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             switch (instruction.OpCode)
@@ -1168,10 +1175,10 @@ public static class LocalVariables
                     break;
                 case OpCode.Move:
                     changed |= PropagateMove(instruction, method.AppContext.Binary.PointerSizeBytes,
-                        method.AppContext.SystemTypes.SystemInt32Type);
+                        method.AppContext.SystemTypes.SystemInt32Type, definitions);
                     break;
                 case OpCode.Phi:
-                    changed |= PropagatePhi(instruction);
+                    changed |= PropagatePhi(instruction, definitions);
                     break;
                 case OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.VectorMin or OpCode.VectorMax:
                     changed |= PropagateArithmetic(instruction, method);
@@ -1428,7 +1435,7 @@ public static class LocalVariables
                 : method.AppContext.SystemTypes.SystemInt64Type
             : null;
 
-    private static bool ContainsLocal(IOperand? operand, LocalVariable local) => operand switch
+    internal static bool ContainsLocal(IOperand? operand, LocalVariable local) => operand switch
     {
         LocalVariable value => ReferenceEquals(value, local),
         MemoryOperand memory => ContainsLocal(memory.Base, local) || ContainsLocal(memory.Index, local),
@@ -1442,6 +1449,36 @@ public static class LocalVariables
         ArrayLength length => ReferenceEquals(length.Array, local),
         _ => false,
     };
+
+    // A copy between locals that can never hold each other's value - a register or stack slot
+    // merging unrelated managed references across paths - has no legal managed store: emitting it
+    // produces an invalid stloc, and forwarding the source into a typed position such as a field
+    // receiver produces an invalid ldflda. The destination is left at default instead. This is the
+    // same bit-pattern rule SsaForm.Remove applies to phi edges; the check is symmetric so either
+    // direction of the relationship is sufficient to permit the copy.
+    //
+    // A copy whose destination is a pointer local (T& or T*) is exempt when the source is the
+    // same kind of pointer, whatever the element type: the copied value is an address, so
+    // forwarding it into address-position uses is representable - each use re-emits the
+    // address from the source rather than needing a typed slot - and a mismatched source
+    // reaching the IL emitter is converted into a typed scratch cell with a decompiler-issue
+    // note rather than an invalid stloc. Managed pointers are invariant in CIL (a &U slot
+    // cannot receive a &T value) so in strict form copies between pointer locals of
+    // different element types stay illegal, as does any copy from a class source, which
+    // would turn a resolvable managed-pointer access into a raw object+offset store under
+    // [dest + off] memory bases. Pass allowByRefReinterpret at every site whose outcome is
+    // forwarding (the source reaches the uses); keep the strict form where the copy itself
+    // is emitted or the local sits under an address-of or field access.
+    internal static bool NoLegalManagedCopy(LocalVariable destination, LocalVariable source, bool allowByRefReinterpret = false) =>
+        destination.Type is { IsValueType: false } destinationType
+        && source.Type is { IsValueType: false } sourceType
+        && !(allowByRefReinterpret && SamePointerKind(destinationType, sourceType))
+        && !sourceType.IsAssignableTo(destinationType)
+        && !destinationType.IsAssignableTo(sourceType);
+
+    private static bool SamePointerKind(TypeAnalysisContext destinationType, TypeAnalysisContext sourceType) =>
+        (destinationType is ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+        && destinationType.GetType() == sourceType.GetType();
 
     // An integer operand makes the result an integer. Excludes bool operands so flag logic stays boolean.
     private static bool PropagateIntegerResult(Instruction instruction, MethodAnalysisContext method)
@@ -1502,7 +1539,8 @@ public static class LocalVariables
             _ => null,
         };
 
-    private static bool PropagateMove(Instruction move, int pointerSize, TypeAnalysisContext systemInt32Type)
+    private static bool PropagateMove(Instruction move, int pointerSize, TypeAnalysisContext systemInt32Type,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
     {
         var destination = move.Operands[0];
         var source = move.Operands[1];
@@ -1555,6 +1593,17 @@ public static class LocalVariables
             && (elementAccess.Index != null || elementAccess.Addend >= 4L * pointerSize))
             return SetTypeIfUnknown(elementDest, elementType);
 
+        // A load at the array data offset through pointer arithmetic is also an element load:
+        // the base proves `array + scaled index` rather than naming the array local directly.
+        // ArrayRecovery rewrites the same shape into an ArrayAccess later, but only after type
+        // propagation, so resolve the array through the copy/pointer def chain here. Reference
+        // elements only - a whole pointer-sized load is exactly one element for them.
+        if (destination is LocalVariable { Type: null } pointerElementDest
+            && source is MemoryOperand { Index: null, Scale: 0, Addend: var pointerAddend, Base: { } pointerBase }
+            && pointerAddend == 4L * pointerSize
+            && PointerArithmeticElementType(pointerBase, definitions, []) is { IsValueType: false } pointerElementType)
+            return SetTypeIfUnknown(pointerElementDest, pointerElementType);
+
         // Move local, [byref]: dereferencing a managed pointer to a reference type yields that referent
         // (a struct byref accesses fields directly with no deref, so this only fires for class referents).
         if (destination is LocalVariable { Type: null } derefDest
@@ -1571,9 +1620,36 @@ public static class LocalVariables
         return false;
     }
 
+    // Whether `operand` resolves, through single-definition Move and Add (pointer arithmetic)
+    // chains, to a local carrying a managed array type - and if so its element type. Mirrors the
+    // proof ArrayRecovery.DerivedElementAccess applies to the same `Add(array, scaled index)`
+    // shape when it later rewrites the access.
+    private static TypeAnalysisContext? PointerArithmeticElementType(IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions, HashSet<LocalVariable> visiting)
+    {
+        if (operand is not LocalVariable local || !visiting.Add(local))
+            return null;
+
+        if (local.Type is SzArrayTypeAnalysisContext { ElementType: { } elementType })
+            return elementType;
+
+        if (!definitions.TryGetValue(local, out var definition) || definition == null)
+            return null;
+
+        return definition switch
+        {
+            { OpCode: OpCode.Move, Operands: [_, var moveSource] }
+                => PointerArithmeticElementType(moveSource, definitions, visiting),
+            { OpCode: OpCode.Add, Operands: [_, var left, var right] }
+                => PointerArithmeticElementType(left, definitions, visiting)
+                    ?? PointerArithmeticElementType(right, definitions, visiting),
+            _ => null,
+        };
+    }
+
     // A phi is a copy from each predecessor's value, so types flow both ways across it - mirroring
     // the bidirectional Move copies it decays into once SSA is destroyed.
-    private static bool PropagatePhi(Instruction phi)
+    private static bool PropagatePhi(Instruction phi, IReadOnlyDictionary<LocalVariable, Instruction> definitions)
     {
         if (phi.Operands[0] is not LocalVariable destination)
             return false;
@@ -1608,12 +1684,19 @@ public static class LocalVariables
             }
         }
 
-        // Backward: a typed phi result types each of its still-untyped inputs.
+        // Backward: a typed phi result types each of its still-untyped inputs - except inputs
+        // that are themselves produced by a copy or a merge. Those locals carry the value their
+        // producer proves; a register reused upstream for an unrelated value (e.g. a loop
+        // backedge delivering a collected list where the joined type is `this`) must not be
+        // retyped to this phi's joined type - that asserts a type the binary never proves and
+        // emits impossible `as` conversions downstream.
         if (destination.Type != null)
         {
             for (var i = 1; i < phi.Operands.Count; i++)
             {
-                if (phi.Operands[i] is LocalVariable input)
+                if (phi.Operands[i] is LocalVariable input
+                    && !(definitions.TryGetValue(input, out var inputDefinition)
+                        && inputDefinition.OpCode is OpCode.Move or OpCode.Phi))
                     changed |= SetTypeIfUnknown(input, destination.Type);
             }
         }

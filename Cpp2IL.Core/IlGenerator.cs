@@ -2510,7 +2510,16 @@ public static class IlGenerator
                 : constructor;
             var methodArguments = (constructor as ConcreteGenericMethodAnalysisContext)?.MethodGenericParameters
                 ?? (IReadOnlyList<TypeAnalysisContext>)[];
-            return new ConcreteGenericMethodAnalysisContext(baseConstructor, destination.GenericArguments, methodArguments);
+            var retargeted = new ConcreteGenericMethodAnalysisContext(baseConstructor,
+                destination.GenericArguments, methodArguments);
+            // The re-anchored parent instantiation must satisfy the generic
+            // definition's declared constraints: a destination whose argument
+            // does not fulfil them (an open parameter that fails an F-bounded
+            // constraint, say) spells a member reference the verifier rejects,
+            // so the callee's declared instantiation stays.
+            return Analysis.InaccessibleCalleeRecovery.SatisfiesDeclaredConstraints(retargeted)
+                ? retargeted
+                : null;
         }
 
         private static bool SameMethodIdentity(MethodAnalysisContext a, MethodAnalysisContext b)
@@ -2795,7 +2804,14 @@ public static class IlGenerator
         var solvedTypeArguments = typeArguments
             ?? (targetMethod as ConcreteGenericMethodAnalysisContext)?.TypeGenericParameters
             ?? [];
-        return new ConcreteGenericMethodAnalysisContext(open, solvedTypeArguments, methodArguments ?? []);
+        var solvedMethod = new ConcreteGenericMethodAnalysisContext(open, solvedTypeArguments,
+            methodArguments ?? []);
+        // A solved instantiation that violates the callee's declared generic
+        // constraints cannot be named either; keep the declared instantiation
+        // rather than retarget into a member reference the verifier rejects.
+        return Analysis.InaccessibleCalleeRecovery.SatisfiesDeclaredConstraints(solvedMethod)
+            ? solvedMethod
+            : null;
     }
 
     // Whether the emitted operand type still satisfies the open parameter pattern
@@ -5245,7 +5261,15 @@ public static class IlGenerator
             if (local.Type == context.AppContext.SystemTypes.SystemObjectType
                 && SharpenedObjectAllocationType(local, context) is { } allocatedType)
                 return allocatedType;
-            return IsNativeHandleType(local.Type) ? context.AppContext.SystemTypes.SystemIntPtrType : local.Type;
+            // A cast source (isinst/castclass) must verify as a managed reference and
+            // no stack operation bridges native int into that operand, so a
+            // handle-typed local that feeds one emits object instead of IntPtr.
+            // Every other use position keeps its legal coerce-or-default bridge.
+            return IsNativeHandleType(local.Type)
+                ? UsedAsCastSource(local, context)
+                    ? context.AppContext.SystemTypes.SystemObjectType
+                    : context.AppContext.SystemTypes.SystemIntPtrType
+                : local.Type;
         }
         if (context.DeclaringType is { } declaringType
             && !context.IsStatic && ReferenceEquals(local, context.ParameterLocals.FirstOrDefault()))
@@ -5258,8 +5282,15 @@ public static class IlGenerator
             return untypedCallType;
         if (IsBooleanEmissionLocal(local, context))
             return context.AppContext.SystemTypes.SystemBooleanType;
+        // A cast source (isinst/castclass) must verify as a managed reference and no
+        // stack operation bridges native int into that operand, so a local that feeds
+        // one emits object instead of IntPtr. Its definitions substitute the same
+        // honest defaults the untyped path produces, and every other use position
+        // keeps its legal coerce-or-default bridge.
         if (IsNativePointerEmissionLocal(local, context))
-            return context.AppContext.SystemTypes.SystemIntPtrType;
+            return UsedAsCastSource(local, context)
+                ? context.AppContext.SystemTypes.SystemObjectType
+                : context.AppContext.SystemTypes.SystemIntPtrType;
         if (NumericLocalTypes(context).TryGetValue(local, out var numericType) && CanEmitTypeToken(numericType))
             return numericType;
         return context.AppContext.SystemTypes.SystemObjectType;
@@ -5301,6 +5332,26 @@ public static class IlGenerator
         }
         return sawCastUse;
     }
+
+    // True when the local appears as a cast operand's value - the one operand
+    // position that requires a managed reference and admits no stack bridge.
+    private static bool UsedAsCastSource(LocalVariable local, MethodAnalysisContext context) =>
+        context.ControlFlowGraph!.Instructions.Any(instruction =>
+            instruction.Operands.Any(operand => CastReferencesLocal(operand, local)));
+
+    private static bool CastReferencesLocal(IOperand? operand, LocalVariable local) => operand switch
+    {
+        ReferenceCast cast => OperandReferencesLocal(cast.Value, local),
+        MemoryOperand memory => CastReferencesLocal(memory.Base, local)
+            || CastReferencesLocal(memory.Index, local),
+        AddressOf address => CastReferencesLocal(address.Target, local),
+        ArrayAccess access => CastReferencesLocal(access.Array, local)
+            || CastReferencesLocal(access.Index, local),
+        ArrayElementFieldReference elementField => CastReferencesLocal(elementField.Array, local)
+            || CastReferencesLocal(elementField.Index, local),
+        ArrayLength length => CastReferencesLocal(length.Array, local),
+        _ => false,
+    };
 
     private static bool OperandReferencesLocal(IOperand? operand, LocalVariable local) => operand switch
     {
@@ -5434,12 +5485,25 @@ public static class IlGenerator
         if (method is not ConcreteGenericMethodAnalysisContext concrete
             || result is not GenericInstanceTypeAnalysisContext instance
             || instance.GenericArguments.Count != concrete.TypeGenericParameters.Count
-            || !instance.GenericArguments.All(IsErasedSharedArgument))
+            || !instance.GenericArguments.All(argument => IsErasedSharedArgument(argument)
+                && SubstitutableInCalleeScope(argument, concrete)))
             return result;
 
         return new GenericInstanceTypeAnalysisContext(instance.GenericType,
             concrete.TypeGenericParameters);
     }
+
+    // An erased instance argument may be re-instantiated with the callee's type
+    // arguments only when the placeholder belongs to that callee's generic
+    // scope: a generic parameter owned by a different generic context - the
+    // caller's own declaring type, say - is a real argument, not an erased
+    // slot, and substituting it by index spells a foreign instantiation
+    // (`G<CalleeArg>`) the callee never produced.
+    private static bool SubstitutableInCalleeScope(TypeAnalysisContext argument,
+        ConcreteGenericMethodAnalysisContext concrete) =>
+        argument is not GenericParameterTypeAnalysisContext parameter
+        || parameter.Owner is TypeAnalysisContext owner
+            && ThisConstructorCallPlan.SameTypeIdentity(owner, concrete.BaseMethodContext.DeclaringType);
 
     internal static MethodAnalysisContext RetargetToReceiverInstantiation(MethodAnalysisContext method,
         TypeAnalysisContext? receiverType) =>
@@ -5953,8 +6017,15 @@ public static class IlGenerator
             && EmittedLocalType(objectLocal, context) is { } concreteContract
             && concreteContract != context.AppContext.SystemTypes.SystemObjectType)
             return concreteContract;
+        // A call-defined contract only describes the slot when it agrees with the
+        // emitted local type: a rep that declares another concrete type (e.g. the
+        // `this` declaring type) still has to receive the store through that slot,
+        // so the emitted contract wins whenever they conflict.
         if (destination is LocalVariable callLocal
-            && CallDefinedLocalType(callLocal, context) is { } callContract)
+            && CallDefinedLocalType(callLocal, context) is { } callContract
+            && (EmittedLocalType(callLocal, context) is not { } emittedContract
+                || ThisConstructorCallPlan.SameTypeIdentity(emittedContract, callContract)
+                || emittedContract == context.AppContext.SystemTypes.SystemObjectType))
             return callContract;
         if (declared != null)
             return declared;
@@ -6028,6 +6099,13 @@ public static class IlGenerator
             AddressOf { Target: ArrayElementFieldReference addressedElementField }
                 => new ByRefTypeAnalysisContext(addressedElementField.Field.FieldType),
             AddressOf => context.AppContext.SystemTypes.SystemIntPtrType,
+            // isinst/castclass to a generic parameter lands `ref !0` on the stack
+            // (ECMA III.4.15) - a boxed-T-or-null reference, not the `value !0`
+            // the parameter's own kind declares. Reporting the raw parameter makes
+            // coercions emit `box !0` on a value that is already a reference,
+            // which the verifier rejects.
+            ReferenceCast { Type: GenericParameterTypeAnalysisContext genericCastTarget } genericCast
+                => EmittedGenericCastOperandType(genericCast, genericCastTarget, context),
             ReferenceCast cast => EmittableLocalType(cast.Type, context),
             StringLiteral => context.AppContext.SystemTypes.SystemStringType,
             FloatLiteral => context.AppContext.SystemTypes.SystemSingleType,
@@ -6071,6 +6149,22 @@ public static class IlGenerator
 
     private static TypeAnalysisContext? ResolveSystemType(MethodAnalysisContext context, string fullName) =>
         context.AppContext.GetAssemblyByName("mscorlib")?.GetTypeByFullName(fullName);
+
+    // The stack type a ReferenceCast to a generic parameter actually emits, mirroring
+    // the ReferenceCast case of LoadOperand: a replaced cast leaves a `value !0`
+    // default, an elided cast leaves the operand's own value, and a real
+    // isinst/castclass pushes `ref !0` - the boxed-T-or-null the verifier tracks.
+    private static TypeAnalysisContext? EmittedGenericCastOperandType(ReferenceCast cast,
+        GenericParameterTypeAnalysisContext castTarget, MethodAnalysisContext context)
+    {
+        var castValueType = EmittedOperandType(cast.Value, context);
+        if (castValueType is { IsValueType: true } or PointerTypeAnalysisContext or ByRefTypeAnalysisContext
+            || !TypeTokenUsableFrom(castTarget, context))
+            return EmittableLocalType(castTarget, context);
+        if (ThisConstructorCallPlan.SameTypeIdentity(castValueType, castTarget))
+            return castValueType;
+        return new BoxedTypeAnalysisContext(castTarget);
+    }
 
     // Mirrors the Immediate branch of LoadOperand: the reported stack type is whatever
     // the literal actually emits under the consumer's contract.
@@ -6250,11 +6344,33 @@ public static class IlGenerator
         if (to != null && IsNativeHandleType(to))
             to = to.AppContext.SystemTypes.SystemIntPtrType;
 
-        if (from == null || to == null || from.FullName == to.FullName)
+        if (from == null || to == null)
             return true;
 
-        // No stack op synthesizes a generic-parameter or byref value from another kind.
-        if (to is GenericParameterTypeAnalysisContext or ByRefTypeAnalysisContext)
+        // unbox.any is the canonical `ref !0` -> `value !0` conversion - and the
+        // only one: it is legal solely when the source proves `ref !0` for that
+        // same parameter (a boxed-T-or-null from isinst/castclass). A boxed type
+        // shares its element's name, so this must run before the identical-name
+        // early-out; any other source stays unbridgeable and gets diagnosed.
+        if (to is GenericParameterTypeAnalysisContext genericContract)
+        {
+            if (from is not BoxedTypeAnalysisContext && from.FullName == to.FullName)
+                return true;
+            if (from is BoxedTypeAnalysisContext { ElementType: { } boxedElement }
+                && ThisConstructorCallPlan.SameTypeIdentity(boxedElement, genericContract)
+                && TypeTokenUsableFrom(genericContract, context))
+            {
+                method.CilMethodBody!.Instructions.Add(CilOpCodes.Unbox_Any, to.ToTypeSignature().ToTypeDefOrRef());
+                return true;
+            }
+            return false;
+        }
+
+        if (from.FullName == to.FullName)
+            return true;
+
+        // No stack op synthesizes a byref value from another kind.
+        if (to is ByRefTypeAnalysisContext)
             return false;
 
         var instructions = method.CilMethodBody!.Instructions;
@@ -6593,12 +6709,24 @@ public static class IlGenerator
         if (to != null && IsNativeHandleType(to))
             to = to.AppContext.SystemTypes.SystemIntPtrType;
 
-        if (from == null || to == null || from.FullName == to.FullName)
+        if (from == null || to == null)
             return true;
 
-        // No stack op synthesizes a generic-parameter or byref destination value;
-        // only the identical type already satisfies those slots.
-        if (to is GenericParameterTypeAnalysisContext or ByRefTypeAnalysisContext)
+        // Mirrors EmitStackCoerce: only a `ref !0` proven for that parameter - a
+        // boxed-T-or-null - reaches a `!0` slot, through unbox.any. The boxed
+        // wrapper shares the parameter's name, so check it before the
+        // identical-name early-out; every other source stays unbridgeable. A
+        // byref slot still takes only the identical pointer type.
+        if (to is GenericParameterTypeAnalysisContext genericContract)
+        {
+            if (from is BoxedTypeAnalysisContext { ElementType: { } boxedElement })
+                return ThisConstructorCallPlan.SameTypeIdentity(boxedElement, genericContract)
+                    && TypeTokenUsableFrom(genericContract, context);
+            return StackAssignableTo(from, to);
+        }
+        if (from.FullName == to.FullName)
+            return true;
+        if (to is ByRefTypeAnalysisContext)
             return StackAssignableTo(from, to);
 
         // A T source fits a managed reference through box T; nothing else is legal.
