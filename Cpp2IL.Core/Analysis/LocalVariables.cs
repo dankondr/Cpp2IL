@@ -338,6 +338,10 @@ public static class LocalVariables
             }
         }
 
+        // Where a vector binop's destination register view carries a sibling
+        // lifetime's scalar type, the def site gets its own vector-typed local.
+        SplitVectorBinopDefSites(method);
+
         // With every local's stack kind resolved, operand positions whose kind is
         // incompatible with the whole-register local they read can be split off to
         // the register's lane-0 view - the slot the scalar operation actually sees.
@@ -1505,6 +1509,166 @@ public static class LocalVariables
         {
             if (instruction.Operands.Count == 1 && instruction.Operands[0] is LocalVariable local)
                 local.Type = method.ReturnType;
+        }
+    }
+
+    /// <summary>
+    /// A scalarized register view (a `Vn`/`Vn.Sk` local) names a window of a physical
+    /// SIMD register, so unrelated lifetimes share the register name: a vector binop
+    /// writes the whole register on one lifetime while a scalar convert or lane sync
+    /// writes a lane view on a sibling. The type fixpoint only ever fills, so when a
+    /// sibling's scalar seed reaches a vector def site first - through an integer
+    /// operand, a phi merge with a scalar-typed version, or a lane-width write - the
+    /// def site's version locks in a type that cannot represent the vector result it
+    /// actually holds. Give that def site's lifetime its own vector-typed local and
+    /// retarget all of its uses; scalar consumers then read the lane-0 field through
+    /// <see cref="SplitScalarOperandViews"/>.
+    /// </summary>
+    private static void SplitVectorBinopDefSites(MethodAnalysisContext method)
+    {
+        var instructions = method.ControlFlowGraph!.Instructions;
+
+        foreach (var instruction in instructions)
+        {
+            if (instruction.OpCode is not (OpCode.Add or OpCode.Subtract or OpCode.Multiply
+                    or OpCode.Divide or OpCode.VectorMin or OpCode.VectorMax)
+                || instruction.Operands is not [LocalVariable destination, var left, var right]
+                || !IsRegisterViewName(destination.Register.Name)
+                || destination.Register.Version < 0
+                || !IsScalarLaneType(destination.Type))
+                continue;
+
+            // Negate is excluded deliberately: `fneg s8, s0` is a scalar lane op whose
+            // register-view destination is honestly scalar, and its ISIL is
+            // indistinguishable from a vector `fneg v0.4s`.
+            // For Add/Subtract (and the lane-wise VectorMin/VectorMax) every operand
+            // must be a proven vector: `VectorN + scalar`/`scalar + VectorN` is not a
+            // legal managed operator, so an Add mixing a scalar-typed or unproven
+            // operand with a vector-typed one is scalar lane math (`fadd s0,s1,s2`)
+            // whose source local merely carries a vector type. Multiply has both
+            // `VectorN op float` directions, so a single vector operand is evidence
+            // enough; Divide has no `float / VectorN`, so the left operand must be
+            // the vector. `VectorN op VectorM` is legal only for N == M - different
+            // widths mean a scalar lane op whose operands carry unrelated types.
+            var leftVector = UnityVectorOperandType(left);
+            var rightVector = UnityVectorOperandType(right);
+            var provableVectorOp = instruction.OpCode switch
+            {
+                OpCode.Multiply => leftVector != null || rightVector != null,
+                OpCode.Divide => leftVector != null,
+                _ => leftVector != null && rightVector != null,
+            };
+            if (!provableVectorOp || (leftVector != null && rightVector != null
+                    && leftVector.FullName != rightVector.FullName))
+                continue;
+            var vectorType = leftVector ?? rightVector;
+
+            var split = new LocalVariable($"{destination.Name}_vec",
+                new Register(null,
+                    $"VEC_{destination.Register.Name}_{destination.Register.Version}"),
+                vectorType);
+            method.Locals.Add(split);
+            instruction.SetOperand(0, split);
+
+            // Every other operand position holding the old local reads this def
+            // site's value, so the whole lifetime retargets to the vector local.
+            foreach (var other in instructions)
+            for (var operandIndex = 0; operandIndex < other.Operands.Count; operandIndex++)
+                if (ReplaceLocal(other.Operands[operandIndex], destination, split) is { } rewritten)
+                    other.SetOperand(operandIndex, rewritten);
+        }
+    }
+
+    // Scalarized SIMD register views are named "Vn" (whole register) or "Vn.Lk"
+    // (lane k of register n in element width L). Both view the same physical
+    // register, so scalar lifetimes can smear onto a vector def that shares it.
+    private static bool IsRegisterViewName(string? name)
+    {
+        if (name is null || name.Length < 2 || name[0] != 'V' || !char.IsDigit(name[1]))
+            return false;
+
+        var i = 1;
+        while (i < name.Length && char.IsDigit(name[i]))
+            i++;
+        if (i == name.Length)
+            return true;
+        if (name[i] != '.' || i + 1 >= name.Length || name[i + 1] is not ('B' or 'H' or 'S' or 'D'))
+            return false;
+        i += 2;
+        var digitStart = i;
+        while (i < name.Length && char.IsDigit(name[i]))
+            i++;
+        return i > digitStart && i == name.Length;
+    }
+
+    // Rebuilds an operand tree with every occurrence of `from` replaced by `to`.
+    // Returns null when `from` does not occur, so callers only SetOperand on a hit.
+    private static IOperand? ReplaceLocal(IOperand? operand, LocalVariable from, LocalVariable to)
+    {
+        switch (operand)
+        {
+            case null:
+                return null;
+            case LocalVariable local:
+                return ReferenceEquals(local, from) ? to : null;
+            case MemoryOperand memory:
+            {
+                var replacedBase = ReplaceLocal(memory.Base, from, to);
+                var replacedIndex = ReplaceLocal(memory.Index, from, to);
+                if (replacedBase == null && replacedIndex == null)
+                    return null;
+                memory.Base = replacedBase ?? memory.Base;
+                memory.Index = replacedIndex ?? memory.Index;
+                return memory;
+            }
+            case AddressOf address:
+                return ReplaceLocal(address.Target, from, to) is { } target
+                    ? new AddressOf(target)
+                    : null;
+            case ReferenceCast cast:
+                return ReferenceEquals(cast.Value, from)
+                    ? new ReferenceCast(to, cast.Type, cast.NullOnFailure)
+                    : null;
+            case FieldReference field:
+                return ReferenceEquals(field.Local, from)
+                    ? new FieldReference(field.Field, to, field.Offset, field.Containers,
+                        field.AccessSize)
+                    : null;
+            case SelectedFieldReference selected:
+            {
+                var selector = ReferenceEquals(selected.Selector, from) ? to : null;
+                if (selector == null && selected.Choices.All(choice =>
+                        !ReferenceEquals(choice.Field.Local, from)))
+                    return null;
+                var choices = selected.Choices.Select(choice => ReferenceEquals(choice.Field.Local, from)
+                        ? (choice.Value,
+                            new FieldReference(choice.Field.Field, to, choice.Field.Offset,
+                                choice.Field.Containers, choice.Field.AccessSize))
+                        : choice)
+                    .ToList();
+                return new SelectedFieldReference(selector ?? selected.Selector, choices);
+            }
+            case ArrayAccess access:
+            {
+                var replacedIndex = ReplaceLocal(access.Index, from, to);
+                if (!ReferenceEquals(access.Array, from) && replacedIndex == null)
+                    return null;
+                return new ArrayAccess(ReferenceEquals(access.Array, from) ? to : access.Array,
+                    replacedIndex ?? access.Index);
+            }
+            case ArrayElementFieldReference elementField:
+            {
+                var replacedIndex = ReplaceLocal(elementField.Index, from, to);
+                if (!ReferenceEquals(elementField.Array, from) && replacedIndex == null)
+                    return null;
+                return new ArrayElementFieldReference(
+                    ReferenceEquals(elementField.Array, from) ? to : elementField.Array,
+                    replacedIndex ?? elementField.Index, elementField.Field);
+            }
+            case ArrayLength length:
+                return ReferenceEquals(length.Array, from) ? new ArrayLength(to) : null;
+            default:
+                return null;
         }
     }
 
