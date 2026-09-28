@@ -4301,14 +4301,49 @@ public static class IlGenerator
         bool writeAccess = false)
     {
         var receiverType = EmittedOperandType(field.Local, context);
+        var chainHead = true;
         foreach (var container in field.Containers)
         {
-            if (!FieldUsableFrom(container, context, receiverType: receiverType))
+            // Only the chain head can substitute `this` or coerce the operand into
+            // the base contract; deeper links always receive &previous.FieldType.
+            var effectiveReceiver = chainHead && !container.IsStatic
+                ? ResolvedFieldReceiverType(container, field.Local, receiverType, context)
+                : receiverType;
+            chainHead = false;
+            if (!FieldUsableFrom(container, context, receiverType: effectiveReceiver))
                 return false;
             receiverType = container.FieldType;
         }
         return FieldUsableFrom(field.Field, context, writeAccess,
-            receiverType: field.Field.IsStatic ? null : receiverType);
+            receiverType: field.Field.IsStatic ? null
+                : field.Containers.Count == 0
+                    ? ResolvedFieldReceiverType(field.Field, field.Local, receiverType, context)
+                    : receiverType);
+    }
+
+    // Mirrors what LoadBase actually pushes as the field receiver: `ldarg.0` when
+    // the operand cannot satisfy the base contract and `this` shares the owner's
+    // generic definition; otherwise the operand coerced into the contract - which
+    // always lands contract-shaped for a reference owner - or the operand's own
+    // managed address for a value owner.
+    private static TypeAnalysisContext? ResolvedFieldReceiverType(FieldAnalysisContext target,
+        IOperand receiverOperand, TypeAnalysisContext? receiverType, MethodAnalysisContext context)
+    {
+        var declaring = target.DeclaringType;
+        var contract = FieldBaseContract(target);
+        if (declaring != null && context.DeclaringType != null && !context.IsStatic
+            && ThisConstructorCallPlan.SameTypeIdentity(GenericDefinition(declaring),
+                GenericDefinition(context.DeclaringType))
+            && (!StackContractSatisfied(receiverType, contract, context)
+                || IsUndefinedOwnTypeReceiver(receiverOperand, context)))
+            return context.DeclaringType;
+        // LoadOperandIntoSlot coerces the operand into a reference owner's contract
+        // (or substitutes a contract-typed default), so the receiver always ends
+        // up assignable to the declaring type there. A value owner takes the
+        // operand's own managed address - its referent must be the owner.
+        if (contract is not ByRefTypeAnalysisContext)
+            return declaring;
+        return receiverType is ByRefTypeAnalysisContext byRefReceiver ? byRefReceiver.ElementType : receiverType;
     }
 
     private static void EmitSelectedFieldLoad(SelectedFieldReference selected, MethodDefinition method,
@@ -8455,6 +8490,13 @@ public static class IlGenerator
             || receiverType != null
                 && !Analysis.InaccessibleCalleeRecovery.IsVisibleType(receiverType, callerType))
             return false;
+        // The verifier binds ldfld/ldflda/stfld to the receiver's emitted type: the
+        // member's declaring instantiation must cover it. A mistyped receiver - say
+        // an awaiter value whose declaring context was widened to a different generic
+        // instantiation - that agrees only on the open definition would emit a
+        // token/receiver mismatch.
+        if (!field.IsStatic && receiverType != null && !receiverType.IsAssignableTo(declaring))
+            return false;
         // A direct native access proves that an inlined managed member reached a
         // same-assembly field. ToFieldDescriptor widens exactly that copied
         // definition, so private storage remains faithfully usable. Dependency
@@ -8474,7 +8516,7 @@ public static class IlGenerator
         var sameAssembly = Extensions.AccessibilityExtensions.SharesEmittedInternals(
             callerType.DeclaringAssembly, declaring.DeclaringAssembly);
         var sameType = ThisConstructorCallPlan.SameTypeIdentity(declaring, callerType);
-        return (attrs & FieldAttributes.FieldAccessMask) switch
+        var declaredAccess = (attrs & FieldAttributes.FieldAccessMask) switch
         {
             FieldAttributes.Public => true,
             FieldAttributes.Private => sameType,
@@ -8484,6 +8526,15 @@ public static class IlGenerator
             FieldAttributes.FamORAssem => sameAssembly || sameType || callerType.IsAssignableTo(declaring),
             _ => false,
         };
+        // A declared-access miss is still honest wherever the reference itself can widen
+        // the emitted member: ToFieldDescriptor passes every emitted field through
+        // MemberAccessibility.EnsureAccessible, which promotes the copied definition
+        // (and its declaring types) to the access the reference needs - the same fix the
+        // same-assembly shortcut above relies on. External runtime assemblies are
+        // frozen, their stubs mirror the real runtime surface, so a reference there
+        // must fit the declared access.
+        return declaredAccess
+            || !Extensions.AccessibilityExtensions.IsExternalRuntimeAssembly(declaring.DeclaringAssembly?.Name);
     }
 
     // Typed `stelem` requires the stack value to be exactly the element type, which
