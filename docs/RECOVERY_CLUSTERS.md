@@ -145,12 +145,15 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
 
 | castle-recovery#123 `invalid-conversion` (compile bucket CS0039, `ReferenceCast` operand not treated as an SSA use) | dataflow | `SsaSimplifier`/`CopyCoalescer` never descended into `ReferenceCast.Value`, so the value operand of `isinst`/`castclass` was invisible to both passes: `CollectReadLocals`/`Used` did not count it (the producing `Move` could die as unread, or the operand's copy group merged into a differently-typed sibling — interference from a competing definition was never seen) and `ReplaceUses`/`Rewrite` never re-bound it to the forwarded or unioned representative. Both passes now treat the operand like a memory base: it counts as a read/use of `cast.Value` (non-destination), substitutes a resolved `LocalVariable` into a rebuilt `ReferenceCast` (constant resolutions stay put — `isinst` needs a managed ref), and rewrites it through the coalesced group. `UsedOnlyAsCastSource` (#116) narrows accordingly: a producer that types the local as a managed reference now proves the type (a cast *use* keeps it), while a value-typed or untyped definition can never satisfy the object slot, so the `object` fallback still applies there. r241 measurement (control `development` `66e02ca8`): cast-source `object` fallback locals 184 -> 67 (117 now carry their producer's type), `object`-typed local declarations 17,136 -> 16,238, ILVerify `ilverify-invalid` -> `ilverify-valid` on 4 methods, **0 valid->invalid**; compile buckets unchanged (851 -> 851, CS0039 1 -> 1 — the residual site binds its operand to the `int` parameter's own SSA version upstream of these passes, not to a stale register-reuse version) | `Regression/CastOperandUseTests.*` (3 tests) |
 
+
+| castle-recovery#124 `override-accessibility-mismatch` (compile bucket CS0507, signed-friend access) | metadata emission | `MemberAccessibility`'s friend-scope relation answered for unsigned emission — internals shared iff the *friend* had no public key — while the signed driver flips it: a keyed grantor's synthetic `InternalsVisibleTo` list can only name keyed friends, so internals are shared iff the *grantor* is unkeyed or the friend is keyed. `RequiredScope` (member references) and `InternalScopeShared` (override-chain `FamORAssem` promotion) now apply that relation: an unkeyed consumer's reference to a keyed grantor's internal member widens it to `public` (no grant can carry it), a keyed friend stops at `internal` (its bound grant suffices), an unkeyed override of a keyed `protected internal` base drops to `protected`, and a keyed override keeps `protected internal`. r241 control `development@6a988c3b` (854 signed errors): `override-accessibility-mismatch` 10 → 0 — the 4 keyed→keyed sites signing added (`Grpc.Net.Client` ×3, `Newtonsoft.Json` ×1, dropped to `protected` by the inverted rule) and the 6 unkeyed→keyed sites present either way (incl. both `VoodooTuneSDK` sites) all resolve; total errors 854 → 978 as clearing the declaration-phase CS0507s unmasks Newtonsoft.Json (+127) and VoodooTuneSDK (+7) body diagnostics Roslyn had suppressed; `invalid_il` 446 → 446 with 0/178,273 per-method ILVerify transitions and all 183 emitted `PublicKey` blobs byte-identical | `Regression/KeyedFriendScopeTests.*` (6 tests) |
+
 ## Summary
 
 - **84 fork PRs** merged since `b5ad444b` (#1–#79, #81–#85; no #80), plus the
   castle-recovery#NN issue rows.
 - **2 are not live recovery fixes**: #26 (reverted by #27) and #85 (CI only).
-- **113 recovery-fix clusters.** **111** carry reproducing tests (tests added or
+- **114 recovery-fix clusters.** **112** carry reproducing tests (tests added or
   strengthened in the same PR): the 80 through the backfill wave (#16 + #47,
   #38, #40, #41, #57, #58), castle-recovery#74's `UnboxEmissionTests.*`,
   castle-recovery#75's `Arm64VectorLaneLiftingTests.*`,
@@ -183,8 +186,9 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
   castle-recovery#119's `VectorRegisterViewDefSiteSplitTests.*`,
   castle-recovery#118's `FrameSlotContractTypeTests.*`,
   castle-recovery#121's `ByRefAddressSlotTests.*`,
-  castle-recovery#123's `CastOperandUseTests.*`, and
-  castle-recovery#125's `InternalsVisibleToEvidenceTests.*`.
+  castle-recovery#123's `CastOperandUseTests.*`,
+  castle-recovery#125's `InternalsVisibleToEvidenceTests.*`, and
+  castle-recovery#124's `KeyedFriendScopeTests.*`.
 - **2 remain `none`**, both compile-only fixes: #15 (`IReadOnlySet` on
   netstandard2.0) and #20 (`AddOperands` signature fix, exercised downstream by
   `Arm64LibcMathImportTests`).

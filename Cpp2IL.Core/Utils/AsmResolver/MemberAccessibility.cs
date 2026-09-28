@@ -72,11 +72,17 @@ internal static class MemberAccessibility
             || memberAssembly?.Name is { } memberName && memberName == referencingAssembly?.Name)
             return ReferenceScope.Internal;
         // Cross-assembly internals reach the reference through the restored
-        // InternalsVisibleTo grants - but a grant naming a friend with a
-        // public key can never bind, because the emitted assembly is unsigned
-        // (the same asymmetry InternalScopeShared bakes into chain promotion).
+        // InternalsVisibleTo grants - except the one pairing the grant set
+        // cannot express: a keyed grantor may only name keyed friends
+        // (RestoreInternalsVisibleTo drops unkeyed names outright, or a signed
+        // recompile rejects the whole list with CS1726). An unkeyed friend's
+        // reference must therefore see the member as public. Every other
+        // pairing shares internals - keyed friends are re-signed with their
+        // recovered keys and their grants bind (the same relation
+        // InternalScopeShared bakes into chain promotion).
         return AccessibilityExtensions.SharesEmittedInternals(memberAssembly, referencingAssembly)
-            && referencingAssembly?.PublicKey is null
+            && (memberAssembly?.PublicKey is not { Length: > 0 }
+                || referencingAssembly?.PublicKey is { Length: > 0 })
             ? ReferenceScope.Internal
             : ReferenceScope.Public;
     }
@@ -263,9 +269,10 @@ internal static class MemberAccessibility
     }
 
     // Mirrors the friend scope RestoreInternalsVisibleTo emits: every generated
-    // assembly carries InternalsVisibleTo to each sibling whose name is not a
-    // runtime assembly's, so the internal half of a protected internal base is
-    // visible to non-stub overrides and they must keep it.
+    // assembly carries InternalsVisibleTo to each non-stub sibling its
+    // strong-naming rules allow - a keyed grantor names only keyed friends - so
+    // the internal half of a protected internal base is visible to the overrides
+    // those grants satisfy, and they must keep it.
     private static bool InternalScopeShared(AssemblyAnalysisContext? parentAssembly, MethodAnalysisContext member)
     {
         var memberAssembly = member.DeclaringType?.DeclaringAssembly;
@@ -277,10 +284,12 @@ internal static class MemberAccessibility
             && parentAssembly.GetExtraData<AssemblyDefinition>("AsmResolverAssembly") is not null
             && memberAssembly.Name is { } name
             && !AccessibilityExtensions.IsExternalRuntimeAssembly(name)
-            // A friend name with a public key yields an InternalsVisibleTo that
-            // can never bind, because the emitted assembly is unsigned; internals
-            // are effectively not shared with it.
-            && memberAssembly.PublicKey is null;
+            // The one pairing the emitted grant set cannot express: a keyed
+            // grantor never names an unkeyed friend, so the base's internals are
+            // not shared with an unkeyed override and it must drop to Family.
+            // Keyed friends re-sign with their recovered keys and the grants bind.
+            && (parentAssembly.PublicKey is not { Length: > 0 }
+                || memberAssembly.PublicKey is { Length: > 0 });
     }
 
     // Declared access is read off the analysis context, not the emitted
