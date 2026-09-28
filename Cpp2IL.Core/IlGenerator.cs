@@ -5968,7 +5968,7 @@ public static class IlGenerator
     // box and unbox.any are illegal IL on them. Generic instances carry no
     // custom attributes of their own - the marker lives on the definition
     // (e.g. ReadOnlySpan<T>), so look through it.
-    private static bool IsByRefLike(TypeAnalysisContext type) =>
+    internal static bool IsByRefLike(TypeAnalysisContext type) =>
         (type is GenericInstanceTypeAnalysisContext { GenericType: var generic } ? generic : type)
             .HasCustomAttributeWithFullName("System.Runtime.CompilerServices.IsByRefLikeAttribute");
 
@@ -6245,6 +6245,21 @@ public static class IlGenerator
             return true;
         }
 
+        // An array into a Span<T>/ReadOnlySpan<T> slot is the array-to-span
+        // conversion the compiler emits (`ctx.buffer = new ReadOnlySpan(arr)`):
+        // the span .ctor takes the array's data pointer and its length, which is
+        // exactly what the native store pair wrote.
+        if (to is GenericInstanceTypeAnalysisContext
+                { GenericType.FullName: "System.Span`1" or "System.ReadOnlySpan`1" } spanType
+            && spanType.GenericArguments is [var spanElement]
+            && from is SzArrayTypeAnalysisContext { ElementType: { } arrayElement }
+            && ThisConstructorCallPlan.SameTypeIdentity(arrayElement, spanElement)
+            && SpanArrayConstructor(spanType) is { } spanCtor)
+        {
+            instructions.Add(CilOpCodes.Newobj, spanCtor);
+            return true;
+        }
+
         if (!from.IsValueType && to.IsValueType)
         {
             // unbox.any on a ref struct is not legal IL either.
@@ -6465,6 +6480,15 @@ public static class IlGenerator
                         && (IsAssignableToLoose(from, to) || !CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context)));
         if (!from.IsValueType && to.FullName == "System.Boolean")
             return false;
+        // An array satisfies a Span<T>/ReadOnlySpan<T> slot through the
+        // span-of-array .ctor - see EmitStackCoerce for the newobj it emits.
+        if (to is GenericInstanceTypeAnalysisContext
+                { GenericType.FullName: "System.Span`1" or "System.ReadOnlySpan`1" } spanSlot
+            && spanSlot.GenericArguments is [var spanElement]
+            && from is SzArrayTypeAnalysisContext { ElementType: { } arrayElement }
+            && ThisConstructorCallPlan.SameTypeIdentity(arrayElement, spanElement)
+            && SpanArrayConstructor(spanSlot) != null)
+            return true;
         if (!from.IsValueType && to.IsValueType)
             // unbox.any accepts any managed reference - but not a byref-like target
             return !IsByRefLike(to) && (!CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context));
@@ -6529,6 +6553,24 @@ public static class IlGenerator
             && TryRecoverLateFieldReference(memory, context, out var lateField)
                 ? lateField.Field.FieldType
                 : EmittedOperandType(resolved, context, contract);
+        // A pointer chain ending in `unbox(arr) + K` carries the array's data
+        // pointer; for a Span<T>/ReadOnlySpan<T> slot the honest operand is the
+        // array itself - `new Span(arr)` writes the same pointer plus the
+        // array's length. Only fires when the operand is not already span-kind.
+        if (contract is GenericInstanceTypeAnalysisContext
+                { GenericType.FullName: "System.Span`1" or "System.ReadOnlySpan`1" } spanContract
+            && emitted is not GenericInstanceTypeAnalysisContext
+                { GenericType.FullName: "System.Span`1" or "System.ReadOnlySpan`1" }
+            && Analysis.LocalVariables.TryUnwrapArrayDataPointer(operand, context,
+                context.AppContext.Binary.PointerSizeBytes, out var spanArrayOperand)
+            && EmittedOperandType(spanArrayOperand!, context) is SzArrayTypeAnalysisContext
+                { ElementType: { } spanArrayElement }
+            && ThisConstructorCallPlan.SameTypeIdentity(spanArrayElement,
+                spanContract.GenericArguments[0]))
+        {
+            resolved = spanArrayOperand!;
+            emitted = EmittedOperandType(resolved, context, contract);
+        }
         // An operand emitting &S is already the address of S's offset-0 field: when
         // the slot wants &F and S carries a unique instance field of type F at
         // offset 0, the operand is &S.f0 - the ldflda form - not a default. The
@@ -8477,6 +8519,20 @@ public static class IlGenerator
     // receiver's own instantiation: `ldfld !0 C`1::f` expects a `ref C`1` (the
     // unbound definition), which no stack value can be, while `C`1<!0>::f` is the
     // member the verifier actually accepts.
+    // `Span<T>(T[])`/`ReadOnlySpan<T>(T[])` on the span's open generic type,
+    // instantiated with the slot's arguments - the array-to-span conversion the
+    // recovered store came from.
+    private static IMethodDescriptor? SpanArrayConstructor(GenericInstanceTypeAnalysisContext spanType)
+    {
+        var constructor = spanType.GenericType.Methods.FirstOrDefault(candidate =>
+            candidate.Name == ".ctor" && !candidate.IsStatic && candidate.Parameters.Count == 1
+            && candidate.Parameters[0].ParameterType is SzArrayTypeAnalysisContext);
+        return constructor == null
+            ? null
+            : new ConcreteGenericMethodAnalysisContext(constructor, spanType.GenericArguments, [])
+                .ToMethodDescriptor();
+    }
+
     private static IFieldDescriptor FieldDescriptorFor(FieldAnalysisContext field,
         TypeAnalysisContext? receiverType)
     {
@@ -8490,6 +8546,29 @@ public static class IlGenerator
                 && GenericDefinition(concrete.DeclaringType) is { } concreteDeclaring
                 && !ThisConstructorCallPlan.SameTypeIdentity(baseDeclaring, concreteDeclaring))
                 return FieldDescriptorFor(concrete.BaseFieldContext, receiverType);
+            // A concrete field minted against one instantiation only exists on
+            // that instantiation; when the receiver names a different one of the
+            // same generic definition, the member must be re-concretized on the
+            // receiver (type inference refines locals after references bind).
+            // Struct receivers only: `ldloca` pins the pushed address to the
+            // local's emitted type, while a class receiver is coerced to the
+            // field's own declaring type, which already matches the member.
+            var concreteReceiver = concrete.DeclaringType.IsValueType
+                ? receiverType switch
+                {
+                    GenericInstanceTypeAnalysisContext instance => instance,
+                    ByRefTypeAnalysisContext { ElementType: GenericInstanceTypeAnalysisContext instance }
+                        => instance,
+                    _ => null,
+                }
+                : null;
+            if (concreteReceiver != null
+                && GenericDefinition(concrete.DeclaringType) is { } liveDeclaring
+                && ThisConstructorCallPlan.SameTypeIdentity(liveDeclaring, concreteReceiver.GenericType)
+                && concrete.DeclaringType.FullName != concreteReceiver.FullName)
+                return FieldDescriptorFor(
+                    concrete.BaseFieldContext.MakeConcreteGenericField(concreteReceiver.GenericArguments),
+                    receiverType);
             return field.ToFieldDescriptor();
         }
         var receiverInstance = receiverType switch
