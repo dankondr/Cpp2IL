@@ -4937,9 +4937,9 @@ public static class IlGenerator
             return thisType.IsValueType ? new ByRefTypeAnalysisContext(thisType) : thisType;
         }
         // An isinst/castclass source slot holds a managed object reference. When a
-        // local reaches the emitted body only through such a slot - no producer and
-        // no other use - the propagated type is a register-reuse leftover and the
-        // slot contract is the only proven type.
+        // local reaches the emitted body only through such a slot - no producer
+        // that can prove a reference and no other use - the propagated type is a
+        // register-reuse leftover and the slot contract is the only proven type.
         if (local.Type != null && UsedOnlyAsCastSource(local, context))
             return context.AppContext.SystemTypes.SystemObjectType;
         // System.Object is also the lifter's fallback for a register whose real
@@ -4995,7 +4995,14 @@ public static class IlGenerator
         foreach (var instruction in context.ControlFlowGraph!.Instructions)
         {
             if (ReferenceEquals(instruction.Destination, local))
-                return false;
+            {
+                // A producer that types the local as a managed reference carries the proof. A
+                // value-typed or untyped one can never hold the object the slot requires, so the
+                // slot contract stays the only proven type.
+                if (local.Type == null || (!local.Type.IsValueType && !IsNativeHandleType(local.Type)))
+                    return false;
+                continue;
+            }
             foreach (var operand in instruction.Operands)
             {
                 if (operand is ReferenceCast cast)
@@ -6250,9 +6257,13 @@ public static class IlGenerator
         var toWidth = IntegralStackWidth(to);
 
         // A raw pointer slot takes a native-int value: an integral/native source
-        // reaches it through conv.i, a managed pointer needs the opt-in convertByRef.
+        // reaches it through conv.i. A managed pointer never satisfies it -
+        // EmitStackCoerce has no legal & -> * coercion and drops the operand
+        // for the slot default, so loading it only emits a value the coerce
+        // immediately throws away (e.g. ldloca on a & local, which no C#
+        // spelling renders - ilspy prints it as `ref ref x`).
         if (to is PointerTypeAnalysisContext)
-            return fromWidth != 0 || from is ByRefTypeAnalysisContext && convertByRef;
+            return from is not ByRefTypeAnalysisContext && fromWidth != 0;
 
         if (from is ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
         {
