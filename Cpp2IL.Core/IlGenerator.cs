@@ -557,6 +557,23 @@ public static class IlGenerator
                     }
                     if (!FieldReferenceUsableFrom(field, context, writeAccess: true))
                     {
+                        if (InitOnlyLeafAddressable(field, context))
+                        {
+                            if (field.Containers.Count == 0
+                                && RequiresThisPointerReceiver(field.Field, context)
+                                && (field.Local is null or LocalVariable
+                                    || ThisAliasLocals(context).Contains(field.Local)))
+                                instructions.Add(CilOpCodes.Ldarg_0);
+                            else
+                                LoadFieldReceiver(field, context, method, locals, writeLine);
+                            instructions.Add(CilOpCodes.Ldflda,
+                                FieldDescriptorFor(field.Field, FieldReceiverType(field, context)));
+                            LoadOperandIntoSlot(instruction.Operands[1], field.Field.FieldType,
+                                context, method, locals, writeLine);
+                            instructions.Add(CilOpCodes.Stobj,
+                                field.Field.FieldType.ToTypeSignature().ToTypeDefOrRef());
+                            break;
+                        }
                         EmitUnrecoverableOperation(method, writeLine,
                             $"Inaccessible field store: {field.Field.DeclaringType?.FullName}.{field.Field.Name}");
                         break;
@@ -6892,20 +6909,44 @@ public static class IlGenerator
             : CallDefinedLocalType(local, context) ?? ObjectDefinitionType(local, context);
         if (owner == null || owner == systemObject
             || owner is SzArrayTypeAnalysisContext or GenericParameterTypeAnalysisContext
-                or PointerTypeAnalysisContext
-            || Analysis.MetadataResolver.FindInstanceFieldPathAtOffset(owner, memory.Addend,
-                memory.AccessSize) is not { } found
-            || found.Containers.Count == 0 && !FieldStoreWidthMatches(memory, found.Field, context))
+                or PointerTypeAnalysisContext)
             return false;
 
-        var resolved = found.Field;
-        if (owner is GenericInstanceTypeAnalysisContext genericOwner)
-            resolved = new ConcreteGenericFieldAnalysisContext(resolved, genericOwner);
-        field = new FieldReference(resolved, local, (int)memory.Addend, found.Containers,
-            memory.AccessSize);
-        return FieldReferenceUsableFrom(field, context, writeAccess: true)
-            && TryResolveSlotLoad(source, field.Field.FieldType, context, false, out _, out _);
+        var candidates = Analysis.MetadataResolver.FindInstanceFieldPathAtOffset(owner,
+                memory.Addend, memory.AccessSize) is { } flat
+            ? [flat]
+            : Analysis.MetadataResolver.FindInteriorInstanceFieldPaths(owner, memory.Addend,
+                memory.AccessSize) ?? [];
+        foreach (var found in candidates)
+        {
+            if (found.Containers.Count == 0 && !FieldStoreWidthMatches(memory, found.Field, context))
+                continue;
+            var resolved = found.Field;
+            // Interior-path leaves already carry their declaring context's binding;
+            // only a flat leaf on a generic owner still needs it.
+            if (owner is GenericInstanceTypeAnalysisContext genericOwner
+                && resolved is not ConcreteGenericFieldAnalysisContext)
+                resolved = new ConcreteGenericFieldAnalysisContext(resolved, genericOwner);
+            field = new FieldReference(resolved, local, (int)memory.Addend, found.Containers,
+                memory.AccessSize);
+            var writable = FieldReferenceUsableFrom(field, context, writeAccess: true)
+                || InitOnlyLeafAddressable(field, context);
+            if (writable
+                && TryResolveSlotLoad(source, field.Field.FieldType, context, false, out _, out _))
+                return true;
+        }
+        return false;
     }
+
+    // A readonly leaf can't take stfld outside its declaring .ctor, but the
+    // verifier's initonly rule only covers stfld/stsfld: ldflda still yields
+    // the member's address and stobj writes the same bytes legally.
+    private static bool InitOnlyLeafAddressable(FieldReference field, MethodAnalysisContext context)
+        => !field.Field.IsStatic
+            && (field.Field.Attributes & FieldAttributes.InitOnly) != 0
+            && field.Field.FieldType.IsValueType
+            && TypeTokenUsableFrom(field.Field.FieldType, context)
+            && FieldReferenceUsableFrom(field, context);
 
     // Frame-pointer- and stack-slot-relative stores ([x29 - N], [stack_N + K])
     // write a native frame slot the lifter never promoted to a local. Each
