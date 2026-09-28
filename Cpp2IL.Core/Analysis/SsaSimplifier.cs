@@ -104,6 +104,14 @@ public static class SsaSimplifier
                         if (resolved.TryGetValue(choice.Field.Local, out var receiverValue) && receiverValue is LocalVariable receiverReplacement)
                             choice.Field.Local = receiverReplacement;
                     break;
+
+                // Same as a memory base: the operand of a reference cast is a managed-reference
+                // slot typed LocalVariable, so only a local replacement is substituted there; a
+                // constant stays put, which keeps the source Move alive.
+                case ReferenceCast cast
+                    when resolved.TryGetValue(cast.Value, out var castValue) && castValue is LocalVariable castReplacement:
+                    instruction.SetOperand(i, new ReferenceCast(castReplacement, cast.Type, cast.NullOnFailure));
+                    break;
             }
         }
     }
@@ -142,6 +150,9 @@ public static class SsaSimplifier
                             reads.Add(selected.Selector);
                             foreach (var choice in selected.Choices)
                                 reads.Add(choice.Field.Local);
+                            break;
+                        case ReferenceCast cast when !ReferenceEquals(cast.Value, destination):
+                            reads.Add(cast.Value);
                             break;
                     }
                 }
