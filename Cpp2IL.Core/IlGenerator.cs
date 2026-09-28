@@ -6250,9 +6250,13 @@ public static class IlGenerator
         var toWidth = IntegralStackWidth(to);
 
         // A raw pointer slot takes a native-int value: an integral/native source
-        // reaches it through conv.i, a managed pointer needs the opt-in convertByRef.
+        // reaches it through conv.i. A managed pointer never satisfies it -
+        // EmitStackCoerce has no legal & -> * coercion and drops the operand
+        // for the slot default, so loading it only emits a value the coerce
+        // immediately throws away (e.g. ldloca on a & local, which no C#
+        // spelling renders - ilspy prints it as `ref ref x`).
         if (to is PointerTypeAnalysisContext)
-            return fromWidth != 0 || from is ByRefTypeAnalysisContext && convertByRef;
+            return from is not ByRefTypeAnalysisContext && fromWidth != 0;
 
         if (from is ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
         {
