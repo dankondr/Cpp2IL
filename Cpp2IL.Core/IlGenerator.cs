@@ -4430,8 +4430,24 @@ public static class IlGenerator
         }
     }
 
-    private static TypeAnalysisContext? FieldReceiverType(FieldReference field, MethodAnalysisContext context) =>
-        field.Containers.Count == 0 ? EmittedOperandType(field.Local, context) : field.Containers[^1].FieldType;
+    private static TypeAnalysisContext? FieldReceiverType(FieldReference field, MethodAnalysisContext context)
+    {
+        if (field.Containers.Count == 0)
+            return EmittedOperandType(field.Local, context);
+        var receiverType = EmittedOperandType(field.Local, context);
+        var chainHead = true;
+        foreach (var container in field.Containers)
+        {
+            var effectiveReceiver = chainHead && !container.IsStatic
+                ? ResolvedFieldReceiverType(container, field.Local, receiverType, context)
+                : receiverType;
+            chainHead = false;
+            receiverType = container.IsStatic
+                ? container.FieldType
+                : EmittedContainerFieldType(container, effectiveReceiver);
+        }
+        return receiverType;
+    }
 
     private static bool FieldReferenceUsableFrom(FieldReference field, MethodAnalysisContext context,
         bool writeAccess = false)
@@ -4448,7 +4464,9 @@ public static class IlGenerator
             chainHead = false;
             if (!FieldUsableFrom(container, context, receiverType: effectiveReceiver))
                 return false;
-            receiverType = container.FieldType;
+            receiverType = container.IsStatic
+                ? container.FieldType
+                : EmittedContainerFieldType(container, effectiveReceiver);
         }
         return FieldUsableFrom(field.Field, context, writeAccess,
             receiverType: field.Field.IsStatic ? null
@@ -4480,6 +4498,31 @@ public static class IlGenerator
         if (contract is not ByRefTypeAnalysisContext)
             return declaring;
         return receiverType is ByRefTypeAnalysisContext byRefReceiver ? byRefReceiver.ElementType : receiverType;
+    }
+
+    // The field type the emitted container member actually carries:
+    // FieldDescriptorFor re-concretizes a concrete value-type field onto the
+    // receiver's live instantiation, so the next link's receiver is the base
+    // field's type instantiated with the receiver's arguments - not the
+    // (possibly stale) bound instantiation's field type.
+    private static TypeAnalysisContext? EmittedContainerFieldType(FieldAnalysisContext container,
+        TypeAnalysisContext? resolvedReceiver)
+    {
+        if (container is not ConcreteGenericFieldAnalysisContext { DeclaringType.IsValueType: true } concrete)
+            return container.FieldType;
+        var instance = resolvedReceiver switch
+        {
+            GenericInstanceTypeAnalysisContext i => i,
+            ByRefTypeAnalysisContext { ElementType: GenericInstanceTypeAnalysisContext i } => i,
+            _ => null,
+        };
+        if (instance == null
+            || GenericDefinition(concrete.DeclaringType) is not { } boundDefinition
+            || !ThisConstructorCallPlan.SameTypeIdentity(boundDefinition, instance.GenericType)
+            || concrete.DeclaringType.FullName == instance.FullName)
+            return container.FieldType;
+        return GenericInstantiation.Instantiate(concrete.BaseFieldContext.FieldType,
+            instance.GenericArguments, []);
     }
 
     // A `<Property>k__BackingField` member is always compiler-named, so no
@@ -4560,11 +4603,22 @@ public static class IlGenerator
         }
         else
             LoadBase(first);
+        var chainHead = start == 0;
         foreach (var container in field.Containers.Skip(start))
         {
+            // FieldDescriptorFor binds the member onto the receiver actually on
+            // the stack (resolved the way LoadBase pushes it), and the emitted
+            // member's field type - not the bound one - is the next link's
+            // receiver.
+            var effectiveReceiver = chainHead && !container.IsStatic
+                ? ResolvedFieldReceiverType(container, field.Local, receiverType, context)
+                : receiverType;
+            chainHead = false;
             method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldflda,
-                FieldDescriptorFor(container, receiverType));
-            receiverType = container.FieldType;
+                FieldDescriptorFor(container, effectiveReceiver));
+            receiverType = container.IsStatic
+                ? container.FieldType
+                : EmittedContainerFieldType(container, effectiveReceiver);
         }
     }
 
@@ -8717,7 +8771,25 @@ public static class IlGenerator
         // member's declaring instantiation must cover it. A mistyped receiver - say
         // an awaiter value whose declaring context was widened to a different generic
         // instantiation - that agrees only on the open definition would emit a
-        // token/receiver mismatch.
+        // token/receiver mismatch. FieldDescriptorFor binds the emitted member onto
+        // the receiver's live instantiation whenever it can - a concrete value-type
+        // field re-concretizes, a plain field becomes a MemberReference on the
+        // receiver - so the member's declaring context for this check is the live
+        // instantiation too. Fields that keep their bound declaring context (no
+        // concrete re-concretization, no field definition to reference) keep the
+        // mismatch rejection.
+        if (receiverType switch
+            {
+                GenericInstanceTypeAnalysisContext instance => instance,
+                ByRefTypeAnalysisContext { ElementType: GenericInstanceTypeAnalysisContext instance } => instance,
+                _ => null,
+            } is { } liveReceiver
+            && GenericDefinition(declaring) is { } boundDeclaring
+            && ThisConstructorCallPlan.SameTypeIdentity(boundDeclaring, liveReceiver.GenericType)
+            && (field is ConcreteGenericFieldAnalysisContext concreteField
+                ? concreteField.DeclaringType.IsValueType
+                : field.GetExtraData<FieldDefinition>("AsmResolverField") != null))
+            declaring = liveReceiver;
         if (!field.IsStatic && receiverType != null && !receiverType.IsAssignableTo(declaring))
             return false;
         // A direct native access proves that an inlined managed member reached a
