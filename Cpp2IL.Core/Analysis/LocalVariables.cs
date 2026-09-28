@@ -326,6 +326,7 @@ public static class LocalVariables
             changed |= TypeAddressedLocals(method);
             changed |= PropagateTypesOnce(method);
             changed |= ResolveStackAggregateFields(method);
+            changed |= RewriteAggregateFieldStores(method);
             changed |= InheritEscapedCellVersions(method);
 
             // Hidden struct returns are discovered before field/type propagation, when a shared-
@@ -398,6 +399,212 @@ public static class LocalVariables
         }
         return changed;
     }
+
+    // A Move that stores into a whole struct-typed local but records less than the
+    // struct's width is an interior store: the operand lands in one of the local's
+    // fields, not in the value itself. (`new T(field)` lowers to exactly those
+    // stores - `ctx.buffer = span` arrives as a pointer-width store into a 100+
+    // byte ref-struct slot.) Rewriting the destination to the covered field lets
+    // the store emit as a real field store instead of dropping the operand across
+    // the value/reference boundary. Three faithful shapes:
+    //   - the source's own type names a unique instance field of the struct
+    //     (`span -> ctx.buffer`),
+    //   - a leading span field fed an `array + data offset` pointer: `&arr[0]`
+    //     lowers to the span-of-array constructor, so the honest operand is the
+    //     array itself rather than the pointer-carrying local,
+    //   - a literal zero covering the leading field (`f = default`/`f = null`).
+    // Every other pairing keeps the diagnosed default. The rewrite only runs where
+    // the field is writable from the method (no initonly store outside the
+    // declaring .ctor, no private store outside the declaring type) and the
+    // recorded access width stays inside the field.
+    private static bool RewriteAggregateFieldStores(MethodAnalysisContext method)
+    {
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        var changed = false;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction.OpCode != OpCode.Move
+                || instruction.Operands is not [LocalVariable destination, var source])
+                continue;
+            if (!(destination.Type is { IsValueType: true } destinationType)
+                || destinationType is ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+                    or GenericParameterTypeAnalysisContext)
+                continue;
+            var destinationSize = TypeSizes.MinimumUnboxedSize(destinationType, pointerSize);
+            if (destinationSize <= pointerSize)
+                continue;
+            var accessSize = instruction.NativeMemoryAccessSize ?? StoredOperandSize(source, pointerSize);
+            if (accessSize <= 0 || accessSize >= destinationSize)
+                continue;
+            var fields = (destinationType is GenericInstanceTypeAnalysisContext genericDestination
+                    ? genericDestination.GenericType.Fields.Select(field =>
+                        (FieldAnalysisContext)field.MakeConcreteGenericField(genericDestination.GenericArguments))
+                    : (IEnumerable<FieldAnalysisContext>)destinationType.Fields)
+                .Where(field => !field.IsStatic && field.Offset >= 0
+                    && field.Offset + TypeSizes.MinimumUnboxedSize(field.FieldType, pointerSize)
+                        <= destinationSize
+                    && AggregateFieldWritableFrom(field, method))
+                .ToList();
+
+            // The operand's own type can name the covered field outright
+            // (`span -> ctx.buffer`) when exactly one field declares it.
+            var sourceType = IlGenerator.EmittedOperandType(source, method);
+            var typeMatches = sourceType is not { IsValueType: true }
+                    || IlGenerator.IntegralStackWidth(sourceType) != 0
+                ? []
+                : fields.Where(field => field.FieldType.FullName == sourceType.FullName
+                        && TypeSizes.MinimumUnboxedSize(field.FieldType, pointerSize) >= accessSize)
+                    .ToList();
+            if (typeMatches is [var matched])
+            {
+                instruction.SetOperand(0,
+                    new FieldReference(matched, destination, matched.Offset, [], accessSize));
+                changed = true;
+                continue;
+            }
+
+            var leading = fields.FirstOrDefault(field => field.Offset == 0
+                && TypeSizes.MinimumUnboxedSize(field.FieldType, pointerSize) >= accessSize);
+            if (leading == null)
+                continue;
+            if (source is Immediate { Value: 0 })
+            {
+                instruction.SetOperand(0, new FieldReference(leading, destination, 0, [], accessSize));
+                changed = true;
+                continue;
+            }
+            if (SpanFieldElementType(leading) is { } spanElement
+                && TryUnwrapArrayDataPointer(source, method, pointerSize, out var arrayOperand)
+                && IlGenerator.EmittedOperandType(arrayOperand!, method) is SzArrayTypeAnalysisContext
+                    { ElementType: { } arrayElement }
+                && arrayElement.FullName == spanElement.FullName)
+            {
+                instruction.SetOperand(0, new FieldReference(leading, destination, 0, [], accessSize));
+                instruction.SetOperand(1, arrayOperand!);
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    // `arr + K` on an array local is `&arr[0]` - K is the array data offset and
+    // Il2CppArray's header is four pointer words. For a span-typed consumer the
+    // honest operand is the array itself: `new Span(arr)` writes the same data
+    // pointer plus the array's own length. A phi'd store source resolves only
+    // when every branch unwraps to the same operand - the store carries one
+    // operand, so genuinely different arrays per branch keep the diagnostic.
+    private static bool TryUnwrapArrayDataPointer(IOperand operand, MethodAnalysisContext method,
+        int pointerSize, out IOperand? arrayOperand)
+    {
+        arrayOperand = null;
+        return operand is LocalVariable local
+            && TryUnwrapArrayDataPointer(local, method, pointerSize, [], out arrayOperand);
+    }
+
+    private static bool TryUnwrapArrayDataPointer(LocalVariable local, MethodAnalysisContext method,
+        int pointerSize, HashSet<LocalVariable> visited, out IOperand? arrayOperand)
+    {
+        arrayOperand = null;
+        if (!visited.Add(local))
+            return false;
+        var definitions = method.ControlFlowGraph!.Instructions
+            .Where(instruction => instruction.IsAssignment
+                && instruction.Operands.Count >= 2
+                && ReferenceEquals(instruction.Operands[0], local))
+            .ToList();
+        var add = definitions.FirstOrDefault(definition => definition.OpCode == OpCode.Add
+            && definition.Operands is [_, _, Immediate { Value: var offset }]
+            && offset == pointerSize * 4);
+        if (add != null)
+        {
+            if (add.Operands[1] is LocalVariable addBase && !ReferenceEquals(addBase, local))
+                return TryUnwrapArrayDataPointer(addBase, method, pointerSize, visited,
+                    out arrayOperand);
+            definitions.Remove(add);
+        }
+        if (definitions is [{ OpCode: OpCode.Move, Operands: [_, var moveSource, ..] }])
+        {
+            if (IlGenerator.EmittedOperandType(moveSource, method) is SzArrayTypeAnalysisContext)
+            {
+                arrayOperand = moveSource;
+                return true;
+            }
+            return moveSource is LocalVariable moveLocal
+                && TryUnwrapArrayDataPointer(moveLocal, method, pointerSize, visited,
+                    out arrayOperand);
+        }
+        if (definitions is [{ OpCode: OpCode.Phi } phi] && phi.Operands.Count >= 3)
+        {
+            foreach (var phiSource in phi.Operands.Skip(1))
+            {
+                // Every branch gets the visited set the phi saw, so a source
+                // reaching back through this phi is a cycle and fails the unwrap,
+                // while independent branch chains never block each other.
+                if (phiSource is not LocalVariable phiLocal
+                    || !TryUnwrapArrayDataPointer(phiLocal, method, pointerSize,
+                        new HashSet<LocalVariable>(visited), out var sourceOperand)
+                    || sourceOperand == null)
+                    return false;
+                if (arrayOperand == null)
+                    arrayOperand = sourceOperand;
+                else if (!SameOperand(arrayOperand, sourceOperand))
+                    return false;
+            }
+            return arrayOperand != null;
+        }
+        return false;
+    }
+
+    private static bool SameOperand(IOperand left, IOperand right) =>
+        (left, right) switch
+        {
+            (LocalVariable leftLocal, LocalVariable rightLocal) =>
+                ReferenceEquals(leftLocal, rightLocal),
+            (FieldReference leftField, FieldReference rightField) =>
+                leftField.Field.Name == rightField.Field.Name
+                    && leftField.Offset == rightField.Offset
+                    && ReferenceEquals(leftField.Local, rightField.Local),
+            _ => ReferenceEquals(left, right)
+        };
+
+    private static TypeAnalysisContext? SpanFieldElementType(FieldAnalysisContext field) =>
+        field.FieldType is GenericInstanceTypeAnalysisContext
+            { GenericType.FullName: "System.Span`1" or "System.ReadOnlySpan`1" } span
+        && span.GenericArguments is [var element]
+            ? element
+            : null;
+
+    // stfld can only write what the method may legally touch: no initonly store
+    // outside the declaring type's own .ctor, and no private/family store outside
+    // the declaring type. Anything else keeps the whole-struct destination and
+    // its diagnostic rather than emitting a store the verifier rejects.
+    private static bool AggregateFieldWritableFrom(FieldAnalysisContext field, MethodAnalysisContext method)
+    {
+        var attributes = field.Attributes;
+        if ((attributes & FieldAttributes.InitOnly) != 0
+            && !(method.Name is ".ctor"
+                && field.DeclaringType?.FullName == method.DeclaringType?.FullName))
+            return false;
+        return (attributes & FieldAttributes.FieldAccessMask) switch
+        {
+            FieldAttributes.Private or FieldAttributes.PrivateScope or FieldAttributes.Family
+                => field.DeclaringType?.FullName == method.DeclaringType?.FullName,
+            FieldAttributes.Assembly or FieldAttributes.FamANDAssem
+                => field.DeclaringType?.DeclaringAssembly?.Name
+                    == method.DeclaringType?.DeclaringAssembly?.Name,
+            _ => true,
+        };
+    }
+
+    private static int StoredOperandSize(IOperand operand, int pointerSize) => operand switch
+    {
+        LocalVariable { Type: { } type }
+            => (int)System.Math.Min(TypeSizes.MinimumUnboxedSize(type, pointerSize), int.MaxValue),
+        FieldReference field
+            => (int)System.Math.Min(TypeSizes.MinimumUnboxedSize(field.Field.FieldType, pointerSize),
+                int.MaxValue),
+        _ => pointerSize,
+    };
 
     // A FieldReference materialized while its owner local still typed the erased shared
     // instantiation (e.g. `Dictionary<K,V>.Enumerator<object,object>` under generic
