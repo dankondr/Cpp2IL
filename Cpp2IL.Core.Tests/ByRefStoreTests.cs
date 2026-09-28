@@ -53,7 +53,8 @@ public class ByRefStoreTests
     [TestCase("reference", 0, 0, false)]
     [TestCase("reference", 8, 8, false)]
     [TestCase("int", 4, 0, true)] // whole-value stores to a T& lower to stobj T
-    [TestCase("struct", 8, 0, false)]
+    [TestCase("struct", 8, 0, true)] // a zero literal covers the whole pointee: stobj default(T)
+    [TestCase("struct", 4, 0, false)] // a narrower write cannot prove the whole struct is zero
     [TestCase("pointer", 8, 0, false)]
     [TestCase("generic", 8, 0, false)]
     [TestCase("unmanaged", 8, 0, false)]
