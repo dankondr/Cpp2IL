@@ -140,4 +140,56 @@ public class CrossAssemblyFieldAccessTests
                 "the frozen surface cannot widen, so no real load is emitted");
         });
     }
+
+    [Test]
+    public void AutoPropertyBackingFieldKeepsDiagnosedDefault()
+    {
+        // ILSpy folds a `<P>k__BackingField` member into its auto-property, so no
+        // widened access lets the decompiled reference spell it. Widening the
+        // member anyway would trade the honest diagnosed default for
+        // CS1061/CS0103 errors, so the site keeps the default and the note names
+        // the backing field.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+
+        var owner = app.InjectAssembly("Recovered.Owner").InjectType("Tests", "Owner",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var field = owner.InjectFieldContext("<Counter>k__BackingField", app.SystemTypes.SystemInt32Type,
+            R.FieldAttributes.Private | R.FieldAttributes.Static);
+
+        var result = new LocalVariable("result", new Register(null, "result"))
+            { Type = app.SystemTypes.SystemInt32Type };
+        var module = new ModuleDefinition("FieldAccessBacking.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemVoidType, app.SystemTypes.SystemObjectType);
+        var ownerDefinition = new TypeDefinition("Tests", "Owner",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(ownerDefinition);
+        var fieldDefinition = new FieldDefinition("<Counter>k__BackingField",
+            FieldAttributes.Private | FieldAttributes.Static,
+            new FieldSignature(module.CorLibTypeFactory.Int32));
+        ownerDefinition.Fields.Add(fieldDefinition);
+        field.PutExtraData("AsmResolverField", fieldDefinition);
+
+        var (caller, method) = InjectedCaller(app, module, "Tests", [
+            new(0, OpCode.Move, result, new FieldReference(field, result, 0)),
+            new(1, OpCode.Return, result)], [result],
+            app.SystemTypes.SystemInt32Type, module.CorLibTypeFactory.Int32);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("compiler-generated backing field")), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldsfld), Is.False,
+                "the folded backing field is unspellable, so no real load is emitted");
+            Assert.That(fieldDefinition.Attributes & FieldAttributes.FieldAccessMask,
+                Is.EqualTo(FieldAttributes.Private),
+                "the unspellable member is not widened");
+        });
+    }
 }

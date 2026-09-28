@@ -4154,7 +4154,10 @@ public static class IlGenerator
                 }
                 if (!FieldReferenceUsableFrom(field, callingContext))
                 {
-                    PushDefaultOf(field.Field.FieldType, method, instructions, callingContext);
+                    PushDefaultOf(field.Field.FieldType, method, instructions, callingContext,
+                        IsAutoPropertyBackingField(field.Field)
+                            ? $"Operand slot of type {field.Field.FieldType.FullName} filled with a synthetic default value: {field.Field.Name} is a compiler-generated backing field"
+                            : null);
                     break;
                 }
                 if (field.Field.IsStatic)
@@ -4478,6 +4481,14 @@ public static class IlGenerator
             return declaring;
         return receiverType is ByRefTypeAnalysisContext byRefReceiver ? byRefReceiver.ElementType : receiverType;
     }
+
+    // A `<Property>k__BackingField` member is always compiler-named, so no
+    // access level lets a decompiled reference spell it: ILSpy folds the field
+    // into its auto-property regardless of the widened access. Widening one
+    // here trades an honest diagnosed default for CS1061/CS0103 errors, so the
+    // declared-access path below keeps the default instead.
+    private static bool IsAutoPropertyBackingField(FieldAnalysisContext field)
+        => field.Name.StartsWith("<") && field.Name.EndsWith("k__BackingField");
 
     private static void EmitSelectedFieldLoad(SelectedFieldReference selected, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
@@ -8744,9 +8755,12 @@ public static class IlGenerator
         // (and its declaring types) to the access the reference needs - the same fix the
         // same-assembly shortcut above relies on. External runtime assemblies are
         // frozen, their stubs mirror the real runtime surface, so a reference there
-        // must fit the declared access.
+        // must fit the declared access. Widening a compiler-generated backing field
+        // gains nothing either - no access level lets a reference spell the name -
+        // so those keep the diagnosed path as well.
         return declaredAccess
-            || !Extensions.AccessibilityExtensions.IsExternalRuntimeAssembly(declaring.DeclaringAssembly?.Name);
+            || !Extensions.AccessibilityExtensions.IsExternalRuntimeAssembly(declaring.DeclaringAssembly?.Name)
+                && !IsAutoPropertyBackingField(field);
     }
 
     // Typed `stelem` requires the stack value to be exactly the element type, which
