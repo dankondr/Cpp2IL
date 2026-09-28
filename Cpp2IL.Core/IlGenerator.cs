@@ -141,6 +141,12 @@ public static class IlGenerator
         var frameSlotLocals = CollectFrameSlotLocals(context);
         context.Locals.AddRange(frameSlotLocals.Values);
 
+        // A load of a slot the collection typed reads the same synthesized
+        // local: rewrite the source operand to it so every load path (Move,
+        // call arguments, comparisons, returns) emits a plain ldloc. Slots no
+        // store typed and width-mismatched loads keep the load diagnostic.
+        RewriteFrameSlotLoads(context, frameSlotLocals);
+
         // Map ISIL locals to IL. The declared type joins the method body's locals
         // signature, so a local whose recovered type cannot be named here is
         // declared as the closest verifier-legal placeholder instead.
@@ -6314,10 +6320,39 @@ public static class IlGenerator
         return slots;
     }
 
+    // Completes the frame-slot dataflow CollectFrameSlotLocals starts: a source
+    // operand naming a slot with a typed local becomes that local outright, so
+    // the normal operand path loads it with ldloc under whatever contract the
+    // consumer applies. Store destinations stay MemoryOperand so the stloc arm
+    // keeps its type/width agreement check, and a slot with no typed store - or
+    // a load whose recorded width disagrees with the slot's type - keeps the
+    // unmanaged-load diagnostic rather than reading a default.
+    private static void RewriteFrameSlotLoads(MethodAnalysisContext context,
+        IReadOnlyDictionary<(bool StackRelative, long Offset), LocalVariable> frameSlotLocals)
+    {
+        if (frameSlotLocals.Count == 0)
+            return;
+        var pointerSize = context.AppContext.Binary.PointerSizeBytes;
+        foreach (var instruction in context.ControlFlowGraph!.Instructions)
+        {
+            var destination = instruction.Destination;
+            var operands = instruction.Operands;
+            for (var i = 0; i < operands.Count; i++)
+            {
+                if (operands[i] is MemoryOperand memory
+                    && !ReferenceEquals(operands[i], destination)
+                    && FrameSlotKey(memory, context) is { } key
+                    && frameSlotLocals.TryGetValue(key, out var slot)
+                    && FrameSlotWidthMatches(memory, slot.Type!, pointerSize))
+                    instruction.SetOperand(i, slot);
+            }
+        }
+    }
+
     private static (bool StackRelative, long Offset)? FrameSlotKey(MemoryOperand memory,
         MethodAnalysisContext context)
     {
-        if (memory.Index != null || memory.Scale != 0 || memory.Addend == 0
+        if (memory.Index != null || memory.Scale != 0
             || memory.Base is not LocalVariable baseLocal
             || baseLocal.Type is { } baseType
                 && baseType != context.AppContext.SystemTypes.SystemObjectType)
@@ -6325,9 +6360,15 @@ public static class IlGenerator
 
         var name = baseLocal.Register.Name;
         if (name.StartsWith("X29", System.StringComparison.Ordinal))
-            return (false, memory.Addend);
+            // [X29+0] addresses the saved-FP record, not a spill slot.
+            return memory.Addend == 0 ? null : (false, memory.Addend);
         if (TryParseStackSlotOffset(name) is { } stackOffset)
-            return (true, stackOffset + memory.Addend);
+        {
+            // A stack_N register already names a slot; the addend shifts it and
+            // is usually absent. Offset zero is SP itself, not a slot.
+            var offset = stackOffset + memory.Addend;
+            return offset == 0 ? null : (true, offset);
+        }
         return null;
     }
 
@@ -6340,6 +6381,11 @@ public static class IlGenerator
         var negative = digits.StartsWith("-", System.StringComparison.Ordinal);
         if (negative)
             digits = digits[1..];
+        // SSA versioning rewrites the register (stack_-30_v3); the frame offset
+        // it names is unchanged by the version suffix.
+        var versionSeparator = digits.IndexOf('_');
+        if (versionSeparator >= 0)
+            digits = digits[..versionSeparator];
         return long.TryParse(digits, System.Globalization.NumberStyles.HexNumber,
             System.Globalization.CultureInfo.InvariantCulture, out var value)
             ? negative ? -value : value
