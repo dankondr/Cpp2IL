@@ -391,6 +391,9 @@ public static class LocalVariables
             if (nearest.Count != 1)
                 continue;
             var match = nearest[0];
+            if (MetadataResolver.MemberPathUnspellable(match.Nested!.Value, method,
+                    instruction.OpCode == OpCode.Move && operandIndex == 0, addressed: false))
+                continue;
             instruction.SetOperand(operandIndex, new FieldReference(match.Nested!.Value.Field,
                 match.Root, match.Offset, match.Nested.Value.Containers, accessSize));
             if (instruction.OpCode == OpCode.Move && operandIndex == 1
@@ -690,7 +693,9 @@ public static class LocalVariables
                 || emitted.GenericArguments.Any(IlGenerator.ContainsErasedSharedArgument))
                 continue;
             if (MetadataResolver.FindInstanceFieldPathAtOffset(emitted, reference.Offset,
-                    reference.AccessSize) is not { } resolved)
+                    reference.AccessSize) is not { } resolved
+                || MetadataResolver.MemberPathUnspellable(resolved, method,
+                    instruction.OpCode == OpCode.Move && i == 0, addressed))
                 continue;
             var field = resolved.Field;
             if (field is not ConcreteGenericFieldAnalysisContext)

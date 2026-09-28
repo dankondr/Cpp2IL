@@ -1,6 +1,7 @@
 using System.Linq;
 using AsmResolver;
 using AsmResolver.DotNet;
+using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.PE.DotNet.Cil;
 
 namespace Cpp2IL.Core.OutputFormats;
@@ -17,7 +18,10 @@ namespace Cpp2IL.Core.OutputFormats;
 /// is already a managed pointer to the enum, and an enum is interchangeable with
 /// its underlying type, so the same stack shape is produced by
 /// <c>ldobj</c>/<c>stobj</c> of the enum itself — which decompiles as the enum
-/// value rather than the unprintable field name.</item>
+/// value rather than the unprintable field name. The same applies to
+/// <c>ldflda</c>: <c>&amp;e.value__</c> is <c>&amp;e</c>, so the retagging
+/// <c>ldflda</c> is dropped and its <c>ldobj</c>/<c>stobj</c>/<c>ldind</c>/
+/// <c>stind</c> consumer retargets to the enum.</item>
 /// <item>field access on a <c>&lt;X&gt;k__BackingField</c> whose declaring type
 /// still carries property <c>X</c> with the matching accessor. IL2CPP inline-
 /// expands auto-property accessors, so the access is the accessor call the
@@ -60,6 +64,10 @@ internal static class DecompilerMemberAccessRewrites
                 case CilCode.Stsfld:
                     RewriteBackingFieldAccess(method, field, instruction, runtimeContext, load: false);
                     break;
+                case CilCode.Ldflda:
+                    TryRewriteEnumUnderlyingAddress(field, instruction, instructions, i,
+                        runtimeContext);
+                    break;
             }
         }
     }
@@ -74,6 +82,40 @@ internal static class DecompilerMemberAccessRewrites
         instruction.OpCode = load ? CilOpCodes.Ldobj : CilOpCodes.Stobj;
         instruction.Operand = declaringType;
         return true;
+    }
+
+    // &e.value__ is the same address as &e: value__ is the enum's only instance
+    // member, at offset zero, so the ldflda exists only to retag the managed
+    // pointer to the underlying type. An immediately following ldobj, stobj,
+    // ldind or stind consumes that pointer to move exactly the enum's storage -
+    // the same bytes move under the enum's own name when the consumer retargets
+    // to the enum and the retagging ldflda is dropped.
+    private static void TryRewriteEnumUnderlyingAddress(IFieldDescriptor field, CilInstruction instruction,
+        CilInstructionCollection instructions, int index, RuntimeContext? runtimeContext)
+    {
+        if (field.Name?.Value != "value__" || field.DeclaringType is not ITypeDefOrRef declaringType)
+            return;
+        if (!TryResolveType(declaringType, runtimeContext, out var declaringDef) || declaringDef is not { IsEnum: true })
+            return;
+        if (index + 1 >= instructions.Count)
+            return;
+        var consumer = instructions[index + 1];
+        var load = consumer.OpCode.Code switch
+        {
+            CilCode.Ldobj or CilCode.Ldind_I or CilCode.Ldind_I1 or CilCode.Ldind_I2
+                or CilCode.Ldind_I4 or CilCode.Ldind_I8 or CilCode.Ldind_U1 or CilCode.Ldind_U2
+                or CilCode.Ldind_U4 or CilCode.Ldind_R4 or CilCode.Ldind_R8 or CilCode.Ldind_Ref => true,
+            CilCode.Stobj or CilCode.Stind_I or CilCode.Stind_I1 or CilCode.Stind_I2
+                or CilCode.Stind_I4 or CilCode.Stind_I8 or CilCode.Stind_R4 or CilCode.Stind_R8
+                or CilCode.Stind_Ref => false,
+            _ => (bool?)null,
+        };
+        if (load == null)
+            return;
+        instruction.OpCode = CilOpCodes.Nop;
+        instruction.Operand = null;
+        consumer.OpCode = load.Value ? CilOpCodes.Ldobj : CilOpCodes.Stobj;
+        consumer.Operand = declaringType;
     }
 
     private static void RewriteBackingFieldAccess(MethodDefinition method, IFieldDescriptor field,

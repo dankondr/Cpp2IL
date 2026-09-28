@@ -226,7 +226,9 @@ public static class MetadataResolver
                         catch (System.OverflowException) { choices.Clear(); break; }
 
                         if (ResolveField(owner, staticOwner, offset, memory.AccessSize,
-                                byRefElement != null) is not { } selectedField)
+                                byRefElement != null) is not { } selectedField
+                            || MemberPathUnspellable(selectedField, method,
+                                instruction.OpCode == OpCode.Move && i == 0, addressed: false))
                         {
                             choices.Clear();
                             break;
@@ -257,7 +259,9 @@ public static class MetadataResolver
                     byRefElement != null);
                 var field = resolved?.Field;
 
-                if (field == null) // TODO: Support nested fields (Field1.Field2.Field3)
+                if (field == null // TODO: Support nested fields (Field1.Field2.Field3)
+                    || MemberPathUnspellable(resolved!.Value, method,
+                        instruction.OpCode == OpCode.Move && i == 0, addressed: false))
                     continue;
 
                 // make sure we have a full GIT for field access. open type is bad.
@@ -492,6 +496,79 @@ public static class MetadataResolver
             || !(ReferenceEquals(declaringAssembly, callerAssembly)
                 || (declaringAssembly.Name != null && declaringAssembly.Name == callerAssembly.Name)
                 || Extensions.AccessibilityExtensions.SharesEmittedInternals(declaringAssembly, callerAssembly));
+    }
+
+    // A resolved path that must name a compiler-generated backing field can only
+    // be spelled through its property accessor: a load needs a getter visible
+    // from the caller, a store a visible setter. As a container hop or under an
+    // address-of the member emits ldflda, which no accessor can replace, so
+    // those paths stay diagnosed rather than naming a member the recovered
+    // source cannot write.
+    internal static bool MemberPathUnspellable(
+        (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers) resolved,
+        MethodAnalysisContext caller, bool store, bool addressed)
+    {
+        if (resolved.Containers.Any(IsCompilerGeneratedBackingField))
+            return true;
+        var leaf = resolved.Field;
+        return IsCompilerGeneratedBackingField(leaf)
+            && (addressed || !BackingAccessorVisible(leaf, caller, store));
+    }
+
+    private static bool IsCompilerGeneratedBackingField(FieldAnalysisContext field) =>
+        field.Name.StartsWith("<", System.StringComparison.Ordinal)
+        && field.Name.EndsWith(">k__BackingField", System.StringComparison.Ordinal);
+
+    private static bool BackingAccessorVisible(FieldAnalysisContext field,
+        MethodAnalysisContext caller, bool store)
+    {
+        var property = field.Name[1..field.Name.IndexOf('>')];
+        var accessorName = (store ? "set_" : "get_") + property;
+        for (var type = field.DeclaringType; type != null; type = type.BaseType)
+        {
+            var lookup = type is GenericInstanceTypeAnalysisContext instance ? instance.GenericType : type;
+            var accessor = lookup.Methods.FirstOrDefault(m => m.Name == accessorName
+                && m.IsStatic == field.IsStatic
+                && m.Parameters.Count == (store ? 1 : 0));
+            if (accessor != null)
+                return AccessorAccessibleFrom(accessor, caller);
+        }
+        return false;
+    }
+
+    // Mirrors the emission pass's accessor reachability (a declared-access check
+    // against the calling type) closely enough to decide whether the recovered
+    // body can spell the call: same-type access is always legal, declared
+    // visibility is judged from the caller's assembly and hierarchy. It stays a
+    // shade conservative of the real widening rules - a miss keeps a diagnostic
+    // rather than emitting an unnameable access.
+    private static bool AccessorAccessibleFrom(MethodAnalysisContext accessor, MethodAnalysisContext caller)
+    {
+        if (ReferenceEquals(accessor, caller))
+            return false; // the accessor's own body must keep its field access
+        var callerType = caller.DeclaringType;
+        var declaring = accessor.DeclaringType;
+        if (callerType == null || declaring == null)
+            return false;
+        var callerDef = callerType is GenericInstanceTypeAnalysisContext callerInstance
+            ? callerInstance.GenericType : callerType;
+        var declaringDef = declaring is GenericInstanceTypeAnalysisContext declaringInstance
+            ? declaringInstance.GenericType : declaring;
+        if (ReferenceEquals(callerDef, declaringDef))
+            return true;
+        var sameAssembly = callerType.DeclaringAssembly != null && declaring.DeclaringAssembly != null
+            && (ReferenceEquals(callerType.DeclaringAssembly, declaring.DeclaringAssembly)
+                || callerType.DeclaringAssembly.Name == declaring.DeclaringAssembly.Name);
+        var derived = callerType.IsAssignableTo(declaring);
+        return (accessor.Attributes & MethodAttributes.MemberAccessMask) switch
+        {
+            MethodAttributes.Public => true,
+            MethodAttributes.Assembly => sameAssembly,
+            MethodAttributes.Family => derived,
+            MethodAttributes.FamORAssem => sameAssembly || derived,
+            MethodAttributes.FamANDAssem => sameAssembly && derived,
+            _ => false,
+        };
     }
 
     internal static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)?

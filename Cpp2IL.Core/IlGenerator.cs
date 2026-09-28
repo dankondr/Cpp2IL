@@ -4768,7 +4768,9 @@ public static class IlGenerator
             return false;
         var resolved = Analysis.MetadataResolver.FindInstanceFieldPathAtOffset(
             owner, memory.Addend, memory.AccessSize);
-        if (resolved is not { } path)
+        if (resolved is not { } path
+            || Analysis.MetadataResolver.MemberPathUnspellable(path, context,
+                store: false, addressed: false))
             return false;
         var field = path.Field;
         if (owner is GenericInstanceTypeAnalysisContext genericOwner

@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using AsmResolver.DotNet;
+using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
 using AsmResolver.PE.DotNet.Metadata.Tables;
@@ -233,6 +234,156 @@ public class NestedFieldPathLoadTests
                 () => $"eight-byte load must not narrow to first:\n{Dump(method)}");
             Assert.That(EmitsUnmanagedLoadDiagnostic(method), Is.True, () => Dump(method));
         });
+    }
+
+    // Cfg { <Level>k__BackingField int @0 } - an auto-property backing field is
+    // only spellable through its accessor.
+    private static (InjectedTypeAnalysisContext type, FieldAnalysisContext backing)
+        Cfg(ApplicationAnalysisContext app)
+    {
+        var type = InjectStruct(app, "Cfg");
+        var backing = new InjectedFieldAnalysisContext("<Level>k__BackingField",
+            app.SystemTypes.SystemInt32Type, R.FieldAttributes.Private, type, 0);
+        type.Fields.Add(backing);
+        return (type, backing);
+    }
+
+    [Test]
+    public void ByRefBackingFieldLoadWithVisibleGetterResolvesToField()
+    {
+        // [cfg& +0] reads Config's <Level>k__BackingField; the public getter is
+        // callable from the caller, so the load resolves - the emission pass
+        // then decides whether the accessor call or an honest default spells it.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var (cfg, backing) = Cfg(app);
+        cfg.InjectMethodContext("get_Level", app.SystemTypes.SystemInt32Type,
+            R.MethodAttributes.Public);
+        var module = new ModuleDefinition("Reads.dll");
+        Seed(module, app, cfg);
+        SeedCorLibTypes(app, module, cfg, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemObjectType);
+
+        var local = Local("cfg", new ByRefTypeAnalysisContext(cfg));
+        var dst = Local("dst", app.SystemTypes.SystemInt32Type);
+        var load = new Instruction(0, OpCode.Move, dst,
+            new MemoryOperand(local, null, 0, 0, 4));
+        var (caller, method) = ForeignCaller(app, module, [load, new(1, OpCode.Return)], [local, dst]);
+
+        MetadataResolver.ResolveFieldOffsets(caller);
+        IlGenerator.GenerateIl(caller, method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(load.Operands[1], Is.TypeOf<FieldReference>(),
+                "a backing-field load with a callable getter must resolve");
+            Assert.That(((FieldReference)load.Operands[1]).Field, Is.SameAs(backing));
+            Assert.That(EmitsUnmanagedLoadDiagnostic(method), Is.False, () => Dump(method));
+        });
+    }
+
+    [Test]
+    public void ByRefBackingFieldStoreWithoutVisibleSetterKeepsDiagnostic()
+    {
+        // A store into Config's <Level>k__BackingField can only spell
+        // cfg.Level = v; the setter is private, so the store keeps its
+        // diagnostic instead of emitting an unspellable stfld.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var (cfg, backing) = Cfg(app);
+        cfg.InjectMethodContext("set_Level", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Private, app.SystemTypes.SystemInt32Type);
+        var module = new ModuleDefinition("Reads.dll");
+        Seed(module, app, cfg);
+        SeedCorLibTypes(app, module, cfg, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemObjectType);
+
+        var local = Local("cfg", new ByRefTypeAnalysisContext(cfg));
+        var src = Local("src", app.SystemTypes.SystemInt32Type);
+        var store = new Instruction(0, OpCode.Move,
+            new MemoryOperand(local, null, 0, 0, 4), src);
+        var (caller, _) = ForeignCaller(app, module, [store, new(1, OpCode.Return)], [local, src]);
+
+        MetadataResolver.ResolveFieldOffsets(caller);
+
+        Assert.That(store.Operands[0], Is.TypeOf<MemoryOperand>(),
+            "store into an unspellable backing field must keep its diagnostic operand");
+        Assert.That(backing, Is.Not.Null);
+    }
+
+    [Test]
+    public void NestedPathThroughBackingFieldContainerKeepsDiagnostic()
+    {
+        // [box +0x14] would be box.<Inner>k__BackingField.y - the container hop
+        // needs ldflda on the backing field, which no accessor call can spell,
+        // so the load keeps its diagnostic even though get_Inner is public.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var (point, _, _) = Point2(app);
+        var box = InjectClass(app, "Box");
+        var backing = new InjectedFieldAnalysisContext("<Inner>k__BackingField",
+            point, R.FieldAttributes.Private, box, 0x10);
+        box.Fields.Add(backing);
+        box.InjectMethodContext("get_Inner", point, R.MethodAttributes.Public);
+        var module = new ModuleDefinition("Reads.dll");
+        Seed(module, app, point, box);
+        SeedCorLibTypes(app, module, point, box, app.SystemTypes.SystemSingleType,
+            app.SystemTypes.SystemObjectType);
+
+        var receiver = Local("box", box);
+        var dst = Local("dst", app.SystemTypes.SystemSingleType);
+        var load = new Instruction(0, OpCode.Move, dst,
+            new MemoryOperand(receiver, null, 0x14, 0, 4));
+        var (caller, _) = ForeignCaller(app, module, [load, new(1, OpCode.Return)], [receiver, dst]);
+
+        MetadataResolver.ResolveFieldOffsets(caller);
+
+        Assert.That(load.Operands[1], Is.TypeOf<MemoryOperand>(),
+            "a path through a backing-field container must keep its diagnostic operand");
+        Assert.That(backing, Is.Not.Null);
+    }
+
+    [Test]
+    public void EnumUnderlyingAddressReadSpellsLdobjEnum()
+    {
+        // ldflda E::value__ + ldobj int32 pushes the same bytes as ldobj E on
+        // &e - the address is identical and only the element type differed, so
+        // the decompiler-facing rewrite retargets the consumer to the enum.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("Reads.dll");
+        var enumDefinition = new TypeDefinition("Tests", "E",
+            TypeAttributes.Public | TypeAttributes.Sealed,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "Enum"));
+        var valueField = new FieldDefinition("value__",
+            FieldAttributes.Public | FieldAttributes.SpecialName | FieldAttributes.RuntimeSpecialName,
+            new FieldSignature(module.CorLibTypeFactory.Int32));
+        enumDefinition.Fields.Add(valueField);
+        module.TopLevelTypes.Add(enumDefinition);
+        var method = new MethodDefinition("M",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        enumDefinition.Methods.Add(method);
+        method.CilMethodBody = new CilMethodBody();
+        var instructions = method.CilMethodBody.Instructions;
+        instructions.Add(CilOpCodes.Ldflda, valueField);
+        instructions.Add(CilOpCodes.Ldobj, module.CorLibTypeFactory.Int32.Type);
+        instructions.Add(CilOpCodes.Ret);
+
+        Cpp2IL.Core.OutputFormats.DecompilerMemberAccessRewrites.Apply(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(instructions[0].OpCode, Is.EqualTo(CilOpCodes.Nop),
+                "the retagging ldflda should be dropped");
+            Assert.That(instructions[1].OpCode, Is.EqualTo(CilOpCodes.Ldobj));
+            Assert.That(instructions[1].Operand, Is.SameAs(enumDefinition));
+        });
+        Assert.That(app, Is.Not.Null);
     }
 
     [Test]
