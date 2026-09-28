@@ -69,6 +69,50 @@ public static class AsmResolverAssemblyPopulator
         }
     }
 
+    // ECMA-335 writes a nested type's attribute-blob SerString as
+    // "Ns.Parent+Child": only the outermost element carries a namespace.
+    // AsmResolver's TypeNameBuilder walks DeclaringType but still prints each
+    // element's own Namespace, so a nested typedef/typeref that kept it emits
+    // "Parent+Ns.Child", which no compiler resolves. Rewrap nested elements in
+    // null-namespace TypeReference clones - only the name the blob serializes
+    // changes; resolution scope is preserved via the parent chain.
+    internal static TypeSignature CanonicalBlobTypeName(TypeSignature signature) => signature switch
+    {
+        TypeDefOrRefSignature { Type.DeclaringType: not null } defOrRef =>
+            new TypeDefOrRefSignature(CanonicalBlobTypeRef(defOrRef.Type), defOrRef.IsValueType),
+        GenericInstanceTypeSignature generic => new GenericInstanceTypeSignature(
+            CanonicalBlobTypeRef(generic.GenericType), generic.IsValueType,
+            generic.TypeArguments.Select(CanonicalBlobTypeName).ToList()),
+        SzArrayTypeSignature szArray => CanonicalBlobTypeName(szArray.BaseType).MakeSzArrayType(),
+        ByReferenceTypeSignature byRef => CanonicalBlobTypeName(byRef.BaseType).MakeByReferenceType(),
+        PointerTypeSignature pointer => CanonicalBlobTypeName(pointer.BaseType).MakePointerType(),
+        PinnedTypeSignature pinned => CanonicalBlobTypeName(pinned.BaseType).MakePinnedType(),
+        CustomModifierTypeSignature modifier => CanonicalBlobTypeName(modifier.BaseType)
+            .MakeModifierType(modifier.ModifierType, modifier.IsRequired),
+        ArrayTypeSignature array => new ArrayTypeSignature(
+            CanonicalBlobTypeName(array.BaseType), array.Dimensions.ToArray()),
+        _ => signature,
+    };
+
+    private static TypeReference CanonicalBlobTypeRef(ITypeDefOrRef type)
+    {
+        if (type.DeclaringType is { } declaring)
+            // Nested level: the canonical SerString drops the element's own
+            // namespace; its scope is the canonicalized parent.
+            return new TypeReference(CanonicalBlobTypeRef(declaring), null, type.Name);
+
+        // Outermost element keeps its real scope (module, or declaring
+        // assembly reference) and namespace. ITypeDefOrRef.Scope already
+        // answers module-or-parent for TypeDefinition and the declared scope
+        // for TypeReference.
+        return new TypeReference(type.Scope, type.Namespace, type.Name);
+    }
+
+    private static TypeSignature? BlobTypeValue(BaseCustomAttributeTypeParameter parameter)
+        => parameter.TypeContext?.ToTypeSignature() is { } signature
+            ? CanonicalBlobTypeName(signature)
+            : null;
+
     private static TypeSignature GetTypeSigFromAttributeArg(BaseCustomAttributeParameter parameter) =>
         parameter switch
         {
@@ -98,7 +142,7 @@ public static class AsmResolverAssemblyPopulator
                 {
                     CustomAttributePrimitiveParameter primitiveParameter => primitiveParameter.PrimitiveValue,
                     CustomAttributeEnumParameter enumParameter => enumParameter.UnderlyingPrimitiveParameter.PrimitiveValue,
-                    BaseCustomAttributeTypeParameter type => (object?)type.TypeContext?.ToTypeSignature(),
+                    BaseCustomAttributeTypeParameter type => (object?)BlobTypeValue(type),
                     CustomAttributeNullParameter => null,
                     CustomAttributeArrayParameter array => BuildArrayArgument(array).Elements.ToArray(),
                     _ => throw new("Not supported array element type: " + e.GetType().FullName)
@@ -145,7 +189,7 @@ public static class AsmResolverAssemblyPopulator
     /// <remarks>
     /// BoxIfNeeded will cause the resulting attribute to be boxed if the parameter is an enum or a type parameter. This is required if, for example, the enum or type is being passed as the argument in a constructor for which the parameter is typed as object.
     /// </remarks>
-    private static CustomAttributeArgument FromAnalyzedAttributeArgument(BaseCustomAttributeParameter parameter, bool boxIfNeeded)
+    internal static CustomAttributeArgument FromAnalyzedAttributeArgument(BaseCustomAttributeParameter parameter, bool boxIfNeeded)
     {
 #if !DEBUG
         try
@@ -164,8 +208,8 @@ public static class AsmResolverAssemblyPopulator
                 //A typeof(x) argument in an object-typed slot is boxed like an enum is:
                 //the blob needs the SERIALIZATION_TYPE_TYPE tag before the SerString or
                 //the attribute decodes as garbage ("Could not decode attribute arguments").
-                BaseCustomAttributeTypeParameter typeParameter when boxIfNeeded => new(systemTypes.SystemObjectType.ToTypeSignature(), new BoxedArgument(systemTypes.SystemTypeType.ToTypeSignature(), typeParameter.TypeContext?.ToTypeSignature())),
-                BaseCustomAttributeTypeParameter typeParameter => new(systemTypes.SystemTypeType.ToTypeSignature(), typeParameter.TypeContext?.ToTypeSignature()),
+                BaseCustomAttributeTypeParameter typeParameter when boxIfNeeded => new(systemTypes.SystemObjectType.ToTypeSignature(), new BoxedArgument(systemTypes.SystemTypeType.ToTypeSignature(), BlobTypeValue(typeParameter))),
+                BaseCustomAttributeTypeParameter typeParameter => new(systemTypes.SystemTypeType.ToTypeSignature(), BlobTypeValue(typeParameter)),
                 
                 CustomAttributeArrayParameter arrayParameter => BuildArrayArgument(arrayParameter),
                 _ => throw new ArgumentException("Unknown custom attribute parameter type: " + parameter.GetType().FullName)
