@@ -4498,10 +4498,30 @@ public static class IlGenerator
         // (or substitutes a contract-typed default), so the receiver always ends
         // up assignable to the declaring type there. A value owner takes the
         // operand's own managed address - its referent must be the owner.
-        if (contract is not ByRefTypeAnalysisContext)
+        if (contract is not ByRefTypeAnalysisContext byRefContract)
             return declaring;
-        return receiverType is ByRefTypeAnalysisContext byRefReceiver ? byRefReceiver.ElementType : receiverType;
+        return receiverType switch
+        {
+            ByRefTypeAnalysisContext byRefReceiver => byRefReceiver.ElementType,
+            // `unbox` lands the reference as `&T` - the member binds to T.
+            _ when FieldReceiverUnboxes(receiverOperand, byRefContract.ElementType, context)
+                => byRefContract.ElementType,
+            _ => receiverType,
+        };
     }
+
+    // Mirrors the `unbox` arm EmitManagedAddress applies to a local emitting as
+    // a true object reference under a `&T` contract: the stack then holds `&T`
+    // so the referent a member binds against is T. Any other operand pushes
+    // whatever it already is (`&U`, a raw pointer, or the reference itself).
+    private static bool FieldReceiverUnboxes(IOperand receiverOperand,
+        TypeAnalysisContext? pointeeType, MethodAnalysisContext context)
+        => receiverOperand is LocalVariable receiverLocal
+            && EmittedLocalType(receiverLocal, context) is { IsValueType: false } emittedReceiver
+            && IntegralStackWidth(emittedReceiver) == 0
+            && pointeeType is { IsValueType: true } or GenericParameterTypeAnalysisContext
+            && !IsByRefLike(pointeeType)
+            && TypeTokenUsableFrom(pointeeType, context);
 
     // The field type the emitted container member actually carries, which is
     // the next link's receiver and the field type a leaf's declaring check
