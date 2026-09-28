@@ -314,6 +314,11 @@ public static class IlGenerator
             branchInstruction.Operand = new CilInstructionLabel(target);
         }
 
+        // A proven unwind landing pad on a finalizer is emitted as the finally clause
+        // it was compiled from: exit copies of the base call become leaves out of the
+        // try, and the handler carries base.Finalize + endfinally.
+        Analysis.FinalizerEhRecovery.Apply(context, definition, instructionMap);
+
         // Nothing may fall off the physical end of a body: a conditional branch
         // (or any other fall-through-capable opcode) as the last instruction
         // makes the verifier index a fall-through block past the code end. The
