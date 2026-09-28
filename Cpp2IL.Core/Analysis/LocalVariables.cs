@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
@@ -184,7 +185,7 @@ public static class LocalVariables
 
     // Every local an operand can reach, through any nesting the emitter walks:
     // field receivers, array bases and indices, addressed targets, casts.
-    private static IEnumerable<LocalVariable> OperandLocals(IOperand operand)
+    internal static IEnumerable<LocalVariable> OperandLocals(IOperand operand)
     {
         switch (operand)
         {
@@ -1434,7 +1435,7 @@ public static class LocalVariables
                 : method.AppContext.SystemTypes.SystemInt64Type
             : null;
 
-    private static bool ContainsLocal(IOperand? operand, LocalVariable local) => operand switch
+    internal static bool ContainsLocal(IOperand? operand, LocalVariable local) => operand switch
     {
         LocalVariable value => ReferenceEquals(value, local),
         MemoryOperand memory => ContainsLocal(memory.Base, local) || ContainsLocal(memory.Index, local),
@@ -1448,6 +1449,36 @@ public static class LocalVariables
         ArrayLength length => ReferenceEquals(length.Array, local),
         _ => false,
     };
+
+    // A copy between locals that can never hold each other's value - a register or stack slot
+    // merging unrelated managed references across paths - has no legal managed store: emitting it
+    // produces an invalid stloc, and forwarding the source into a typed position such as a field
+    // receiver produces an invalid ldflda. The destination is left at default instead. This is the
+    // same bit-pattern rule SsaForm.Remove applies to phi edges; the check is symmetric so either
+    // direction of the relationship is sufficient to permit the copy.
+    //
+    // A copy whose destination is a pointer local (T& or T*) is exempt when the source is the
+    // same kind of pointer, whatever the element type: the copied value is an address, so
+    // forwarding it into address-position uses is representable - each use re-emits the
+    // address from the source rather than needing a typed slot - and a mismatched source
+    // reaching the IL emitter is converted into a typed scratch cell with a decompiler-issue
+    // note rather than an invalid stloc. Managed pointers are invariant in CIL (a &U slot
+    // cannot receive a &T value) so in strict form copies between pointer locals of
+    // different element types stay illegal, as does any copy from a class source, which
+    // would turn a resolvable managed-pointer access into a raw object+offset store under
+    // [dest + off] memory bases. Pass allowByRefReinterpret at every site whose outcome is
+    // forwarding (the source reaches the uses); keep the strict form where the copy itself
+    // is emitted or the local sits under an address-of or field access.
+    internal static bool NoLegalManagedCopy(LocalVariable destination, LocalVariable source, bool allowByRefReinterpret = false) =>
+        destination.Type is { IsValueType: false } destinationType
+        && source.Type is { IsValueType: false } sourceType
+        && !(allowByRefReinterpret && SamePointerKind(destinationType, sourceType))
+        && !sourceType.IsAssignableTo(destinationType)
+        && !destinationType.IsAssignableTo(sourceType);
+
+    private static bool SamePointerKind(TypeAnalysisContext destinationType, TypeAnalysisContext sourceType) =>
+        (destinationType is ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+        && destinationType.GetType() == sourceType.GetType();
 
     // An integer operand makes the result an integer. Excludes bool operands so flag logic stays boolean.
     private static bool PropagateIntegerResult(Instruction instruction, MethodAnalysisContext method)

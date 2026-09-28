@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
+using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.Model.Contexts;
 
@@ -236,10 +237,14 @@ public class Instruction : IOperand
             return elementField.Index is LocalVariable index
                 ? [operand, elementField.Array, index]
                 : [operand, elementField.Array];
-        if (operand is AddressOf { Target: ArrayElementFieldReference addressedElementField })
-            return addressedElementField.Index is LocalVariable index
-                ? [operand, addressedElementField.Array, index]
-                : [operand, addressedElementField.Array];
+        if (operand is AddressOf { Target: LocalVariable })
+            // &v names the cell itself, not a value inside it.
+            return [operand];
+
+        if (operand is AddressOf address)
+            // A compound target (&receiver.field, &array[i].field, &mem[base+index]) reads the
+            // locals inside it like any other operand.
+            return LocalVariables.OperandLocals(address.Target).OfType<LocalVariable>().Prepend(operand).Distinct().ToList();
         if (operand is not SelectedFieldReference selected)
             return [operand];
 
