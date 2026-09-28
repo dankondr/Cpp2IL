@@ -86,14 +86,17 @@ internal static class DecompilerMemberAccessRewrites
             switch (instruction.Operand)
             {
                 case CilInstructionLabel label:
-                    jumpTargets.Add(label.Instruction);
+                    if (label.Instruction != null)
+                        jumpTargets.Add(label.Instruction);
+                    else
+                        foreignLabel = true;
                     break;
                 case CilInstruction target:
                     jumpTargets.Add(target);
                     break;
                 case IEnumerable<ICilLabel> labels:
                     foreach (var label in labels)
-                        if (label is CilInstructionLabel instructionLabel)
+                        if (label is CilInstructionLabel instructionLabel && instructionLabel.Instruction != null)
                             jumpTargets.Add(instructionLabel.Instruction);
                         else
                             foreignLabel = true;
@@ -111,7 +114,10 @@ internal static class DecompilerMemberAccessRewrites
                 switch (edge)
                 {
                     case CilInstructionLabel label:
-                        jumpTargets.Add(label.Instruction);
+                        if (label.Instruction != null)
+                            jumpTargets.Add(label.Instruction);
+                        else
+                            foreignLabel = true;
                         break;
                     case not null:
                         foreignLabel = true;
