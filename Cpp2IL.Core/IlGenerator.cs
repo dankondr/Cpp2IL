@@ -2881,7 +2881,7 @@ public static class IlGenerator
         || argument is GenericInstanceTypeAnalysisContext instance
             && instance.GenericArguments.Any(ContainsSharedEnumMarker);
 
-    private static bool ContainsErasedSharedArgument(TypeAnalysisContext argument) =>
+    internal static bool ContainsErasedSharedArgument(TypeAnalysisContext argument) =>
         IsErasedSharedArgument(argument)
         || argument is GenericInstanceTypeAnalysisContext instance
         && instance.GenericArguments.Any(ContainsErasedSharedArgument);
@@ -4936,6 +4936,12 @@ public static class IlGenerator
             var thisType = local.Type as GenericInstanceTypeAnalysisContext ?? thisDeclaring;
             return thisType.IsValueType ? new ByRefTypeAnalysisContext(thisType) : thisType;
         }
+        // An isinst/castclass source slot holds a managed object reference. When a
+        // local reaches the emitted body only through such a slot - no producer and
+        // no other use - the propagated type is a register-reuse leftover and the
+        // slot contract is the only proven type.
+        if (local.Type != null && UsedOnlyAsCastSource(local, context))
+            return context.AppContext.SystemTypes.SystemObjectType;
         // System.Object is also the lifter's fallback for a register whose real
         // numeric type was lost. Do not guess from arithmetic alone; a concrete
         // numeric mate (array length, typed field/parameter, etc.) must prove it.
@@ -4981,6 +4987,54 @@ public static class IlGenerator
             return numericType;
         return context.AppContext.SystemTypes.SystemObjectType;
     }
+
+    private static bool UsedOnlyAsCastSource(LocalVariable local, MethodAnalysisContext context)
+    {
+        var sawCastUse = false;
+        var objectType = context.AppContext.SystemTypes.SystemObjectType;
+        foreach (var instruction in context.ControlFlowGraph!.Instructions)
+        {
+            if (ReferenceEquals(instruction.Destination, local))
+                return false;
+            foreach (var operand in instruction.Operands)
+            {
+                if (operand is ReferenceCast cast)
+                {
+                    if (!ReferenceEquals(cast.Value, local))
+                        continue;
+                    // Demoting to object would make the operand's type equal a
+                    // cast-to-object target, and the emitter then drops the
+                    // redundant isinst; the raw local-vs-token compare that is
+                    // left behind decompiles worse than the cast did. Keep the
+                    // stale type for those locals.
+                    if (ThisConstructorCallPlan.SameTypeIdentity(cast.Type, objectType))
+                        return false;
+                    sawCastUse = true;
+                }
+                else if (OperandReferencesLocal(operand, local))
+                    return false;
+            }
+        }
+        return sawCastUse;
+    }
+
+    private static bool OperandReferencesLocal(IOperand? operand, LocalVariable local) => operand switch
+    {
+        LocalVariable value => ReferenceEquals(value, local),
+        ReferenceCast cast => ReferenceEquals(cast.Value, local),
+        MemoryOperand memory => OperandReferencesLocal(memory.Base, local)
+            || OperandReferencesLocal(memory.Index, local),
+        AddressOf address => OperandReferencesLocal(address.Target, local),
+        FieldReference field => ReferenceEquals(field.Local, local),
+        SelectedFieldReference selected => ReferenceEquals(selected.Selector, local)
+            || selected.Choices.Any(choice => ReferenceEquals(choice.Field.Local, local)),
+        ArrayAccess access => ReferenceEquals(access.Array, local)
+            || OperandReferencesLocal(access.Index, local),
+        ArrayElementFieldReference elementField => ReferenceEquals(elementField.Array, local)
+            || OperandReferencesLocal(elementField.Index, local),
+        ArrayLength length => ReferenceEquals(length.Array, local),
+        _ => false,
+    };
 
     private static TypeAnalysisContext? CallDefinedLocalType(LocalVariable local,
         MethodAnalysisContext context)
@@ -7559,16 +7613,21 @@ public static class IlGenerator
         if (publicMethod == null)
             return false;
 
-        LoadOperandIntoSlot(instruction.Operands[2], target.Parameters[0].ParameterType,
-            context, method, locals, writeLine);
         if (target.Name == "Internal_FromEulerRad")
         {
+            LoadOperandIntoSlot(instruction.Operands[2], target.Parameters[0].ParameterType,
+                context, method, locals, writeLine);
             method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldc_R4, 57.29578f);
             method.CilMethodBody.Instructions.Add(CilOpCodes.Call, multiply.ToMethodDescriptor());
             method.CilMethodBody.Instructions.Add(CilOpCodes.Call, publicMethod.ToMethodDescriptor());
         }
         else
         {
+            // get_eulerAngles is an instance method on a struct: the receiver must be
+            // Quaternion& on the stack, not a Quaternion value (ilspy prints a value
+            // receiver as `((Quaternion*)local)->eulerAngles`, a CS0030).
+            EmitStructValueReceiver(instruction.Operands[2], quaternion,
+                context, method, locals, writeLine);
             method.CilMethodBody!.Instructions.Add(CilOpCodes.Call, publicMethod.ToMethodDescriptor());
             method.CilMethodBody.Instructions.Add(CilOpCodes.Ldc_R4, 0.017453292f);
             method.CilMethodBody.Instructions.Add(CilOpCodes.Call, multiply.ToMethodDescriptor());
@@ -8061,6 +8120,41 @@ public static class IlGenerator
             default:
                 return false;
         }
+    }
+
+    // An instance method on a struct operand needs `&T` on the stack, not a T
+    // value. A nested field ref whose leaf sits at offset 0 of the struct
+    // container (a whole-struct SIMD read resolving to `this.field.firstMember`)
+    // resolves to the container's address; an operand already emitting `&T`/`T*`
+    // pushes that address; a local/parameter/field/array element has a managed
+    // address via EmitManagedAddress; anything else spills the value into a
+    // scratch local and takes its address.
+    private static void EmitStructValueReceiver(IOperand operand, TypeAnalysisContext structType,
+        MethodAnalysisContext context, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        if (operand is FieldReference nested
+            && nested.Containers.Count > 0
+            && nested.Offset == nested.Containers[^1].Offset
+            && ThisConstructorCallPlan.SameTypeIdentity(nested.Containers[^1].FieldType, structType))
+        {
+            LoadFieldReceiver(nested, context, method, locals, writeLine);
+            return;
+        }
+        if (ReceiverEmitsStructAddress(operand, context, structType))
+        {
+            LoadOperandIntoSlot(operand, new ByRefTypeAnalysisContext(structType),
+                context, method, locals, writeLine);
+            return;
+        }
+        if (EmitManagedAddress(operand, method, context, locals, writeLine))
+            return;
+        LoadOperandIntoSlot(operand, structType, context, method, locals, writeLine);
+        var scratch = new CilLocalVariable(structType.ToTypeSignature());
+        method.CilMethodBody!.LocalVariables.Add(scratch);
+        var instructions = method.CilMethodBody.Instructions;
+        instructions.Add(CilOpCodes.Stloc, scratch);
+        instructions.Add(CilOpCodes.Ldloca, scratch);
     }
 
     // The array an element access was lifted through always declares SzArray, but the
