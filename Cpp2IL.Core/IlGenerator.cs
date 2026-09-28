@@ -3867,15 +3867,18 @@ public static class IlGenerator
         var module = method.DeclaringModule!;
 
         // A null reference reaches us as an integer zero, which would otherwise be emitted as a literal 0
-        // and read back as a cast from a number. Runtime handle types lower to native int, where the
-        // zero is an address, not a reference.
-        // Byrefs, unmanaged pointers and generic parameters are not managed
-        // references either; their zeroes are handled inside the switch.
-        if (expectedType is { IsValueType: false } && IsZeroConstant(operand) && !IsNativeHandleType(expectedType)
-            && expectedType is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext
-                or GenericParameterTypeAnalysisContext))
+        // and read back as a cast from a number. The same literal into a
+        // value-type or generic-parameter slot is the all-zero value the slot
+        // proves: default(T) through initobj, the emission the compiler uses.
+        // Runtime handle types lower to native int, where the zero is an
+        // address, not a reference; & and * slots have no managed zero form.
+        if (IsZeroConstant(operand) && SlotTakesZeroLiteralDefault(expectedType)
+            && LiteralZeroCoversContract(expectedType!, callingContext))
         {
-            instructions.Add(CilOpCodes.Ldnull);
+            if (expectedType is { IsValueType: false } and not GenericParameterTypeAnalysisContext)
+                instructions.Add(CilOpCodes.Ldnull);
+            else
+                PushDefaultValue(expectedType!, method, instructions, callingContext);
             return;
         }
 
@@ -4154,7 +4157,10 @@ public static class IlGenerator
                 }
                 if (!FieldReferenceUsableFrom(field, callingContext))
                 {
-                    PushDefaultOf(field.Field.FieldType, method, instructions, callingContext);
+                    PushDefaultOf(field.Field.FieldType, method, instructions, callingContext,
+                        IsAutoPropertyBackingField(field.Field)
+                            ? $"Operand slot of type {field.Field.FieldType.FullName} filled with a synthetic default value: {field.Field.Name} is a compiler-generated backing field"
+                            : null);
                     break;
                 }
                 if (field.Field.IsStatic)
@@ -4427,22 +4433,123 @@ public static class IlGenerator
         }
     }
 
-    private static TypeAnalysisContext? FieldReceiverType(FieldReference field, MethodAnalysisContext context) =>
-        field.Containers.Count == 0 ? EmittedOperandType(field.Local, context) : field.Containers[^1].FieldType;
+    private static TypeAnalysisContext? FieldReceiverType(FieldReference field, MethodAnalysisContext context)
+    {
+        if (field.Containers.Count == 0)
+            return EmittedOperandType(field.Local, context);
+        var receiverType = EmittedOperandType(field.Local, context);
+        var chainHead = true;
+        foreach (var container in field.Containers)
+        {
+            var effectiveReceiver = chainHead && !container.IsStatic
+                ? ResolvedFieldReceiverType(container, field.Local, receiverType, context)
+                : receiverType;
+            chainHead = false;
+            receiverType = container.IsStatic
+                ? container.FieldType
+                : EmittedContainerFieldType(container, effectiveReceiver);
+        }
+        return receiverType;
+    }
 
     private static bool FieldReferenceUsableFrom(FieldReference field, MethodAnalysisContext context,
         bool writeAccess = false)
     {
         var receiverType = EmittedOperandType(field.Local, context);
+        var chainHead = true;
         foreach (var container in field.Containers)
         {
-            if (!FieldUsableFrom(container, context, receiverType: receiverType))
+            // Only the chain head can substitute `this` or coerce the operand into
+            // the base contract; deeper links always receive &previous.FieldType.
+            var effectiveReceiver = chainHead && !container.IsStatic
+                ? ResolvedFieldReceiverType(container, field.Local, receiverType, context)
+                : receiverType;
+            chainHead = false;
+            if (!FieldUsableFrom(container, context, receiverType: effectiveReceiver))
                 return false;
-            receiverType = container.FieldType;
+            receiverType = container.IsStatic
+                ? container.FieldType
+                : EmittedContainerFieldType(container, effectiveReceiver);
         }
         return FieldUsableFrom(field.Field, context, writeAccess,
-            receiverType: field.Field.IsStatic ? null : receiverType);
+            receiverType: field.Field.IsStatic ? null
+                : field.Containers.Count == 0
+                    ? ResolvedFieldReceiverType(field.Field, field.Local, receiverType, context)
+                    : receiverType);
     }
+
+    // Mirrors what LoadBase actually pushes as the field receiver: `ldarg.0` when
+    // the operand cannot satisfy the base contract and `this` shares the owner's
+    // generic definition; otherwise the operand coerced into the contract - which
+    // always lands contract-shaped for a reference owner - or the operand's own
+    // managed address for a value owner.
+    private static TypeAnalysisContext? ResolvedFieldReceiverType(FieldAnalysisContext target,
+        IOperand receiverOperand, TypeAnalysisContext? receiverType, MethodAnalysisContext context)
+    {
+        var declaring = target.DeclaringType;
+        var contract = FieldBaseContract(target);
+        if (declaring != null && context.DeclaringType != null && !context.IsStatic
+            && ThisConstructorCallPlan.SameTypeIdentity(GenericDefinition(declaring),
+                GenericDefinition(context.DeclaringType))
+            && (!StackContractSatisfied(receiverType, contract, context)
+                || IsUndefinedOwnTypeReceiver(receiverOperand, context)))
+            return context.DeclaringType;
+        // LoadOperandIntoSlot coerces the operand into a reference owner's contract
+        // (or substitutes a contract-typed default), so the receiver always ends
+        // up assignable to the declaring type there. A value owner takes the
+        // operand's own managed address - its referent must be the owner.
+        if (contract is not ByRefTypeAnalysisContext)
+            return declaring;
+        return receiverType is ByRefTypeAnalysisContext byRefReceiver ? byRefReceiver.ElementType : receiverType;
+    }
+
+    // The field type the emitted container member actually carries, which is
+    // the next link's receiver and the field type a leaf's declaring check
+    // must agree with. FieldDescriptorFor binds the member onto the receiver's
+    // live instantiation whenever it can - a concrete value-type field
+    // re-concretizes (its field type was minted against a possibly stale
+    // instantiation, so the base signature is re-instantiated) and a plain
+    // field becomes a MemberReference on the receiver (its signature keeps the
+    // declaring definition's !T, instantiated by the receiver's arguments).
+    private static TypeAnalysisContext? EmittedContainerFieldType(FieldAnalysisContext container,
+        TypeAnalysisContext? resolvedReceiver)
+    {
+        var instance = resolvedReceiver switch
+        {
+            GenericInstanceTypeAnalysisContext i => i,
+            ByRefTypeAnalysisContext { ElementType: GenericInstanceTypeAnalysisContext i } => i,
+            _ => null,
+        };
+        if (instance == null)
+            return container.FieldType;
+        if (container is ConcreteGenericFieldAnalysisContext { DeclaringType.IsValueType: true } concrete)
+        {
+            if (GenericDefinition(concrete.DeclaringType) is { } boundDefinition
+                && ThisConstructorCallPlan.SameTypeIdentity(boundDefinition, instance.GenericType))
+                return GenericInstantiation.Instantiate(concrete.BaseFieldContext.FieldType,
+                    instance.GenericArguments, []);
+            return container.FieldType;
+        }
+        if (container.DeclaringType != null
+            && GenericDefinition(container.DeclaringType) is { } declaringDefinition
+            && ThisConstructorCallPlan.SameTypeIdentity(declaringDefinition, instance.GenericType)
+            && container.GetExtraData<FieldDefinition>("AsmResolverField") != null)
+            return GenericInstantiation.Instantiate(container.FieldType, instance.GenericArguments, []);
+        // No rebind: the member lands on the field's bound declaring context.
+        // When that context is itself a generic instance, its member
+        // signature's !T still resolves through the instance's arguments.
+        if (container.DeclaringType is GenericInstanceTypeAnalysisContext boundInstance)
+            return GenericInstantiation.Instantiate(container.FieldType, boundInstance.GenericArguments, []);
+        return container.FieldType;
+    }
+
+    // A `<Property>k__BackingField` member is always compiler-named, so no
+    // access level lets a decompiled reference spell it: ILSpy folds the field
+    // into its auto-property regardless of the widened access. Widening one
+    // here trades an honest diagnosed default for CS1061/CS0103 errors, so the
+    // declared-access path below keeps the default instead.
+    private static bool IsAutoPropertyBackingField(FieldAnalysisContext field)
+        => field.Name.StartsWith("<") && field.Name.EndsWith("k__BackingField");
 
     private static void EmitSelectedFieldLoad(SelectedFieldReference selected, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
@@ -4515,11 +4622,22 @@ public static class IlGenerator
         }
         else
             LoadBase(first);
+        var chainHead = start == 0;
         foreach (var container in field.Containers.Skip(start))
         {
+            // FieldDescriptorFor binds the member onto the receiver actually on
+            // the stack (resolved the way LoadBase pushes it), and the emitted
+            // member's field type - not the bound one - is the next link's
+            // receiver.
+            var effectiveReceiver = chainHead && !container.IsStatic
+                ? ResolvedFieldReceiverType(container, field.Local, receiverType, context)
+                : receiverType;
+            chainHead = false;
             method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldflda,
-                FieldDescriptorFor(container, receiverType));
-            receiverType = container.FieldType;
+                FieldDescriptorFor(container, effectiveReceiver));
+            receiverType = container.IsStatic
+                ? container.FieldType
+                : EmittedContainerFieldType(container, effectiveReceiver);
         }
     }
 
@@ -5695,6 +5813,65 @@ public static class IlGenerator
 
     private static bool IsZeroConstant(IOperand operand) => operand is Immediate { Value: 0 };
 
+    // A zero literal fills a slot honestly: ldnull for references, default(T)
+    // for value types and generic parameters - the same all-zero value the
+    // binary proves the slot held. Byref and unmanaged-pointer slots have no
+    // managed zero form, runtime handles lower to a native-int address rather
+    // than a value, and a contract that may itself carry a pointer leaves a
+    // bare zero ambiguous: lifted data-pointer stores collapse to `Move := 0`
+    // the same way, so those slots keep the usual literal handling.
+    private static bool SlotTakesZeroLiteralDefault(TypeAnalysisContext? contract) =>
+        contract != null
+        && contract is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+        && !IsNativeHandleType(contract)
+        && !ContractMayCarryPointer(contract);
+
+    // A value type can itself hold a pointer: by-ref-like structs are built on
+    // native data pointers, and a struct whose instance fields include a
+    // pointer, an IntPtr/UIntPtr, a runtime-handle type or a by-ref-like member
+    // may stand for a pointer store the lifter collapsed to a bare zero.
+    // Managed references are safe (their zero is null), so the walk descends
+    // into value-type fields only.
+    private static bool ContractMayCarryPointer(TypeAnalysisContext contract)
+    {
+        if (contract is not { IsValueType: true })
+            return false;
+        if (IsByRefLike(contract))
+            return true;
+        var seen = new HashSet<TypeAnalysisContext>();
+        var pending = new Stack<TypeAnalysisContext>();
+        pending.Push(contract);
+        while (pending.Count > 0)
+        {
+            var type = pending.Pop();
+            if (!seen.Add(type))
+                continue;
+            foreach (var field in InstanceFields(type))
+            {
+                if (field.IsStatic)
+                    continue;
+                var fieldType = field.FieldType;
+                if (fieldType is PointerTypeAnalysisContext or ByRefTypeAnalysisContext
+                    || IsNativeHandleType(fieldType)
+                    || fieldType.FullName is "System.IntPtr" or "System.UIntPtr"
+                    || IsByRefLike(fieldType))
+                    return true;
+                if (fieldType is { IsValueType: true })
+                    pending.Push(fieldType);
+            }
+        }
+        return false;
+    }
+
+    // A `Move := 0` proves the register's native word. default(T) spells the
+    // zero-covered value only when the contract's unboxed size fits inside it;
+    // a wider value type (a 16-byte struct in a register pair, an HFA across
+    // v0-v3) keeps the diagnostic since one register cannot prove the rest.
+    private static bool LiteralZeroCoversContract(TypeAnalysisContext contract, MethodAnalysisContext context) =>
+        contract is { IsValueType: false }
+            || TypeSizes.MinimumUnboxedSize(contract, context.AppContext.Binary.PointerSizeBytes)
+                <= context.AppContext.Binary.PointerSizeBytes;
+
     private static TypeAnalysisContext? NullComparisonType(Instruction instruction, int operandIndex, MethodAnalysisContext context)
     {
         if (instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual)
@@ -5826,9 +6003,10 @@ public static class IlGenerator
             // for it; only a known contract pins down its emitted width. A zero into
             // a reference contract emits ldnull, which is the contract type itself.
             Immediate immediate => expectedType is null ? null
-                : immediate.Value == 0 && expectedType is { IsValueType: false } && !IsNativeHandleType(expectedType)
-                    && expectedType is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext
-                        or GenericParameterTypeAnalysisContext)
+                : immediate.Value == 0 && SlotTakesZeroLiteralDefault(expectedType)
+                    && LiteralZeroCoversContract(expectedType!, context)
+                    // ldnull reports the reference contract; default(T) reports
+                    // the value-type or generic-parameter contract itself.
                     ? expectedType
                     : EmittedImmediateType(immediate, expectedType, context),
             LocalVariable local => EmittedLocalType(local, context),
@@ -6638,7 +6816,8 @@ public static class IlGenerator
     {
         if (referent is { IsValueType: true } or GenericParameterTypeAnalysisContext)
             return TypeTokenUsableFrom(referent, context)
-                && TryResolveSlotLoad(source, referent, context, false, out _, out _);
+                && TryResolveSlotLoad(source, referent, context, false, out _, out _)
+                && (!IsZeroConstant(source) || LiteralStoreCoversReferent(store, referent, context));
         return store.AccessSize == context.AppContext.Binary.PointerSizeBytes;
     }
 
@@ -7237,6 +7416,18 @@ public static class IlGenerator
             return slotType.IsValueType;
         return TypeSizes.MinimumUnboxedSize(slotType, pointerSize) == memory.AccessSize;
     }
+
+    // stobj writes the referent's full unboxed size, but a literal zero only
+    // proves the bytes the native store wrote: the whole-value store is
+    // honest only when the recorded access covers the referent - a narrower
+    // store would clobber bytes the write never zeroed. Generic parameters
+    // have no measurable unboxed size, and vector-family stores (AccessSize
+    // 0) name no exact width, so both stay unproven.
+    private static bool LiteralStoreCoversReferent(MemoryOperand store, TypeAnalysisContext referent,
+        MethodAnalysisContext context) =>
+        referent is not GenericParameterTypeAnalysisContext && store.AccessSize != 0
+            && TypeSizes.MinimumUnboxedSize(referent, context.AppContext.Binary.PointerSizeBytes)
+                <= store.AccessSize;
 
     // stfld stores the whole field, so it is honest only when the width the
     // native store recorded covers the field exactly. Width-0 stores are
@@ -8588,6 +8779,42 @@ public static class IlGenerator
             field.Name, new FieldSignature(field.ToTypeSignature()));
     }
 
+    // The declaring context the emitted member actually carries, mirroring the
+    // same decisions FieldDescriptorFor makes: an outer-owner concrete field
+    // falls back to its base member, a concrete value-type field re-concretizes
+    // onto the receiver's live instantiation, and a plain field binds as a
+    // MemberReference on the receiver instance when its definition is
+    // referenceable. Anything else keeps the field's bound declaring context.
+    private static TypeAnalysisContext? EmittedMemberDeclaring(FieldAnalysisContext field,
+        TypeAnalysisContext? receiverType)
+    {
+        var instance = receiverType switch
+        {
+            GenericInstanceTypeAnalysisContext i => i,
+            ByRefTypeAnalysisContext { ElementType: GenericInstanceTypeAnalysisContext i } => i,
+            _ => null,
+        };
+        if (field is ConcreteGenericFieldAnalysisContext concrete)
+        {
+            if (GenericDefinition(concrete.BaseFieldContext.DeclaringType) is { } baseDeclaring
+                && GenericDefinition(concrete.DeclaringType) is { } concreteDeclaring
+                && !ThisConstructorCallPlan.SameTypeIdentity(baseDeclaring, concreteDeclaring))
+                return EmittedMemberDeclaring(concrete.BaseFieldContext, receiverType);
+            return concrete.DeclaringType.IsValueType && instance != null
+                && GenericDefinition(concrete.DeclaringType) is { } boundDeclaring
+                && ThisConstructorCallPlan.SameTypeIdentity(boundDeclaring, instance.GenericType)
+                && concrete.DeclaringType.FullName != instance.FullName
+                    ? instance
+                    : field.DeclaringType;
+        }
+        return instance != null
+            && GenericDefinition(field.DeclaringType) is { } declaringDefinition
+            && ThisConstructorCallPlan.SameTypeIdentity(declaringDefinition, instance.GenericType)
+            && field.GetExtraData<FieldDefinition>("AsmResolverField") != null
+                ? instance
+                : field.DeclaringType;
+    }
+
     // stfld on an initonly instance field only verifies when the receiver is the
     // literal `this` pointer (ILVerify requires actualThis.IsThisPtr) - a copy of
     // `this` parked in an ordinary local does not qualify even though it holds the
@@ -8693,6 +8920,17 @@ public static class IlGenerator
             || receiverType != null
                 && !Analysis.InaccessibleCalleeRecovery.IsVisibleType(receiverType, callerType))
             return false;
+        // The verifier binds ldfld/ldflda/stfld to the receiver's emitted type: the
+        // member's declaring instantiation must cover it. FieldDescriptorFor decides
+        // which declaring context the emitted member actually carries - a concrete
+        // value-type field may re-concretize onto the receiver's live instantiation,
+        // an outer-owner concrete falls back to its base field, and a plain field
+        // may bind as a MemberReference on the receiver - so this check compares
+        // the receiver against the declaring context emission will use, not the
+        // (possibly mistyped) bound one.
+        if (!field.IsStatic && receiverType != null
+            && !receiverType.IsAssignableTo(EmittedMemberDeclaring(field, receiverType) ?? declaring))
+            return false;
         // A direct native access proves that an inlined managed member reached a
         // same-assembly field. ToFieldDescriptor widens exactly that copied
         // definition, so private storage remains faithfully usable. Dependency
@@ -8712,7 +8950,7 @@ public static class IlGenerator
         var sameAssembly = Extensions.AccessibilityExtensions.SharesEmittedInternals(
             callerType.DeclaringAssembly, declaring.DeclaringAssembly);
         var sameType = ThisConstructorCallPlan.SameTypeIdentity(declaring, callerType);
-        return (attrs & FieldAttributes.FieldAccessMask) switch
+        var declaredAccess = (attrs & FieldAttributes.FieldAccessMask) switch
         {
             FieldAttributes.Public => true,
             FieldAttributes.Private => sameType,
@@ -8722,6 +8960,18 @@ public static class IlGenerator
             FieldAttributes.FamORAssem => sameAssembly || sameType || callerType.IsAssignableTo(declaring),
             _ => false,
         };
+        // A declared-access miss is still honest wherever the reference itself can widen
+        // the emitted member: ToFieldDescriptor passes every emitted field through
+        // MemberAccessibility.EnsureAccessible, which promotes the copied definition
+        // (and its declaring types) to the access the reference needs - the same fix the
+        // same-assembly shortcut above relies on. External runtime assemblies are
+        // frozen, their stubs mirror the real runtime surface, so a reference there
+        // must fit the declared access. Widening a compiler-generated backing field
+        // gains nothing either - no access level lets a reference spell the name -
+        // so those keep the diagnosed path as well.
+        return declaredAccess
+            || !Extensions.AccessibilityExtensions.IsExternalRuntimeAssembly(declaring.DeclaringAssembly?.Name)
+                && !IsAutoPropertyBackingField(field);
     }
 
     // Typed `stelem` requires the stack value to be exactly the element type, which
