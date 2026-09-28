@@ -148,12 +148,14 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
 
 | castle-recovery#124 `override-accessibility-mismatch` (compile bucket CS0507, signed-friend access) | metadata emission | `MemberAccessibility`'s friend-scope relation answered for unsigned emission — internals shared iff the *friend* had no public key — while the signed driver flips it: a keyed grantor's synthetic `InternalsVisibleTo` list can only name keyed friends, so internals are shared iff the *grantor* is unkeyed or the friend is keyed. `RequiredScope` (member references) and `InternalScopeShared` (override-chain `FamORAssem` promotion) now apply that relation: an unkeyed consumer's reference to a keyed grantor's internal member widens it to `public` (no grant can carry it), a keyed friend stops at `internal` (its bound grant suffices), an unkeyed override of a keyed `protected internal` base drops to `protected`, and a keyed override keeps `protected internal`. r241 control `development@6a988c3b` (854 signed errors): `override-accessibility-mismatch` 10 → 0 — the 4 keyed→keyed sites signing added (`Grpc.Net.Client` ×3, `Newtonsoft.Json` ×1, dropped to `protected` by the inverted rule) and the 6 unkeyed→keyed sites present either way (incl. both `VoodooTuneSDK` sites) all resolve; total errors 854 → 978 as clearing the declaration-phase CS0507s unmasks Newtonsoft.Json (+127) and VoodooTuneSDK (+7) body diagnostics Roslyn had suppressed; `invalid_il` 446 → 446 with 0/178,273 per-method ILVerify transitions and all 183 emitted `PublicKey` blobs byte-identical | `Regression/KeyedFriendScopeTests.*` (6 tests) |
 
+| castle-recovery#130 `invalid-il` (ILVerify bucket `StackObjRef`/`StackUnexpected`, `ReferenceCast` operand invisible to post-SSA `Simplifier`) | dataflow | `Simplifier` (`IsLocalUsedAfterInstruction`, `ReplaceLocalsUntilReassignment`) had the same `ReferenceCast` blind spot `SsaSimplifier`/`CopyCoalescer` carried before castle-recovery#123: the operand of `isinst`/`castclass` was not counted as a use of `cast.Value` and could not be re-bound on substitution. Both arms now descend into `ReferenceCast` like #123's passes do, with one extra gate that pass does not need: the operand slot holds a managed object reference, so the use counts — and a `LocalVariable` substitutes into a rebuilt `ReferenceCast` — only when the local's emitted signature kind lands as an object reference (`Il2CppTypeEnum` CLASS/STRING/OBJECT/SZARRAY/ARRAY/GENERICINST/BOXED, non-value-type). For a value-typed, generic-parameter (`VAR`/`MVAR`), pointer, byref or native-handle local the producer stays droppable and the operand stays put: a dead operand's local demotes to `System.Object` at emission and verifies, while a kept producer would emit a non-reference stack kind ILVerify rejects. r241 control `development@a421bb98` (973 signed errors): **0/178,273 per-method ILVerify transitions** (`invalid_il` 446 → 446); the arms evaluate a `ReferenceCast` operand in 648 methods (liveness counts the read in 252, substitution rebinds it in 233) — visible as `isinst`/`castclass`-bearing methods 8,047 → 8,045 (two operands rebind to their properly-typed local and the emitter elides the redundant `isinst`); compile total 973 → 974 (`fails_compile` 214 → 215: +1 `Google.Protobuf` CS0039 — the rebound operand types an `as` on a `sealed` type as a statically impossible conversion Roslyn rejects; the upstream register→version mis-binding is out of scope) | `Regression/SimplifierCastOperandTests.*` (4 tests) |
+
 ## Summary
 
 - **84 fork PRs** merged since `b5ad444b` (#1–#79, #81–#85; no #80), plus the
   castle-recovery#NN issue rows.
 - **2 are not live recovery fixes**: #26 (reverted by #27) and #85 (CI only).
-- **114 recovery-fix clusters.** **112** carry reproducing tests (tests added or
+- **115 recovery-fix clusters.** **113** carry reproducing tests (tests added or
   strengthened in the same PR): the 80 through the backfill wave (#16 + #47,
   #38, #40, #41, #57, #58), castle-recovery#74's `UnboxEmissionTests.*`,
   castle-recovery#75's `Arm64VectorLaneLiftingTests.*`,
@@ -187,8 +189,9 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
   castle-recovery#118's `FrameSlotContractTypeTests.*`,
   castle-recovery#121's `ByRefAddressSlotTests.*`,
   castle-recovery#123's `CastOperandUseTests.*`,
-  castle-recovery#125's `InternalsVisibleToEvidenceTests.*`, and
-  castle-recovery#124's `KeyedFriendScopeTests.*`.
+  castle-recovery#125's `InternalsVisibleToEvidenceTests.*`,
+  castle-recovery#124's `KeyedFriendScopeTests.*`, and
+  castle-recovery#130's `SimplifierCastOperandTests.*`.
 - **2 remain `none`**, both compile-only fixes: #15 (`IReadOnlySet` on
   netstandard2.0) and #20 (`AddOperands` signature fix, exercised downstream by
   `Arm64LibcMathImportTests`).
