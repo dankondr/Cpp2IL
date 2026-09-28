@@ -1486,18 +1486,18 @@ public static class LocalVariables
         if (method.Parameters.Count == 0)
             return;
 
-        // Normal params
-        var paramIndex = 0;
+        // Normal params. Match each local to its parameter by the name it was
+        // given - the same identity EmittedLocalType and ParameterForLocal use -
+        // because a parameter whose register never produced a local leaves no
+        // slot to count, and positional re-mapping then shifts every later
+        // local onto the preceding parameter's type.
         foreach (var local in method.ParameterLocals)
         {
-            if (local.IsThis || local.IsMethodInfo)
+            if (local.IsThis || local.IsMethodInfo || local.Name == null)
                 continue;
 
-            if (paramIndex >= method.Parameters.Count)
-                break;
-
-            local.Type = method.Parameters[paramIndex].ParameterType;
-            paramIndex++;
+            if (method.Parameters.FirstOrDefault(p => p.ParameterName == local.Name) is { } parameter)
+                local.Type = parameter.ParameterType;
         }
     }
 
