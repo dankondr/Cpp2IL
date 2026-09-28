@@ -1,11 +1,14 @@
 using System.Linq;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Signatures;
+using AsmResolver.DotNet.Signatures.Parsing;
 using AsmResolver.PE.DotNet.Cil;
 using AsmResolver.PE.DotNet.Metadata.Tables;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Model.CustomAttributes;
+using Cpp2IL.Core.Utils.AsmResolver;
 using R = System.Reflection;
 using static Cpp2IL.Core.Tests.Regression.SyntheticFixture;
 
@@ -26,6 +29,19 @@ namespace Cpp2IL.Core.Tests.Regression;
 //    loads, the store is dead and the whole Move drops out. Live destinations
 //    (fields, call arguments, locals that are read) keep their ldftn; replacing
 //    the pointer with a placeholder would silently discard a real value.
+//  * A standalone `ldtoken <field>` — recovered for a RuntimeFieldHandle or
+//    IntPtr slot — is likewise unspellable (`__ldtoken`). Non-initializer
+//    loads now go through `typeof(D).GetField(name, flags).FieldHandle`;
+//    only the field argument of RuntimeHelpers.InitializeArray keeps the
+//    token, because ilspy folds that call shape into an array initializer.
+//  * Nested types that kept their own namespace were emitted into
+//    custom-attribute blobs as "Parent+Ns.Child", which nothing resolves;
+//    the blob SerString must be the ECMA-335 canonical "Ns.Parent+Child".
+//  * The reflection chain names the field's declaring type in typeof(), so it
+//    only applies where that type is actually declared in the decompiled
+//    source. Fields on the compiler-internal <PrivateImplementationDetails>
+//    (and <Module>) rows - types a decompiler never declares - keep the
+//    diagnosed placeholder instead.
 public class CompilerGeneratedNameTests
 {
     private static TypeAnalysisContext SystemRuntimeFieldHandle(ApplicationAnalysisContext app) =>
@@ -434,5 +450,220 @@ public class CompilerGeneratedNameTests
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Newobj), Is.True,
                 "the delegate .ctor lowers to newobj");
         });
+    }
+
+    [Test]
+    public void FieldHandleStoreToRuntimeFieldHandleSlotEmitsReflectionLookup()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.AssembliesByName["UnityEngine.CoreModule"];
+        var holder = new InjectedTypeAnalysisContext(assembly, "Tests", "StaticData",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var blob = holder.InjectFieldContext("Blob", app.SystemTypes.SystemInt32Type,
+            R.FieldAttributes.Public | R.FieldAttributes.Static);
+        var fieldInfo = new RuntimeFieldInfoAnalysisContext(blob, assembly);
+        var slot = new LocalVariable("slot", new Register(null, "slot"))
+            { Type = SystemRuntimeFieldHandle(app) };
+        var readBack = new LocalVariable("readBack", new Register(null, "readBack"))
+            { Type = SystemRuntimeFieldHandle(app) };
+
+        var module = new ModuleDefinition("FieldHandle.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemVoidType, app.SystemTypes.SystemObjectType,
+            SystemRuntimeFieldHandle(app));
+        var holderDefinition = new TypeDefinition("Tests", "StaticData",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(holderDefinition);
+        holder.PutExtraData("AsmResolverType", holderDefinition);
+        var blobDefinition = new FieldDefinition("Blob",
+            FieldAttributes.Public | FieldAttributes.Static,
+            new FieldSignature(module.CorLibTypeFactory.Int32));
+        holderDefinition.Fields.Add(blobDefinition);
+        blob.PutExtraData("AsmResolverField", blobDefinition);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, slot, fieldInfo),
+            new(1, OpCode.Move, readBack, slot),
+            new(2, OpCode.Return)], [slot, readBack]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        var calledNames = il.Where(i => i.OpCode == CilOpCodes.Call || i.OpCode == CilOpCodes.Callvirt)
+            .Select(i => (i.Operand as IMethodDescriptor)?.Name?.ToString())
+            .ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldtoken && i.Operand is IFieldDescriptor),
+                Is.False,
+                () => "a standalone ldtoken <field> has no C# spelling (__ldtoken):\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldtoken
+                && i.Operand is not IFieldDescriptor), Is.True,
+                "the lookup starts from typeof(D)");
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                && i.Operand?.ToString() == "Blob"), Is.True,
+                "the field name reaches GetField as a string");
+            Assert.That(calledNames, Has.Member("GetField"));
+            Assert.That(calledNames, Has.Member("get_FieldHandle"));
+        });
+    }
+
+    [Test]
+    public void FieldHandleStoreToIntPtrSlotTakesHandleValue()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.AssembliesByName["UnityEngine.CoreModule"];
+        var holder = new InjectedTypeAnalysisContext(assembly, "Tests", "StaticData",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var blob = holder.InjectFieldContext("Blob", app.SystemTypes.SystemInt32Type,
+            R.FieldAttributes.Public | R.FieldAttributes.Static);
+        var fieldInfo = new RuntimeFieldInfoAnalysisContext(blob, assembly);
+        var slot = new LocalVariable("slot", new Register(null, "slot"))
+            { Type = app.SystemTypes.SystemIntPtrType };
+        var readBack = new LocalVariable("readBack", new Register(null, "readBack"))
+            { Type = app.SystemTypes.SystemIntPtrType };
+
+        var module = new ModuleDefinition("FieldPointer.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemVoidType, app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemIntPtrType);
+        var holderDefinition = new TypeDefinition("Tests", "StaticData",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(holderDefinition);
+        holder.PutExtraData("AsmResolverType", holderDefinition);
+        var blobDefinition = new FieldDefinition("Blob",
+            FieldAttributes.Public | FieldAttributes.Static,
+            new FieldSignature(module.CorLibTypeFactory.Int32));
+        holderDefinition.Fields.Add(blobDefinition);
+        blob.PutExtraData("AsmResolverField", blobDefinition);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, slot, fieldInfo),
+            new(1, OpCode.Move, readBack, slot),
+            new(2, OpCode.Return)], [slot, readBack]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        var calledNames = il.Where(i => i.OpCode == CilOpCodes.Call || i.OpCode == CilOpCodes.Callvirt)
+            .Select(i => (i.Operand as IMethodDescriptor)?.Name?.ToString())
+            .ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldtoken && i.Operand is IFieldDescriptor),
+                Is.False,
+                () => "a standalone ldtoken <field> has no C# spelling (__ldtoken):\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(calledNames, Has.Member("GetField"));
+            Assert.That(calledNames, Has.Member("get_FieldHandle"));
+            Assert.That(calledNames, Has.Member("get_Value"),
+                "the IntPtr slot takes the wrapped pointer via RuntimeFieldHandle.Value");
+        });
+    }
+
+    [Test]
+    public void FieldHandleOnCompilerInternalHolderStaysDiagnosed()
+    {
+        // typeof(<PrivateImplementationDetails>) cannot resolve: that typedef
+        // exists in the metadata but a decompiler never declares it, so the
+        // load keeps the diagnosed placeholder instead of the reflection
+        // chain.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.AssembliesByName["UnityEngine.CoreModule"];
+        var holder = new InjectedTypeAnalysisContext(assembly, "",
+            "<PrivateImplementationDetails>", app.SystemTypes.SystemObjectType,
+            R.TypeAttributes.NotPublic | R.TypeAttributes.Class);
+        var blob = holder.InjectFieldContext("Blob", app.SystemTypes.SystemInt32Type,
+            R.FieldAttributes.Assembly | R.FieldAttributes.Static);
+        var fieldInfo = new RuntimeFieldInfoAnalysisContext(blob, assembly);
+        var slot = new LocalVariable("slot", new Register(null, "slot"))
+            { Type = SystemRuntimeFieldHandle(app) };
+        var readBack = new LocalVariable("readBack", new Register(null, "readBack"))
+            { Type = SystemRuntimeFieldHandle(app) };
+
+        var module = new ModuleDefinition("InternalHolder.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemVoidType, app.SystemTypes.SystemObjectType,
+            SystemRuntimeFieldHandle(app));
+        var holderDefinition = new TypeDefinition("", "<PrivateImplementationDetails>",
+            TypeAttributes.NotPublic | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(holderDefinition);
+        holder.PutExtraData("AsmResolverType", holderDefinition);
+        var blobDefinition = new FieldDefinition("Blob",
+            FieldAttributes.Assembly | FieldAttributes.Static,
+            new FieldSignature(module.CorLibTypeFactory.Int32));
+        holderDefinition.Fields.Add(blobDefinition);
+        blob.PutExtraData("AsmResolverField", blobDefinition);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, slot, fieldInfo),
+            new(1, OpCode.Move, readBack, slot),
+            new(2, OpCode.Return)], [slot, readBack]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        var calledNames = il.Where(i => i.OpCode == CilOpCodes.Call || i.OpCode == CilOpCodes.Callvirt)
+            .Select(i => (i.Operand as IMethodDescriptor)?.Name?.ToString())
+            .ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldtoken), Is.False,
+                () => "no ldtoken at all - neither the field nor the undeclarable typeof():\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(calledNames, Has.No.Member("GetField"));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                && i.Operand?.ToString()?.Contains("synthetic default value") == true), Is.True,
+                "the unspellable load stays diagnosed, not silently dropped");
+        });
+    }
+
+    [Test]
+    public void NestedTypeAttributeArgumentEmitsCanonicalBlobName()
+    {
+        // Attribute blobs serialize typeof() arguments as SerStrings; a nested
+        // type's canonical name keeps the namespace only on the outermost
+        // element ("Tests.Outer+Inner"), not on the nested one
+        // ("Tests.Outer+Tests.Inner" - what AsmResolver's TypeNameBuilder
+        // otherwise writes when the nested typedef kept its namespace).
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var assembly = app.AssembliesByName["UnityEngine.CoreModule"];
+        var outer = new InjectedTypeAnalysisContext(assembly, "Tests", "Outer",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var inner = outer.InjectNestedType("Inner", app.SystemTypes.SystemObjectType);
+        var attribute = new InjectedTypeAnalysisContext(assembly, "Tests", "Marker",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var ctor = attribute.InjectMethodContext(".ctor", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public, app.SystemTypes.SystemTypeType);
+
+        var module = new ModuleDefinition("AttrArg.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemVoidType, app.SystemTypes.SystemTypeType);
+        var outerDefinition = new TypeDefinition("Tests", "Outer",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(outerDefinition);
+        outer.PutExtraData("AsmResolverType", outerDefinition);
+        var innerDefinition = new TypeDefinition("Tests", "Inner",
+            TypeAttributes.NestedPublic | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        outerDefinition.NestedTypes.Add(innerDefinition);
+        inner.PutExtraData("AsmResolverType", innerDefinition);
+
+        var analyzed = new AnalyzedCustomAttribute(ctor);
+        var parameter = new CustomAttributeTypeParameter(inner, analyzed,
+            CustomAttributeParameterKind.ConstructorParam, 0);
+        var argument = AsmResolverAssemblyPopulator.FromAnalyzedAttributeArgument(parameter, false);
+
+        var emitted = argument.Elements.Single();
+        Assert.That(emitted, Is.InstanceOf<TypeSignature>());
+        Assert.That(TypeNameBuilder.GetAssemblyQualifiedName(
+                (TypeSignature)emitted!, module),
+            Is.EqualTo("Tests.Outer+Inner"));
     }
 }

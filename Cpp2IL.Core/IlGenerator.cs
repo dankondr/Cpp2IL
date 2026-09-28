@@ -1274,7 +1274,8 @@ public static class IlGenerator
                         }
                         else if (!TryEmitDelegateCtorPointer(argumentOperand, parameterType,
                                      targetMethod, context, instructions))
-                            LoadOperandIntoSlot(argumentOperand, parameterType, context, method, locals, writeLine);
+                            LoadOperandIntoSlot(argumentOperand, parameterType, context, method, locals, writeLine,
+                                keepFieldToken: IsInitializeArrayFieldSlot(targetMethod, parameterType));
                     }
                     else
                         PushDefaultOf(parameterType, method, instructions, context);
@@ -3332,6 +3333,84 @@ public static class IlGenerator
         return true;
     }
 
+    /// <summary>
+    /// Emits the spellable equivalent of an ldtoken field-handle load:
+    /// `typeof(D).GetField("F", BindingFlags.Instance|Static|Public|NonPublic).FieldHandle`,
+    /// followed by the handle's `Value` (the IntPtr it wraps) when the slot
+    /// wants an IntPtr. Mirrors <see cref="TryEmitMethodPointerReflection"/>.
+    /// </summary>
+    /// <returns>false when the field or its declaring type cannot be named;
+    /// the caller keeps its diagnosed placeholder then.</returns>
+    private static bool TryEmitFieldHandleReflection(
+        FieldAnalysisContext represented, MethodAnalysisContext? callingContext,
+        MethodDefinition method, CilInstructionCollection instructions, bool asPointer)
+    {
+        var field = represented is ConcreteGenericFieldAnalysisContext concrete
+            ? concrete.BaseFieldContext
+            : represented;
+        var declaringType = field.DeclaringType;
+        if (declaringType == null || field.Name is null
+            || !CanEmitFieldToken(field) || !TypeTokenUsableFrom(declaringType, callingContext)
+            || !DeclaringTypeDeclaredInSource(declaringType))
+            return false;
+
+        var corLibScope = method.DeclaringModule!.CorLibTypeFactory.CorLibScope;
+        var systemType = corLibScope.CreateTypeReference("System", "Type");
+        var typeSignature = systemType.ToTypeSignature(false);
+        var runtimeTypeHandle = corLibScope.CreateTypeReference("System", "RuntimeTypeHandle");
+        var runtimeFieldHandle = corLibScope.CreateTypeReference("System", "RuntimeFieldHandle");
+        var getTypeFromHandle = systemType.CreateMemberReference("GetTypeFromHandle",
+            MethodSignature.CreateStatic(typeSignature, [runtimeTypeHandle.ToTypeSignature(true)]));
+        var bindingFlags = corLibScope.CreateTypeReference("System.Reflection", "BindingFlags")
+            .ToTypeSignature(true);
+        var fieldInfo = corLibScope.CreateTypeReference("System.Reflection", "FieldInfo")
+            .ToTypeSignature(false);
+        var getField = systemType.CreateMemberReference("GetField",
+            MethodSignature.CreateInstance(fieldInfo,
+                [method.DeclaringModule.CorLibTypeFactory.String, bindingFlags]));
+
+        instructions.Add(CilOpCodes.Ldtoken, declaringType.ToTypeSignature().ToTypeDefOrRef());
+        instructions.Add(CilOpCodes.Call, getTypeFromHandle);
+        instructions.Add(CilOpCodes.Ldstr, field.Name);
+        // BindingFlags.Instance | Static | Public | NonPublic
+        instructions.Add(CilOpCodes.Ldc_I4, 60);
+        instructions.Add(CilOpCodes.Callvirt, getField);
+        instructions.Add(CilOpCodes.Callvirt,
+            corLibScope.CreateTypeReference("System.Reflection", "FieldInfo")
+                .CreateMemberReference("get_FieldHandle",
+                    MethodSignature.CreateInstance(runtimeFieldHandle.ToTypeSignature(true))));
+        if (!asPointer)
+            return true;
+
+        var handleLocal = new CilLocalVariable(runtimeFieldHandle.ToTypeSignature(true));
+        method.CilMethodBody!.LocalVariables.Add(handleLocal);
+        instructions.Add(CilOpCodes.Stloc, handleLocal);
+        instructions.Add(CilOpCodes.Ldloca, handleLocal);
+        instructions.Add(CilOpCodes.Call,
+            runtimeFieldHandle.CreateMemberReference("get_Value",
+                MethodSignature.CreateInstance(
+                    corLibScope.CreateTypeReference("System", "IntPtr").ToTypeSignature(true))));
+        return true;
+    }
+
+    // A field handle is spellable through typeof() only when its declaring
+    // type is declared in the decompiled source. The compiler-internal
+    // <PrivateImplementationDetails> and <Module> rows exist in metadata but
+    // decompilers never declare them, so typeof() on either is an
+    // unresolvable reference; such loads stay on the caller's diagnosed
+    // fallback.
+    private static bool DeclaringTypeDeclaredInSource(TypeAnalysisContext declaringType) =>
+        declaringType.Name is not ("<PrivateImplementationDetails>" or "<Module>");
+
+    // The field argument of RuntimeHelpers.InitializeArray is the one consumer
+    // that keeps ldtoken: ilspy folds that exact call shape back into the
+    // array's byte initializer.
+    private static bool IsInitializeArrayFieldSlot(MethodAnalysisContext callee,
+        TypeAnalysisContext contract) =>
+        contract.FullName == "System.RuntimeFieldHandle"
+            && callee is { Name: "InitializeArray" }
+            && callee.DeclaringType?.FullName == "System.Runtime.CompilerServices.RuntimeHelpers";
+
     // A local counts as loaded when any instruction's UsedLocals yields it:
     // destinations are writes, while memory bases, field receivers, array/index
     // and select operands all count as loads - including inside loops, so the
@@ -3672,7 +3751,8 @@ public static class IlGenerator
 
     private static void LoadOperand(IOperand operand, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
-        TypeAnalysisContext? expectedType, MethodAnalysisContext callingContext)
+        TypeAnalysisContext? expectedType, MethodAnalysisContext callingContext,
+        bool keepFieldToken = false)
     {
         var instructions = method.CilMethodBody!.Instructions;
 
@@ -4059,8 +4139,14 @@ public static class IlGenerator
                 }
                 break;
             case RuntimeFieldInfoAnalysisContext runtimeField:
-                // fieldof(F), e.g. the handle InitializeArray takes.
-                if (expectedType?.FullName == "System.RuntimeFieldHandle")
+                // fieldof(F). `ldtoken <field>` survives only as the field
+                // argument of RuntimeHelpers.InitializeArray - the one call
+                // shape ilspy folds back into the array initializer (same as
+                // ldftn on delegate .ctors). Everywhere else it has no C#
+                // spelling (__ldtoken), so a handle or IntPtr slot takes the
+                // spellable reflection chain
+                // typeof(D).GetField(name, flags).FieldHandle[.Value] instead.
+                if (keepFieldToken && expectedType?.FullName == "System.RuntimeFieldHandle")
                 {
                     if (RuntimeFieldTokenUsableFrom(runtimeField.RepresentedField, callingContext))
                         instructions.Add(CilOpCodes.Ldtoken, runtimeField.RepresentedField.ToFieldDescriptor());
@@ -4069,11 +4155,25 @@ public static class IlGenerator
                     break;
                 }
 
-                instructions.Add(CilOpCodes.Ldstr, Diagnostic(
-                    $"Field handle for {runtimeField.RepresentedField} cannot be spelled as a {expectedType?.FullName ?? "non-handle"} value; substituting a native-int zero."));
-                instructions.Add(CilOpCodes.Call, writeLine);
-                instructions.Add(CilOpCodes.Ldc_I4_0);
-                instructions.Add(CilOpCodes.Conv_I);
+                if (expectedType?.FullName is "System.RuntimeFieldHandle" or "System.IntPtr"
+                    && TryEmitFieldHandleReflection(runtimeField.RepresentedField, callingContext,
+                        method, instructions, expectedType.FullName == "System.IntPtr"))
+                    break;
+
+                // Same fallback contract as the method-handle arm above: a
+                // value-type slot takes its default; everything else keeps
+                // the diagnosed native-int zero the handle wrapper lowers to.
+                if (expectedType is { IsValueType: true }
+                    && expectedType.FullName is not "System.IntPtr" and not "System.UIntPtr")
+                    PushDefaultOf(expectedType, method, instructions, callingContext);
+                else
+                {
+                    instructions.Add(CilOpCodes.Ldstr, Diagnostic(
+                        $"Field handle for {runtimeField.RepresentedField} cannot be spelled as a {expectedType?.FullName ?? "non-handle"} value; substituting a native-int zero."));
+                    instructions.Add(CilOpCodes.Call, writeLine);
+                    instructions.Add(CilOpCodes.Ldc_I4_0);
+                    instructions.Add(CilOpCodes.Conv_I);
+                }
                 break;
             case RuntimeClassTypeAnalysisContext runtimeClass when expectedType?.FullName == "System.RuntimeTypeHandle":
                 if (TypeTokenUsableFrom(runtimeClass.RepresentedType, callingContext))
@@ -6141,11 +6241,11 @@ public static class IlGenerator
     private static void LoadOperandIntoSlot(IOperand operand, TypeAnalysisContext? contract,
         MethodAnalysisContext context, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
-        bool convertByRef = false)
+        bool convertByRef = false, bool keepFieldToken = false)
     {
         if (TryResolveSlotLoad(operand, contract, context, convertByRef, out var resolved, out var emitted))
         {
-            LoadOperand(resolved, method, locals, writeLine, contract, context);
+            LoadOperand(resolved, method, locals, writeLine, contract, context, keepFieldToken);
             // The contract pre-check can still pass an operand whose coercion
             // then fails (e.g. a ref-struct element has no legal crossing).
             // Whatever its kind, an uncoercible value must not leak into the
