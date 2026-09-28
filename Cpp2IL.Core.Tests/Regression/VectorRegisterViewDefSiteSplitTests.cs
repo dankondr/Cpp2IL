@@ -81,7 +81,9 @@ public class VectorRegisterViewDefSiteSplitTests
             app.SystemTypes.SystemVoidType);
         InjectVectorMultiply(vector, module, app);
 
-        var vec = new LocalVariable("vec", new Register(null, "V1", 1)) { Type = vector };
+        // The vector operand sits off the register window - a `Vn` local's type
+        // is untrusted evidence because it may be a sibling lifetime's smear.
+        var vec = new LocalVariable("vec", new Register(null, "X8", 1)) { Type = vector };
         var arg = new LocalVariable("arg", new Register(null, "S2", 3))
             { Type = app.SystemTypes.SystemSingleType };
         var result = new LocalVariable("result", new Register(null, "V0.S0", 6));
@@ -164,7 +166,10 @@ public class VectorRegisterViewDefSiteSplitTests
         var vecParam = new LocalVariable("vecParam", new Register(null, "X0", 0)) { Type = vector };
         var argParam = new LocalVariable("argParam", new Register(null, "X1", 0))
             { Type = app.SystemTypes.SystemSingleType };
-        var vec = new LocalVariable("vec", new Register(null, "V1", 2));
+        // The vector operand sits off the register window (an X-register local)
+        // because register-view operand types are untrusted evidence - they may
+        // be a sibling lifetime's smear.
+        var vec = new LocalVariable("vec", new Register(null, "X8", 2));
         var arg = new LocalVariable("arg", new Register(null, "S2", 1));
         var converted = new LocalVariable("converted", new Register(null, "W3", 1))
             { Type = app.SystemTypes.SystemInt32Type };
@@ -196,6 +201,108 @@ public class VectorRegisterViewDefSiteSplitTests
                 "the merge keeps the scalar type of its remaining inputs");
             Assert.That(phi.Operands[2], Is.SameAs(split),
                 "the phi input reads the vector def site's own local");
+        });
+    }
+
+    [Test]
+    public void VectorTypedRegisterViewOperandDoesNotSplitScalarMultiply()
+    {
+        // `fmul s0, s1, s2` reads whole register views: its ISIL is
+        // `Multiply V0, V1, V2`. When the operand's register view carries a
+        // vector type because a sibling lifetime smeared it (the shared
+        // unversioned register local is the smear's widest surface), the
+        // multiply is still scalar lane math - the register window's type is
+        // never evidence, so no split local is created.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = Vector3(app);
+        var module = new ModuleDefinition("VectorOps.dll");
+        SeedCorLibTypes(app, module, vector, app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemSingleType, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemVoidType);
+        InjectVectorMultiply(vector, module, app);
+
+        var sharedVecView = new LocalVariable("sharedVecView", new Register(null, "V1"))
+            { Type = vector };
+        var arg = new LocalVariable("arg", new Register(null, "S2", 3))
+            { Type = app.SystemTypes.SystemSingleType };
+        var result = new LocalVariable("result", new Register(null, "V0.S0", 6));
+        var outLocal = new LocalVariable("out", new Register(null, "V2", 2))
+            { Type = app.SystemTypes.SystemSingleType };
+
+        var multiply = new Instruction(0, OpCode.Multiply, result, sharedVecView, arg)
+        {
+            NativeIntegerWidthBits = 32,
+        };
+        var (caller, _) = ForeignCaller(app, module, [
+            multiply,
+            new(1, OpCode.Move, outLocal, result),
+            new(2, OpCode.Return)],
+            [sharedVecView, arg, result, outLocal]);
+
+        LocalVariables.ResolveTypesAndFields(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(multiply.Operands[0], Is.SameAs(result),
+                "a scalar multiply whose only vector hint is a register-view operand must not split");
+            Assert.That(caller.Locals.Any(l => l.Name == "result_vec"), Is.False);
+            Assert.That(result.Type?.FullName, Is.EqualTo("System.Int32"));
+            Assert.That(caller.ControlFlowGraph!.Instructions
+                    .SelectMany(i => i.Operands)
+                    .OfType<LocalVariable>()
+                    .Any(l => l.Name == "result_vec"), Is.False,
+                "no vector-typed def-site local may be created off smear evidence");
+        });
+    }
+
+    [Test]
+    public void LaneElementOperandProvesVectorMultiplyAndSplits()
+    {
+        // `fmul v0.4s, v4.4s, v0.s[0]` lifts to `Multiply` with a `Vn.Sk`
+        // lane-view operand - a shape scalar forms never produce. The element
+        // operand is structural proof of the vector form, so the split still
+        // applies even though the vector operand itself is a register view.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = Vector3(app);
+        var module = new ModuleDefinition("VectorOps.dll");
+        SeedCorLibTypes(app, module, vector, app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemSingleType, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemVoidType);
+        InjectVectorMultiply(vector, module, app);
+
+        var vecView = new LocalVariable("vecView", new Register(null, "V4")) { Type = vector };
+        var element = new LocalVariable("element", new Register(null, "V1.S0", 8))
+            { Type = app.SystemTypes.SystemSingleType };
+        var result = new LocalVariable("result", new Register(null, "V0.S0", 6));
+        var outLocal = new LocalVariable("out", new Register(null, "V2", 2)) { Type = vector };
+
+        var multiply = new Instruction(0, OpCode.Multiply, result, vecView, element)
+        {
+            NativeIntegerWidthBits = 32,
+        };
+        var (caller, method) = ForeignCaller(app, module, [
+            multiply,
+            new(1, OpCode.Move, outLocal, result),
+            new(2, OpCode.Return)],
+            [vecView, element, result, outLocal]);
+
+        LocalVariables.ResolveTypesAndFields(caller);
+        IlGenerator.GenerateIl(caller, method);
+
+        var split = (LocalVariable)multiply.Operands[0];
+        Assert.Multiple(() =>
+        {
+            Assert.That(split, Is.Not.SameAs(result),
+                "the `vN.s[i]` element operand proves the vector form");
+            Assert.That(split.Type?.FullName, Is.EqualTo("UnityEngine.Vector3"));
+            Assert.That(result.Type?.FullName, Is.EqualTo("System.Int32"));
+            Assert.That(method.CilMethodBody!.Instructions.Any(i => i.OpCode == CilOpCodes.Call
+                    && i.Operand?.ToString()?.Contains("op_Multiply") == true), Is.True,
+                () => string.Join("\n", method.CilMethodBody.Instructions.Select(i => i.ToString())));
         });
     }
 }

@@ -1541,27 +1541,45 @@ public static class LocalVariables
             // Negate is excluded deliberately: `fneg s8, s0` is a scalar lane op whose
             // register-view destination is honestly scalar, and its ISIL is
             // indistinguishable from a vector `fneg v0.4s`.
-            // For Add/Subtract (and the lane-wise VectorMin/VectorMax) every operand
-            // must be a proven vector: `VectorN + scalar`/`scalar + VectorN` is not a
-            // legal managed operator, so an Add mixing a scalar-typed or unproven
-            // operand with a vector-typed one is scalar lane math (`fadd s0,s1,s2`)
-            // whose source local merely carries a vector type. Multiply has both
-            // `VectorN op float` directions, so a single vector operand is evidence
-            // enough; Divide has no `float / VectorN`, so the left operand must be
-            // the vector. `VectorN op VectorM` is legal only for N == M - different
-            // widths mean a scalar lane op whose operands carry unrelated types.
-            var leftVector = UnityVectorOperandType(left);
-            var rightVector = UnityVectorOperandType(right);
+            // A register-view operand can never be the vector evidence: its type
+            // comes from the same fill-only register-window typing this pass
+            // exists to fix, so a `Vn`/`Vn.Sk` local carrying a VectorN type may
+            // be a sibling lifetime's smear rather than a real vector. Evidence
+            // must come from outside the register windows (a spilled `stack_`
+            // local or a field typed VectorN) or structurally: a `Vn.Sk` lane
+            // operand only exists on the vector-element form
+            // (`fmul v0.4s, v4.4s, v0.s[i]`) - scalar forms read whole register
+            // views only (`fmul s0, s1, s2` normalizes S registers to `Vn`).
+            // For Add/Subtract (and the lane-wise VectorMin/VectorMax) every
+            // operand must be a proven vector: `VectorN + scalar`/`scalar +
+            // VectorN` is not a legal managed operator, so an Add mixing a
+            // scalar-typed or unproven operand with a vector-typed one is scalar
+            // lane math (`fadd s0,s1,s2`) whose source local merely carries a
+            // vector type. Multiply has both `VectorN op float` directions, so a
+            // single vector operand is evidence enough; Divide has no
+            // `float / VectorN`, so the left operand must be the vector.
+            // `VectorN op VectorM` is legal only for N == M - different widths
+            // mean a scalar lane op whose operands carry unrelated types.
+            var leftVector = VectorOperandEvidence(left);
+            var rightVector = VectorOperandEvidence(right);
+            var leftIsElement = IsLaneViewOperand(left);
+            var rightIsElement = IsLaneViewOperand(right);
             var provableVectorOp = instruction.OpCode switch
             {
-                OpCode.Multiply => leftVector != null || rightVector != null,
-                OpCode.Divide => leftVector != null,
+                OpCode.Multiply => (leftVector ?? rightVector) != null
+                    || (leftIsElement && UnityVectorOperandType(right) != null)
+                    || (rightIsElement && UnityVectorOperandType(left) != null),
+                OpCode.Divide => leftVector != null
+                    || (rightIsElement && UnityVectorOperandType(left) != null),
                 _ => leftVector != null && rightVector != null,
             };
             if (!provableVectorOp || (leftVector != null && rightVector != null
                     && leftVector.FullName != rightVector.FullName))
                 continue;
-            var vectorType = leftVector ?? rightVector;
+            var vectorType = leftVector ?? rightVector
+                ?? UnityVectorOperandType(left) ?? UnityVectorOperandType(right);
+            if (vectorType is null)
+                continue;
 
             var split = new LocalVariable($"{destination.Name}_vec",
                 new Register(null,
@@ -1578,6 +1596,30 @@ public static class LocalVariables
                     other.SetOperand(operandIndex, rewritten);
         }
     }
+
+    /// <summary>
+    /// The vector type this operand proves for a binop. Register-view locals
+    /// (`Vn`/`Vn.Sk`) are never evidence: their type is produced by the same
+    /// fill-only register-window typing whose smear this pass repairs, so a
+    /// vector-typed register view can be a scalar `fmul s` operand wearing a
+    /// sibling lifetime's type.
+    /// </summary>
+    private static TypeAnalysisContext? VectorOperandEvidence(IOperand operand)
+        => operand is LocalVariable local && IsRegisterViewName(local.Register.Name)
+            ? null
+            : UnityVectorOperandType(operand);
+
+    /// <summary>
+    /// A `Vn.Sk` lane operand is produced only by a vector-element operand
+    /// (`vN.s[i]`), which scalar forms never carry - its presence is structural
+    /// proof the lifted instruction was the vector form, independent of types.
+    /// </summary>
+    private static bool IsLaneViewOperand(IOperand operand)
+        => operand is LocalVariable local && IsLaneViewName(local.Register.Name);
+
+    private static bool IsLaneViewName(string? name)
+        => name is { Length: >= 4 } && name[0] == 'V' && name.Contains('.')
+            && IsRegisterViewName(name);
 
     // Scalarized SIMD register views are named "Vn" (whole register) or "Vn.Lk"
     // (lane k of register n in element width L). Both view the same physical
