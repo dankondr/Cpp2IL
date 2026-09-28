@@ -620,10 +620,9 @@ public class SsaForm
                     // control-flow join (especially normal and exception paths). Such
                     // a bit-pattern phi has no legal managed copy; emitting castclass
                     // makes the normal path throw. Leave that edge at default instead.
-                    if (destination is LocalVariable { Type: { IsValueType: false } destinationType }
-                        && source is LocalVariable { Type: { IsValueType: false } sourceType }
-                        && !sourceType.IsAssignableTo(destinationType)
-                        && !destinationType.IsAssignableTo(sourceType))
+                    if (destination is LocalVariable destinationLocal
+                        && source is LocalVariable sourceLocal
+                        && LocalVariables.NoLegalManagedCopy(destinationLocal, sourceLocal))
                         continue;
 
                     moves.Add(new Instruction(-1, OpCode.Move, destination, source));

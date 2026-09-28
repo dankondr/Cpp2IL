@@ -148,12 +148,14 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
 
 | castle-recovery#124 `override-accessibility-mismatch` (compile bucket CS0507, signed-friend access) | metadata emission | `MemberAccessibility`'s friend-scope relation answered for unsigned emission — internals shared iff the *friend* had no public key — while the signed driver flips it: a keyed grantor's synthetic `InternalsVisibleTo` list can only name keyed friends, so internals are shared iff the *grantor* is unkeyed or the friend is keyed. `RequiredScope` (member references) and `InternalScopeShared` (override-chain `FamORAssem` promotion) now apply that relation: an unkeyed consumer's reference to a keyed grantor's internal member widens it to `public` (no grant can carry it), a keyed friend stops at `internal` (its bound grant suffices), an unkeyed override of a keyed `protected internal` base drops to `protected`, and a keyed override keeps `protected internal`. r241 control `development@6a988c3b` (854 signed errors): `override-accessibility-mismatch` 10 → 0 — the 4 keyed→keyed sites signing added (`Grpc.Net.Client` ×3, `Newtonsoft.Json` ×1, dropped to `protected` by the inverted rule) and the 6 unkeyed→keyed sites present either way (incl. both `VoodooTuneSDK` sites) all resolve; total errors 854 → 978 as clearing the declaration-phase CS0507s unmasks Newtonsoft.Json (+127) and VoodooTuneSDK (+7) body diagnostics Roslyn had suppressed; `invalid_il` 446 → 446 with 0/178,273 per-method ILVerify transitions and all 183 emitted `PublicKey` blobs byte-identical | `Regression/KeyedFriendScopeTests.*` (6 tests) |
 
+| castle-recovery#127 `invalid-method-body` (compile bucket CS0165 `use of unassigned local` — `&receiver.field` pointer-binding gap, largest Cpp2IL-owned shape) | dataflow | `SsaSimplifier`/`Simplifier` never descended into `AddressOf`'s compound target: a copy used only as the receiver of `&copy.field` (a `this`/value snapshot feeding `ldflda` pointers and pointer phis) was invisible to forwarding and to liveness — `ExpandCompoundSource` did not name the receiver, `IsLocalUsedAfterInstruction`/`CollectReadLocals` did not count it, and `ReplaceUses`/`ReplaceLocalsUntilReassignment` did not re-bind it — so the copy's `Move` was dropped while `&copy.field` still named it, leaving `ldloc` of a never-stored local (CS0165 ×14 of 46; the biggest family, all `X = (T)(object)X.field` self-field sites). Both passes now treat the receiver inside a compound address-take like any other read: `ContainsLocal`/`OperandLocals` count it (`&v` bare keeps its cell identity — it is not a value read), and a resolved `LocalVariable` substitutes into `FieldReference`/`SelectedFieldReference`/`ArrayAccess`/`ArrayElementFieldReference`/`ArrayLength`/`MemoryOperand`/`ReferenceCast` targets. Companion fix uncovered by the pipeline: the same gap let a bit-pattern `Move copy(d__57), v(ForgeRewardsManager)` revive a store the destination slot cannot hold — `NoLegalManagedCopy` (the `SsaForm.Remove` phi-edge rule, now shared) drops such copies in both passes and gates receiver substitution, so the site stays an unassigned-local diagnostic instead of invalid IL. r241 measurement (control `development` `1f43dc91`): CS0165 46 -> 32 (all 14 `&v.field` sites closed; residual 32 = 19 unbound merge-version self-copies/read sites Cpp2IL-owned, 10 ilspy lambda-capture reads, 3 generic-T slots), total errors 851 -> 836, `invalid-method-body` 173 -> 159, `compiler-generated-name` 75 -> 74, no other bucket moved; ILVerify `ilverify-invalid` 879 -> 877, `ilverify-valid` 169,667 -> 169,669, **0 valid->invalid** per-method transitions | `Regression/AddressOfReceiverForwardTests.*` (6 tests) |
+
 ## Summary
 
 - **84 fork PRs** merged since `b5ad444b` (#1–#79, #81–#85; no #80), plus the
   castle-recovery#NN issue rows.
 - **2 are not live recovery fixes**: #26 (reverted by #27) and #85 (CI only).
-- **114 recovery-fix clusters.** **112** carry reproducing tests (tests added or
+- **115 recovery-fix clusters.** **113** carry reproducing tests (tests added or
   strengthened in the same PR): the 80 through the backfill wave (#16 + #47,
   #38, #40, #41, #57, #58), castle-recovery#74's `UnboxEmissionTests.*`,
   castle-recovery#75's `Arm64VectorLaneLiftingTests.*`,
@@ -187,8 +189,9 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
   castle-recovery#118's `FrameSlotContractTypeTests.*`,
   castle-recovery#121's `ByRefAddressSlotTests.*`,
   castle-recovery#123's `CastOperandUseTests.*`,
-  castle-recovery#125's `InternalsVisibleToEvidenceTests.*`, and
-  castle-recovery#124's `KeyedFriendScopeTests.*`.
+  castle-recovery#125's `InternalsVisibleToEvidenceTests.*`,
+  castle-recovery#124's `KeyedFriendScopeTests.*`, and
+  castle-recovery#127's `AddressOfReceiverForwardTests.*`.
 - **2 remain `none`**, both compile-only fixes: #15 (`IReadOnlySet` on
   netstandard2.0) and #20 (`AddOperands` signature fix, exercised downstream by
   `Arm64LibcMathImportTests`).

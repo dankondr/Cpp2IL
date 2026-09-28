@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
@@ -184,7 +185,7 @@ public static class LocalVariables
 
     // Every local an operand can reach, through any nesting the emitter walks:
     // field receivers, array bases and indices, addressed targets, casts.
-    private static IEnumerable<LocalVariable> OperandLocals(IOperand operand)
+    internal static IEnumerable<LocalVariable> OperandLocals(IOperand operand)
     {
         switch (operand)
         {
@@ -1173,7 +1174,7 @@ public static class LocalVariables
                 : method.AppContext.SystemTypes.SystemInt64Type
             : null;
 
-    private static bool ContainsLocal(IOperand? operand, LocalVariable local) => operand switch
+    internal static bool ContainsLocal(IOperand? operand, LocalVariable local) => operand switch
     {
         LocalVariable value => ReferenceEquals(value, local),
         MemoryOperand memory => ContainsLocal(memory.Base, local) || ContainsLocal(memory.Index, local),
@@ -1187,6 +1188,18 @@ public static class LocalVariables
         ArrayLength length => ReferenceEquals(length.Array, local),
         _ => false,
     };
+
+    // A copy between locals that can never hold each other's value - a register or stack slot
+    // merging unrelated managed references across paths - has no legal managed store: emitting it
+    // produces an invalid stloc, and forwarding the source into a typed position such as a field
+    // receiver produces an invalid ldflda. The destination is left at default instead. This is the
+    // same bit-pattern rule SsaForm.Remove applies to phi edges; the check is symmetric so either
+    // direction of the relationship is sufficient to permit the copy.
+    internal static bool NoLegalManagedCopy(LocalVariable destination, LocalVariable source) =>
+        destination.Type is { IsValueType: false } destinationType
+        && source.Type is { IsValueType: false } sourceType
+        && !sourceType.IsAssignableTo(destinationType)
+        && !destinationType.IsAssignableTo(sourceType);
 
     // An integer operand makes the result an integer. Excludes bool operands so flag logic stays boolean.
     private static bool PropagateIntegerResult(Instruction instruction, MethodAnalysisContext method)
