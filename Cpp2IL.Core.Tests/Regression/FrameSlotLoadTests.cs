@@ -75,10 +75,11 @@ public class FrameSlotLoadTests
         var stack = new LocalVariable("stack", new Register(null, "stack_40_v2"));
         var value = new LocalVariable("value", new Register(null, "value")) { Type = int32 };
         var result = new LocalVariable("result", new Register(null, "result")) { Type = int32 };
-        // [stack_40 + 8] — the stack_N base plus the addend names the slot.
+        // [stack_40_v2] — the real shape carries the slot offset in the
+        // register name with no addend at all.
         var (caller, method) = ForeignCaller(app, module, [
-            new(0, OpCode.Move, new MemoryOperand(stack, addend: 8, accessSize: 4), value),
-            new(1, OpCode.Move, result, new MemoryOperand(stack, addend: 8, accessSize: 4)),
+            new(0, OpCode.Move, new MemoryOperand(stack, addend: 0, accessSize: 4), value),
+            new(1, OpCode.Move, result, new MemoryOperand(stack, addend: 0, accessSize: 4)),
             new(2, OpCode.Return)], [stack, value, result]);
 
         IlGenerator.GenerateIl(caller, method);

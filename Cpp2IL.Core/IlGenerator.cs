@@ -6352,7 +6352,7 @@ public static class IlGenerator
     private static (bool StackRelative, long Offset)? FrameSlotKey(MemoryOperand memory,
         MethodAnalysisContext context)
     {
-        if (memory.Index != null || memory.Scale != 0 || memory.Addend == 0
+        if (memory.Index != null || memory.Scale != 0
             || memory.Base is not LocalVariable baseLocal
             || baseLocal.Type is { } baseType
                 && baseType != context.AppContext.SystemTypes.SystemObjectType)
@@ -6360,9 +6360,15 @@ public static class IlGenerator
 
         var name = baseLocal.Register.Name;
         if (name.StartsWith("X29", System.StringComparison.Ordinal))
-            return (false, memory.Addend);
+            // [X29+0] addresses the saved-FP record, not a spill slot.
+            return memory.Addend == 0 ? null : (false, memory.Addend);
         if (TryParseStackSlotOffset(name) is { } stackOffset)
-            return (true, stackOffset + memory.Addend);
+        {
+            // A stack_N register already names a slot; the addend shifts it and
+            // is usually absent. Offset zero is SP itself, not a slot.
+            var offset = stackOffset + memory.Addend;
+            return offset == 0 ? null : (true, offset);
+        }
         return null;
     }
 
