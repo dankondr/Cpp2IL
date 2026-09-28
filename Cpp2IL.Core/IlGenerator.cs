@@ -141,6 +141,12 @@ public static class IlGenerator
         var frameSlotLocals = CollectFrameSlotLocals(context);
         context.Locals.AddRange(frameSlotLocals.Values);
 
+        // A load of a slot the collection typed reads the same synthesized
+        // local: rewrite the source operand to it so every load path (Move,
+        // call arguments, comparisons, returns) emits a plain ldloc. Slots no
+        // store typed and width-mismatched loads keep the load diagnostic.
+        RewriteFrameSlotLoads(context, frameSlotLocals);
+
         // Map ISIL locals to IL. The declared type joins the method body's locals
         // signature, so a local whose recovered type cannot be named here is
         // declared as the closest verifier-legal placeholder instead.
@@ -615,7 +621,7 @@ public static class IlGenerator
                 if (instruction.Operands is [LocalVariable deadPointerLocal, RuntimeMethodInfoAnalysisContext methodPointer]
                     && StoreContract(deadPointerLocal, context)?.FullName == "System.IntPtr"
                     && SpellableMethodPointer(methodPointer, context) is { Name: not ".ctor" }
-                    && !LocalIsLoaded(context, deadPointerLocal))
+                    && !LocalIsLoadedOutsideUnresolvedCalls(context, deadPointerLocal))
                 {
                     instructions.Add(CilOpCodes.Nop);
                     break;
@@ -1930,6 +1936,23 @@ public static class IlGenerator
                     hoisted.PrologueCalls.Add((calls[0].Callee, initArguments));
                     return hoisted;
                 }
+
+                // A legal base-`this` call can still sit mid-body when one of its
+                // argument operands is only readable where the call stands - for
+                // example a field of a closure local the body populated just above
+                // the call. When the single dominating store into that field is a
+                // parameter or constant, the operand forwards to the stored value
+                // and the call can run in the initializer position.
+                if (calls.Count == 1 && hasLegalInitialization
+                    && context.ControlFlowGraph.FindBlockByInstruction(calls[0].Instruction) is { } legalCallBlock
+                    && ForwardedPrologueArguments(calls[0].Instruction, calls[0].Callee, legalCallBlock, context) is { } forwardedArguments
+                    && SafeToHoistBefore(calls[0].Instruction, legalCallBlock, context, forwardedArguments))
+                {
+                    var hoisted = new ThisConstructorCallPlan();
+                    hoisted.Skip.Add(calls[0].Instruction);
+                    hoisted.PrologueCalls.Add((calls[0].Callee, forwardedArguments));
+                    return hoisted;
+                }
                 return null;
             }
 
@@ -2036,6 +2059,170 @@ public static class IlGenerator
                 }).ToArray();
             return allowDefaults || arguments.All(a => a != null) ? arguments : null;
         }
+
+        // Same contract as PrologueArguments, but each operand is normalized
+        // through PrologueOperand so a field read can forward to the entry-live
+        // value its dominating store placed there. Strict: every parameter must
+        // resolve, there is no defaulting.
+        private static IOperand?[]? ForwardedPrologueArguments(Instruction call,
+            MethodAnalysisContext callee, Block callBlock, MethodAnalysisContext context)
+        {
+            var receiver = ConstructorReceiverIndex(call);
+            if (call.Operands.Count < receiver + 1 + callee.Parameters.Count)
+                return null;
+
+            var arguments = new IOperand?[callee.Parameters.Count];
+            for (var i = 0; i < arguments.Length; i++)
+            {
+                if (PrologueOperand(call.Operands[receiver + 1 + i], call, callBlock, context) is { } argument)
+                    arguments[i] = argument;
+                else
+                    return null;
+            }
+            return arguments;
+        }
+
+        // An operand usable in the constructor-initializer position: parameters,
+        // constants and type operands are live at entry; a field read forwards to
+        // the operand its last dominating store in the call's block placed there
+        // when that source is itself prologue-safe. Anything else stays unreadable
+        // at entry and the caller decides between a diagnosed default and keeping
+        // the call in place.
+        private static IOperand? PrologueOperand(IOperand operand, Instruction call, Block callBlock,
+            MethodAnalysisContext context, int depth = 0)
+        {
+            var thisLocal = context.ParameterLocals.FirstOrDefault();
+            return operand switch
+            {
+                Immediate or StringLiteral or FloatLiteral or DoubleLiteral or TypeAnalysisContext => operand,
+                LocalVariable { IsThis: false, IsMethodInfo: false } local
+                    when context.ParameterLocals.Contains(local) => operand,
+                FieldReference { Local: { } holder } field
+                    when depth < 4 && !IsThisLocal(holder, thisLocal)
+                        && ForwardedStoreSource(field, call, callBlock) is { } source
+                    => PrologueOperand(source, call, callBlock, context, depth + 1),
+                _ => null,
+            };
+        }
+
+        // The value a field read provably holds: the source operand of the last
+        // store into that field within the call's block. Any other write to the
+        // holder (or to the probed field by a non-Move) invalidates it.
+        private static IOperand? ForwardedStoreSource(FieldReference read, Instruction call, Block callBlock)
+        {
+            Instruction? store = null;
+            foreach (var instruction in callBlock.Instructions)
+            {
+                if (ReferenceEquals(instruction, call))
+                    break;
+
+                switch (instruction.OpCode == OpCode.Move ? instruction.Operands[0] : instruction.Destination)
+                {
+                    case FieldReference destination
+                        when ReferenceEquals(destination.Local, read.Local)
+                            && SameFieldIdentity(destination.Field, read.Field)
+                            && destination.Containers.Count == read.Containers.Count:
+                        store = instruction.OpCode == OpCode.Move ? instruction : null;
+                        break;
+                    case LocalVariable holder
+                        when ReferenceEquals(holder, read.Local):
+                    case MemoryOperand { Base: LocalVariable memoryHolder }
+                        when ReferenceEquals(memoryHolder, read.Local):
+                        store = null;
+                        break;
+                }
+            }
+            return store?.Operands[1];
+        }
+
+        // Instructions the lifted body runs before the call may not slide behind a
+        // hoisted initializer: nothing before the call may write `this` or its
+        // fields (the base call would overwrite the store), read `this` state
+        // (it would observe initialized fields where the lifted code saw none), or
+        // rewrite a local a recovered argument reads.
+        private static bool SafeToHoistBefore(Instruction call, Block callBlock, MethodAnalysisContext context,
+            IReadOnlyList<IOperand?> arguments)
+        {
+            var thisLocal = context.ParameterLocals.FirstOrDefault();
+            var argLocals = arguments.OfType<LocalVariable>().ToHashSet();
+
+            // A dominator-only scan is not enough: an instruction in one arm of
+            // an if/else that rejoins at the call block runs before the call on
+            // some paths without dominating it. Walk the full predecessor
+            // closure - every block that can reach the call - and cut the call
+            // block at the call itself.
+            var pending = new Stack<Block>();
+            var seen = new HashSet<Block>();
+            pending.Push(callBlock);
+            while (pending.Count > 0)
+            {
+                var block = pending.Pop();
+                if (!seen.Add(block))
+                    continue;
+                foreach (var predecessor in block.Predecessors)
+                    pending.Push(predecessor);
+                var limit = ReferenceEquals(block, callBlock)
+                    ? block.Instructions.IndexOf(call)
+                    : block.Instructions.Count;
+                for (var i = 0; i < limit; i++)
+                {
+                    var instruction = block.Instructions[i];
+                    if (instruction.OpCode == OpCode.Move)
+                    {
+                        // A `this` value copy (captured into a closure field or
+                        // local) reads the same object reference before and after
+                        // init - only writes into `this` or reads of its state are
+                        // order-sensitive. Any other opcode reading `this` stays a
+                        // hard stop: a call on `this` can observe field state.
+                        if (instruction.Operands[0] is { } moveTarget
+                            && (ReferencesThisState(moveTarget, thisLocal)
+                                || moveTarget is LocalVariable targetLocal
+                                    && argLocals.Contains(targetLocal)))
+                            return false;
+                        if (instruction.Operands.Skip(1).Any(operand => ReferencesThisField(operand, thisLocal)))
+                            return false;
+                        continue;
+                    }
+                    if (instruction.Destination is LocalVariable destination
+                        && (IsThisLocal(destination, thisLocal) || argLocals.Contains(destination)))
+                        return false;
+                    if (instruction.Operands.Any(operand => ReferencesThisState(operand, thisLocal)))
+                        return false;
+                }
+            }
+            return true;
+        }
+
+        // Field/state of `this` reads (a this-rooted field or memory access) but not
+        // the bare `this` reference: the object identity is the same value before
+        // and after the base call.
+        private static bool ReferencesThisField(IOperand operand, LocalVariable? thisLocal) =>
+            operand is not LocalVariable && ReferencesThisState(operand, thisLocal);
+
+        private static bool ReferencesThisState(IOperand operand, LocalVariable? thisLocal) => operand switch
+        {
+            LocalVariable local => IsThisLocal(local, thisLocal),
+            FieldReference field => ReferencesThisState(field.Local, thisLocal),
+            SelectedFieldReference selected => ReferencesThisState(selected.Selector, thisLocal)
+                || selected.Choices.Any(choice => ReferencesThisState(choice.Field, thisLocal)),
+            ArrayElementFieldReference element => ReferencesThisState(element.Array, thisLocal),
+            ArrayAccess access => ReferencesThisState(access.Array, thisLocal)
+                || (access.Index is { } index && ReferencesThisState(index, thisLocal)),
+            ArrayLength length => ReferencesThisState(length.Array, thisLocal),
+            MemoryOperand memory => (memory.Base != null && ReferencesThisState(memory.Base, thisLocal))
+                || (memory.Index != null && ReferencesThisState(memory.Index, thisLocal)),
+            AddressOf address => ReferencesThisState(address.Target, thisLocal),
+            ReferenceCast cast => ReferencesThisState(cast.Value, thisLocal),
+            _ => false,
+        };
+
+        private static bool IsThisLocal(LocalVariable local, LocalVariable? thisLocal) =>
+            local.IsThis || ReferenceEquals(local, thisLocal);
+
+        private static bool SameFieldIdentity(FieldAnalysisContext? a, FieldAnalysisContext? b) =>
+            a != null && b != null
+            && (ReferenceEquals(a, b)
+                || (a.Name == b.Name && SameTypeIdentity(a.DeclaringType, b.DeclaringType)));
 
         // A base-init call the verifier honours only covers the `ret`s its block
         // dominates; a guard can leave a path that reaches `ret` with `this` still
@@ -3233,6 +3420,51 @@ public static class IlGenerator
         context.ControlFlowGraph!.Blocks
             .SelectMany(block => block.Instructions)
             .Any(other => Analysis.DeadCodeEliminator.UsedLocals(other).Any(used => ReferenceEquals(used, local)));
+
+    // A call that never resolved emits only its "Method not found" diagnostic -
+    // the raw register operands it still carries are never loaded for real, so a
+    // method-pointer local consumed solely by one is dead for store purposes.
+    // The deadness is transitive through copies: a Move into a local that is
+    // itself only read by unresolved calls is also a dead use.
+    private static bool LocalIsLoadedOutsideUnresolvedCalls(MethodAnalysisContext context, LocalVariable local)
+    {
+        var instructions = context.ControlFlowGraph!.Blocks
+            .SelectMany(block => block.Instructions)
+            .ToList();
+
+        static bool IsUnresolvedCall(Instruction insn) =>
+            insn.IsCall && (insn.Operands.Count == 0 || insn.Operands[0] is not MethodAnalysisContext);
+        static bool IsDeadMove(Instruction insn, HashSet<LocalVariable> dead) =>
+            insn.OpCode == OpCode.Move
+            && insn.Operands is [LocalVariable moveDestination, _]
+            && dead.Contains(moveDestination);
+
+        var usesOf = new Dictionary<LocalVariable, List<Instruction>>();
+        foreach (var insn in instructions)
+            foreach (var used in Analysis.DeadCodeEliminator.UsedLocals(insn))
+                (usesOf.TryGetValue(used, out var list) ? list : usesOf[used] = []).Add(insn);
+
+        var dead = new HashSet<LocalVariable>();
+        for (var changed = true; changed;)
+        {
+            changed = false;
+            foreach (var insn in instructions)
+            {
+                if (IsUnresolvedCall(insn) || insn.OpCode != OpCode.Move
+                    || insn.Operands is not [LocalVariable dest, _] || dead.Contains(dest))
+                    continue;
+                if (usesOf.TryGetValue(dest, out var destUses)
+                    && destUses.All(u => IsUnresolvedCall(u) || IsDeadMove(u, dead)))
+                {
+                    dead.Add(dest);
+                    changed = true;
+                }
+            }
+        }
+
+        return usesOf.TryGetValue(local, out var uses)
+            && uses.Any(u => !(IsUnresolvedCall(u) || IsDeadMove(u, dead)));
+    }
 
     private static bool DerivesFromMulticastDelegate(TypeAnalysisContext type)
     {
@@ -6057,6 +6289,37 @@ public static class IlGenerator
             && TryRecoverLateFieldReference(memory, context, out var lateField)
                 ? lateField.Field.FieldType
                 : EmittedOperandType(resolved, context, contract);
+        // An operand emitting &S is already the address of S's offset-0 field: when
+        // the slot wants &F and S carries a unique instance field of type F at
+        // offset 0, the operand is &S.f0 - the ldflda form - not a default. The
+        // inverse fold (&v.f0 where f0 sits at 0 means &v) applies in the same way.
+        if (emitted is ByRefTypeAnalysisContext { ElementType: { IsValueType: true } sourceStruct }
+            && contract is ByRefTypeAnalysisContext { ElementType: { } targetElement }
+            && !ThisConstructorCallPlan.SameTypeIdentity(sourceStruct, targetElement))
+        {
+            if (resolved is LocalVariable sourceLocal
+                && InstanceFields(sourceStruct).Where(field =>
+                        !field.IsStatic && field.Offset == 0
+                        && ThisConstructorCallPlan.SameTypeIdentity(field.FieldType, targetElement))
+                    .ToList() is [var offsetField])
+            {
+                resolved = new AddressOf(new FieldReference(offsetField, sourceLocal, 0));
+                emitted = contract;
+            }
+            else if (resolved is AddressOf
+                     {
+                         Target: FieldReference { Offset: 0, Containers: { Count: 0 } } addressedField
+                     }
+                     && ThisConstructorCallPlan.SameTypeIdentity(
+                         addressedField.Local.Type is ByRefTypeAnalysisContext addressedByRef
+                             ? addressedByRef.ElementType : addressedField.Local.Type, targetElement))
+            {
+                resolved = addressedField.Local.Type is ByRefTypeAnalysisContext
+                    ? addressedField.Local
+                    : new AddressOf(addressedField.Local);
+                emitted = contract;
+            }
+        }
         if (resolved is LocalVariable { IsThis: true }
             && contract is { IsValueType: true }
             && emitted is { IsValueType: false } and not PointerTypeAnalysisContext and not ByRefTypeAnalysisContext)
@@ -6157,10 +6420,39 @@ public static class IlGenerator
         return slots;
     }
 
+    // Completes the frame-slot dataflow CollectFrameSlotLocals starts: a source
+    // operand naming a slot with a typed local becomes that local outright, so
+    // the normal operand path loads it with ldloc under whatever contract the
+    // consumer applies. Store destinations stay MemoryOperand so the stloc arm
+    // keeps its type/width agreement check, and a slot with no typed store - or
+    // a load whose recorded width disagrees with the slot's type - keeps the
+    // unmanaged-load diagnostic rather than reading a default.
+    private static void RewriteFrameSlotLoads(MethodAnalysisContext context,
+        IReadOnlyDictionary<(bool StackRelative, long Offset), LocalVariable> frameSlotLocals)
+    {
+        if (frameSlotLocals.Count == 0)
+            return;
+        var pointerSize = context.AppContext.Binary.PointerSizeBytes;
+        foreach (var instruction in context.ControlFlowGraph!.Instructions)
+        {
+            var destination = instruction.Destination;
+            var operands = instruction.Operands;
+            for (var i = 0; i < operands.Count; i++)
+            {
+                if (operands[i] is MemoryOperand memory
+                    && !ReferenceEquals(operands[i], destination)
+                    && FrameSlotKey(memory, context) is { } key
+                    && frameSlotLocals.TryGetValue(key, out var slot)
+                    && FrameSlotWidthMatches(memory, slot.Type!, pointerSize))
+                    instruction.SetOperand(i, slot);
+            }
+        }
+    }
+
     private static (bool StackRelative, long Offset)? FrameSlotKey(MemoryOperand memory,
         MethodAnalysisContext context)
     {
-        if (memory.Index != null || memory.Scale != 0 || memory.Addend == 0
+        if (memory.Index != null || memory.Scale != 0
             || memory.Base is not LocalVariable baseLocal
             || baseLocal.Type is { } baseType
                 && baseType != context.AppContext.SystemTypes.SystemObjectType)
@@ -6168,9 +6460,15 @@ public static class IlGenerator
 
         var name = baseLocal.Register.Name;
         if (name.StartsWith("X29", System.StringComparison.Ordinal))
-            return (false, memory.Addend);
+            // [X29+0] addresses the saved-FP record, not a spill slot.
+            return memory.Addend == 0 ? null : (false, memory.Addend);
         if (TryParseStackSlotOffset(name) is { } stackOffset)
-            return (true, stackOffset + memory.Addend);
+        {
+            // A stack_N register already names a slot; the addend shifts it and
+            // is usually absent. Offset zero is SP itself, not a slot.
+            var offset = stackOffset + memory.Addend;
+            return offset == 0 ? null : (true, offset);
+        }
         return null;
     }
 
@@ -6183,6 +6481,11 @@ public static class IlGenerator
         var negative = digits.StartsWith("-", System.StringComparison.Ordinal);
         if (negative)
             digits = digits[1..];
+        // SSA versioning rewrites the register (stack_-30_v3); the frame offset
+        // it names is unchanged by the version suffix.
+        var versionSeparator = digits.IndexOf('_');
+        if (versionSeparator >= 0)
+            digits = digits[..versionSeparator];
         return long.TryParse(digits, System.Globalization.NumberStyles.HexNumber,
             System.Globalization.CultureInfo.InvariantCulture, out var value)
             ? negative ? -value : value

@@ -1117,7 +1117,8 @@ public static class MetadataResolver
             {
                 if (!ReferenceEquals(resolved, representedMethod)
                     && ReferenceEquals(BaseMethodOf(resolved), BaseMethodOf(representedMethod))
-                    && ErasedGenericArgumentCount(representedMethod) < ErasedGenericArgumentCount(resolved))
+                    && ErasedGenericArgumentCount(representedMethod) < ErasedGenericArgumentCount(resolved)
+                    && ReceiverTypeConsistent(instruction, representedMethod))
                 {
                     instruction.SetOperand(0, representedMethod);
                     representedMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, representedMethod);
@@ -1140,7 +1141,8 @@ public static class MetadataResolver
             if (!ReferenceEquals(representedMethod, method)
                 && hiddenParamIndex < instruction.Operands.Count
                 && AsMethodInfo(instruction.Operands[hiddenParamIndex]) is { RepresentedMethod: { } hiddenMethod }
-                && ReferenceEquals(BaseMethodOf(hiddenMethod), BaseMethodOf(representedMethod)))
+                && ReferenceEquals(BaseMethodOf(hiddenMethod), BaseMethodOf(representedMethod))
+                && ReceiverTypeConsistent(instruction, representedMethod))
             {
                 instruction.SetOperand(0, representedMethod);
                 representedMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, representedMethod);
@@ -1157,7 +1159,8 @@ public static class MetadataResolver
                     continue;
 
                 if (hiddenParamIndex >= instruction.Operands.Count
-                    || AsMethodInfo(instruction.Operands[hiddenParamIndex]) == null)
+                    || AsMethodInfo(instruction.Operands[hiddenParamIndex]) == null
+                    || !ReceiverTypeConsistent(instruction, representedMethod))
                     continue;
 
                 instruction.SetOperand(0, representedMethod);
@@ -1171,7 +1174,8 @@ public static class MetadataResolver
 
             //Try to actually match on the method name so we don't just replace a call with something else.
             var representedBase = BaseMethodOf(representedMethod);
-            if (!candidates.Any(candidate => ReferenceEquals(BaseMethodOf(candidate), representedBase)))
+            if (!candidates.Any(candidate => ReferenceEquals(BaseMethodOf(candidate), representedBase))
+                || !ReceiverTypeConsistent(instruction, representedMethod))
                 continue;
 
             instruction.SetOperand(0, representedMethod);
@@ -1333,6 +1337,113 @@ public static class MetadataResolver
             LocalVariable { Type: RuntimeMethodInfoAnalysisContext methodInfoLocal } => methodInfoLocal,
             _ => null
         };
+
+    // The MethodInfo* a call's operand list carries can be a stale register leftover
+    // rather than this call's hidden argument - an earlier sibling call's rgctx load
+    // still occupies the register. A callee bound from it is only believable when the
+    // receiver operand's known type can be the declaring type: a `&SomeStruct` this
+    // can never be a class instance, and an `&A` this can never host a method of B.
+    private static bool ReceiverTypeConsistent(Instruction call, MethodAnalysisContext representedMethod)
+    {
+        if (representedMethod.IsStatic || representedMethod.DeclaringType is not { } declaring)
+            return true;
+
+        // A hidden return buffer shifts the receiver register on conventions where it
+        // consumes an argument slot, and where it does not the buffer is still operand
+        // clutter - skip rather than inspect the wrong operand.
+        var resolver = representedMethod.AppContext.InstructionSet.CallingConventionResolver;
+        if (resolver?.ReturnsViaHiddenBuffer(representedMethod) == true)
+            return true;
+
+        var firstArg = call.OpCode == OpCode.CallVoid ? 1 : 2;
+        if (firstArg >= call.Operands.Count
+            || OperandEmittedType(call.Operands[firstArg]) is not { } receiverType)
+            return true;
+
+        if (receiverType is RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext
+            or RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext
+            or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext)
+            // Runtime handle operands say nothing about the receiver object.
+            return true;
+
+        if (receiverType is not ByRefTypeAnalysisContext { ElementType: { } receiverElement })
+            // Only a managed-pointer operand carries reliable receiver evidence: a
+            // byref type states what the register points at, while a plain local's
+            // static type can be stale (register reuse re-labels a pointer value).
+            return true;
+
+        if (receiverElement is GenericParameterTypeAnalysisContext
+            || receiverElement.FullName?.Contains("__Il2CppFullySharedGeneric") == true)
+            // Shared-generic or erased receivers cannot be checked against a declaring type.
+            return true;
+
+        // A managed pointer can be a struct `this`, or a class receiver under
+        // `constrained.` (a `&T` holding a T object), or reach the type through
+        // the pointed-to struct's offset-0 field (the pointer is the same address).
+        if (SameTypeFamily(receiverElement, declaring)
+            || ZeroOffsetField(receiverElement, declaring) != null)
+            return true;
+
+        // &v.f0 names the same address as &v: treat it as a pointer to V.
+        if (call.Operands[firstArg] is AddressOf
+            { Target: FieldReference { Offset: 0, Containers: { Count: 0 } } addressedField })
+        {
+            var addressedStruct = addressedField.Local.Type is ByRefTypeAnalysisContext addressedByRef
+                ? addressedByRef.ElementType
+                : addressedField.Local.Type;
+            if (addressedStruct is { IsValueType: true })
+                return SameTypeFamily(addressedStruct, declaring);
+        }
+        return false;
+    }
+
+    private static TypeAnalysisContext? OperandEmittedType(IOperand operand) => operand switch
+    {
+        LocalVariable local => local.Type,
+        FieldReference field => field.Field.FieldType,
+        AddressOf { Target: LocalVariable addressed } => addressed.Type is { } localType
+            ? new ByRefTypeAnalysisContext(localType)
+            : null,
+        AddressOf { Target: FieldReference field } => new ByRefTypeAnalysisContext(field.Field.FieldType),
+        _ => null,
+    };
+
+    // Generic-sharing erases receiver types (a MapField<K,V> body sees MapField<object,object>),
+    // so family membership is decided on the generic definitions; a System.Object operand
+    // carries no evidence either way. Context objects for one type are not interned, so the
+    // erased names are what is compared.
+    private static bool SameTypeFamily(TypeAnalysisContext actual, TypeAnalysisContext expected)
+    {
+        var erasedActual = actual is GenericInstanceTypeAnalysisContext actualInstance
+            ? actualInstance.GenericType ?? actual : actual;
+        var erasedExpected = expected is GenericInstanceTypeAnalysisContext expectedInstance
+            ? expectedInstance.GenericType ?? expected : expected;
+        if (ReferenceEquals(erasedActual, erasedExpected)
+            || erasedActual.FullName == erasedExpected.FullName
+            || erasedActual.FullName is "System.Object")
+            return true;
+        for (var type = erasedActual; type != null; type = type.BaseType)
+        {
+            var erased = type is GenericInstanceTypeAnalysisContext instance
+                ? instance.GenericType ?? type : type;
+            if (erased.FullName == erasedExpected.FullName)
+                return true;
+            // Interface dispatch reaches the receiver through implements, not extends.
+            foreach (var iface in type.InterfaceContexts)
+                if ((iface is GenericInstanceTypeAnalysisContext ifaceInstance
+                        ? ifaceInstance.GenericType ?? iface : iface).FullName == erasedExpected.FullName)
+                    return true;
+        }
+        for (var type = erasedExpected.BaseType; type != null; type = type.BaseType)
+            if ((type is GenericInstanceTypeAnalysisContext instance ? instance.GenericType ?? type : type)
+                    .FullName == erasedActual.FullName)
+                return true;
+        return false;
+    }
+
+    private static FieldAnalysisContext? ZeroOffsetField(TypeAnalysisContext owner, TypeAnalysisContext fieldType) =>
+        owner.Fields.Where(field => !field.IsStatic && field.Offset == 0 && SameTypeFamily(field.FieldType, fieldType))
+            .ToList() is [var field] ? field : null;
 
     private static void HandleKeyFunction(ApplicationAnalysisContext appContext, Instruction instruction, ulong target, BaseKeyFunctionAddresses kFA)
     {
