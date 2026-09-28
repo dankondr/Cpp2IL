@@ -60,13 +60,16 @@ public class InternalsVisibleToKeyGrantTests
         var expectedGrant = "Recovered.SignedFriend, PublicKey="
             + string.Concat(signedKey.Select(b => b.ToString("x2")));
 
-        // Every sibling grantor emits the unkeyed friend bare and the keyed
-        // friend with exactly the key its emitted definition claims.
+        // Every unkeyed sibling grantor emits the unkeyed friend bare and the
+        // keyed friend with exactly the key its emitted definition claims. A
+        // keyed grantor cannot name an unsigned friend (CS1726 under a signed
+        // recompile), so it emits grants to keyed friends only.
         foreach (var grantor in assemblies.Where(a =>
                      a != unsignedFriend && a != signedFriend && a.Modules.Count > 0))
         {
+            var grantorKeyed = grantor.PublicKey is { Length: > 0 };
             Assert.That(GrantArgument(grantor, "Recovered.UnsignedFriend"),
-                Is.EqualTo("Recovered.UnsignedFriend"),
+                grantorKeyed ? Is.Null : Is.EqualTo("Recovered.UnsignedFriend"),
                 $"{grantor.Name}: unsigned friend gained a key suffix");
             Assert.That(GrantArgument(grantor, "Recovered.SignedFriend"),
                 Is.EqualTo(expectedGrant),
