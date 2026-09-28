@@ -615,7 +615,7 @@ public static class IlGenerator
                 if (instruction.Operands is [LocalVariable deadPointerLocal, RuntimeMethodInfoAnalysisContext methodPointer]
                     && StoreContract(deadPointerLocal, context)?.FullName == "System.IntPtr"
                     && SpellableMethodPointer(methodPointer, context) is { Name: not ".ctor" }
-                    && !LocalIsLoaded(context, deadPointerLocal))
+                    && !LocalIsLoadedOutsideUnresolvedCalls(context, deadPointerLocal))
                 {
                     instructions.Add(CilOpCodes.Nop);
                     break;
@@ -3335,6 +3335,51 @@ public static class IlGenerator
         context.ControlFlowGraph!.Blocks
             .SelectMany(block => block.Instructions)
             .Any(other => Analysis.DeadCodeEliminator.UsedLocals(other).Any(used => ReferenceEquals(used, local)));
+
+    // A call that never resolved emits only its "Method not found" diagnostic -
+    // the raw register operands it still carries are never loaded for real, so a
+    // method-pointer local consumed solely by one is dead for store purposes.
+    // The deadness is transitive through copies: a Move into a local that is
+    // itself only read by unresolved calls is also a dead use.
+    private static bool LocalIsLoadedOutsideUnresolvedCalls(MethodAnalysisContext context, LocalVariable local)
+    {
+        var instructions = context.ControlFlowGraph!.Blocks
+            .SelectMany(block => block.Instructions)
+            .ToList();
+
+        static bool IsUnresolvedCall(Instruction insn) =>
+            insn.IsCall && (insn.Operands.Count == 0 || insn.Operands[0] is not MethodAnalysisContext);
+        static bool IsDeadMove(Instruction insn, HashSet<LocalVariable> dead) =>
+            insn.OpCode == OpCode.Move
+            && insn.Operands is [LocalVariable moveDestination, _]
+            && dead.Contains(moveDestination);
+
+        var usesOf = new Dictionary<LocalVariable, List<Instruction>>();
+        foreach (var insn in instructions)
+            foreach (var used in Analysis.DeadCodeEliminator.UsedLocals(insn))
+                (usesOf.TryGetValue(used, out var list) ? list : usesOf[used] = []).Add(insn);
+
+        var dead = new HashSet<LocalVariable>();
+        for (var changed = true; changed;)
+        {
+            changed = false;
+            foreach (var insn in instructions)
+            {
+                if (IsUnresolvedCall(insn) || insn.OpCode != OpCode.Move
+                    || insn.Operands is not [LocalVariable dest, _] || dead.Contains(dest))
+                    continue;
+                if (usesOf.TryGetValue(dest, out var destUses)
+                    && destUses.All(u => IsUnresolvedCall(u) || IsDeadMove(u, dead)))
+                {
+                    dead.Add(dest);
+                    changed = true;
+                }
+            }
+        }
+
+        return usesOf.TryGetValue(local, out var uses)
+            && uses.Any(u => !(IsUnresolvedCall(u) || IsDeadMove(u, dead)));
+    }
 
     private static bool DerivesFromMulticastDelegate(TypeAnalysisContext type)
     {
@@ -6138,6 +6183,37 @@ public static class IlGenerator
             && TryRecoverLateFieldReference(memory, context, out var lateField)
                 ? lateField.Field.FieldType
                 : EmittedOperandType(resolved, context, contract);
+        // An operand emitting &S is already the address of S's offset-0 field: when
+        // the slot wants &F and S carries a unique instance field of type F at
+        // offset 0, the operand is &S.f0 - the ldflda form - not a default. The
+        // inverse fold (&v.f0 where f0 sits at 0 means &v) applies in the same way.
+        if (emitted is ByRefTypeAnalysisContext { ElementType: { IsValueType: true } sourceStruct }
+            && contract is ByRefTypeAnalysisContext { ElementType: { } targetElement }
+            && !ThisConstructorCallPlan.SameTypeIdentity(sourceStruct, targetElement))
+        {
+            if (resolved is LocalVariable sourceLocal
+                && InstanceFields(sourceStruct).Where(field =>
+                        !field.IsStatic && field.Offset == 0
+                        && ThisConstructorCallPlan.SameTypeIdentity(field.FieldType, targetElement))
+                    .ToList() is [var offsetField])
+            {
+                resolved = new AddressOf(new FieldReference(offsetField, sourceLocal, 0));
+                emitted = contract;
+            }
+            else if (resolved is AddressOf
+                     {
+                         Target: FieldReference { Offset: 0, Containers: { Count: 0 } } addressedField
+                     }
+                     && ThisConstructorCallPlan.SameTypeIdentity(
+                         addressedField.Local.Type is ByRefTypeAnalysisContext addressedByRef
+                             ? addressedByRef.ElementType : addressedField.Local.Type, targetElement))
+            {
+                resolved = addressedField.Local.Type is ByRefTypeAnalysisContext
+                    ? addressedField.Local
+                    : new AddressOf(addressedField.Local);
+                emitted = contract;
+            }
+        }
         if (resolved is LocalVariable { IsThis: true }
             && contract is { IsValueType: true }
             && emitted is { IsValueType: false } and not PointerTypeAnalysisContext and not ByRefTypeAnalysisContext)
