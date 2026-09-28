@@ -12,10 +12,11 @@ using static Cpp2IL.Core.Tests.Regression.SyntheticFixture;
 namespace Cpp2IL.Core.Tests.Regression;
 
 // Recovery cluster: dominating mid-body base-.ctor calls (castle-recovery#107).
-// IL2CPP inlines constructor chains, so a lifted derived .ctor keeps a distant
-// ancestor .ctor call on `this` with the real base .ctor's body stores left
-// behind it. A `call` to a .ctor on `this` mid-body cannot verify and cannot be
-// written as a C# `base(...)` initializer; the call must move to the head.
+// IL2CPP inlines constructor chains, so a lifted derived .ctor can keep a
+// `call` to a .ctor on `this` mid-body - it cannot verify and cannot be written
+// as a C# `base(...)` initializer; the call must move to the head. Hoisting is
+// allowed only over code that provably cannot observe the moved call: a `this`
+// write or read on any path reaching the call keeps it in place.
 public class InlinedBaseConstructorCallTests
 {
     private static (InjectedTypeAnalysisContext type, TypeDefinition definition) InjectType(
@@ -45,101 +46,6 @@ public class InlinedBaseConstructorCallTests
         definition.Methods.Add(method);
         context.PutExtraData("AsmResolverMethod", method);
         return (context, method);
-    }
-
-    [Test]
-    public void InlinedBaseConstructorStoreTrailHoistsCallWithRecoveredArguments()
-    {
-        // The derived .ctor kept the distant ancestor's .ctor call while the real
-        // base .ctor was inlined: its `this.F = arg` stores trail the call. The
-        // matching base .ctor is identified from its own parameter-fed stores and
-        // the call is hoisted with the trail operands as its arguments.
-        Cpp2IlApi.ResetInternalState();
-        TestGameLoader.LoadSimple2019Game();
-        var app = Cpp2IlApi.CurrentAppContext!;
-        var module = new ModuleDefinition("InlinedCtor.dll");
-        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type,
-            app.SystemTypes.SystemStringType, app.SystemTypes.SystemBooleanType);
-
-        var (ancestor, ancestorDef) = InjectType(app, module, "Ancestor",
-            app.SystemTypes.SystemObjectType, module.CorLibTypeFactory.Object.Type);
-        var (baseType, baseDef) = InjectType(app, module, "Base", ancestor, ancestorDef.ToTypeReference());
-        var (derived, derivedDef) = InjectType(app, module, "Derived", baseType, baseDef.ToTypeReference());
-
-        var (ancestorCtor, _) = InjectCtor(ancestor, ancestorDef, module);
-        var (baseCtor, baseCtorDef) = InjectCtor(baseType, baseDef, module,
-            ("count", app.SystemTypes.SystemInt32Type, module.CorLibTypeFactory.Int32),
-            ("name", app.SystemTypes.SystemStringType, module.CorLibTypeFactory.String));
-
-        var countField = baseType.InjectFieldContext("count", app.SystemTypes.SystemInt32Type,
-            R.FieldAttributes.Public);
-        var nameField = baseType.InjectFieldContext("name", app.SystemTypes.SystemStringType,
-            R.FieldAttributes.Public);
-        var flagField = derived.InjectFieldContext("flag", app.SystemTypes.SystemBooleanType,
-            R.FieldAttributes.Public);
-        var countFieldDef = new FieldDefinition("count", FieldAttributes.Public, module.CorLibTypeFactory.Int32);
-        baseDef.Fields.Add(countFieldDef);
-        countField.PutExtraData("AsmResolverField", countFieldDef);
-        var nameFieldDef = new FieldDefinition("name", FieldAttributes.Public, module.CorLibTypeFactory.String);
-        baseDef.Fields.Add(nameFieldDef);
-        nameField.PutExtraData("AsmResolverField", nameFieldDef);
-        var flagFieldDef = new FieldDefinition("flag", FieldAttributes.Public, module.CorLibTypeFactory.Boolean);
-        derivedDef.Fields.Add(flagFieldDef);
-        flagField.PutExtraData("AsmResolverField", flagFieldDef);
-
-        // The base .ctor's own body: ancestor init plus `this.F = param` stores.
-        var baseThis = new LocalVariable("this", new Register(null, "this"), baseType) { IsThis = true };
-        var baseCount = new LocalVariable("count", new Register(null, "p0"), app.SystemTypes.SystemInt32Type);
-        var baseName = new LocalVariable("name", new Register(null, "p1"), app.SystemTypes.SystemStringType);
-        baseCtor.ParameterLocals = [baseThis, baseCount, baseName];
-        baseCtor.Locals = [baseThis, baseCount, baseName];
-        baseCtor.AnalysisWarnings = [];
-        baseCtor.ControlFlowGraph = new ISILControlFlowGraph([
-            new(0, OpCode.CallVoid, ancestorCtor, baseThis),
-            new(1, OpCode.Move, new FieldReference(countField, baseThis, 0), baseCount),
-            new(2, OpCode.Move, new FieldReference(nameField, baseThis, 0), baseName),
-            new(3, OpCode.Return)]);
-
-        var (caller, method) = InjectCtor(derived, derivedDef, module,
-            ("count", app.SystemTypes.SystemInt32Type, module.CorLibTypeFactory.Int32),
-            ("name", app.SystemTypes.SystemStringType, module.CorLibTypeFactory.String));
-        var thisLocal = new LocalVariable("this", new Register(null, "this"), derived) { IsThis = true };
-        var count = new LocalVariable("count", new Register(null, "p0"), app.SystemTypes.SystemInt32Type);
-        var name = new LocalVariable("name", new Register(null, "p1"), app.SystemTypes.SystemStringType);
-        caller.ParameterLocals = [thisLocal, count, name];
-        caller.Locals = [thisLocal, count, name];
-        caller.AnalysisWarnings = [];
-        caller.ControlFlowGraph = new ISILControlFlowGraph([
-            new(0, OpCode.CallVoid, ancestorCtor, thisLocal),
-            new(1, OpCode.Move, new FieldReference(countField, thisLocal, 0), count),
-            new(2, OpCode.Move, new FieldReference(nameField, thisLocal, 0), name),
-            // A store to a field the candidate's map does not cover is a derived
-            // field initializer, not inlined-body evidence: it stays in the body.
-            new(3, OpCode.Move, new FieldReference(flagField, thisLocal, 0), new Immediate(0)),
-            new(4, OpCode.Return)]);
-        caller.DominatorInfo = new DominatorInfo(caller.ControlFlowGraph);
-
-        IlGenerator.GenerateIl(caller, method);
-
-        var il = method.CilMethodBody!.Instructions;
-        var callIndex = il.ToList().FindIndex(i => i.OpCode == CilOpCodes.Call);
-        Assert.Multiple(() =>
-        {
-            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldarg_0),
-                () => string.Join("\n", il.Select(i => i.ToString())));
-            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Ldarg));
-            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Ldarg));
-            Assert.That(callIndex, Is.EqualTo(3));
-            Assert.That(il[callIndex].Operand, Is.SameAs(baseCtorDef),
-                "the inlined-store trail identifies the real base .ctor");
-            // The consumed `this.count`/`this.name` stores are gone - the base
-            // call performs them; the uncovered `this.flag` initializer stays.
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stfld && ReferenceEquals(i.Operand, flagFieldDef)),
-                Is.True, "the derived field initializer keeps its in-body store");
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stfld && ReferenceEquals(i.Operand, countFieldDef)),
-                Is.False, "the store the recovered base call performs is consumed");
-            Assert.That(il[^1].OpCode, Is.EqualTo(CilOpCodes.Ret));
-        });
     }
 
     [Test]
@@ -207,64 +113,61 @@ public class InlinedBaseConstructorCallTests
     [Test]
     public void ThisFieldWriteInOneBranchArmBlocksHoist()
     {
-        // Same distant-call shape as the hoisting test, but one arm of a
-        // conditional writes `this.seen` before the paths rejoin at the call.
-        // That arm does not dominate the call, so only the full predecessor
-        // closure sees the write - and the call must stay where it is.
+        // A legal immediate-base .ctor call whose argument is a field read on a
+        // closure local - the operand resolves only through the store-forwarding
+        // path, which `SafeToHoistBefore` guards. One arm of a conditional
+        // writes `this.seen` before the paths rejoin at the call block; that arm
+        // does not dominate the call, so only the full predecessor closure sees
+        // the write - and the call must stay where it is.
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
         var app = Cpp2IlApi.CurrentAppContext!;
         var module = new ModuleDefinition("BranchedCtor.dll");
-        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type,
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemStringType,
             app.SystemTypes.SystemBooleanType);
 
-        var (ancestor, ancestorDef) = InjectType(app, module, "Ancestor",
+        var (baseType, baseDef) = InjectType(app, module, "Base",
             app.SystemTypes.SystemObjectType, module.CorLibTypeFactory.Object.Type);
-        var (baseType, baseDef) = InjectType(app, module, "Base", ancestor, ancestorDef.ToTypeReference());
         var (derived, derivedDef) = InjectType(app, module, "Derived", baseType, baseDef.ToTypeReference());
+        var (closure, closureDef) = InjectType(app, module, "Closure",
+            app.SystemTypes.SystemObjectType, module.CorLibTypeFactory.Object.Type);
 
-        var (ancestorCtor, _) = InjectCtor(ancestor, ancestorDef, module);
-        var (baseCtor, baseCtorDef) = InjectCtor(baseType, baseDef, module,
-            ("count", app.SystemTypes.SystemInt32Type, module.CorLibTypeFactory.Int32));
+        var (baseCtor, _) = InjectCtor(baseType, baseDef, module,
+            ("descriptor", app.SystemTypes.SystemStringType, module.CorLibTypeFactory.String));
 
-        var countField = baseType.InjectFieldContext("count", app.SystemTypes.SystemInt32Type,
-            R.FieldAttributes.Public);
+        var descriptorField = closure.InjectFieldContext("descriptor",
+            app.SystemTypes.SystemStringType, R.FieldAttributes.Public);
+        var descriptorFieldDef = new FieldDefinition("descriptor", FieldAttributes.Public,
+            module.CorLibTypeFactory.String);
+        closureDef.Fields.Add(descriptorFieldDef);
+        descriptorField.PutExtraData("AsmResolverField", descriptorFieldDef);
         var seenField = derived.InjectFieldContext("seen", app.SystemTypes.SystemBooleanType,
             R.FieldAttributes.Public);
-        var countFieldDef = new FieldDefinition("count", FieldAttributes.Public, module.CorLibTypeFactory.Int32);
-        baseDef.Fields.Add(countFieldDef);
-        countField.PutExtraData("AsmResolverField", countFieldDef);
         var seenFieldDef = new FieldDefinition("seen", FieldAttributes.Public, module.CorLibTypeFactory.Boolean);
         derivedDef.Fields.Add(seenFieldDef);
         seenField.PutExtraData("AsmResolverField", seenFieldDef);
 
-        var baseThis = new LocalVariable("this", new Register(null, "this"), baseType) { IsThis = true };
-        var baseCount = new LocalVariable("count", new Register(null, "p0"), app.SystemTypes.SystemInt32Type);
-        baseCtor.ParameterLocals = [baseThis, baseCount];
-        baseCtor.Locals = [baseThis, baseCount];
-        baseCtor.AnalysisWarnings = [];
-        baseCtor.ControlFlowGraph = new ISILControlFlowGraph([
-            new(0, OpCode.CallVoid, ancestorCtor, baseThis),
-            new(1, OpCode.Move, new FieldReference(countField, baseThis, 0), baseCount),
-            new(2, OpCode.Return)]);
-
         var (caller, method) = InjectCtor(derived, derivedDef, module,
-            ("count", app.SystemTypes.SystemInt32Type, module.CorLibTypeFactory.Int32),
+            ("descriptor", app.SystemTypes.SystemStringType, module.CorLibTypeFactory.String),
             ("cond", app.SystemTypes.SystemBooleanType, module.CorLibTypeFactory.Boolean));
         var thisLocal = new LocalVariable("this", new Register(null, "this"), derived) { IsThis = true };
-        var count = new LocalVariable("count", new Register(null, "p0"), app.SystemTypes.SystemInt32Type);
+        var descriptor = new LocalVariable("descriptor", new Register(null, "p0"), app.SystemTypes.SystemStringType);
         var cond = new LocalVariable("cond", new Register(null, "p1"), app.SystemTypes.SystemBooleanType);
-        caller.ParameterLocals = [thisLocal, count, cond];
-        caller.Locals = [thisLocal, count, cond];
+        var closureLocal = new LocalVariable("closure", new Register(null, "v0"), closure);
+        caller.ParameterLocals = [thisLocal, descriptor, cond];
+        caller.Locals = [thisLocal, descriptor, cond, closureLocal];
         caller.AnalysisWarnings = [];
-        var call = new Instruction(4, OpCode.CallVoid, ancestorCtor, thisLocal);
+        var store = new Instruction(4, OpCode.Move,
+            new FieldReference(descriptorField, closureLocal, 0), descriptor);
+        var call = new Instruction(5, OpCode.CallVoid, baseCtor, thisLocal,
+            new FieldReference(descriptorField, closureLocal, 0));
         caller.ControlFlowGraph = new ISILControlFlowGraph([
-            new(0, OpCode.ConditionalJump, call, cond),
+            new(0, OpCode.ConditionalJump, store, cond),
             new(1, OpCode.Move, new FieldReference(seenField, thisLocal, 0), new Immediate(1)),
-            new(2, OpCode.Jump, call),
-            new(3, OpCode.Jump, call),
+            new(2, OpCode.Jump, store),
+            new(3, OpCode.Jump, store),
+            store,
             call,
-            new(5, OpCode.Move, new FieldReference(countField, thisLocal, 0), count),
             new(6, OpCode.Return)]);
         caller.DominatorInfo = new DominatorInfo(caller.ControlFlowGraph);
 
