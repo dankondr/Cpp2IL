@@ -3,6 +3,7 @@ using System.Linq;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Metadata.Tables;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Model.CustomAttributes;
 using Cpp2IL.Core.OutputFormats;
 using Cpp2IL.Core.Utils;
 using NUnit.Framework;
@@ -107,5 +108,56 @@ public class FrameworkSurfaceTypesTests
             t.FullName == "System.Runtime.CompilerServices.MethodImplAttribute"), Is.True);
         Assert.That(corlib.TopLevelTypes.Any(t =>
             t.FullName == "System.Runtime.CompilerServices.MethodImplOptions"), Is.True);
+    }
+
+    // A System.Type attribute argument naming a nested type of a
+    // global-namespace typedef must reuse that typedef, not materialize an
+    // empty shell on top of it: the typedef carries Namespace=null while the
+    // reference's empty namespace reads "", and an unnormalized typedef-side
+    // compare misses the match.
+    [Test]
+    public void GlobalNamespaceNestedTypeAttributeArgumentReusesRealTypedef()
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2022Game();
+        var assembly = app.AssembliesByName["UnityEngine.CoreModule"];
+
+        var global = assembly.InjectType("", "GlobalData",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var inner = global.InjectNestedType("Inner", app.SystemTypes.SystemObjectType);
+        global.InjectFieldContext("Marker", app.SystemTypes.SystemInt32Type,
+            R.FieldAttributes.Public | R.FieldAttributes.Static);
+        var attributeType = assembly.InjectType("Tests", "GlobalMarkerAttribute",
+            app.SystemTypes.SystemAttributeType,
+            R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var constructor = attributeType.InjectMethodContext(".ctor",
+            app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public | R.MethodAttributes.SpecialName
+                | R.MethodAttributes.RTSpecialName | R.MethodAttributes.HideBySig,
+            app.SystemTypes.SystemTypeType);
+
+        var holder = assembly.InjectType("Tests", "GlobalMarkerHolder",
+            app.SystemTypes.SystemObjectType,
+            R.TypeAttributes.Public | R.TypeAttributes.Class);
+        holder.AnalyzeCustomAttributeData();
+        holder.CustomAttributes ??= [];
+        var attribute = new AnalyzedCustomAttribute(constructor);
+        attribute.ConstructorParameters.Add(
+            new CustomAttributeTypeParameter(inner, attribute,
+                CustomAttributeParameterKind.ConstructorParam, 0));
+        holder.CustomAttributes.Add(attribute);
+
+        var assemblies = new AsmResolverDllOutputFormatEmpty().BuildAssemblies(app);
+        var module = assemblies.First(a => a.Name == assembly.Name.ToString()).ManifestModule!;
+
+        var typedefs = module.TopLevelTypes.Where(t => t.Name == "GlobalData").ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(typedefs, Has.Count.EqualTo(1),
+                "the argument's declaring type must reuse the real typedef, not materialize a shell");
+            Assert.That(typedefs.Single().Fields.Any(f => f.Name == "Marker"), Is.True,
+                "the surviving typedef is the populated one, not an empty shell");
+            Assert.That(typedefs.Single().NestedTypes.Count(t => t.Name == "Inner"), Is.EqualTo(1));
+        });
     }
 }
