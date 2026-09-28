@@ -154,6 +154,53 @@ public class AggregateFieldStoreTests
     }
 
     [Test]
+    public void ZeroIntoLeadingSpanFieldKeepsDiagnostic()
+    {
+        // A literal zero covering a leading span field is ambiguous: a lifted
+        // data-pointer store collapses to the same `Move := 0`, so
+        // `buffer = default` would silently mask a lost array - the named
+        // diagnostic stays.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var byteType = app.SystemTypes.SystemByteType;
+        var byteArray = new SzArrayTypeAnalysisContext(byteType);
+        var spanDefinition = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"],
+            "System", "ReadOnlySpan`1", app.SystemTypes.SystemValueTypeType,
+            R.TypeAttributes.Public | R.TypeAttributes.Sealed | R.TypeAttributes.SequentialLayout);
+        var t = new GenericParameterTypeAnalysisContext("T", 0, Il2CppTypeEnum.IL2CPP_TYPE_VAR,
+            R.GenericParameterAttributes.None, spanDefinition);
+        spanDefinition.GenericParameters.Add(t);
+        AddField(spanDefinition, "_pointer", app.SystemTypes.SystemIntPtrType, 0);
+        AddField(spanDefinition, "_length", app.SystemTypes.SystemIntPtrType, 8);
+        var spanType = new GenericInstanceTypeAnalysisContext(spanDefinition, [byteType]);
+        var outer = InjectStruct(app, "Outer");
+        AddField(outer, "buffer", spanType, 0);
+        AddField(outer, "state", app.SystemTypes.SystemInt64Type, 16);
+        var module = new ModuleDefinition("Aggregate.dll");
+        SeedCorLibTypes(app, module, byteType, spanDefinition, outer, app.SystemTypes.SystemVoidType);
+        var slot = new LocalVariable("slot", new Register(null, "slot"), outer);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, slot, new Immediate(0)),
+            new(1, OpCode.Return)], [slot]);
+
+        LocalVariables.ResolveTypesAndFields(caller);
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stfld), Is.False,
+                () => "the ambiguous zero must not emit a field store:\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("synthetic default")), Is.True,
+                () => "the diagnostic must be kept when the zero is ambiguous:\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
+        });
+    }
+
+    [Test]
     public void ArrayDataPointerStoresIntoLeadingSpanField()
     {
         // `arr + 32` is `&arr[0]` (the il2cpp array-data offset). Stored into a

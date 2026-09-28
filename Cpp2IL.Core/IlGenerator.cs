@@ -5956,7 +5956,7 @@ public static class IlGenerator
     // box and unbox.any are illegal IL on them. Generic instances carry no
     // custom attributes of their own - the marker lives on the definition
     // (e.g. ReadOnlySpan<T>), so look through it.
-    private static bool IsByRefLike(TypeAnalysisContext type) =>
+    internal static bool IsByRefLike(TypeAnalysisContext type) =>
         (type is GenericInstanceTypeAnalysisContext { GenericType: var generic } ? generic : type)
             .HasCustomAttributeWithFullName("System.Runtime.CompilerServices.IsByRefLikeAttribute");
 

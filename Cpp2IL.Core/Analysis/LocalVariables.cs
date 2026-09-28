@@ -467,7 +467,8 @@ public static class LocalVariables
                 && TypeSizes.MinimumUnboxedSize(field.FieldType, pointerSize) >= accessSize);
             if (leading == null)
                 continue;
-            if (source is Immediate { Value: 0 })
+            if (source is Immediate { Value: 0 }
+                && !FieldTypeMayCarryPointer(leading.FieldType))
             {
                 instruction.SetOperand(0, new FieldReference(leading, destination, 0, [], accessSize));
                 changed = true;
@@ -607,6 +608,19 @@ public static class LocalVariables
         && span.GenericArguments is [var element]
             ? element
             : null;
+
+    // A zero covering a pointer-carrying field is ambiguous: lifted
+    // data-pointer stores also collapse to `Move := 0` when the pointer `add`
+    // emits as a dead sibling expression, so `field = default` would silently
+    // mask a lost array. Only fields that cannot carry a pointer take the
+    // `default` rewrite; the rest keep the whole-struct destination and its
+    // named diagnostic.
+    private static bool FieldTypeMayCarryPointer(TypeAnalysisContext type) =>
+        type is PointerTypeAnalysisContext or ByRefTypeAnalysisContext
+        || type.FullName is "System.IntPtr" or "System.UIntPtr"
+        || type is GenericInstanceTypeAnalysisContext
+            { GenericType.FullName: "System.Span`1" or "System.ReadOnlySpan`1" or "System.ByReference`1" }
+        || IlGenerator.IsByRefLike(type);
 
     // stfld can only write what the method may legally touch: no initonly store
     // outside the declaring type's own .ctor, and no private/family store outside
