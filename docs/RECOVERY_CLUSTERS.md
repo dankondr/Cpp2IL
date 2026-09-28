@@ -129,12 +129,14 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
 
 | castle-recovery#106 `ghost-call-target` (`decompiler-issue`: `Ref struct cannot cross the value/reference boundary`, 765 sites -> 71) | call-target resolution + IL emission | Two Cpp2IL-owned causes fixed: (1) `ResolveCallsViaMethodInfo` trusted any `MethodInfo*` operand in the hidden-argument slot even when it was a stale rgctx-register leftover from a sibling call — every bind path (`MethodAnalysisContext` upgrade, hidden-slot match, no-candidates fallback, shared-address candidate match) now requires `ReceiverTypeConsistent`: the receiver operand's emitted type must reach the represented method's declaring type on generic-erased family terms, and a `&S` receiver also reaches `declaring` through S's unique offset-0 field — a `&ParseContext` operand can no longer bind a `MapField`/`RepeatedField` instance method; unproven callees keep the raw-address operand and emit the `Method not found` diagnostic instead (+181 unbound calls). (2) `TryResolveSlotLoad` narrows a `&S` operand into a `&F` slot through `ldflda` on S's unique offset-0 field of type F (and the inverse `&v.f0` -> `&v` fold), so ref-struct first members like `ParseContext.buffer`/`WriteContext.buffer` fill their slots instead of defaulting (~513 sites). Unresolved calls' raw operands are now treated as dead for `ldftn` store purposes (transitively through `Move` copies), so a method-pointer local consumed only by an unbound call no longer emits an unspellable `__ldftn`. Residual 71 keep the diagnosed default: `Byte[]`/`int`/`nint`/`object`/`char`/`string` operands into value-struct and ref-struct slots (type inference of stack locals, hidden buffers and zero-init stores — #97-adjacent), and a handful of `ParseContext`/`WriteContext`/`Type` operands into collection `this`-slots bound by address-candidate paths that cannot disprove the callee | `Regression/ByRefStructReceiverTests.StaleMethodInfoReceiverMismatchStaysUnresolved`, `FreshMethodInfoWithMatchingReceiverStillBinds`, `StructByRefNarrowsToOffsetZeroField` |
 
+| castle-recovery#114 `invalid-conversion` (compile bucket, isinst/`as` behind an `Il2CppClass<T>` slot) | type inference / dataflow | A reference-array store emits a runtime element-class check: `LDR klass,[array]` then `LDR target,[klass + element_class]` feed `object_is_inst`. `RewriteElementClassLoads` typed the element class from the klass local's `Il2CppClass<instance.Type>` tag — but `instance.Type` can be polluted by register merging (a phi that merges the array register with an unrelated typed copy, e.g. a `params object[]` register sharing with an `Action<T>` copy), producing `isinst`/`as` against a wrong managed type (CS0039). The element type is now re-derived from the definition that produced the instance: `ProducerElementType`/`ProducedManagedType` chase the `[instance + 0]` klass load back through `Move` copies to the producer — the `NewArr`/array-`new` key-function class argument, a call return type, a field type, or unanimous phi inputs — falling back to the represented tag when no producer pins one. `RewriteIsInst` also types the `isinst` result local from the resolved target (except value types and generic parameters, whose `isinst` result is a `ref` the `value`-declared slot cannot hold). Sites whose isinst *object operand* is itself a native `Il2CppClass*` keep the #104 diagnostic — `(nint)k as object` is the closest honest spelling. r241 measurement (`development` @ `8ffdd0cd`): `invalid-conversion` 67 -> 37 (CS0039 29 -> 2, CS0030 38 -> 35); residual 37 are the vector/scalar-binop, `Quaternion*`, misc-scalar and other-isinst shapes owned elsewhere | `Regression/IsInstElementClassTests.*` (2 tests) |
+
 ## Summary
 
 - **84 fork PRs** merged since `b5ad444b` (#1–#79, #81–#85; no #80), plus the
   castle-recovery#NN issue rows.
 - **2 are not live recovery fixes**: #26 (reverted by #27) and #85 (CI only).
-- **103 recovery-fix clusters.** **101** carry reproducing tests (tests added or
+- **104 recovery-fix clusters.** **102** carry reproducing tests (tests added or
   strengthened in the same PR): the 80 through the backfill wave (#16 + #47,
   #38, #40, #41, #57, #58), castle-recovery#74's `UnboxEmissionTests.*`,
   castle-recovery#75's `Arm64VectorLaneLiftingTests.*`,
@@ -155,8 +157,9 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
   castle-recovery#104's `ErasedReceiverSharpeningTests.*`,
   castle-recovery#108's `AddressTakeClobberTests.*`,
   castle-recovery#106's `ByRefStructReceiverTests.*`,
-  castle-recovery#107's `InlinedBaseConstructorCallTests.*`, and
-  castle-recovery#111's `FrameSlotLoadTests.*`.
+  castle-recovery#107's `InlinedBaseConstructorCallTests.*`,
+  castle-recovery#111's `FrameSlotLoadTests.*`, and
+  castle-recovery#114's `IsInstElementClassTests.*`.
 - **2 remain `none`**, both compile-only fixes: #15 (`IReadOnlySet` on
   netstandard2.0) and #20 (`AddOperands` signature fix, exercised downstream by
   `Arm64LibcMathImportTests`).

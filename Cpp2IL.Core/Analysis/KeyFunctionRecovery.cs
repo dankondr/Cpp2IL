@@ -269,7 +269,7 @@ public static class KeyFunctionRecovery
                             Base: LocalVariable
                             {
                                 Type: RuntimeClassTypeAnalysisContext { RepresentedType: var represented }
-                            },
+                            } klassLocal,
                             Index: null,
                             Scale: 0,
                             Addend: >= 0 and <= uint.MaxValue and var offset
@@ -278,19 +278,21 @@ public static class KeyFunctionRecovery
                 || !Il2CppClassUsefulOffsets.IsElementTypePtr((uint)offset, method.AppContext.Binary.is32Bit))
                 continue;
 
-            var elementType = represented switch
-            {
-                SzArrayTypeAnalysisContext or ArrayTypeAnalysisContext
-                    => ((WrappedTypeAnalysisContext)represented).ElementType,
-                PointerTypeAnalysisContext pointer => pointer.ElementType,
-                GenericInstanceTypeAnalysisContext
+            var elementType = ProducerElementType(method.ControlFlowGraph!, klassLocal,
+                    instruction.Index)
+                ?? represented switch
                 {
-                    GenericType.FullName: "System.Nullable`1",
-                    GenericArguments: [{ } nullableElement]
-                } => nullableElement,
-                { IsEnumType: true, DefaultEnumUnderlyingType: { } underlying } => underlying,
-                _ => represented,
-            };
+                    SzArrayTypeAnalysisContext or ArrayTypeAnalysisContext
+                        => ((WrappedTypeAnalysisContext)represented).ElementType,
+                    PointerTypeAnalysisContext pointer => pointer.ElementType,
+                    GenericInstanceTypeAnalysisContext
+                    {
+                        GenericType.FullName: "System.Nullable`1",
+                        GenericArguments: [{ } nullableElement]
+                    } => nullableElement,
+                    { IsEnumType: true, DefaultEnumUnderlyingType: { } underlying } => underlying,
+                    _ => represented,
+                };
             var elementClass = new RuntimeClassTypeAnalysisContext(elementType,
                 elementType.DeclaringAssembly);
             instruction.SetOperand(1, elementClass);
@@ -809,11 +811,22 @@ public static class KeyFunctionRecovery
         // helper, result, object, target class. Object::IsInst returns null when
         // the object is not assignable; it does not have castclass semantics.
         if (instruction.OpCode != OpCode.Call
-            || instruction.Operands is not [_, var result, LocalVariable value, var classOperand, ..]
-            || IsInstTarget(ResolveMoveSource(cfg, classOperand), cfg, is32Bit) is not { } target)
+            || instruction.Operands is not [_, var result, LocalVariable value, var classOperand, ..])
+            return;
+        var resolved = ResolveMoveSource(cfg, classOperand);
+        var target = IsInstTarget(resolved, cfg, is32Bit);
+        if (target is null)
             return;
         instruction.OpCode = OpCode.Move;
         instruction.SetOperands(result, new ReferenceCast(value, target, nullOnFailure: true));
+        // The cast produces the target type (or null): whatever the slot held from
+        // register merging, the local now provably carries the cast result. Skip
+        // value types and generic parameters: isinst yields a reference ('ref T'),
+        // while a slot declared on the raw type expects the value form ('value T')
+        // - typing it T would box/unbox the reference and fail verification.
+        if (!target.IsValueType && target is not GenericParameterTypeAnalysisContext
+            && result is LocalVariable resultLocal)
+            resultLocal.Type = target;
     }
 
     private static TypeAnalysisContext? IsInstTarget(IOperand operand, Graphs.ISILControlFlowGraph cfg, bool is32Bit)
@@ -856,6 +869,105 @@ public static class KeyFunctionRecovery
             } when Il2CppClassUsefulOffsets.IsElementTypePtr((uint)offset, is32Bit) => array.ElementType,
             _ => null,
         };
+    }
+
+    private static readonly HashSet<string> ArrayNewFunctions =
+    [
+        "SzArrayNew",
+        "il2cpp_vm_array_new_specific",
+        "il2cpp_array_new_specific",
+    ];
+
+    // `[klass + elementOff]` reads Il2CppClass::element_class - the class a reference
+    // array store checks its value against - which is meaningful only when the klass
+    // local's represented type is an array/pointer klass. klass.Type is derived from
+    // `instance.Type` at the `[instance + 0]` object-klass load, and that tag can be
+    // polluted by register merging (e.g. a phi that merges the params-array register
+    // with a callback copy carrying an unrelated type). Re-derive the element type
+    // from the definition that produced the instance instead of trusting its tag.
+    private static TypeAnalysisContext? ProducerElementType(Graphs.ISILControlFlowGraph cfg,
+        LocalVariable klassLocal, int beforeIndex)
+    {
+        for (var depth = 0; depth < 4; depth++)
+        {
+            var definition = cfg.Instructions.LastOrDefault(i =>
+                i.Index < beforeIndex
+                && i.OpCode == OpCode.Move
+                && i.Destination is LocalVariable candidate && candidate.Register == klassLocal.Register);
+            if (definition?.Operands is not [_, var source])
+                return null;
+            switch (source)
+            {
+                case MemoryOperand { Base: LocalVariable instance, Index: null, Scale: 0, Addend: 0 }:
+                    return ProducedManagedType(cfg, instance, definition.Index, 0) switch
+                    {
+                        WrappedTypeAnalysisContext wrapped => wrapped.ElementType,
+                        _ => null,
+                    };
+                case LocalVariable copy when !ReferenceEquals(copy, klassLocal):
+                    klassLocal = copy;
+                    beforeIndex = definition.Index;
+                    break;
+                default:
+                    return null;
+            }
+        }
+
+        return null;
+    }
+
+    // The managed type the producing definition of `local` pins on it, when one is
+    // provable: new-array allocations, array-allocating key functions, call results,
+    // field loads and move/phi chains of those. Returns null when no definition
+    // pins a type (parameters, opaque producers).
+    private static TypeAnalysisContext? ProducedManagedType(Graphs.ISILControlFlowGraph cfg,
+        LocalVariable local, int beforeIndex, int depth)
+    {
+        if (depth >= 4)
+            return null;
+        var definition = cfg.Instructions.LastOrDefault(i =>
+            i.Index < beforeIndex
+            && i.Destination is LocalVariable candidate && candidate.Register == local.Register);
+        switch (definition)
+        {
+            case { OpCode: OpCode.Move, Operands: [_, LocalVariable source] }:
+                return ProducedManagedType(cfg, source, definition.Index, depth + 1);
+            case { OpCode: OpCode.Move, Operands: [_, FieldReference field] }:
+                return field.Field.FieldType;
+            case { OpCode: OpCode.NewArr, Operands: [_, TypeAnalysisContext arrayType, ..] }:
+                return arrayType;
+            case { OpCode: OpCode.Call, Operands: [_, _, var classArgument, ..] } arrayNew
+                when arrayNew.Operands[0] is StringLiteral { Value: var callee }
+                    && ArrayNewFunctions.Contains(callee):
+                return classArgument switch
+                {
+                    LocalVariable
+                    {
+                        Type: RuntimeClassTypeAnalysisContext { RepresentedType: var representedArgument },
+                    } => representedArgument,
+                    RuntimeClassTypeAnalysisContext runtimeClass => runtimeClass.RepresentedType,
+                    TypeAnalysisContext type => type,
+                    _ => null,
+                };
+            case { OpCode: OpCode.Call, Operands: [MethodAnalysisContext callee, ..] }
+                when !callee.IsVoid:
+                return callee.ReturnType;
+            case { OpCode: OpCode.Phi }:
+                TypeAnalysisContext? merged = null;
+                foreach (var input in definition.Operands.Skip(1))
+                {
+                    if (input is not LocalVariable source
+                        || ProducedManagedType(cfg, source, definition.Index, depth + 1) is not { } produced)
+                        return null;
+                    if (merged == null)
+                        merged = produced;
+                    else if (merged.FullName != produced.FullName)
+                        return null;
+                }
+                return merged;
+            default:
+                return null;
+        }
     }
 
     private static TypeAnalysisContext? InferDefaultsBoxType(MethodAnalysisContext method, IOperand classOperand)
