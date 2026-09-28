@@ -95,11 +95,11 @@ public class AddressOfReceiverForwardTests
 
     // A slot copied from a local whose type can never hold the slot's declared type is a
     // bit-pattern copy with no legal managed store: forwarding the source into the field
-    // receiver would emit an invalid ldflda, keeping the move emits an invalid stloc. The move
-    // is dropped and the address-take keeps naming the unassigned slot, so the site stays a
-    // decompiler diagnostic instead of invalid IL.
+    // receiver would emit an invalid ldflda. The move stays for the emitter, which fills
+    // the slot with a noted synthetic default (a decompiler-issue call naming both types),
+    // so the stored value is measured instead of silently dropped.
     [Test]
-    public void SsaSimplifierDropsTypeIncompatibleCopy()
+    public void SsaSimplifierKeepsTypeIncompatibleCopyForEmission()
     {
         var other = Local("other", App.SystemTypes.SystemExceptionType);
         var copy = Local("copy", App.SystemTypes.SystemStringType);
@@ -112,8 +112,8 @@ public class AddressOfReceiverForwardTests
 
         SsaSimplifier.Run(graph, [other]);
 
-        Assert.That(move.OpCode, Is.EqualTo(OpCode.Nop),
-            "a copy between mutually incompatible reference types has no legal managed store");
+        Assert.That(move.OpCode, Is.EqualTo(OpCode.Move),
+            "an unspellable store stays for the emitter's noted synthetic default, not a silent drop");
         Assert.That(FieldInsideAddressOfUsedBy(call).Local, Is.SameAs(copy),
             "the mismatched source is never forwarded into the field receiver position");
     }
@@ -145,7 +145,7 @@ public class AddressOfReceiverForwardTests
 
     // The post-SSA form of the same bit-pattern copy.
     [Test]
-    public void SimplifierDropsTypeIncompatibleCopy()
+    public void SimplifierKeepsTypeIncompatibleCopyForEmission()
     {
         var other = Local("other", App.SystemTypes.SystemExceptionType);
         var copy = Local("copy", App.SystemTypes.SystemStringType);
@@ -159,8 +159,8 @@ public class AddressOfReceiverForwardTests
 
         Simplifier.Simplify(method);
 
-        Assert.That(move.OpCode, Is.EqualTo(OpCode.Nop),
-            "a copy between mutually incompatible reference types has no legal managed store");
+        Assert.That(move.OpCode, Is.EqualTo(OpCode.Move),
+            "an unspellable store stays for the emitter's noted synthetic default, not a silent drop");
         Assert.That(FieldInsideAddressOfUsedBy(call).Local, Is.SameAs(copy),
             "the mismatched source is never forwarded into the field receiver position");
     }
@@ -212,6 +212,47 @@ public class AddressOfReceiverForwardTests
 
         Assert.That(move.OpCode, Is.EqualTo(OpCode.Nop),
             "the copy has no remaining reads once the address-take names its source");
+    }
+
+    // Emission-side of the same rule: a copy the emitter cannot spell (`String` into an
+    // `Exception&` slot) keeps its move, and the destination is stored with a synthetic
+    // default under a decompiler-issue note naming both types - the local is provably
+    // assigned and the substitution is measured, not a silent default read.
+    [Test]
+    public void UnspellableCopyEmitsNotedDefaultStore()
+    {
+        var app = App;
+        var source = Local("source", app.SystemTypes.SystemStringType);
+        var destination = Local("destination", new ByRefTypeAnalysisContext(app.SystemTypes.SystemExceptionType));
+        var reader = Local("reader", new ByRefTypeAnalysisContext(app.SystemTypes.SystemExceptionType));
+
+        var module = new AsmResolver.DotNet.ModuleDefinition("DroppedCopy.dll");
+        SyntheticFixture.SeedCorLibTypes(app, module,
+            app.SystemTypes.SystemStringType, app.SystemTypes.SystemExceptionType,
+            app.SystemTypes.SystemVoidType);
+        var (caller, method) = SyntheticFixture.ForeignCaller(app, module, [
+            new(0, OpCode.Move, destination, source),
+            new(1, OpCode.Move, reader, destination),
+            new(2, OpCode.Return)], [source, destination, reader]);
+
+        Simplifier.Simplify(caller);
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        // source, destination, reader in declaration order; synthetic defaults append later.
+        var destinationSlot = method.CilMethodBody.LocalVariables[1];
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == AsmResolver.PE.DotNet.Cil.CilOpCodes.Ldstr
+                    && i.Operand is string text
+                    && text.Contains("System.String") && text.Contains("System.Exception")), Is.True,
+                () => "expected a decompiler-issue note naming both types\n" + string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == AsmResolver.PE.DotNet.Cil.CilOpCodes.Call), Is.True,
+                "the diagnostic must be an emitted call, not just a string");
+            Assert.That(il.Any(i => i.OpCode == AsmResolver.PE.DotNet.Cil.CilOpCodes.Stloc
+                    && Equals(i.Operand, destinationSlot)), Is.True,
+                () => "the destination local stays provably assigned\n" + string.Join("\n", il.Select(i => i.ToString())));
+        });
     }
 
     private static MethodAnalysisContext CreateMethod(ISILControlFlowGraph graph, params LocalVariable[] locals)

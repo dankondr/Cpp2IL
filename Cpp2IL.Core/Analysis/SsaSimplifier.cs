@@ -25,19 +25,16 @@ public static class SsaSimplifier
                     && !parameterLocals.Contains(dest))
                 {
                     // A copy between locals that cannot hold each other's value - a slot merging
-                    // unrelated references across paths - has no legal managed store (the
-                    // non-phi form of the rule SsaForm.Remove applies to phi edges). The
-                    // destination stays at default: the store cannot be emitted legally, and
-                    // forwarding the source into a typed position such as an address-of field
-                    // receiver would emit an invalid ldflda. Copies between managed pointers
-                    // (T& or T* on both sides) are exempt - the value is the address itself.
+                    // unrelated references across paths - has no legal managed store, so the
+                    // source is never forwarded into the destination's typed positions (an
+                    // address-of field receiver would emit an invalid ldflda). The move itself
+                    // stays: the emitter fills the slot with a noted synthetic default (a
+                    // decompiler-issue call naming both types), so the stored value is measured
+                    // rather than silently dropped. Copies between managed pointers (T& or T*
+                    // on both sides) are exempt - the value is the address itself.
                     if (instruction.Operands[1] is LocalVariable copySource
                         && LocalVariables.NoLegalManagedCopy(dest, copySource, allowByRefReinterpret: true))
-                    {
-                        instruction.OpCode = OpCode.Nop;
-                        instruction.SetOperands();
                         continue;
-                    }
 
                     if (IsForwardable(instruction.Operands[1]))
                         forwarded[dest] = instruction.Operands[1];

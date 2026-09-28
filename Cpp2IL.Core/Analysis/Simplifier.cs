@@ -112,19 +112,15 @@ public static class Simplifier
 
                         // A copy between locals that cannot hold each other's value - a slot
                         // merging unrelated references across paths - has no legal managed
-                        // store. The destination stays at default rather than emitting an
-                        // invalid stloc (the non-phi form of the rule SsaForm.Remove applies
-                        // to phi edges). Copies between managed pointers (T& or T* on both
-                        // sides) are exempt - the value is the address itself.
+                        // store, so the source cannot be forwarded into the destination's
+                        // typed positions. The move itself stays: the emitter fills the slot
+                        // with a noted synthetic default (a decompiler-issue call naming both
+                        // types), so the stored value is measured rather than silently
+                        // dropped. Copies between managed pointers (T& or T* on both sides)
+                        // are exempt - the value is the address itself.
                         if (instruction.Operands[1] is LocalVariable incompatibleSource
                             && LocalVariables.NoLegalManagedCopy(local, incompatibleSource, allowByRefReinterpret: true))
-                        {
-                            instruction.OpCode = OpCode.Nop;
-                            instruction.SetOperands();
-                            UpdateSourceCache(block, instruction);
-                            changed = true;
                             continue;
-                        }
 
                         if (IsLocalUsedAfterInstruction(block, i + 1, local, out var usedByMemory))
                         {
@@ -231,16 +227,13 @@ public static class Simplifier
                     if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable local, LocalVariable source] })
                     {
                         // A copy between locals that cannot hold each other's value has no legal
-                        // managed store - leave the destination at default instead. Copies between
-                        // managed pointers (T& or T* on both sides) are exempt - the value is the
-                        // address itself.
+                        // managed store, so the source is never forwarded into the destination's
+                        // typed positions. The move stays for the emitter, which fills the slot
+                        // with a noted synthetic default instead of dropping the store silently.
+                        // Copies between managed pointers (T& or T* on both sides) are exempt -
+                        // the value is the address itself.
                         if (LocalVariables.NoLegalManagedCopy(local, source, allowByRefReinterpret: true))
-                        {
-                            instruction.OpCode = OpCode.Nop;
-                            instruction.SetOperands();
-                            UpdateSourceCache(block, instruction);
                             continue;
-                        }
 
                         // A local with several definitions is not in SSA form, so its value at a join
                         // depends on the path taken; don't carry this definition across that join.
