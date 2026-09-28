@@ -4500,29 +4500,44 @@ public static class IlGenerator
         return receiverType is ByRefTypeAnalysisContext byRefReceiver ? byRefReceiver.ElementType : receiverType;
     }
 
-    // The field type the emitted container member actually carries:
-    // FieldDescriptorFor re-concretizes a concrete value-type field onto the
-    // receiver's live instantiation, so the next link's receiver is the base
-    // field's type instantiated with the receiver's arguments - not the
-    // (possibly stale) bound instantiation's field type.
+    // The field type the emitted container member actually carries, which is
+    // the next link's receiver and the field type a leaf's declaring check
+    // must agree with. FieldDescriptorFor binds the member onto the receiver's
+    // live instantiation whenever it can - a concrete value-type field
+    // re-concretizes (its field type was minted against a possibly stale
+    // instantiation, so the base signature is re-instantiated) and a plain
+    // field becomes a MemberReference on the receiver (its signature keeps the
+    // declaring definition's !T, instantiated by the receiver's arguments).
     private static TypeAnalysisContext? EmittedContainerFieldType(FieldAnalysisContext container,
         TypeAnalysisContext? resolvedReceiver)
     {
-        if (container is not ConcreteGenericFieldAnalysisContext { DeclaringType.IsValueType: true } concrete)
-            return container.FieldType;
         var instance = resolvedReceiver switch
         {
             GenericInstanceTypeAnalysisContext i => i,
             ByRefTypeAnalysisContext { ElementType: GenericInstanceTypeAnalysisContext i } => i,
             _ => null,
         };
-        if (instance == null
-            || GenericDefinition(concrete.DeclaringType) is not { } boundDefinition
-            || !ThisConstructorCallPlan.SameTypeIdentity(boundDefinition, instance.GenericType)
-            || concrete.DeclaringType.FullName == instance.FullName)
+        if (instance == null)
             return container.FieldType;
-        return GenericInstantiation.Instantiate(concrete.BaseFieldContext.FieldType,
-            instance.GenericArguments, []);
+        if (container is ConcreteGenericFieldAnalysisContext { DeclaringType.IsValueType: true } concrete)
+        {
+            if (GenericDefinition(concrete.DeclaringType) is { } boundDefinition
+                && ThisConstructorCallPlan.SameTypeIdentity(boundDefinition, instance.GenericType))
+                return GenericInstantiation.Instantiate(concrete.BaseFieldContext.FieldType,
+                    instance.GenericArguments, []);
+            return container.FieldType;
+        }
+        if (container.DeclaringType != null
+            && GenericDefinition(container.DeclaringType) is { } declaringDefinition
+            && ThisConstructorCallPlan.SameTypeIdentity(declaringDefinition, instance.GenericType)
+            && container.GetExtraData<FieldDefinition>("AsmResolverField") != null)
+            return GenericInstantiation.Instantiate(container.FieldType, instance.GenericArguments, []);
+        // No rebind: the member lands on the field's bound declaring context.
+        // When that context is itself a generic instance, its member
+        // signature's !T still resolves through the instance's arguments.
+        if (container.DeclaringType is GenericInstanceTypeAnalysisContext boundInstance)
+            return GenericInstantiation.Instantiate(container.FieldType, boundInstance.GenericArguments, []);
+        return container.FieldType;
     }
 
     // A `<Property>k__BackingField` member is always compiler-named, so no
@@ -8662,6 +8677,42 @@ public static class IlGenerator
             field.Name, new FieldSignature(field.ToTypeSignature()));
     }
 
+    // The declaring context the emitted member actually carries, mirroring the
+    // same decisions FieldDescriptorFor makes: an outer-owner concrete field
+    // falls back to its base member, a concrete value-type field re-concretizes
+    // onto the receiver's live instantiation, and a plain field binds as a
+    // MemberReference on the receiver instance when its definition is
+    // referenceable. Anything else keeps the field's bound declaring context.
+    private static TypeAnalysisContext? EmittedMemberDeclaring(FieldAnalysisContext field,
+        TypeAnalysisContext? receiverType)
+    {
+        var instance = receiverType switch
+        {
+            GenericInstanceTypeAnalysisContext i => i,
+            ByRefTypeAnalysisContext { ElementType: GenericInstanceTypeAnalysisContext i } => i,
+            _ => null,
+        };
+        if (field is ConcreteGenericFieldAnalysisContext concrete)
+        {
+            if (GenericDefinition(concrete.BaseFieldContext.DeclaringType) is { } baseDeclaring
+                && GenericDefinition(concrete.DeclaringType) is { } concreteDeclaring
+                && !ThisConstructorCallPlan.SameTypeIdentity(baseDeclaring, concreteDeclaring))
+                return EmittedMemberDeclaring(concrete.BaseFieldContext, receiverType);
+            return concrete.DeclaringType.IsValueType && instance != null
+                && GenericDefinition(concrete.DeclaringType) is { } boundDeclaring
+                && ThisConstructorCallPlan.SameTypeIdentity(boundDeclaring, instance.GenericType)
+                && concrete.DeclaringType.FullName != instance.FullName
+                    ? instance
+                    : field.DeclaringType;
+        }
+        return instance != null
+            && GenericDefinition(field.DeclaringType) is { } declaringDefinition
+            && ThisConstructorCallPlan.SameTypeIdentity(declaringDefinition, instance.GenericType)
+            && field.GetExtraData<FieldDefinition>("AsmResolverField") != null
+                ? instance
+                : field.DeclaringType;
+    }
+
     // stfld on an initonly instance field only verifies when the receiver is the
     // literal `this` pointer (ILVerify requires actualThis.IsThisPtr) - a copy of
     // `this` parked in an ordinary local does not qualify even though it holds the
@@ -8768,29 +8819,15 @@ public static class IlGenerator
                 && !Analysis.InaccessibleCalleeRecovery.IsVisibleType(receiverType, callerType))
             return false;
         // The verifier binds ldfld/ldflda/stfld to the receiver's emitted type: the
-        // member's declaring instantiation must cover it. A mistyped receiver - say
-        // an awaiter value whose declaring context was widened to a different generic
-        // instantiation - that agrees only on the open definition would emit a
-        // token/receiver mismatch. FieldDescriptorFor binds the emitted member onto
-        // the receiver's live instantiation whenever it can - a concrete value-type
-        // field re-concretizes, a plain field becomes a MemberReference on the
-        // receiver - so the member's declaring context for this check is the live
-        // instantiation too. Fields that keep their bound declaring context (no
-        // concrete re-concretization, no field definition to reference) keep the
-        // mismatch rejection.
-        if (receiverType switch
-            {
-                GenericInstanceTypeAnalysisContext instance => instance,
-                ByRefTypeAnalysisContext { ElementType: GenericInstanceTypeAnalysisContext instance } => instance,
-                _ => null,
-            } is { } liveReceiver
-            && GenericDefinition(declaring) is { } boundDeclaring
-            && ThisConstructorCallPlan.SameTypeIdentity(boundDeclaring, liveReceiver.GenericType)
-            && (field is ConcreteGenericFieldAnalysisContext concreteField
-                ? concreteField.DeclaringType.IsValueType
-                : field.GetExtraData<FieldDefinition>("AsmResolverField") != null))
-            declaring = liveReceiver;
-        if (!field.IsStatic && receiverType != null && !receiverType.IsAssignableTo(declaring))
+        // member's declaring instantiation must cover it. FieldDescriptorFor decides
+        // which declaring context the emitted member actually carries - a concrete
+        // value-type field may re-concretize onto the receiver's live instantiation,
+        // an outer-owner concrete falls back to its base field, and a plain field
+        // may bind as a MemberReference on the receiver - so this check compares
+        // the receiver against the declaring context emission will use, not the
+        // (possibly mistyped) bound one.
+        if (!field.IsStatic && receiverType != null
+            && !receiverType.IsAssignableTo(EmittedMemberDeclaring(field, receiverType) ?? declaring))
             return false;
         // A direct native access proves that an inlined managed member reached a
         // same-assembly field. ToFieldDescriptor widens exactly that copied
