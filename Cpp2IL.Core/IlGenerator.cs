@@ -6266,12 +6266,14 @@ public static class IlGenerator
         // above: `unbox` asserts the reference boxes T and pushes exactly the
         // `&T` the slot wants. Other pointer contracts (`&ref`, `*`) have no
         // legal bridge from a reference - and no castclass token either - so
-        // the caller defaults the slot.
-        if (!from.IsValueType && to is ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+        // the caller defaults the slot. Only a true object reference
+        // (fromWidth 0) can unbox: `&T`, `*` and nint sources keep the existing
+        // arms (`&` satisfies `&` as-is; a pointer/nint is already a usable
+        // receiver).
+        if (fromWidth == 0 && to is ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
         {
             var pointee = to is ByRefTypeAnalysisContext byRefTo ? byRefTo.ElementType : null;
-            if (fromWidth == 0
-                && pointee is { IsValueType: true } or GenericParameterTypeAnalysisContext
+            if (pointee is { IsValueType: true } or GenericParameterTypeAnalysisContext
                 && !IsByRefLike(pointee))
             {
                 if (!TypeTokenUsableFrom(pointee, context))
@@ -8780,17 +8782,18 @@ public static class IlGenerator
                         instructions.Add(CilOpCodes.Ldarg, parameter);
                     else
                         instructions.Add(CilOpCodes.Ldloc, locals[local]);
-                    if (pointeeType is not ({ IsValueType: true } or GenericParameterTypeAnalysisContext))
+                    if (pointeeType is not ({ IsValueType: true } or GenericParameterTypeAnalysisContext)
+                        || IntegralStackWidth(emittedType) != 0)
+                        // A native or managed pointer (width -1) is already a
+                        // legal receiver for ldfld/ldobj - keep the push. Only a
+                        // true object reference (width 0) bridges via unbox.
                         return true;
-                    if (IntegralStackWidth(emittedType) == 0
-                        && !IsByRefLike(pointeeType)
-                        && TypeTokenUsableFrom(pointeeType, context))
-                    {
-                        instructions.Add(CilOpCodes.Unbox,
-                            pointeeType.ToTypeSignature().ToTypeDefOrRef());
-                        return true;
-                    }
-                    return false;
+                    if (IsByRefLike(pointeeType)
+                        || !TypeTokenUsableFrom(pointeeType, context))
+                        return false;
+                    instructions.Add(CilOpCodes.Unbox,
+                        pointeeType.ToTypeSignature().ToTypeDefOrRef());
+                    return true;
                 }
                 else if (parameter != null)
                     instructions.Add(CilOpCodes.Ldarga, parameter);
