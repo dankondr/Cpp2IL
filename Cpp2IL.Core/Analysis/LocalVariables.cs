@@ -493,12 +493,25 @@ public static class LocalVariables
     // pointer plus the array's own length. A phi'd store source resolves only
     // when every branch unwraps to the same operand - the store carries one
     // operand, so genuinely different arrays per branch keep the diagnostic.
-    private static bool TryUnwrapArrayDataPointer(IOperand operand, MethodAnalysisContext method,
+    internal static bool TryUnwrapArrayDataPointer(IOperand operand, MethodAnalysisContext method,
         int pointerSize, out IOperand? arrayOperand)
     {
         arrayOperand = null;
-        return operand is LocalVariable local
-            && TryUnwrapArrayDataPointer(local, method, pointerSize, [], out arrayOperand);
+        return operand switch
+        {
+            LocalVariable local => TryUnwrapArrayDataPointer(local, method, pointerSize, [],
+                out arrayOperand),
+            // An Add embedded as the operand carries the same `arr + K` shape
+            // without a local to trace; a local base still traces its defs.
+            Instruction { OpCode: OpCode.Add, Operands: [_, LocalVariable addBaseLocal, Immediate { Value: var addOffset1 }] }
+                when addOffset1 == pointerSize * 4
+                => TryUnwrapArrayDataPointer(addBaseLocal, method, pointerSize, [], out arrayOperand),
+            Instruction { OpCode: OpCode.Add, Operands: [_, var addBase, Immediate { Value: var addOffset }] }
+                when addOffset == pointerSize * 4
+                    && IlGenerator.EmittedOperandType(addBase, method) is SzArrayTypeAnalysisContext
+                => (arrayOperand = addBase) != null,
+            _ => false,
+        };
     }
 
     private static bool TryUnwrapArrayDataPointer(LocalVariable local, MethodAnalysisContext method,
@@ -517,8 +530,18 @@ public static class LocalVariables
             && offset == pointerSize * 4);
         if (add != null)
         {
-            if (add.Operands[1] is LocalVariable addBase && !ReferenceEquals(addBase, local))
-                return TryUnwrapArrayDataPointer(addBase, method, pointerSize, visited,
+            // `arr + K` where the base already emits an array needs no tracing -
+            // but only for a non-local base (a field load, an embedded value): a
+            // local's declared type can read array while the local currently
+            // holds a coerced pointer, so locals keep tracing their own defs.
+            if (add.Operands[1] is { } addBase && addBase is not LocalVariable
+                && IlGenerator.EmittedOperandType(addBase, method) is SzArrayTypeAnalysisContext)
+            {
+                arrayOperand = addBase;
+                return true;
+            }
+            if (add.Operands[1] is LocalVariable addBaseLocal && !ReferenceEquals(addBaseLocal, local))
+                return TryUnwrapArrayDataPointer(addBaseLocal, method, pointerSize, visited,
                     out arrayOperand);
             definitions.Remove(add);
         }
@@ -532,6 +555,17 @@ public static class LocalVariables
             return moveSource is LocalVariable moveLocal
                 && TryUnwrapArrayDataPointer(moveLocal, method, pointerSize, visited,
                     out arrayOperand);
+        }
+        // `unbox Int32(arr)` is the unsafe load of the array's first pointer word;
+        // a following `+32` makes it the data pointer. The operand only unwraps
+        // when what was unboxed is provably an array - an `object` local could
+        // hold anything and keeps the diagnostic.
+        if (definitions is [{ OpCode: OpCode.Unbox, Operands: [_, TypeAnalysisContext unboxedType, var boxedOperand, ..] }]
+            && IlGenerator.IntegralStackWidth(unboxedType) > 0
+            && IlGenerator.EmittedOperandType(boxedOperand, method) is SzArrayTypeAnalysisContext)
+        {
+            arrayOperand = boxedOperand;
+            return true;
         }
         if (definitions is [{ OpCode: OpCode.Phi } phi] && phi.Operands.Count >= 3)
         {

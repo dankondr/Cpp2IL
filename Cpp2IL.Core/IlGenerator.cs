@@ -6541,6 +6541,24 @@ public static class IlGenerator
             && TryRecoverLateFieldReference(memory, context, out var lateField)
                 ? lateField.Field.FieldType
                 : EmittedOperandType(resolved, context, contract);
+        // A pointer chain ending in `unbox(arr) + K` carries the array's data
+        // pointer; for a Span<T>/ReadOnlySpan<T> slot the honest operand is the
+        // array itself - `new Span(arr)` writes the same pointer plus the
+        // array's length. Only fires when the operand is not already span-kind.
+        if (contract is GenericInstanceTypeAnalysisContext
+                { GenericType.FullName: "System.Span`1" or "System.ReadOnlySpan`1" } spanContract
+            && emitted is not GenericInstanceTypeAnalysisContext
+                { GenericType.FullName: "System.Span`1" or "System.ReadOnlySpan`1" }
+            && Analysis.LocalVariables.TryUnwrapArrayDataPointer(operand, context,
+                context.AppContext.Binary.PointerSizeBytes, out var spanArrayOperand)
+            && EmittedOperandType(spanArrayOperand!, context) is SzArrayTypeAnalysisContext
+                { ElementType: { } spanArrayElement }
+            && ThisConstructorCallPlan.SameTypeIdentity(spanArrayElement,
+                spanContract.GenericArguments[0]))
+        {
+            resolved = spanArrayOperand!;
+            emitted = EmittedOperandType(resolved, context, contract);
+        }
         // An operand emitting &S is already the address of S's offset-0 field: when
         // the slot wants &F and S carries a unique instance field of type F at
         // offset 0, the operand is &S.f0 - the ldflda form - not a default. The
