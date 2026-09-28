@@ -4931,6 +4931,12 @@ public static class IlGenerator
             var thisType = local.Type as GenericInstanceTypeAnalysisContext ?? thisDeclaring;
             return thisType.IsValueType ? new ByRefTypeAnalysisContext(thisType) : thisType;
         }
+        // An isinst/castclass source slot holds a managed object reference. When a
+        // local reaches the emitted body only through such a slot - no producer and
+        // no other use - the propagated type is a register-reuse leftover and the
+        // slot contract is the only proven type.
+        if (local.Type != null && UsedOnlyAsCastSource(local, context))
+            return context.AppContext.SystemTypes.SystemObjectType;
         // System.Object is also the lifter's fallback for a register whose real
         // numeric type was lost. Do not guess from arithmetic alone; a concrete
         // numeric mate (array length, typed field/parameter, etc.) must prove it.
@@ -4976,6 +4982,42 @@ public static class IlGenerator
             return numericType;
         return context.AppContext.SystemTypes.SystemObjectType;
     }
+
+    private static bool UsedOnlyAsCastSource(LocalVariable local, MethodAnalysisContext context)
+    {
+        var sawCastUse = false;
+        foreach (var instruction in context.ControlFlowGraph!.Instructions)
+        {
+            if (ReferenceEquals(instruction.Destination, local))
+                return false;
+            foreach (var operand in instruction.Operands)
+            {
+                if (operand is ReferenceCast cast)
+                    sawCastUse |= ReferenceEquals(cast.Value, local);
+                else if (OperandReferencesLocal(operand, local))
+                    return false;
+            }
+        }
+        return sawCastUse;
+    }
+
+    private static bool OperandReferencesLocal(IOperand? operand, LocalVariable local) => operand switch
+    {
+        LocalVariable value => ReferenceEquals(value, local),
+        ReferenceCast cast => ReferenceEquals(cast.Value, local),
+        MemoryOperand memory => OperandReferencesLocal(memory.Base, local)
+            || OperandReferencesLocal(memory.Index, local),
+        AddressOf address => OperandReferencesLocal(address.Target, local),
+        FieldReference field => ReferenceEquals(field.Local, local),
+        SelectedFieldReference selected => ReferenceEquals(selected.Selector, local)
+            || selected.Choices.Any(choice => ReferenceEquals(choice.Field.Local, local)),
+        ArrayAccess access => ReferenceEquals(access.Array, local)
+            || OperandReferencesLocal(access.Index, local),
+        ArrayElementFieldReference elementField => ReferenceEquals(elementField.Array, local)
+            || OperandReferencesLocal(elementField.Index, local),
+        ArrayLength length => ReferenceEquals(length.Array, local),
+        _ => false,
+    };
 
     private static TypeAnalysisContext? CallDefinedLocalType(LocalVariable local,
         MethodAnalysisContext context)
