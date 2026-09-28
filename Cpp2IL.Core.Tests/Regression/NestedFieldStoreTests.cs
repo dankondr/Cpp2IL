@@ -92,7 +92,7 @@ public class NestedFieldStoreTests
     }
 
     [Test]
-    public void StoreToReadonlyStructMemberEmitsStobj()
+    public void StoreToReadonlyStructMemberKeepsDiagnostic()
     {
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
@@ -119,8 +119,10 @@ public class NestedFieldStoreTests
         var holder = new LocalVariable("holder", new Register(null, "holder")) { Type = owner };
         var value = new LocalVariable("value", new Register(null, "value")) { Type = token };
         // [holder + 0x18] covers holder.outer.token exactly, but token is
-        // readonly: stfld would be invalid IL outside the .ctor, so the store
-        // spells ldflda + stobj - the same bytes, verifier-legal.
+        // readonly: stfld is invalid outside the .ctor, and every
+        // write-through-address spelling ilspy can render (a folded
+        // ldflda + stobj store, a ref readonly local) still violates C#'s
+        // readonly rule - the store keeps its named diagnostic.
         var (caller, method) = ForeignCaller(app, module, [
             new(0, OpCode.Move, new MemoryOperand(holder, addend: 0x18, accessSize: 8), value),
             new(1, OpCode.Return)], [holder, value]);
@@ -130,15 +132,12 @@ public class NestedFieldStoreTests
         var il = method.CilMethodBody!.Instructions;
         Assert.Multiple(() =>
         {
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldflda
-                    && i.Operand?.ToString().Contains("outer") == true), Is.True,
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stfld), Is.False,
                 () => string.Join("\n", il.Select(i => i.ToString())));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldflda
-                    && i.Operand?.ToString().Contains("token") == true), Is.True,
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stobj), Is.False,
                 () => string.Join("\n", il.Select(i => i.ToString())));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stobj), Is.True,
-                () => string.Join("\n", il.Select(i => i.ToString())));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.False,
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand?.ToString().Contains("unmanaged memory") == true), Is.True,
                 () => string.Join("\n", il.Select(i => i.ToString())));
         });
     }

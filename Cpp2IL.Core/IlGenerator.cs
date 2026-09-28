@@ -557,23 +557,6 @@ public static class IlGenerator
                     }
                     if (!FieldReferenceUsableFrom(field, context, writeAccess: true))
                     {
-                        if (InitOnlyLeafAddressable(field, context))
-                        {
-                            if (field.Containers.Count == 0
-                                && RequiresThisPointerReceiver(field.Field, context)
-                                && (field.Local is null or LocalVariable
-                                    || ThisAliasLocals(context).Contains(field.Local)))
-                                instructions.Add(CilOpCodes.Ldarg_0);
-                            else
-                                LoadFieldReceiver(field, context, method, locals, writeLine);
-                            instructions.Add(CilOpCodes.Ldflda,
-                                FieldDescriptorFor(field.Field, FieldReceiverType(field, context)));
-                            LoadOperandIntoSlot(instruction.Operands[1], field.Field.FieldType,
-                                context, method, locals, writeLine);
-                            instructions.Add(CilOpCodes.Stobj,
-                                field.Field.FieldType.ToTypeSignature().ToTypeDefOrRef());
-                            break;
-                        }
                         EmitUnrecoverableOperation(method, writeLine,
                             $"Inaccessible field store: {field.Field.DeclaringType?.FullName}.{field.Field.Name}");
                         break;
@@ -4494,11 +4477,13 @@ public static class IlGenerator
         {
             // Only the chain head can substitute `this` or coerce the operand into
             // the base contract; deeper links always receive &previous.FieldType.
+            // A write must be writable at every link: a readonly container makes
+            // any store beneath it unspellable in C# (CS1648/CS1650 family).
             var effectiveReceiver = chainHead && !container.IsStatic
                 ? ResolvedFieldReceiverType(container, field.Local, receiverType, context)
                 : receiverType;
             chainHead = false;
-            if (!FieldUsableFrom(container, context, receiverType: effectiveReceiver))
+            if (!FieldUsableFrom(container, context, writeAccess, receiverType: effectiveReceiver))
                 return false;
             receiverType = container.IsStatic
                 ? container.FieldType
@@ -6986,24 +6971,12 @@ public static class IlGenerator
                 resolved = new ConcreteGenericFieldAnalysisContext(resolved, genericOwner);
             field = new FieldReference(resolved, local, (int)memory.Addend, found.Containers,
                 memory.AccessSize);
-            var writable = FieldReferenceUsableFrom(field, context, writeAccess: true)
-                || InitOnlyLeafAddressable(field, context);
-            if (writable
+            if (FieldReferenceUsableFrom(field, context, writeAccess: true)
                 && TryResolveSlotLoad(source, field.Field.FieldType, context, false, out _, out _))
                 return true;
         }
         return false;
     }
-
-    // A readonly leaf can't take stfld outside its declaring .ctor, but the
-    // verifier's initonly rule only covers stfld/stsfld: ldflda still yields
-    // the member's address and stobj writes the same bytes legally.
-    private static bool InitOnlyLeafAddressable(FieldReference field, MethodAnalysisContext context)
-        => !field.Field.IsStatic
-            && (field.Field.Attributes & FieldAttributes.InitOnly) != 0
-            && field.Field.FieldType.IsValueType
-            && TypeTokenUsableFrom(field.Field.FieldType, context)
-            && FieldReferenceUsableFrom(field, context);
 
     // Frame-pointer- and stack-slot-relative stores ([x29 - N], [stack_N + K])
     // write a native frame slot the lifter never promoted to a local. Each
