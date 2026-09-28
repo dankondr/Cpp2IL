@@ -1786,7 +1786,7 @@ public class IlGeneratorTests
         var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
             app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
         context.ControlFlowGraph = new ISILControlFlowGraph([
-            new(0, OpCode.Move, dest, new Immediate(0)),
+            new(0, OpCode.Move, dest, new Immediate(4)),
             new(1, OpCode.Return)]);
         context.Locals = [dest];
         context.ParameterLocals = [];
@@ -2366,7 +2366,7 @@ public class IlGeneratorTests
         var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller",
             app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
         caller.ControlFlowGraph = new ISILControlFlowGraph([
-            new(0, OpCode.CallVoid, target, new Immediate(0)),
+            new(0, OpCode.CallVoid, target, new Immediate(4)),
             new(1, OpCode.Return)]);
         caller.Locals = [];
         caller.ParameterLocals = [];
