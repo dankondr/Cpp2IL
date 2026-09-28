@@ -129,12 +129,14 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
 
 | castle-recovery#106 `ghost-call-target` (`decompiler-issue`: `Ref struct cannot cross the value/reference boundary`, 765 sites -> 71) | call-target resolution + IL emission | Two Cpp2IL-owned causes fixed: (1) `ResolveCallsViaMethodInfo` trusted any `MethodInfo*` operand in the hidden-argument slot even when it was a stale rgctx-register leftover from a sibling call — every bind path (`MethodAnalysisContext` upgrade, hidden-slot match, no-candidates fallback, shared-address candidate match) now requires `ReceiverTypeConsistent`: the receiver operand's emitted type must reach the represented method's declaring type on generic-erased family terms, and a `&S` receiver also reaches `declaring` through S's unique offset-0 field — a `&ParseContext` operand can no longer bind a `MapField`/`RepeatedField` instance method; unproven callees keep the raw-address operand and emit the `Method not found` diagnostic instead (+181 unbound calls). (2) `TryResolveSlotLoad` narrows a `&S` operand into a `&F` slot through `ldflda` on S's unique offset-0 field of type F (and the inverse `&v.f0` -> `&v` fold), so ref-struct first members like `ParseContext.buffer`/`WriteContext.buffer` fill their slots instead of defaulting (~513 sites). Unresolved calls' raw operands are now treated as dead for `ldftn` store purposes (transitively through `Move` copies), so a method-pointer local consumed only by an unbound call no longer emits an unspellable `__ldftn`. Residual 71 keep the diagnosed default: `Byte[]`/`int`/`nint`/`object`/`char`/`string` operands into value-struct and ref-struct slots (type inference of stack locals, hidden buffers and zero-init stores — #97-adjacent), and a handful of `ParseContext`/`WriteContext`/`Type` operands into collection `this`-slots bound by address-candidate paths that cannot disprove the callee | `Regression/ByRefStructReceiverTests.StaleMethodInfoReceiverMismatchStaysUnresolved`, `FreshMethodInfoWithMatchingReceiverStillBinds`, `StructByRefNarrowsToOffsetZeroField` |
 
+| castle-recovery#113 `invalid-conversion` (compile bucket, vector/scalar binop result typing) | type inference | `PropagateArithmetic` fills an untyped result local with the Unity vector type when an `Add`/`Subtract`/`Multiply`/`Divide` operand — or a `Negate` operand — is a whole `Vector2/3/4` (the lifted op lowers to `VectorN.op_*`/`op_UnaryNegation`, so the result register holds the vector even when a consumer views it as a scalar; a `vector / int` result no longer becomes `int32`, killing the `(double)(vector * x)`/`(Quaternion)(v4 * f)` CS0030/CS0039 casts). Fill-only: a lifter-seeded scalar destination is an honest lane view the operand splitter still reads as `vector.x` | `Regression/VectorOperatorResultTypingTests.*` (3 tests) |
+
 ## Summary
 
 - **84 fork PRs** merged since `b5ad444b` (#1–#79, #81–#85; no #80), plus the
   castle-recovery#NN issue rows.
 - **2 are not live recovery fixes**: #26 (reverted by #27) and #85 (CI only).
-- **103 recovery-fix clusters.** **101** carry reproducing tests (tests added or
+- **104 recovery-fix clusters.** **102** carry reproducing tests (tests added or
   strengthened in the same PR): the 80 through the backfill wave (#16 + #47,
   #38, #40, #41, #57, #58), castle-recovery#74's `UnboxEmissionTests.*`,
   castle-recovery#75's `Arm64VectorLaneLiftingTests.*`,
@@ -155,8 +157,9 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
   castle-recovery#104's `ErasedReceiverSharpeningTests.*`,
   castle-recovery#108's `AddressTakeClobberTests.*`,
   castle-recovery#106's `ByRefStructReceiverTests.*`,
-  castle-recovery#107's `InlinedBaseConstructorCallTests.*`, and
-  castle-recovery#111's `FrameSlotLoadTests.*`.
+  castle-recovery#107's `InlinedBaseConstructorCallTests.*`,
+  castle-recovery#111's `FrameSlotLoadTests.*`, and
+  castle-recovery#113's `VectorOperatorResultTypingTests.*`.
 - **2 remain `none`**, both compile-only fixes: #15 (`IReadOnlySet` on
   netstandard2.0) and #20 (`AddOperands` signature fix, exercised downstream by
   `Arm64LibcMathImportTests`).
