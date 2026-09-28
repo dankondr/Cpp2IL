@@ -2876,7 +2876,7 @@ public static class IlGenerator
         || argument is GenericInstanceTypeAnalysisContext instance
             && instance.GenericArguments.Any(ContainsSharedEnumMarker);
 
-    private static bool ContainsErasedSharedArgument(TypeAnalysisContext argument) =>
+    internal static bool ContainsErasedSharedArgument(TypeAnalysisContext argument) =>
         IsErasedSharedArgument(argument)
         || argument is GenericInstanceTypeAnalysisContext instance
         && instance.GenericArguments.Any(ContainsErasedSharedArgument);
@@ -7554,16 +7554,21 @@ public static class IlGenerator
         if (publicMethod == null)
             return false;
 
-        LoadOperandIntoSlot(instruction.Operands[2], target.Parameters[0].ParameterType,
-            context, method, locals, writeLine);
         if (target.Name == "Internal_FromEulerRad")
         {
+            LoadOperandIntoSlot(instruction.Operands[2], target.Parameters[0].ParameterType,
+                context, method, locals, writeLine);
             method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldc_R4, 57.29578f);
             method.CilMethodBody.Instructions.Add(CilOpCodes.Call, multiply.ToMethodDescriptor());
             method.CilMethodBody.Instructions.Add(CilOpCodes.Call, publicMethod.ToMethodDescriptor());
         }
         else
         {
+            // get_eulerAngles is an instance method on a struct: the receiver must be
+            // Quaternion& on the stack, not a Quaternion value (ilspy prints a value
+            // receiver as `((Quaternion*)local)->eulerAngles`, a CS0030).
+            EmitStructValueReceiver(instruction.Operands[2], quaternion,
+                context, method, locals, writeLine);
             method.CilMethodBody!.Instructions.Add(CilOpCodes.Call, publicMethod.ToMethodDescriptor());
             method.CilMethodBody.Instructions.Add(CilOpCodes.Ldc_R4, 0.017453292f);
             method.CilMethodBody.Instructions.Add(CilOpCodes.Call, multiply.ToMethodDescriptor());
@@ -8056,6 +8061,41 @@ public static class IlGenerator
             default:
                 return false;
         }
+    }
+
+    // An instance method on a struct operand needs `&T` on the stack, not a T
+    // value. A nested field ref whose leaf sits at offset 0 of the struct
+    // container (a whole-struct SIMD read resolving to `this.field.firstMember`)
+    // resolves to the container's address; an operand already emitting `&T`/`T*`
+    // pushes that address; a local/parameter/field/array element has a managed
+    // address via EmitManagedAddress; anything else spills the value into a
+    // scratch local and takes its address.
+    private static void EmitStructValueReceiver(IOperand operand, TypeAnalysisContext structType,
+        MethodAnalysisContext context, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        if (operand is FieldReference nested
+            && nested.Containers.Count > 0
+            && nested.Offset == nested.Containers[^1].Offset
+            && ThisConstructorCallPlan.SameTypeIdentity(nested.Containers[^1].FieldType, structType))
+        {
+            LoadFieldReceiver(nested, context, method, locals, writeLine);
+            return;
+        }
+        if (ReceiverEmitsStructAddress(operand, context, structType))
+        {
+            LoadOperandIntoSlot(operand, new ByRefTypeAnalysisContext(structType),
+                context, method, locals, writeLine);
+            return;
+        }
+        if (EmitManagedAddress(operand, method, context, locals, writeLine))
+            return;
+        LoadOperandIntoSlot(operand, structType, context, method, locals, writeLine);
+        var scratch = new CilLocalVariable(structType.ToTypeSignature());
+        method.CilMethodBody!.LocalVariables.Add(scratch);
+        var instructions = method.CilMethodBody.Instructions;
+        instructions.Add(CilOpCodes.Stloc, scratch);
+        instructions.Add(CilOpCodes.Ldloca, scratch);
     }
 
     // The array an element access was lifted through always declares SzArray, but the
