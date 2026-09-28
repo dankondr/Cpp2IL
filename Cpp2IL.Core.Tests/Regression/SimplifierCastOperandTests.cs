@@ -66,7 +66,7 @@ public class SimplifierCastOperandTests
         // and x left the local table while the cast still named it.
         var app = Cpp2IlApi.CurrentAppContext!;
         var target = app.SystemTypes.SystemExceptionType;
-        var x = new LocalVariable("x", new Register(null, "x"));
+        var x = new LocalVariable("x", new Register(null, "x")) { Type = app.SystemTypes.SystemObjectType };
         var y = new LocalVariable("y", new Register(null, "y"));
         var z = new LocalVariable("z", new Register(null, "z"));
         var cond = new LocalVariable("cond", new Register(null, "cond"));
@@ -122,7 +122,7 @@ public class SimplifierCastOperandTests
         // forwarding y would make the emitted IL invalid.
         var app = Cpp2IlApi.CurrentAppContext!;
         var target = app.SystemTypes.SystemExceptionType;
-        var x = new LocalVariable("x", new Register(null, "x"));
+        var x = new LocalVariable("x", new Register(null, "x")) { Type = app.SystemTypes.SystemObjectType };
         var y = new LocalVariable("y", new Register(null, "y")) { Type = app.SystemTypes.SystemInt32Type };
         var result = new LocalVariable("result", new Register(null, "result"));
         var copy = new Instruction(0, OpCode.Move, x, y);
@@ -145,6 +145,41 @@ public class SimplifierCastOperandTests
                 "the copy must survive while the cast still reads its destination");
             Assert.That(method.Locals.Contains(x), Is.True,
                 "the operand's local must stay in the local table");
+        });
+    }
+
+    [Test]
+    public void NonReferenceOperandLocalKeepsProducerDroppable()
+    {
+        // x is Int32-typed and read only by the cast. Resurrecting its copy would
+        // emit `isinst` on Int32 - invalid IL - while a producerless operand emits
+        // System.Object and verifies. The cast use must stay invisible here, so
+        // the copy dies and the operand keeps its (emitted-as-object) local.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var target = app.SystemTypes.SystemExceptionType;
+        var x = new LocalVariable("x", new Register(null, "x")) { Type = app.SystemTypes.SystemInt32Type };
+        var y = new LocalVariable("y", new Register(null, "y")) { Type = app.SystemTypes.SystemInt32Type };
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var copy = new Instruction(0, OpCode.Move, x, y);
+        var cast = new Instruction(1, OpCode.Move, result, new ReferenceCast(x, target, true));
+        var graph = new ISILControlFlowGraph([
+            copy,
+            cast,
+            new Instruction(2, OpCode.CallVoid, Str("sink"), result),
+            new Instruction(3, OpCode.Return)]);
+        var method = CreateMethod(graph, x, y, result);
+
+        Simplifier.Simplify(method);
+
+        var liveCast = LiveCastOperand(graph);
+        Assert.Multiple(() =>
+        {
+            Assert.That(copy.OpCode, Is.EqualTo(OpCode.Nop),
+                "a producer into a non-reference operand local must stay droppable");
+            Assert.That(method.Locals.Contains(x), Is.False,
+                "the non-reference operand local must leave the local table");
+            Assert.That(liveCast.Value, Is.SameAs(x),
+                "the operand keeps its local, which emits as System.Object");
         });
     }
 

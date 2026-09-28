@@ -440,8 +440,14 @@ public static class Simplifier
 
                         // The operand of a reference cast is a managed-reference slot typed
                         // LocalVariable: reading it is a use, but a constant could never be
-                        // substituted into it, same as a memory base or field receiver.
-                        if (operand is ReferenceCast cast && cast.Value == local)
+                        // substituted into it, same as a memory base or field receiver. The use
+                        // only counts when the operand local can itself carry a managed reference:
+                        // for a value-typed, generic-parameter, pointer or untyped operand the
+                        // producer must stay droppable, because keeping it would type the operand
+                        // as a non-reference stack kind - isinst/castclass rejects those - while a
+                        // producerless operand falls back to emitting System.Object, which verifies.
+                        if (operand is ReferenceCast cast && cast.Value == local &&
+                            IsManagedReferenceLocal(local))
                         {
                             usedByMemory = true;
                             return true;
