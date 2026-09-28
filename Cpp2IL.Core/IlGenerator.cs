@@ -2199,13 +2199,11 @@ public static class IlGenerator
         private static Dictionary<FieldAnalysisContext, int>? ParameterFieldStores(
             MethodAnalysisContext constructor)
         {
+            // Only evidence already produced by the callee's own emission pass
+            // counts - running another method's Analyze() from inside IL
+            // generation would make the plan depend on emission order. A
+            // callee with no lifted body is simply not a candidate.
             var instructions = constructor.ControlFlowGraph?.Instructions ?? constructor.ConvertedIsil;
-            if (instructions == null)
-            {
-                try { constructor.Analyze(); }
-                catch { return null; }
-                instructions = constructor.ControlFlowGraph?.Instructions ?? constructor.ConvertedIsil;
-            }
             if (instructions == null)
                 return null;
 
@@ -2329,11 +2327,21 @@ public static class IlGenerator
             var thisLocal = context.ParameterLocals.FirstOrDefault();
             var argLocals = arguments.OfType<LocalVariable>().ToHashSet();
 
-            var blocks = context.DominatorInfo?.Dominators.TryGetValue(callBlock, out var dominating) == true
-                ? dominating
-                : [callBlock];
-            foreach (var block in blocks)
+            // A dominator-only scan is not enough: an instruction in one arm of
+            // an if/else that rejoins at the call block runs before the call on
+            // some paths without dominating it. Walk the full predecessor
+            // closure - every block that can reach the call - and cut the call
+            // block at the call itself.
+            var pending = new Stack<Block>();
+            var seen = new HashSet<Block>();
+            pending.Push(callBlock);
+            while (pending.Count > 0)
             {
+                var block = pending.Pop();
+                if (!seen.Add(block))
+                    continue;
+                foreach (var predecessor in block.Predecessors)
+                    pending.Push(predecessor);
                 var limit = ReferenceEquals(block, callBlock)
                     ? block.Instructions.IndexOf(call)
                     : block.Instructions.Count;
