@@ -6,6 +6,7 @@ using AsmResolver.PE.DotNet.Metadata.Tables;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.OutputFormats;
 using R = System.Reflection;
 using static Cpp2IL.Core.Tests.Regression.SyntheticFixture;
 
@@ -72,13 +73,18 @@ public class BoxedValueFieldAccessTests
         IlGenerator.GenerateIl(caller, method);
 
         var il = method.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Unbox), Is.True,
+            () => string.Join("\n", il.Select(i => i.ToString())));
+
+        DecompilerMemberAccessRewrites.Apply(method);
+
         Assert.Multiple(() =>
         {
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Unbox), Is.True,
-                () => string.Join("\n", il.Select(i => i.ToString())));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldfld
-                    || i.OpCode == CilOpCodes.Ldobj), Is.True,
-                "the value__ load survives on the managed pointer unbox produced");
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Unbox_Any), Is.True,
+                () => "unbox + ldobj fuses to unbox.any\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Unbox), Is.False,
+                "no bare unbox survives once its ldobj consumer fused");
         });
     }
 
@@ -103,13 +109,19 @@ public class BoxedValueFieldAccessTests
         IlGenerator.GenerateIl(caller, method);
 
         var il = method.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Unbox), Is.True,
+            () => string.Join("\n", il.Select(i => i.ToString())));
+
+        DecompilerMemberAccessRewrites.Apply(method);
+
         Assert.Multiple(() =>
         {
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Unbox), Is.True,
-                () => string.Join("\n", il.Select(i => i.ToString())));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stfld
-                    || i.OpCode == CilOpCodes.Stobj), Is.True,
+                "a store keeps the unboxed managed pointer - no unbox.any exists for it");
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stobj), Is.True,
                 "the value__ store survives on the managed pointer unbox produced");
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stfld
+                    && i.Operand == null), Is.False);
         });
     }
 }
