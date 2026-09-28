@@ -3,6 +3,7 @@ using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using LibCpp2IL.BinaryStructures;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -356,11 +357,26 @@ public static class Simplifier
                                     choice.Field.Local = selectedReplacement;
                         }
 
+
                         // An address-take's compound target (&receiver.field, &array[i].field,
                         // &mem[base+index]) reads the locals inside it like any other operand.
                         else if (operand is AddressOf address && replacement is LocalVariable addressReplacement)
                         {
                             SubstituteInAddressTarget(address, local, addressReplacement);
+                        }
+
+                        // A reference cast's operand is a managed-reference slot just like a memory
+                        // base: only a local replacement may be substituted there, so a constant
+                        // stays put and keeps its defining move alive. The local must itself carry
+                        // a managed reference - a value-typed, generic-parameter, pointer or
+                        // native-handle replacement would emit an isinst/castclass on a
+                        // non-reference stack kind, which ILVerify rejects.
+                        else if (operand is ReferenceCast cast && cast.Value == local &&
+                                 replacement is LocalVariable castReplacement &&
+                                 IsManagedReferenceLocal(castReplacement))
+                        {
+                            instruction.SetOperand(j, new ReferenceCast(castReplacement, cast.Type, cast.NullOnFailure));
+                            UpdateSourceCache(currentBlock, instruction);
                         }
                     }
                 }
@@ -419,7 +435,7 @@ public static class Simplifier
                 case ArrayLength length when length.Array == local:
                     length.Array = replacement;
                     break;
-                case ReferenceCast cast when cast.Value == local:
+                case ReferenceCast cast when cast.Value == local && IsManagedReferenceLocal(replacement):
                     address.Target = new ReferenceCast(replacement, cast.Type, cast.NullOnFailure);
                     break;
                 case AddressOf nested:
@@ -427,6 +443,23 @@ public static class Simplifier
                     break;
             }
         }
+
+        // Whether the local's emitted type can fill an isinst/castclass operand slot, which holds a
+        // managed object reference. The slot accepts exactly the signature kinds that land as object
+        // references - classes, strings, object, arrays, non-value generic instances and boxed
+        // values. Everything else is a non-reference stack kind there: primitives and other value
+        // types load as values, IL2CPP_TYPE_VAR/MVAR load as generic-parameter values, and
+        // pointer, byref, native-int, pinned, sentinel and other exotic kinds all emit signatures
+        // ILVerify rejects in the operand position.
+        private static bool IsManagedReferenceLocal(LocalVariable local) =>
+            local.Type is { IsValueType: false } type
+                && type.Type is Il2CppTypeEnum.IL2CPP_TYPE_CLASS
+                    or Il2CppTypeEnum.IL2CPP_TYPE_STRING
+                    or Il2CppTypeEnum.IL2CPP_TYPE_OBJECT
+                    or Il2CppTypeEnum.IL2CPP_TYPE_SZARRAY
+                    or Il2CppTypeEnum.IL2CPP_TYPE_ARRAY
+                    or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST
+                    or Il2CppTypeEnum.IL2CPP_TYPE_BOXED;
 
         private bool IsLocalUsedAfterInstruction(Block startBlock, int startIndex, LocalVariable local, out bool usedByMemory)
         {
@@ -490,6 +523,21 @@ public static class Simplifier
                         }
 
                         if (operand is AddressOf address && LocalVariables.ContainsLocal(address.Target, local))
+                        {
+                            usedByMemory = true;
+                            return true;
+                        }
+
+                        // The operand of a reference cast is a managed-reference slot typed
+                        // LocalVariable: reading it is a use, but a constant could never be
+                        // substituted into it, same as a memory base or field receiver. The use
+                        // only counts when the operand local can itself carry a managed reference:
+                        // for a value-typed, generic-parameter, pointer or untyped operand the
+                        // producer must stay droppable, because keeping it would type the operand
+                        // as a non-reference stack kind - isinst/castclass rejects those - while a
+                        // producerless operand falls back to emitting System.Object, which verifies.
+                        if (operand is ReferenceCast cast && cast.Value == local &&
+                            IsManagedReferenceLocal(local))
                         {
                             usedByMemory = true;
                             return true;
