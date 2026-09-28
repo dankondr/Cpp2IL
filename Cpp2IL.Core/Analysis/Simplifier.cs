@@ -3,6 +3,7 @@ using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using LibCpp2IL.BinaryStructures;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -357,19 +358,21 @@ public static class Simplifier
         }
 
         // Whether the local's emitted type can fill an isinst/castclass operand slot, which holds a
-        // managed object reference. Handle contexts lower to a pointer-sized int at emission, so
-        // they are excluded alongside value types, generic parameters and pointer/byref types.
+        // managed object reference. The slot accepts exactly the signature kinds that land as object
+        // references - classes, strings, object, arrays, non-value generic instances and boxed
+        // values. Everything else is a non-reference stack kind there: primitives and other value
+        // types load as values, IL2CPP_TYPE_VAR/MVAR load as generic-parameter values, and
+        // pointer, byref, native-int, pinned, sentinel and other exotic kinds all emit signatures
+        // ILVerify rejects in the operand position.
         private static bool IsManagedReferenceLocal(LocalVariable local) =>
-            local.Type is { IsValueType: false }
-                and not GenericParameterTypeAnalysisContext
-                and not PointerTypeAnalysisContext
-                and not ByRefTypeAnalysisContext
-                and not RuntimeClassTypeAnalysisContext
-                and not RuntimeMethodInfoAnalysisContext
-                and not RuntimeFieldInfoAnalysisContext
-                and not StaticFieldStorageTypeAnalysisContext
-                and not RgctxTableTypeAnalysisContext
-                and not MethodRgctxTableTypeAnalysisContext;
+            local.Type is { IsValueType: false } type
+                && type.Type is Il2CppTypeEnum.IL2CPP_TYPE_CLASS
+                    or Il2CppTypeEnum.IL2CPP_TYPE_STRING
+                    or Il2CppTypeEnum.IL2CPP_TYPE_OBJECT
+                    or Il2CppTypeEnum.IL2CPP_TYPE_SZARRAY
+                    or Il2CppTypeEnum.IL2CPP_TYPE_ARRAY
+                    or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST
+                    or Il2CppTypeEnum.IL2CPP_TYPE_BOXED;
 
         private bool IsLocalUsedAfterInstruction(Block startBlock, int startIndex, LocalVariable local, out bool usedByMemory)
         {
