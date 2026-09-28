@@ -32,7 +32,7 @@ public class SimplifierCastOperandTests
         var app = Cpp2IlApi.CurrentAppContext!;
         var target = app.SystemTypes.SystemExceptionType;
         var x = new LocalVariable("x", new Register(null, "x"));
-        var y = new LocalVariable("y", new Register(null, "y"));
+        var y = new LocalVariable("y", new Register(null, "y")) { Type = app.SystemTypes.SystemStringType };
         var result = new LocalVariable("result", new Register(null, "result"));
         var copy = new Instruction(0, OpCode.Move, x, y);
         var cast = new Instruction(1, OpCode.Move, result, new ReferenceCast(x, target, true));
@@ -110,6 +110,41 @@ public class SimplifierCastOperandTests
                 "the path-B definition must survive while the cast still reads x");
             Assert.That(method.Locals.Contains(x), Is.True,
                 "the join's local must stay in the local table");
+        });
+    }
+
+    [Test]
+    public void ValueTypedCopySourceIsNotSubstitutedIntoCastOperand()
+    {
+        // x := y where y holds an int; result := isinst<T>(x). A value-typed local
+        // cannot fill the cast's managed-reference operand slot (emitted isinst
+        // rejects Int32), so the operand keeps x and the defining move survives -
+        // forwarding y would make the emitted IL invalid.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var target = app.SystemTypes.SystemExceptionType;
+        var x = new LocalVariable("x", new Register(null, "x"));
+        var y = new LocalVariable("y", new Register(null, "y")) { Type = app.SystemTypes.SystemInt32Type };
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var copy = new Instruction(0, OpCode.Move, x, y);
+        var cast = new Instruction(1, OpCode.Move, result, new ReferenceCast(x, target, true));
+        var graph = new ISILControlFlowGraph([
+            copy,
+            cast,
+            new Instruction(2, OpCode.CallVoid, Str("sink"), result),
+            new Instruction(3, OpCode.Return)]);
+        var method = CreateMethod(graph, x, y, result);
+
+        Simplifier.Simplify(method);
+
+        var liveCast = LiveCastOperand(graph);
+        Assert.Multiple(() =>
+        {
+            Assert.That(liveCast.Value, Is.SameAs(x),
+                "a value-typed source must not be substituted into the cast operand");
+            Assert.That(copy.OpCode, Is.EqualTo(OpCode.Move),
+                "the copy must survive while the cast still reads its destination");
+            Assert.That(method.Locals.Contains(x), Is.True,
+                "the operand's local must stay in the local table");
         });
     }
 

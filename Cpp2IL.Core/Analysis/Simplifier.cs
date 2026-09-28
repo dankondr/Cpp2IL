@@ -328,9 +328,13 @@ public static class Simplifier
 
                         // A reference cast's operand is a managed-reference slot just like a memory
                         // base: only a local replacement may be substituted there, so a constant
-                        // stays put and keeps its defining move alive.
+                        // stays put and keeps its defining move alive. The local must itself carry
+                        // a managed reference - a value-typed, generic-parameter, pointer or
+                        // native-handle replacement would emit an isinst/castclass on a
+                        // non-reference stack kind, which ILVerify rejects.
                         else if (operand is ReferenceCast cast && cast.Value == local &&
-                                 replacement is LocalVariable castReplacement)
+                                 replacement is LocalVariable castReplacement &&
+                                 IsManagedReferenceLocal(castReplacement))
                         {
                             instruction.SetOperand(j, new ReferenceCast(castReplacement, cast.Type, cast.NullOnFailure));
                             UpdateSourceCache(currentBlock, instruction);
@@ -351,6 +355,21 @@ public static class Simplifier
                 }
             }
         }
+
+        // Whether the local's emitted type can fill an isinst/castclass operand slot, which holds a
+        // managed object reference. Handle contexts lower to a pointer-sized int at emission, so
+        // they are excluded alongside value types, generic parameters and pointer/byref types.
+        private static bool IsManagedReferenceLocal(LocalVariable local) =>
+            local.Type is { IsValueType: false }
+                and not GenericParameterTypeAnalysisContext
+                and not PointerTypeAnalysisContext
+                and not ByRefTypeAnalysisContext
+                and not RuntimeClassTypeAnalysisContext
+                and not RuntimeMethodInfoAnalysisContext
+                and not RuntimeFieldInfoAnalysisContext
+                and not StaticFieldStorageTypeAnalysisContext
+                and not RgctxTableTypeAnalysisContext
+                and not MethodRgctxTableTypeAnalysisContext;
 
         private bool IsLocalUsedAfterInstruction(Block startBlock, int startIndex, LocalVariable local, out bool usedByMemory)
         {
