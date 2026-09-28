@@ -4514,10 +4514,30 @@ public static class IlGenerator
         // (or substitutes a contract-typed default), so the receiver always ends
         // up assignable to the declaring type there. A value owner takes the
         // operand's own managed address - its referent must be the owner.
-        if (contract is not ByRefTypeAnalysisContext)
+        if (contract is not ByRefTypeAnalysisContext byRefContract)
             return declaring;
-        return receiverType is ByRefTypeAnalysisContext byRefReceiver ? byRefReceiver.ElementType : receiverType;
+        return receiverType switch
+        {
+            ByRefTypeAnalysisContext byRefReceiver => byRefReceiver.ElementType,
+            // `unbox` lands the reference as `&T` - the member binds to T.
+            _ when FieldReceiverUnboxes(receiverOperand, byRefContract.ElementType, context)
+                => byRefContract.ElementType,
+            _ => receiverType,
+        };
     }
+
+    // Mirrors the `unbox` arm EmitManagedAddress applies to a local emitting as
+    // a true object reference under a `&T` contract: the stack then holds `&T`
+    // so the referent a member binds against is T. Any other operand pushes
+    // whatever it already is (`&U`, a raw pointer, or the reference itself).
+    private static bool FieldReceiverUnboxes(IOperand receiverOperand,
+        TypeAnalysisContext? pointeeType, MethodAnalysisContext context)
+        => receiverOperand is LocalVariable receiverLocal
+            && EmittedLocalType(receiverLocal, context) is { IsValueType: false } emittedReceiver
+            && IntegralStackWidth(emittedReceiver) == 0
+            && pointeeType is { IsValueType: true } or GenericParameterTypeAnalysisContext
+            && !IsByRefLike(pointeeType)
+            && TypeTokenUsableFrom(pointeeType, context);
 
     // The field type the emitted container member actually carries, which is
     // the next link's receiver and the field type a leaf's declaring check
@@ -4611,9 +4631,10 @@ public static class IlGenerator
                 method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldarg_0);
                 return;
             }
-            if (contract is ByRefTypeAnalysisContext)
+            if (contract is ByRefTypeAnalysisContext byRef)
             {
-                if (!EmitManagedAddress(field.Local, method, context, locals, writeLine))
+                if (!EmitManagedAddress(field.Local, method, context, locals, writeLine,
+                        byRef.ElementType))
                     PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context);
             }
             else
@@ -4817,7 +4838,7 @@ public static class IlGenerator
                 || !FieldUsableFrom(field.Field, context, receiverType: nestedReceiverType)
                 && nestedGetter == null))
             return false;
-        if (!EmitManagedAddress(field.Local, method, context, locals, writeLine))
+        if (!EmitManagedAddress(field.Local, method, context, locals, writeLine, enumerator))
             return false;
 
         var concreteGetter = new ConcreteGenericMethodAnalysisContext(getter, enumerator.GenericArguments, []);
@@ -6555,6 +6576,29 @@ public static class IlGenerator
             return true;
         }
 
+        // `ref -> &T` is the managed-pointer sibling of the unbox.any arm
+        // above: `unbox` asserts the reference boxes T and pushes exactly the
+        // `&T` the slot wants. Other pointer contracts (`&ref`, `*`) have no
+        // legal bridge from a reference - and no castclass token either - so
+        // the caller defaults the slot. Only a true object reference
+        // (fromWidth 0) can unbox: `&T`, `*` and nint sources keep the existing
+        // arms (`&` satisfies `&` as-is; a pointer/nint is already a usable
+        // receiver).
+        if (fromWidth == 0 && to is ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+        {
+            var pointee = to is ByRefTypeAnalysisContext byRefTo ? byRefTo.ElementType : null;
+            if (pointee is { IsValueType: true } or GenericParameterTypeAnalysisContext
+                && !IsByRefLike(pointee))
+            {
+                if (!TypeTokenUsableFrom(pointee, context))
+                    return false;
+                instructions.Add(CilOpCodes.Unbox,
+                    pointee.ToTypeSignature().ToTypeDefOrRef());
+                return true;
+            }
+            return false;
+        }
+
         if (!from.IsValueType && !to.IsValueType)
         {
             // When the cast token cannot be emitted the value is left as-is: it may
@@ -8196,7 +8240,8 @@ public static class IlGenerator
                 || IntegralStackWidth(addressField.FieldType) != 0
                     && destinationType is not ByRefTypeAnalysisContext and not PointerTypeAnalysisContext
                     && IntegralStackWidth(destinationType) != 0)
-            && EmitManagedAddress(address, method, context, locals, writeLine))
+            && EmitManagedAddress(address, method, context, locals, writeLine,
+                addressField.DeclaringType))
         {
             instructions.Add(CilOpCodes.Ldfld,
                 FieldDescriptorFor(addressField, EmittedOperandType(address, context)));
@@ -8209,7 +8254,8 @@ public static class IlGenerator
         if (TryGetPackedFieldAccess(instruction, context, out var packed, out var packedField, out var otherOperand)
             && FieldUsableFrom(packedField, context,
                 receiverType: packedField.IsStatic ? null : EmittedOperandType(packed, context))
-            && EmitManagedAddress(packed, method, context, locals, writeLine))
+            && EmitManagedAddress(packed, method, context, locals, writeLine,
+                packedField.DeclaringType))
         {
             var fieldType = packedField.FieldType;
             instructions.Add(CilOpCodes.Ldfld,
@@ -9109,12 +9155,16 @@ public static class IlGenerator
         _ => 0,
     };
 
-    // Pushes a managed address (`&`) or object reference that ldfld/ldflda can
-    // consume for the given storage operand. Returns false for anything that has
-    // no managed address.
+    // Emits a managed pointer to an operand's storage, or the reference that
+    // ldfld/ldflda can consume where no `&` is needed. `pointeeType` names the
+    // T of the caller's `&T` contract where it is knowable: a local that emits
+    // as a reference then claims to box T, and `unbox` is the only verifier-
+    // legal bridge from a reference to a managed pointer. A value-type pointee
+    // the caller cannot name here stays unrecoverable so the slot defaults
+    // honestly instead of leaving a bare reference where `&T` belongs.
     private static bool EmitManagedAddress(IOperand operand, MethodDefinition method,
         MethodAnalysisContext context, Dictionary<LocalVariable, CilLocalVariable> locals,
-        IMethodDescriptor writeLine)
+        IMethodDescriptor writeLine, TypeAnalysisContext? pointeeType = null)
     {
         var instructions = method.CilMethodBody!.Instructions;
         switch (operand)
@@ -9124,12 +9174,24 @@ public static class IlGenerator
                 return true;
             case LocalVariable local:
                 var parameter = ParameterForLocal(local, method, context);
-                if (EmittedLocalType(local, context) is { IsValueType: false })
+                if (EmittedLocalType(local, context) is { IsValueType: false } emittedType)
                 {
                     if (parameter != null)
                         instructions.Add(CilOpCodes.Ldarg, parameter);
                     else
                         instructions.Add(CilOpCodes.Ldloc, locals[local]);
+                    if (pointeeType is not ({ IsValueType: true } or GenericParameterTypeAnalysisContext)
+                        || IntegralStackWidth(emittedType) != 0)
+                        // A native or managed pointer (width -1) is already a
+                        // legal receiver for ldfld/ldobj - keep the push. Only a
+                        // true object reference (width 0) bridges via unbox.
+                        return true;
+                    if (IsByRefLike(pointeeType)
+                        || !TypeTokenUsableFrom(pointeeType, context))
+                        return false;
+                    instructions.Add(CilOpCodes.Unbox,
+                        pointeeType.ToTypeSignature().ToTypeDefOrRef());
+                    return true;
                 }
                 else if (parameter != null)
                     instructions.Add(CilOpCodes.Ldarga, parameter);
@@ -9146,7 +9208,8 @@ public static class IlGenerator
                     return false;
                 if (field.Containers.Count == 0)
                 {
-                    if (!EmitManagedAddress(field.Local, method, context, locals, writeLine))
+                    if (!EmitManagedAddress(field.Local, method, context, locals, writeLine,
+                            field.Field.DeclaringType))
                         return false;
                 }
                 else
@@ -9192,7 +9255,7 @@ public static class IlGenerator
                 context, method, locals, writeLine);
             return;
         }
-        if (EmitManagedAddress(operand, method, context, locals, writeLine))
+        if (EmitManagedAddress(operand, method, context, locals, writeLine, structType))
             return;
         LoadOperandIntoSlot(operand, structType, context, method, locals, writeLine);
         var scratch = new CilLocalVariable(structType.ToTypeSignature());
