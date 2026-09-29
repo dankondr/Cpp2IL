@@ -386,42 +386,55 @@ public class SsaForm
     private void InsertPhiFunctions(ISILControlFlowGraph graph, DominatorInfo dominance)
     {
         var defSites = GetDefinitionSites(graph);
-        var liveIn = ComputeLiveIn(graph);
+        var hasPhi = new Dictionary<int, HashSet<Block>>();
 
-        foreach (var entry in defSites)
+        // Iterate insertion and liveness to a fixpoint: a phi the gate keeps
+        // makes the register used on its predecessor edges, so a join that was
+        // dead before the phi existed can become live. Only-adding-phis keeps
+        // the loop monotone, so it terminates.
+        var inserted = true;
+        while (inserted)
         {
-            var regNumber = entry.Key;
-            var sites = entry.Value;
+            inserted = false;
+            var liveIn = ComputeLiveIn(graph);
 
-            var workList = new Queue<Block>(sites);
-            var onWorkList = new HashSet<Block>(sites);
-            var hasPhi = new HashSet<Block>();
-
-            while (workList.Count > 0)
+            foreach (var entry in defSites)
             {
-                var block = workList.Dequeue();
+                var regNumber = entry.Key;
+                var sites = entry.Value;
+                if (!hasPhi.TryGetValue(regNumber, out var keeps))
+                    keeps = hasPhi[regNumber] = new HashSet<Block>();
 
-                if (!dominance.DominanceFrontier.TryGetValue(block, out var frontier))
-                    continue;
+                var workList = new Queue<Block>(sites);
+                var onWorkList = new HashSet<Block>(sites);
 
-                foreach (var frontierBlock in frontier)
+                while (workList.Count > 0)
                 {
-                    // Pruned SSA: a phi is only worth materializing where the
-                    // register is live-in - a join no path can read would emit
-                    // dead edge copies (often between differently-typed reuse
-                    // versions of the same register).
-                    if (!liveIn[frontierBlock].Contains(regNumber))
+                    var block = workList.Dequeue();
+
+                    if (!dominance.DominanceFrontier.TryGetValue(block, out var frontier))
                         continue;
 
-                    // Only one phi per (block, register).
-                    if (!hasPhi.Add(frontierBlock))
-                        continue;
+                    foreach (var frontierBlock in frontier)
+                    {
+                        // Pruned SSA: a phi is only worth materializing where the
+                        // register is live-in - a join no path can read would emit
+                        // dead edge copies (often between differently-typed reuse
+                        // versions of the same register).
+                        if (!liveIn[frontierBlock].Contains(regNumber))
+                            continue;
 
-                    InsertPhiSkeleton(frontierBlock, regNumber);
+                        // Only one phi per (block, register).
+                        if (!keeps.Add(frontierBlock))
+                            continue;
 
-                    // Inserting a phi is itself a definition, so propagate to its frontier too.
-                    if (onWorkList.Add(frontierBlock))
-                        workList.Enqueue(frontierBlock);
+                        InsertPhiSkeleton(frontierBlock, regNumber);
+                        inserted = true;
+
+                        // Inserting a phi is itself a definition, so propagate to its frontier too.
+                        if (onWorkList.Add(frontierBlock))
+                            workList.Enqueue(frontierBlock);
+                    }
                 }
             }
         }
@@ -448,10 +461,23 @@ public class SsaForm
             {
                 var clobbering = _clobbering.Contains(instruction);
                 var destination = instruction.Destination;
+                // Match the destination by position, not identity: a phi
+                // skeleton repeats one Register instance in every operand slot
+                // and only its first slot is the def.
+                var destinationIndex = -1;
+                if (destination != null)
+                    for (var i = 0; i < instruction.Operands.Count; i++)
+                        if (ReferenceEquals(instruction.Operands[i], destination))
+                        {
+                            destinationIndex = i;
+                            break;
+                        }
 
-                foreach (var operand in instruction.Operands)
+                for (var i = 0; i < instruction.Operands.Count; i++)
                 {
-                    if (ReferenceEquals(operand, destination))
+                    var operand = instruction.Operands[i];
+
+                    if (i == destinationIndex)
                     {
                         // A compound destination (memory cell, field store,
                         // array slot) still reads the registers inside it;
@@ -468,10 +494,16 @@ public class SsaForm
                             use.Add(number);
                 }
 
-                if (destination is Register destinationRegister)
-                    def.Add(destinationRegister.Number);
-                else if (destination is LocalVariable destinationLocal)
-                    def.Add(destinationLocal.Register.Number);
+                // A phi destination is a join, not a kill: it forwards the
+                // reaching version, so it must not block liveness flowing
+                // through the block to phi uses downstream.
+                if (instruction.OpCode != OpCode.Phi)
+                {
+                    if (destination is Register destinationRegister)
+                        def.Add(destinationRegister.Number);
+                    else if (destination is LocalVariable destinationLocal)
+                        def.Add(destinationLocal.Register.Number);
+                }
 
                 if (instruction.ImplicitDefinition is { } clobbered)
                     def.Add(clobbered.Number);
