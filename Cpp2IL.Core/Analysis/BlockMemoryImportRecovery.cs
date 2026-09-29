@@ -224,12 +224,6 @@ public static class BlockMemoryImportRecovery
     {
         if (operand is Immediate)
             return true;
-        // A pointer-typed local declares nint in the emitted signature; judge the
-        // operand on its recovered type so a pointer value still misses the slot.
-        if (operand is LocalVariable local
-            && IlGenerator.EmittedLocalTypeCore(local, context, [])
-                is PointerTypeAnalysisContext or ByRefTypeAnalysisContext)
-            return false;
         var emitted = IlGenerator.EmittedOperandType(operand, context);
         return emitted is not (null or PointerTypeAnalysisContext or ByRefTypeAnalysisContext)
             && IlGenerator.IntegralStackWidth(emitted) != 0;
@@ -269,12 +263,6 @@ public static class BlockMemoryImportRecovery
             case AddressOf:
                 return false;
             case LocalVariable local:
-                // The pointer's element type is provenance, not signature: the local
-                // declares nint where the value is a T*, so judge the region on the
-                // pre-erasure type (string* still points into reference cells).
-                if (IlGenerator.EmittedLocalTypeCore(local, context, [])
-                        is PointerTypeAnalysisContext corePointer)
-                    return IsReferenceFree(corePointer.ElementType);
                 return IlGenerator.EmittedOperandType(local, context) switch
                 {
                     PointerTypeAnalysisContext pointer => IsReferenceFree(pointer.ElementType),
@@ -387,9 +375,6 @@ public static class BlockMemoryImportRecovery
             case AddressOf:
                 return false;
             case LocalVariable baseLocal:
-                if (IlGenerator.EmittedLocalTypeCore(baseLocal, context, [])
-                        is PointerTypeAnalysisContext basePointer)
-                    return IsReferenceFree(basePointer.ElementType);
                 switch (IlGenerator.EmittedOperandType(baseLocal, context))
                 {
                     case PointerTypeAnalysisContext pointer:
