@@ -319,6 +319,8 @@ public static class IlGenerator
         // try, and the handler carries base.Finalize + endfinally.
         Analysis.FinalizerEhRecovery.Apply(context, definition, instructionMap);
 
+        RemoveDiscardedDefaults(definition, writeLine);
+
         // Nothing may fall off the physical end of a body: a conditional branch
         // (or any other fall-through-capable opcode) as the last instruction
         // makes the verifier index a fall-through block past the code end. The
@@ -1129,6 +1131,33 @@ public static class IlGenerator
                 var structCallee = !targetMethod.IsStatic && targetMethod.DeclaringType is { IsValueType: true } structDeclaring
                     ? structDeclaring
                     : null;
+
+                // Non-.ctor targets are final here, so a hidden shared-generic
+                // argument in any parameter slot is known before the receiver
+                // or earlier arguments are pushed; failing now leaves nothing
+                // stranded ahead of the throw.
+                if (targetMethod.Name != ".ctor")
+                {
+                    var scanParamIndex = instruction.OpCode == OpCode.Call
+                        ? (targetMethod.IsStatic ? 2 : 3)
+                        : (targetMethod.IsStatic ? 1 : 2);
+                    var scanArgs = instruction.Operands.Count - scanParamIndex;
+                    var sharedGenericAbort = false;
+                    for (var i = 0; i < targetMethod.Parameters.Count && i < scanArgs; i++)
+                    {
+                        var parameterType = targetMethod.Parameters[i].ParameterType;
+                        if (!OperandFeedsParameter(instruction.Operands[scanParamIndex + i], parameterType))
+                        {
+                            EmitUnrecoverableOperation(method, writeLine,
+                                $"A hidden shared-generic argument landed in parameter slot {parameterType.FullName}; the real argument was dropped upstream.");
+                            sharedGenericAbort = true;
+                            break;
+                        }
+                    }
+                    if (sharedGenericAbort)
+                        break;
+                }
+
                 var isOwnThis = false;
                 if (!targetMethod.IsStatic) // Load 'this' param
                 {
@@ -1301,6 +1330,7 @@ public static class IlGenerator
                 // unknown-callee convention gave it, which may be fewer than the method actually takes.
                 // The stack still has to match the signature, so anything missing gets a placeholder.
                 var availableArgs = instruction.Operands.Count - callParamIndex;
+                var callAborted = false;
                 for (var i = 0; i < targetMethod.Parameters.Count; i++)
                 {
                     var parameterType = targetMethod.Parameters[i].ParameterType;
@@ -1308,27 +1338,14 @@ public static class IlGenerator
                     if (i < availableArgs)
                     {
                         var argumentOperand = instruction.Operands[callParamIndex + i];
-                        var operandFeedsParameter = argumentOperand switch
-                        {
-                            RuntimeMethodInfoAnalysisContext => parameterType.FullName
-                                is "System.RuntimeMethodHandle" or "System.IntPtr" or "System.UIntPtr",
-                            RuntimeFieldInfoAnalysisContext => parameterType.FullName
-                                is "System.RuntimeFieldHandle" or "System.IntPtr" or "System.UIntPtr",
-                            RuntimeClassTypeAnalysisContext => parameterType.FullName
-                                is "System.RuntimeTypeHandle" or "System.Type" or "System.Object"
-                                    or "System.IntPtr" or "System.UIntPtr",
-                            RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext
-                                or StaticFieldStorageTypeAnalysisContext => parameterType.FullName
-                                is "System.IntPtr" or "System.UIntPtr",
-                            _ => true,
-                        };
-                        if (!operandFeedsParameter)
+                        if (!OperandFeedsParameter(argumentOperand, parameterType))
                         {
                             // A hidden shared-generic argument (MethodInfo*/klass*/rgctx) landed in a
-                            // real parameter slot; the actual argument was dropped upstream. Stub the
-                            // slot rather than emit a wrongly-typed placeholder.
-                            PushDefaultOf(parameterType, method, instructions, context,
+                            // real parameter slot; the actual argument was dropped upstream, so the
+                            // call can never be made honestly - fail rather than stub the slot.
+                            EmitUnrecoverableOperation(method, writeLine,
                                 $"A hidden shared-generic argument landed in parameter slot {parameterType.FullName}; the real argument was dropped upstream.");
+                            callAborted = true;
                         }
                         else if (!TryEmitDelegateCtorPointer(argumentOperand, parameterType,
                                      targetMethod, context, instructions))
@@ -1338,6 +1355,9 @@ public static class IlGenerator
                     else
                         PushDefaultOf(parameterType, method, instructions, context);
                 }
+
+                if (callAborted)
+                    break;
 
                 if (ctorReinitReceiver != null)
                 {
@@ -6380,6 +6400,187 @@ public static class IlGenerator
         }
     }
 
+    // A slot whose operand was never produced is filled with a synthetic
+    // default (a note plus ldnull/ldc/default(T)); a destination with no store
+    // spelling then reports the drop by popping that value right back off, and
+    // the pair decompiles to `_ = <expr>` (CS8183 for `_ = null`). The
+    // diagnostics already name the site, so cut the discarded value and its
+    // pop out of the emitted sequence entirely.
+    private static void RemoveDiscardedDefaults(MethodDefinition method, IMethodDescriptor writeLine)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+
+        // Every instruction another instruction or handler boundary points at
+        // is a label target; removing one of those would orphan the label.
+        HashSet<CilInstruction> referenced = [];
+        foreach (var instruction in instructions)
+        {
+            switch (instruction.Operand)
+            {
+                case CilInstructionLabel { Instruction: { } labelTarget }:
+                    referenced.Add(labelTarget);
+                    break;
+                case CilInstruction directTarget:
+                    referenced.Add(directTarget);
+                    break;
+                case IEnumerable<ICilLabel> labels:
+                    foreach (var label in labels)
+                        if (label is CilInstructionLabel { Instruction: { } switchTarget })
+                            referenced.Add(switchTarget);
+                    break;
+            }
+        }
+        foreach (var handler in method.CilMethodBody.ExceptionHandlers)
+        {
+            foreach (var boundary in new ICilLabel?[]
+                     {
+                         handler.TryStart, handler.TryEnd,
+                         handler.HandlerStart, handler.HandlerEnd,
+                         handler.FilterStart,
+                     })
+            {
+                if (boundary is CilInstructionLabel { Instruction: { } boundaryTarget })
+                    referenced.Add(boundaryTarget);
+            }
+        }
+
+        for (var i = instructions.Count - 1; i >= 0; i--)
+        {
+            if (instructions[i].OpCode != CilOpCodes.Pop)
+                continue;
+            // The discarded value sits between the note announcing its default
+            // and the pop; drop arms may emit the store's own note in between
+            // ("Store into unknown operand").
+            var valueEnd = i - 1;
+            while (valueEnd >= 1
+                   && IsDecompilerNotePair(instructions[valueEnd - 1], instructions[valueEnd], writeLine))
+                valueEnd -= 2;
+            if (valueEnd < 0)
+                continue;
+            var valueStart = DefaultEmissionStart(instructions, valueEnd);
+            if (valueStart < 2
+                || !IsDecompilerNotePair(instructions[valueStart - 2], instructions[valueStart - 1], writeLine))
+                continue;
+            var cutsLabelTarget = false;
+            for (var j = valueStart; j <= i; j++)
+                if (referenced.Contains(instructions[j]))
+                {
+                    cutsLabelTarget = true;
+                    break;
+                }
+            if (cutsLabelTarget
+                && !RetargetDiscardedRange(method, instructions, valueStart, i))
+                continue;
+            for (var j = i; j >= valueStart; j--)
+                instructions.RemoveAt(j);
+            i = valueStart; // resume before the cut in case discards chained
+        }
+    }
+
+    // A label or handler boundary landing inside the removal range is
+    // redirected to the instruction just past the pop: the discarded sequence
+    // is stack-neutral, so jumping to it is jumping past it. Returns false when
+    // the range ends at the physical body end or a target cannot be rewritten.
+    private static bool RetargetDiscardedRange(MethodDefinition method,
+        CilInstructionCollection instructions, int valueStart, int end)
+    {
+        if (end + 1 >= instructions.Count)
+            return false;
+        var after = instructions[end + 1];
+        HashSet<CilInstruction> range = [];
+        for (var j = valueStart; j <= end; j++)
+            range.Add(instructions[j]);
+
+        foreach (var instruction in instructions)
+        {
+            switch (instruction.Operand)
+            {
+                case CilInstructionLabel { Instruction: { } labelTarget } label
+                    when range.Contains(labelTarget):
+                    label.Instruction = after;
+                    break;
+                case CilInstruction directTarget when range.Contains(directTarget):
+                    instruction.Operand = after;
+                    break;
+                case IEnumerable<ICilLabel> labels:
+                    foreach (var label in labels)
+                        if (label is CilInstructionLabel { Instruction: { } switchTarget } switchLabel
+                            && range.Contains(switchTarget))
+                            switchLabel.Instruction = after;
+                    break;
+            }
+        }
+        foreach (var handler in method.CilMethodBody!.ExceptionHandlers)
+        {
+            foreach (var boundary in new ICilLabel?[]
+                     {
+                         handler.TryStart, handler.TryEnd,
+                         handler.HandlerStart, handler.HandlerEnd,
+                         handler.FilterStart,
+                     })
+            {
+                if (boundary is CilInstructionLabel { Instruction: { } boundaryTarget } boundaryLabel
+                    && range.Contains(boundaryTarget))
+                    boundaryLabel.Instruction = after;
+            }
+        }
+        return true;
+    }
+
+    // Whether an operand can honestly feed a parameter slot: the hidden
+    // shared-generic contexts (MethodInfo*/klass*/rgctx tables) only spell the
+    // handle shapes IL2CPP actually passes them in; anything else means the
+    // real argument was dropped upstream and the operand array shifted.
+    private static bool OperandFeedsParameter(IOperand argumentOperand, TypeAnalysisContext? parameterType)
+        => argumentOperand switch
+        {
+            RuntimeMethodInfoAnalysisContext => parameterType?.FullName
+                is "System.RuntimeMethodHandle" or "System.IntPtr" or "System.UIntPtr",
+            RuntimeFieldInfoAnalysisContext => parameterType?.FullName
+                is "System.RuntimeFieldHandle" or "System.IntPtr" or "System.UIntPtr",
+            RuntimeClassTypeAnalysisContext => parameterType?.FullName
+                is "System.RuntimeTypeHandle" or "System.Type" or "System.Object"
+                    or "System.IntPtr" or "System.UIntPtr",
+            RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext
+                or StaticFieldStorageTypeAnalysisContext => parameterType?.FullName
+                is "System.IntPtr" or "System.UIntPtr",
+            _ => true,
+        };
+
+    private static bool IsDecompilerNotePair(CilInstruction text, CilInstruction call, IMethodDescriptor writeLine)
+        => text.OpCode == CilOpCodes.Ldstr && call.OpCode == CilOpCodes.Call
+            && call.Operand is IMethodDescriptor callee && callee.FullName == writeLine.FullName;
+
+    // The instructions a default substitution emits end at `end`: ldnull for
+    // references, a ldc.* constant optionally followed by conv.i/conv.u for
+    // primitives and pointers, or the ldloca/initobj/ldloc triple for whole
+    // value types. Anything else pushed before the pop is a real value and
+    // stays.
+    private static int DefaultEmissionStart(CilInstructionCollection instructions, int end)
+    {
+        var last = instructions[end];
+        if (IsConstantDefaultPush(last) || last.OpCode == CilOpCodes.Ldloca)
+            return end;
+        if (last.OpCode.Code is CilCode.Conv_I or CilCode.Conv_U
+            && end - 1 >= 0 && IsConstantDefaultPush(instructions[end - 1]))
+            return end - 1;
+        if (last.OpCode.Code is CilCode.Ldloc or CilCode.Ldloc_0 or CilCode.Ldloc_1
+                or CilCode.Ldloc_2 or CilCode.Ldloc_3 or CilCode.Ldloc_S
+            && end - 2 >= 0
+            && instructions[end - 1].OpCode == CilOpCodes.Initobj
+            && instructions[end - 2].OpCode.Code is CilCode.Ldloca or CilCode.Ldloca_S
+            && Equals(instructions[end - 2].Operand, instructions[end].Operand))
+            return end - 2;
+        return -1;
+    }
+
+    private static bool IsConstantDefaultPush(CilInstruction instruction)
+        => instruction.OpCode.Code is CilCode.Ldnull
+            or CilCode.Ldc_I4 or CilCode.Ldc_I4_S or CilCode.Ldc_I4_0 or CilCode.Ldc_I4_1
+            or CilCode.Ldc_I4_2 or CilCode.Ldc_I4_3 or CilCode.Ldc_I4_4 or CilCode.Ldc_I4_5
+            or CilCode.Ldc_I4_6 or CilCode.Ldc_I4_7 or CilCode.Ldc_I4_8 or CilCode.Ldc_I4_M1
+            or CilCode.Ldc_I8 or CilCode.Ldc_R4 or CilCode.Ldc_R8;
+
     // Reason string for a substituted slot value. The ref-struct boundary
     // wording is preserved verbatim so diagnostics emitted before the note
     // became unconditional keep their cluster text.
@@ -9638,7 +9839,8 @@ public static class IlGenerator
                 if (!FieldReferenceUsableFrom(field, context, writeAccess: true))
                 {
                     // The value is already on the stack; the field cannot legally
-                    // be referenced here, so fail honestly.
+                    // be referenced here, so drop it and fail honestly.
+                    instructions.Add(CilOpCodes.Pop);
                     EmitUnrecoverableOperation(method, writeLine,
                         $"Inaccessible field store: {field.Field.DeclaringType?.FullName}.{field.Field.Name}");
                     break;
