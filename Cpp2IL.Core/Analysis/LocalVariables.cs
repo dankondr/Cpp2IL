@@ -2312,32 +2312,45 @@ public static class LocalVariables
             switch (instruction.OpCode)
             {
                 case OpCode.Move:
-                    SplitMoveOperandViews(instruction);
+                    SplitMoveOperandViews(method, instruction);
                     break;
                 case OpCode.Negate or OpCode.Not
                     or OpCode.Add or OpCode.Subtract or OpCode.Multiply
                     or OpCode.Divide or OpCode.Modulo
                     or OpCode.And or OpCode.Or or OpCode.Xor
                     or OpCode.ShiftLeft or OpCode.ShiftRight:
-                    SplitScalarSources(instruction);
+                    SplitScalarSources(method, instruction);
                     break;
                 case OpCode.CheckEqual or OpCode.CheckNotEqual
                     or OpCode.CheckGreater or OpCode.CheckGreaterOrEqual
                     or OpCode.CheckLess or OpCode.CheckLessOrEqual:
-                    SplitScalarComparisonSources(instruction);
+                    SplitScalarComparisonSources(method, instruction);
                     break;
             }
         }
     }
 
-    private static void SplitMoveOperandViews(Instruction instruction)
+    private static void SplitMoveOperandViews(MethodAnalysisContext method, Instruction instruction)
     {
-        if (instruction.Operands.Count < 2 || instruction.Operands[0] is not LocalVariable destination)
+        if (instruction.Operands.Count < 2)
+            return;
+
+        // A store through a scalar-typed field slot sees the same low-lane view
+        // a scalar local does, so a register-view source splits to its lane-0
+        // field here too.
+        if (instruction.Operands[0] is FieldReference { Field.FieldType: { } fieldType }
+            && IsScalarLaneType(fieldType))
+        {
+            SplitScalarSources(method, instruction, fieldType);
+            return;
+        }
+
+        if (instruction.Operands[0] is not LocalVariable destination)
             return;
 
         if (IsScalarLaneType(destination.Type))
         {
-            SplitScalarSources(instruction);
+            SplitScalarSources(method, instruction);
             return;
         }
 
@@ -2351,18 +2364,22 @@ public static class LocalVariables
             instruction.SetOperand(0, new FieldReference(lane, destination, 0));
     }
 
-    private static void SplitScalarSources(Instruction instruction)
+    private static void SplitScalarSources(MethodAnalysisContext method, Instruction instruction)
     {
         if (instruction.Operands[0] is not LocalVariable destination
             || !IsScalarLaneType(destination.Type))
             return;
+        SplitScalarSources(method, instruction, destination.Type!);
+    }
 
+    private static void SplitScalarSources(MethodAnalysisContext method, Instruction instruction, TypeAnalysisContext laneType)
+    {
         for (var i = 1; i < instruction.Operands.Count; i++)
-            if (LaneOperand(instruction.Operands[i], destination.Type!) is { } lane)
+            if (LaneOperand(instruction.Operands[i], laneType, method) is { } lane)
                 instruction.SetOperand(i, lane);
     }
 
-    private static void SplitScalarComparisonSources(Instruction instruction)
+    private static void SplitScalarComparisonSources(MethodAnalysisContext method, Instruction instruction)
     {
         // A comparison's operand pair shares one stack kind, which the flag-typed
         // destination does not reveal; take it from whichever side is already scalar.
@@ -2377,14 +2394,37 @@ public static class LocalVariables
         if (laneType == null)
             return;
 
-        if (LaneOperand(right, laneType) is { } rightLane)
+        if (LaneOperand(right, laneType, method) is { } rightLane)
             instruction.SetOperand(2, rightLane);
-        if (LaneOperand(left, laneType) is { } leftLane)
+        if (LaneOperand(left, laneType, method) is { } leftLane)
             instruction.SetOperand(1, leftLane);
     }
 
-    private static IOperand? LaneOperand(IOperand operand, TypeAnalysisContext laneType)
+    private static IOperand? LaneOperand(IOperand operand, TypeAnalysisContext laneType,
+        MethodAnalysisContext method)
     {
+        // A scalar read of a resolved aggregate host (a struct field or a
+        // register-view local) sees the host's lane-0 field: `ldr s0, [vec]`
+        // reads `vec`'s first lane.
+        if (operand is FieldReference { Field.FieldType: { } fieldType } fieldRef
+            && fieldType.IsValueType && !IsScalarLaneType(fieldType)
+            && LaneZeroField(fieldType, laneType) is { } nestedLane)
+        {
+            // The aggregate becomes the innermost container of the nested
+            // reference, so it is the hop the emission pass spells `ldflda`
+            // on. For a compiler-generated backing field that hop only
+            // survives when the decompiler-facing rewrite can reach the
+            // getter (inside the accessor's own body it never can - the
+            // rewrite would recurse); otherwise the scalar stays as the
+            // whole-aggregate read its own diagnostic names.
+            if (MetadataResolver.IsCompilerGeneratedBackingField(fieldRef.Field)
+                && !MetadataResolver.BackingAccessorVisible(fieldRef.Field, method,
+                    store: false))
+                return null;
+            return new FieldReference(nestedLane, fieldRef.Local, fieldRef.Offset,
+                [.. fieldRef.Containers, fieldRef.Field], fieldRef.AccessSize);
+        }
+
         if (operand is not LocalVariable { Type: { } aggregateType } local
             || !aggregateType.IsValueType || IsScalarLaneType(aggregateType)
             || LaneZeroField(aggregateType, laneType) is not { } lane)

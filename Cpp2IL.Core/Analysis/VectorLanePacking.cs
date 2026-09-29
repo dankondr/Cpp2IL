@@ -136,7 +136,20 @@ internal static class VectorLanePacking
         Dictionary<LocalVariable, Instruction> definitions)
     {
         var move = block.Instructions[index];
-        if (move.Operands is not [_, LocalVariable source]
+        if (move.Operands.Count < 2)
+            return;
+        // The whole-register rewrite is only honest where the receiving slot is
+        // itself a lane vector - metadata (a field's declared type) or a type
+        // the analysis already assigned (a return buffer). Any other slot
+        // keeps the scalar the forwarded definition carried.
+        var vectorDestination = move.Operands[0] switch
+        {
+            FieldReference { Field.FieldType: { } fieldType } => VectorLiteralSpellable(fieldType),
+            LocalVariable { Type: { } localType } => VectorLiteralSpellable(localType),
+            _ => false,
+        };
+        if (!vectorDestination
+            || move.Operands is not [_, LocalVariable source]
             || !definitions.TryGetValue(source, out var proven)
             || proven.Operands is not [_, var producing])
             return;
@@ -170,7 +183,8 @@ internal static class VectorLanePacking
         }
 
         var constants = new float[4];
-        if (laneOperands.All(lane => TryConstantLane(lane, out _)))
+        if (VectorLiteralSpellable(vectorType)
+            && laneOperands.All(lane => TryConstantLane(lane, out _)))
         {
             for (var lane = 0; lane < lanes.Length; lane++)
                 TryConstantLane(laneOperands[lane], out constants[lane]);
@@ -184,11 +198,21 @@ internal static class VectorLanePacking
 
         for (var lane = 0; lane < lanes.Length; lane++)
             stores.Add(new Instruction(-1, OpCode.Move,
-                new FieldReference(lanes[lane], pack, lanes[lane].Offset), laneOperands[lane]!));
+                new FieldReference(lanes[lane], pack, lanes[lane].Offset),
+                LaneStoreSource(laneOperands[lane]!)));
 
         operand = pack;
         return true;
     }
+
+    // A lane store's slot is System.Single: an integer immediate would emit a
+    // numeric reinterpretation, while FloatLiteral carries the proven value.
+    private static IOperand LaneStoreSource(IOperand operand)
+        => operand switch
+        {
+            Immediate { Value: 0 } => new FloatLiteral(0f),
+            _ => operand,
+        };
 
     /// <summary>
     /// The operand for lane `i` of a register-spread aggregate is whatever the
@@ -219,10 +243,11 @@ internal static class VectorLanePacking
 
         if (definition.OpCode == OpCode.Move && definition.Operands.Count == 2)
         {
-            if (!FloatLaneOperand(method, definitions, definition.Operands[1], 0))
+            if (!TryFloatLaneOperand(method, definitions, definition.Operands[1], 0,
+                    out var laneSource))
                 return false;
-            operand = definition.Operands[1];
-            return true;
+            operand = laneSource;
+            return LaneTreeProvable(method, definitions, operand, 0);
         }
 
         if (definition.OpCode is OpCode.Call or OpCode.IndirectCall)
@@ -232,21 +257,51 @@ internal static class VectorLanePacking
                 || !IsFloatScalar(callee.ReturnType))
                 return false;
             operand = definedLocal;
-            return true;
+            return LaneTreeProvable(method, definitions, operand, 0);
         }
 
         if (FloatMathOps.Contains(definition.OpCode) && definedLocal != null)
         {
             operand = definedLocal;
-            return true;
+            return LaneTreeProvable(method, definitions, operand, 0);
         }
 
         return false;
     }
 
-    private static bool FloatLaneOperand(MethodAnalysisContext method,
+    /// <summary>
+    /// Whether the value behind a computed lane is fully emit-safe: every
+    /// local leaf in its definition tree is either defined by an instruction
+    /// this pipeline keeps, or is an unversioned parameter operand (an ldarg
+    /// the emitter can spell). An undefined entry-register read anywhere in
+    /// the tree makes the lane a guess, so the whole pack stays unproven and
+    /// keeps its diagnosed coercion.
+    /// </summary>
+    private static bool LaneTreeProvable(MethodAnalysisContext method,
         Dictionary<LocalVariable, Instruction> definitions, IOperand operand, int depth)
     {
+        if (depth > 8 || operand is not LocalVariable local)
+            return depth <= 8;
+
+        if (!definitions.TryGetValue(local, out var definition))
+            return local.Register is { Version: -1, Name: { } name }
+                && method.ParameterLocals.Contains(local)
+                && ParameterTypeForRegister(method, name) != null;
+
+        if (definition.OpCode is not (OpCode.Move or OpCode.Call or OpCode.IndirectCall)
+            && !FloatMathOps.Contains(definition.OpCode))
+            return false;
+
+        return definition.Operands.All(o => o is not LocalVariable l
+            || ReferenceEquals(l, definition.Destination)
+            || LaneTreeProvable(method, definitions, o, depth + 1));
+    }
+
+    private static bool TryFloatLaneOperand(MethodAnalysisContext method,
+        Dictionary<LocalVariable, Instruction> definitions, IOperand operand, int depth,
+        out IOperand laneOperand)
+    {
+        laneOperand = operand;
         if (depth > 4)
             return false;
 
@@ -261,25 +316,50 @@ internal static class VectorLanePacking
             case FloatLiteral or DoubleLiteral or Vector128Literal:
                 return true;
             case FieldReference field:
-                return field.Field.FieldType.FullName == "System.Single";
-            case MemoryOperand:
-                // A scalar load lane (`ldr s0, [x]`) is honest whether or not
-                // emission can name the referent - when it cannot, the lane
-                // store itself carries the diagnostic.
-                return true;
+                // `ldr s0, [vec]` reads the host's low four bytes: a Single
+                // field is the lane itself, and any value type's lane-0 view
+                // is split to its lane field downstream once the reference is
+                // resolved.
+                return (field.Field.FieldType.FullName == "System.Single"
+                    || field.Field.FieldType.IsValueType)
+                    && FieldPathSpellable(method, field);
+            case MemoryOperand memory:
+                // A scalar load lane (`ldr s0, [x]`) is honest only when the
+                // referent names itself - the same referent ResolveFieldOffsets
+                // substitutes. An unresolvable referent leaves the whole pack
+                // unproven rather than substituting a per-lane default.
+                if (MetadataResolver.ResolveScalarFieldAccess(method, memory)
+                    is { } resolved)
+                {
+                    laneOperand = resolved;
+                    return resolved is not FieldReference resolvedField
+                        || FieldPathSpellable(method, resolvedField);
+                }
+                return false;
             case LocalVariable local:
             {
                 // A `W`/`X` (or other non-V) register source reached the lane
                 // through `fmov s?, w?` - a bit reinterpretation, not a float.
                 if (local.Register.Name is not { } localName || localName[0] != 'V')
                     return false;
+                // A register bound to a parameter operand emits ldarg; an
+                // unversioned lane view (the HFA's spillover registers, which
+                // carry no parameter operand of their own) cannot be spelled.
                 if (local.Register.Version == -1 && method.ParameterLocals.Contains(local))
-                    return IsFloatScalar(local.Type)
-                        || IsFloatScalar(ParameterTypeForRegister(method, localName));
+                    return IsFloatScalar(ParameterTypeForRegister(method, localName));
                 if (!definitions.TryGetValue(local, out var definition))
                     return false;
                 if (definition.OpCode == OpCode.Move && definition.Operands.Count == 2)
-                    return FloatLaneOperand(method, definitions, definition.Operands[1], depth + 1);
+                {
+                    if (!TryFloatLaneOperand(method, definitions, definition.Operands[1],
+                            depth + 1, out var moved))
+                        return false;
+                    // The lane reads the defined register's low lane, not the
+                    // value it copied - `fmov s0, s8` sees s8's lane 0 either
+                    // way, so the copied operand stays the lane source.
+                    laneOperand = moved;
+                    return true;
+                }
                 if (definition.OpCode is OpCode.Call or OpCode.IndirectCall)
                     return ResolveCallee(method.AppContext, definition.Operands[0]) is { } callee
                         && IsFloatScalar(callee.ReturnType);
@@ -388,13 +468,53 @@ internal static class VectorLanePacking
             .Where(field => !field.IsStatic)
             .OrderBy(field => field.Offset)
             .ToArray();
+        // The lane stores this pass emits are stfld's from the caller, so only
+        // publicly writable fields are reachable. A flat float aggregate with
+        // private lanes still keeps its diagnosed coercion.
         if (lanes.Length is < 2 or > 4
-            || lanes.Any(field => field.FieldType.FullName != "System.Single")
+            || lanes.Any(field => field.FieldType.FullName != "System.Single"
+                || field.Visibility != System.Reflection.FieldAttributes.Public)
             || lanes.Where((field, i) => field.Offset != 4 * i).Any())
             return null;
 
         return lanes;
     }
+
+    /// <summary>
+    /// Whether a resolved field path can be spelled as a lane read. A
+    /// container hop emits `ldflda` on the aggregate, which for a
+    /// compiler-generated backing field survives only when the
+    /// decompiler-facing rewrite can reach the getter - inside the
+    /// accessor's own body it never can (the rewrite would recurse). The
+    /// leaf keeps the flat check: the backing field itself still emits
+    /// wherever its declared access or same-assembly inlining already
+    /// reaches it.
+    /// </summary>
+    private static bool FieldPathSpellable(MethodAnalysisContext method, FieldReference field)
+    {
+        var containers = field.Containers;
+        for (var i = 0; i < containers.Count; i++)
+            if (MetadataResolver.IsCompilerGeneratedBackingField(containers[i])
+                && (i != containers.Count - 1
+                    || !MetadataResolver.BackingAccessorVisible(containers[i], method,
+                        store: false)))
+                return false;
+        return !MetadataResolver.IsCompilerGeneratedBackingField(field.Field)
+            || MetadataResolver.BackingAccessorVisible(field.Field, method, store: false)
+            || method.DeclaringType?.DeclaringAssembly?.Name
+                == field.Field.DeclaringType?.DeclaringAssembly?.Name;
+    }
+
+    /// <summary>
+    /// The emitter spells a 128-bit constant through the vector's all-Single
+    /// constructor, whose component count it tabulates only for the
+    /// UnityEngine lane vectors. Any other lane-shaped aggregate keeps its
+    /// proven lanes but writes them field by field instead.
+    /// </summary>
+    private static bool VectorLiteralSpellable(TypeAnalysisContext type)
+        => type.DefaultFullName is "UnityEngine.Vector2" or "UnityEngine.Vector3"
+            or "UnityEngine.Vector4" or "UnityEngine.Quaternion" or "UnityEngine.Color"
+            && VectorLanes(type) != null;
 
     private static TypeAnalysisContext? ParameterTypeForRegister(MethodAnalysisContext method,
         string registerName)
