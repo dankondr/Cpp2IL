@@ -15,10 +15,10 @@ namespace Cpp2IL.Core.Tests.Regression;
 // is never stored has no value a managed read can spell - no default may be
 // invented for it, so the read stays a plain ldloc (CS0165 keeps the site
 // visible) behind a decompiler-issue note that names the missing value. A phi
-// edge whose merged value has no legal managed copy still stores from an
-// unspellable phantom register - the store existed in the binary - and the
-// phantom's read carries the same diagnostic. Locals whose address is taken
-// keep ldloc because a `&` write can still define them.
+// edge whose merged value has no legal managed copy emits the same diagnostic
+// and no store at all - the destination's reads on that path stay unassigned.
+// Locals whose address is taken keep ldloc because a `&` write can still
+// define them.
 public class UndefinedLocalReadTests
 {
     [Test]
@@ -130,14 +130,13 @@ public class UndefinedLocalReadTests
     }
 
     [Test]
-    public void PhiEdgeWithNoLegalCopyStoresTheUnspellableRead()
+    public void PhiEdgeWithNoLegalCopyEmitsOnlyTheDiagnostic()
     {
         // A bit-pattern phi whose incoming edge merges an incompatible managed
-        // reference: the edge has no legal copy, but skipping it would drop a
-        // store the binary does execute on that path. The edge copies from a
-        // never-stored phantom register, whose read emits the named diagnostic
-        // plus the raw ldloc - the store is kept and the merged value stays
-        // visibly unassigned.
+        // reference: the edge has no legal copy, and inventing any value for it
+        // would fabricate a definition the binary does not prove. The edge
+        // emits only the named diagnostic - no store - so the destination's
+        // reads on that path stay visibly unassigned (CS0165).
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
         var app = Cpp2IlApi.CurrentAppContext!;
@@ -185,23 +184,22 @@ public class UndefinedLocalReadTests
                 () => "no invented default may stand in for the merged value\n"
                     + string.Join("\n", il.Select(i => i.ToString())));
             Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldstr
-                    && i.Operand is string text && text.Contains("Undefined local")),
-                Is.EqualTo(2), "each unspellable edge names its missing value");
-            Assert.That(il.Count(i => i.OpCode == CilOpCodes.Stloc),
-                Is.GreaterThanOrEqualTo(3), "both edge stores plus the merge read");
-            Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldloc),
-                Is.GreaterThanOrEqualTo(3),
-                "each phantom source reads as its own ldloc, plus the merged dest");
+                    && i.Operand is string text && text.Contains("unspellable_edge")),
+                Is.EqualTo(2), "each skipped edge names its unspellable value");
+            Assert.That(il.Count(i => i.OpCode == CilOpCodes.Stloc), Is.EqualTo(3),
+                "the two slot moves plus the merge read; each edge stores nothing");
+            Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldloc), Is.EqualTo(1),
+                "only the merge's read of the never-stored destination loads");
+            Assert.That(method.CilMethodBody.LocalVariables.Count, Is.EqualTo(7),
+                "no phantom local is declared for the skipped edges");
         });
     }
 
     [Test]
     public void ByRefPhiEdgeSkipsTheUnstoreableCopy()
     {
-        // The unspellable-edge phantom does not apply to managed-pointer
-        // destinations: an invented `&` value has no honest form at all (a
-        // `ref` to a block-scoped temp breaks the escape rules, a null managed
-        // pointer is not verifier-legal), so the edge stays unstoreable.
+        // A managed-pointer destination skips the same way: no invented `&`
+        // value has an honest form, so the edge emits only the diagnostic.
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
         var app = Cpp2IlApi.CurrentAppContext!;
@@ -246,14 +244,17 @@ public class UndefinedLocalReadTests
         var il = method.CilMethodBody!.Instructions;
         Assert.Multiple(() =>
         {
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
-                    && i.Operand is string text && text.Contains("unspellable_edge")), Is.False,
-                () => "a byref edge must not materialize a phantom source\n"
+            Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("unspellable_edge")),
+                Is.EqualTo(1),
+                () => "the unstoreable edge emits only its named diagnostic\n"
                     + string.Join("\n", il.Select(i => i.ToString())));
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Initobj), Is.False,
                 "no `&` temp default is invented for the skipped edge");
             Assert.That(il.Count(i => i.OpCode == CilOpCodes.Stloc), Is.EqualTo(4),
                 "each slot and the spellable edge store once; the skipped edge adds none");
+            Assert.That(method.CilMethodBody.LocalVariables.Count, Is.EqualTo(7),
+                "no phantom `&` local is declared");
         });
     }
 

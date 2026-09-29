@@ -622,31 +622,15 @@ public class SsaForm
                     // makes the normal path throw. Unlike the forwarding passes, this
                     // edge is emitted as a real store, so copies between managed
                     // pointers of different element types stay illegal here (a &U
-                    // slot cannot receive a &T value). The binary did store a value
-                    // into the destination on this edge - only its spelling is
-                    // missing - so the edge copies from a register that is never
-                    // stored: the emitter spells that read as the named diagnostic
-                    // plus the raw ldloc, which keeps the store without inventing
-                    // the merged value.
+                    // slot cannot receive a &T value). The edge gets a phantom
+                    // source - a register that is never stored and never declared -
+                    // whose read emits only the named diagnostic, so the edge
+                    // produces no store at all and the destination's reads on this
+                    // path stay visibly unassigned (CS0165) with the note attached.
                     if (destination is LocalVariable destinationLocal
                         && source is LocalVariable sourceLocal
                         && LocalVariables.NoLegalManagedCopy(destinationLocal, sourceLocal))
-                    {
-                        // Except a managed-pointer slot: an invented `&` value
-                        // has no honest form at all (a `ref` to a fresh temp
-                        // violates the escape rules, a null managed pointer is
-                        // not verifier-legal), so the edge stays unstoreable
-                        // and the destination's reads on this path keep the
-                        // unassigned-local diagnostic.
-                        if (destinationLocal.Type is not ByRefTypeAnalysisContext)
-                        {
-                            var unspellable = UnspellableEdgeValue(destinationLocal);
-                            method.Locals.Add(unspellable);
-                            source = unspellable;
-                        }
-                        else
-                            continue;
-                    }
+                        source = UnspellableEdgeValue(destinationLocal);
 
                     moves.Add(new Instruction(-1, OpCode.Move, destination, source));
                 }
@@ -682,10 +666,10 @@ public class SsaForm
         block.Instructions.InsertRange(insertAt, moves);
     }
 
-    // A register that no instruction anywhere stores, carrying the destination's
-    // type so the store keeps the destination's declared slot. Its read emits
-    // the named diagnostic plus a plain ldloc - the unspellable value stays
-    // visibly unassigned instead of being replaced by an invented default.
+    // A register that no instruction anywhere stores and that never joins the
+    // method's locals: it carries the destination's type only for readability,
+    // and its read emits the named diagnostic alone - the edge is left without
+    // a store, exactly the skip the decompiler reports as unassigned.
     private static LocalVariable UnspellableEdgeValue(LocalVariable destination) =>
         new($"unspellable_edge_{destination.Name}",
             new Register(null, $"unspellable_edge_{destination.Register.Name}_{destination.Register.Version}"),

@@ -4054,8 +4054,7 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldstr, s.Value);
                 break;
             case LocalVariable local:
-                LoadLocal(local, method, locals, callingContext);
-                break;
+                return LoadLocal(local, method, locals, callingContext);
             case ReferenceCast referenceCast:
                 var castTarget = referenceCast.Type;
                 var castValueType = EmittedOperandType(referenceCast.Value, callingContext);
@@ -9556,7 +9555,10 @@ public static class IlGenerator
         }
     }
 
-    private static void LoadLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals,
+    /// <returns>False when the local has no value to push - an undeclared
+    /// never-stored local (the unspellable phi-edge source) leaves only its
+    /// diagnostic, so the caller's store is skipped instead of inventing one.</returns>
+    private static bool LoadLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals,
         MethodAnalysisContext context)
     {
         var instructions = method.CilMethodBody!.Instructions;
@@ -9564,24 +9566,35 @@ public static class IlGenerator
         if (local.IsThis)
         {
             instructions.Add(CilOpCodes.Ldarg_0);
-            return;
+            return true;
         }
 
         var parameter = ParameterForLocal(local, method, context);
 
         if (parameter != null)
-            instructions.Add(CilOpCodes.Ldarg, parameter);
-        else
         {
-            if (!DefinedLocalRegisters(context).Contains(local.Register))
-                // The binary holds a value here that has no managed spelling;
-                // substituting any default would invent a definition the binary
-                // does not prove, so the read stays the local itself and the
-                // compiler reports it unassigned (CS0165) next to the note.
-                EmitDecompilerNote(method, context,
-                    $"Undefined local {local}: no instruction in the method stores it, so the read has no value to spell.");
-            instructions.Add(CilOpCodes.Ldloc, locals[local]);
+            instructions.Add(CilOpCodes.Ldarg, parameter);
+            return true;
         }
+
+        if (!DefinedLocalRegisters(context).Contains(local.Register))
+        {
+            // The binary holds a value here that has no managed spelling;
+            // substituting any default would invent a definition the binary
+            // does not prove. The read stays the local itself where it is
+            // declared - the compiler reports it unassigned (CS0165) next to
+            // the note. An undeclared local has no slot to load at all: only
+            // the diagnostic is emitted and the read reports no value.
+            EmitDecompilerNote(method, context,
+                $"Undefined local {local}: no instruction in the method stores it, so the read has no value to spell.");
+            if (!locals.TryGetValue(local, out var declaredLocal))
+                return false;
+            instructions.Add(CilOpCodes.Ldloc, declaredLocal);
+            return true;
+        }
+
+        instructions.Add(CilOpCodes.Ldloc, locals[local]);
+        return true;
     }
 
     private static void StoreToOperand(IOperand operand, MethodDefinition method,
