@@ -167,7 +167,7 @@ public class NestedLeafOwnerBindingTests
             app.SystemTypes.SystemObjectType);
         var (caller, method) = CtorCaller(box, module, [
             new(0, OpCode.Move, new MemoryOperand(self, addend: 0x20, accessSize: 8), value),
-            new(1, OpCode.Return)], [self, value], [self]);
+            new(1, OpCode.Return)], [self, value], [self, value]);
 
         LocalVariables.ResolveTypesAndFields(caller);
         IlGenerator.GenerateIl(caller, method);
