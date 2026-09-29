@@ -1159,6 +1159,11 @@ public static class IlGenerator
                 }
 
                 var isOwnThis = false;
+                // Where each pushed call value (receiver, then each argument)
+                // began emitting: if emission aborts underneath them, the pushes
+                // strand beneath the throw and the synthetic ones are stripped.
+                var callArgsStart = instructions.Count;
+                var receiverPushStart = targetMethod.IsStatic ? -1 : callArgsStart;
                 if (!targetMethod.IsStatic) // Load 'this' param
                 {
                     var referenceTypeConstructor = targetMethod.Name == ".ctor"
@@ -1331,6 +1336,8 @@ public static class IlGenerator
                 // The stack still has to match the signature, so anything missing gets a placeholder.
                 var availableArgs = instruction.Operands.Count - callParamIndex;
                 var callAborted = false;
+                var abortSlot = "";
+                List<int> argPushStarts = [];
                 for (var i = 0; i < targetMethod.Parameters.Count; i++)
                 {
                     var parameterType = targetMethod.Parameters[i].ParameterType;
@@ -1343,21 +1350,42 @@ public static class IlGenerator
                             // A hidden shared-generic argument (MethodInfo*/klass*/rgctx) landed in a
                             // real parameter slot; the actual argument was dropped upstream, so the
                             // call can never be made honestly - fail rather than stub the slot.
-                            EmitUnrecoverableOperation(method, writeLine,
-                                $"A hidden shared-generic argument landed in parameter slot {parameterType.FullName}; the real argument was dropped upstream.");
                             callAborted = true;
+                            abortSlot = parameterType.FullName;
+                            break;
                         }
-                        else if (!TryEmitDelegateCtorPointer(argumentOperand, parameterType,
+                        argPushStarts.Add(instructions.Count);
+                        if (!TryEmitDelegateCtorPointer(argumentOperand, parameterType,
                                      targetMethod, context, instructions))
                             LoadOperandIntoSlot(argumentOperand, parameterType, context, method, locals, writeLine,
                                 keepFieldToken: IsInitializeArrayFieldSlot(targetMethod, parameterType));
                     }
                     else
+                    {
+                        argPushStarts.Add(instructions.Count);
                         PushDefaultOf(parameterType, method, instructions, context);
+                    }
                 }
 
+                // The abort can also arrive from inside a load (an unmanaged
+                // operand throws where it is pushed), not just the slot check:
+                // a throw anywhere in the pushed range strands what came before.
+                var threwMidEmission = false;
+                for (var k = callArgsStart; k < instructions.Count; k++)
+                    if (instructions[k].OpCode == CilOpCodes.Throw)
+                    {
+                        threwMidEmission = true;
+                        break;
+                    }
+                if (callAborted || threwMidEmission)
+                    RemoveStrandedSyntheticArgs(method, receiverPushStart, argPushStarts, writeLine);
+
                 if (callAborted)
+                {
+                    EmitUnrecoverableOperation(method, writeLine,
+                        $"A hidden shared-generic argument landed in parameter slot {abortSlot}; the real argument was dropped upstream.");
                     break;
+                }
 
                 if (ctorReinitReceiver != null)
                 {
@@ -6448,68 +6476,137 @@ public static class IlGenerator
         {
             if (instructions[i].OpCode != CilOpCodes.Pop)
                 continue;
-            // The discarded value sits between the note announcing its default
-            // and the pop; drop arms may emit the store's own note in between
-            // ("Store into unknown operand").
-            var valueEnd = i - 1;
-            while (valueEnd >= 1
-                   && IsDecompilerNotePair(instructions[valueEnd - 1], instructions[valueEnd], writeLine))
-                valueEnd -= 2;
-            if (valueEnd < 0)
-                continue;
-            var valueStart = DefaultEmissionStart(instructions, valueEnd);
-            if (valueStart < 2
-                || !IsDecompilerNotePair(instructions[valueStart - 2], instructions[valueStart - 1], writeLine))
-                continue;
-            var cutsLabelTarget = false;
-            for (var j = valueStart; j <= i; j++)
-                if (referenced.Contains(instructions[j]))
+            // Walk back from the pop over the discarded sequence. Note pairs
+            // are skipped wherever they sit ("Store into unknown operand" and
+            // friends land between the default and the pop) and are kept in
+            // place - only the default-push instructions and the pop are
+            // removed. The walk must bottom out on the note that names the
+            // slot: that pair is what proves the value is synthetic.
+            List<int> remove = [i];
+            var foundDefault = false;
+            var endsOnNote = false;
+            var j = i - 1;
+            while (j >= 0)
+            {
+                if (j >= 1 && IsDecompilerNotePair(instructions[j - 1], instructions[j], writeLine))
                 {
-                    cutsLabelTarget = true;
-                    break;
+                    j -= 2;
+                    endsOnNote = true;
+                    continue;
                 }
-            if (cutsLabelTarget
-                && !RetargetDiscardedRange(method, instructions, valueStart, i))
+                var part = DefaultPushPartLength(instructions, j);
+                if (part == 0)
+                    break;
+                for (var k = j - part + 1; k <= j; k++)
+                    remove.Add(k);
+                j -= part;
+                foundDefault = true;
+                endsOnNote = false;
+            }
+            if (!foundDefault || !endsOnNote)
                 continue;
-            for (var j = i; j >= valueStart; j--)
-                instructions.RemoveAt(j);
-            i = valueStart; // resume before the cut in case discards chained
+            if (remove.Any(k => referenced.Contains(instructions[k]))
+                && !RetargetRemoved(method, instructions, remove))
+                continue;
+            remove.Sort((a, b) => b - a);
+            foreach (var k in remove)
+                instructions.RemoveAt(k);
+            i = j + 1; // resume below the note pair in case discards chained
         }
     }
 
-    // A label or handler boundary landing inside the removal range is
-    // redirected to the instruction just past the pop: the discarded sequence
-    // is stack-neutral, so jumping to it is jumping past it. Returns false when
-    // the range ends at the physical body end or a target cannot be rewritten.
-    private static bool RetargetDiscardedRange(MethodDefinition method,
-        CilInstructionCollection instructions, int valueStart, int end)
+    // When a call's emission aborts after the receiver or earlier arguments
+    // were already pushed, every pushed value is stranded beneath the throw.
+    // A push that is only a synthetic default (its slot note plus the default
+    // instructions) is stripped back to the note; a push carrying a real
+    // operand stays - the decompiler renders it as the honest discard it is.
+    private static void RemoveStrandedSyntheticArgs(MethodDefinition method,
+        int receiverStart, List<int> argStarts, IMethodDescriptor writeLine)
     {
-        if (end + 1 >= instructions.Count)
-            return false;
-        var after = instructions[end + 1];
-        HashSet<CilInstruction> range = [];
-        for (var j = valueStart; j <= end; j++)
-            range.Add(instructions[j]);
+        var instructions = method.CilMethodBody!.Instructions;
+        List<int> starts = [.. argStarts];
+        if (receiverStart >= 0)
+            starts.Add(receiverStart);
+        if (starts.Count == 0)
+            return;
+        starts.Sort();
+
+        List<int> remove = [];
+        for (var p = 0; p < starts.Count; p++)
+        {
+            var start = starts[p];
+            var end = p + 1 < starts.Count ? starts[p + 1] : instructions.Count;
+            var k = start;
+            var spanRemove = new List<int>();
+            var synthetic = true;
+            while (k < end)
+            {
+                if (k + 1 < end && IsDecompilerNotePair(instructions[k], instructions[k + 1], writeLine))
+                {
+                    k += 2;
+                    continue;
+                }
+                var part = DefaultPushPartLength(instructions, k);
+                if (part == 0)
+                {
+                    synthetic = false;
+                    break;
+                }
+                for (var m = k; m < k + part; m++)
+                    spanRemove.Add(m);
+                k += part;
+            }
+            if (synthetic)
+                remove.AddRange(spanRemove);
+        }
+        if (remove.Count == 0 || !RetargetRemoved(method, instructions, remove))
+            return;
+        remove.Sort((a, b) => b - a);
+        foreach (var k in remove)
+            instructions.RemoveAt(k);
+    }
+
+    // A label or handler boundary landing on a removed instruction is
+    // redirected to the first kept instruction after it: the removed pushes
+    // are dead, so jumping to one is jumping past them. Returns false when a
+    // removed instruction has no kept successor to land on.
+    private static bool RetargetRemoved(MethodDefinition? method,
+        CilInstructionCollection instructions, List<int> remove)
+    {
+        var removeSet = new HashSet<int>(remove);
+        var afterOf = new Dictionary<CilInstruction, CilInstruction>();
+        foreach (var k in remove)
+        {
+            var next = k + 1;
+            while (removeSet.Contains(next))
+                next++;
+            if (next >= instructions.Count)
+                return false;
+            afterOf[instructions[k]] = instructions[next];
+        }
 
         foreach (var instruction in instructions)
         {
             switch (instruction.Operand)
             {
                 case CilInstructionLabel { Instruction: { } labelTarget } label
-                    when range.Contains(labelTarget):
-                    label.Instruction = after;
+                    when afterOf.TryGetValue(labelTarget, out var afterLabel):
+                    label.Instruction = afterLabel;
                     break;
-                case CilInstruction directTarget when range.Contains(directTarget):
-                    instruction.Operand = after;
+                case CilInstruction directTarget
+                    when afterOf.TryGetValue(directTarget, out var afterDirect):
+                    instruction.Operand = afterDirect;
                     break;
                 case IEnumerable<ICilLabel> labels:
                     foreach (var label in labels)
                         if (label is CilInstructionLabel { Instruction: { } switchTarget } switchLabel
-                            && range.Contains(switchTarget))
-                            switchLabel.Instruction = after;
+                            && afterOf.TryGetValue(switchTarget, out var afterSwitch))
+                            switchLabel.Instruction = afterSwitch;
                     break;
             }
         }
+        if (method == null)
+            return true;
         foreach (var handler in method.CilMethodBody!.ExceptionHandlers)
         {
             foreach (var boundary in new ICilLabel?[]
@@ -6520,8 +6617,8 @@ public static class IlGenerator
                      })
             {
                 if (boundary is CilInstructionLabel { Instruction: { } boundaryTarget } boundaryLabel
-                    && range.Contains(boundaryTarget))
-                    boundaryLabel.Instruction = after;
+                    && afterOf.TryGetValue(boundaryTarget, out var afterBoundary))
+                    boundaryLabel.Instruction = afterBoundary;
             }
         }
         return true;
@@ -6551,27 +6648,27 @@ public static class IlGenerator
         => text.OpCode == CilOpCodes.Ldstr && call.OpCode == CilOpCodes.Call
             && call.Operand is IMethodDescriptor callee && callee.FullName == writeLine.FullName;
 
-    // The instructions a default substitution emits end at `end`: ldnull for
-    // references, a ldc.* constant optionally followed by conv.i/conv.u for
-    // primitives and pointers, or the ldloca/initobj/ldloc triple for whole
-    // value types. Anything else pushed before the pop is a real value and
-    // stays.
-    private static int DefaultEmissionStart(CilInstructionCollection instructions, int end)
+    // How many instructions ending at index `end` form one default-push part:
+    // ldnull for references, a ldc.* constant optionally followed by
+    // conv.i/conv.u for primitives and pointers, a bare ldloca for a defaulted
+    // address slot, or the ldloca/initobj/ldloc triple for whole value types.
+    // Anything else is a real push and returns 0.
+    private static int DefaultPushPartLength(CilInstructionCollection instructions, int end)
     {
         var last = instructions[end];
-        if (IsConstantDefaultPush(last) || last.OpCode == CilOpCodes.Ldloca)
-            return end;
-        if (last.OpCode.Code is CilCode.Conv_I or CilCode.Conv_U
-            && end - 1 >= 0 && IsConstantDefaultPush(instructions[end - 1]))
-            return end - 1;
         if (last.OpCode.Code is CilCode.Ldloc or CilCode.Ldloc_0 or CilCode.Ldloc_1
                 or CilCode.Ldloc_2 or CilCode.Ldloc_3 or CilCode.Ldloc_S
             && end - 2 >= 0
             && instructions[end - 1].OpCode == CilOpCodes.Initobj
             && instructions[end - 2].OpCode.Code is CilCode.Ldloca or CilCode.Ldloca_S
-            && Equals(instructions[end - 2].Operand, instructions[end].Operand))
-            return end - 2;
-        return -1;
+            && Equals(instructions[end - 2].Operand, last.Operand))
+            return 3;
+        if (last.OpCode.Code is CilCode.Conv_I or CilCode.Conv_U
+            && end - 1 >= 0 && IsConstantDefaultPush(instructions[end - 1]))
+            return 2;
+        if (IsConstantDefaultPush(last) || last.OpCode == CilOpCodes.Ldloca)
+            return 1;
+        return 0;
     }
 
     private static bool IsConstantDefaultPush(CilInstruction instruction)

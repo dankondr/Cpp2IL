@@ -2225,7 +2225,7 @@ public class IlGeneratorTests
     }
 
     [Test]
-    public void HiddenMethodInfoOperandDefaultsStructParameter()
+    public void HiddenMethodInfoOperandAbortsCall()
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var vector = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
@@ -2267,10 +2267,15 @@ public class IlGeneratorTests
             // unrecoverable-operation throw: the hidden MethodInfo* has no real
             // argument, so the call cannot be emitted honestly.
             Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldstr));
+            Assert.That(il[0].Operand as string, Does.Contain("UnityEngine.Vector3"),
+                "the diagnostic names the parameter slot the hidden argument landed in");
             Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Call));
             Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Ldstr));
             Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.Newobj));
             Assert.That(il[4].OpCode, Is.EqualTo(CilOpCodes.Throw));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldnull
+                    || i.OpCode == CilOpCodes.Initobj), Is.False,
+                "no synthetic default may be emitted for the lost argument slot");
         });
     }
 
