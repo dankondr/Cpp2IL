@@ -15,10 +15,10 @@ namespace Cpp2IL.Core.Tests.Regression;
 // is never stored has no value a managed read can spell - no default may be
 // invented for it, so the read stays a plain ldloc (CS0165 keeps the site
 // visible) behind a decompiler-issue note that names the missing value. A phi
-// edge whose merged value has no legal managed copy emits the same diagnostic
-// and no store at all - the destination's reads on that path stay unassigned.
-// Locals whose address is taken keep ldloc because a `&` write can still
-// define them.
+// edge whose merged value has no legal managed copy emits nothing at all -
+// no store and no stand-in - and when no surviving edge stores the
+// destination, its own reads carry the same diagnostic. Locals whose address
+// is taken keep ldloc because a `&` write can still define them.
 public class UndefinedLocalReadTests
 {
     [Test]
@@ -130,12 +130,12 @@ public class UndefinedLocalReadTests
     }
 
     [Test]
-    public void PhiEdgeWithNoLegalCopyEmitsOnlyTheDiagnostic()
+    public void PhiEdgeWithNoLegalCopyIsSkipped()
     {
         // A bit-pattern phi whose incoming edge merges an incompatible managed
         // reference: the edge has no legal copy, and inventing any value for it
         // would fabricate a definition the binary does not prove. The edge
-        // emits only the named diagnostic - no store - so the destination's
+        // emits nothing - no store and no stand-in - so the destination's
         // reads on that path stay visibly unassigned (CS0165).
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
@@ -183,9 +183,13 @@ public class UndefinedLocalReadTests
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Initobj), Is.False,
                 () => "no invented default may stand in for the merged value\n"
                     + string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("unspellable_edge")), Is.False,
+                "the skipped edge emits no phantom local");
             Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldstr
-                    && i.Operand is string text && text.Contains("unspellable_edge")),
-                Is.EqualTo(2), "each skipped edge names its unspellable value");
+                    && i.Operand is string text && text.Contains("Undefined local")),
+                Is.EqualTo(1),
+                "the destination is never stored, so its own read keeps the diagnostic");
             Assert.That(il.Count(i => i.OpCode == CilOpCodes.Stloc), Is.EqualTo(3),
                 "the two slot moves plus the merge read; each edge stores nothing");
             Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldloc), Is.EqualTo(1),
@@ -244,10 +248,9 @@ public class UndefinedLocalReadTests
         var il = method.CilMethodBody!.Instructions;
         Assert.Multiple(() =>
         {
-            Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldstr
-                    && i.Operand is string text && text.Contains("unspellable_edge")),
-                Is.EqualTo(1),
-                () => "the unstoreable edge emits only its named diagnostic\n"
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("unspellable_edge")), Is.False,
+                () => "the skipped edge emits nothing - no phantom, no stand-in\n"
                     + string.Join("\n", il.Select(i => i.ToString())));
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Initobj), Is.False,
                 "no `&` temp default is invented for the skipped edge");

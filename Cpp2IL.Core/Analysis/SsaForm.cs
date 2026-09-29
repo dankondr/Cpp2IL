@@ -622,15 +622,16 @@ public class SsaForm
                     // makes the normal path throw. Unlike the forwarding passes, this
                     // edge is emitted as a real store, so copies between managed
                     // pointers of different element types stay illegal here (a &U
-                    // slot cannot receive a &T value). The edge gets a phantom
-                    // source - a register that is never stored and never declared -
-                    // whose read emits only the named diagnostic, so the edge
-                    // produces no store at all and the destination's reads on this
-                    // path stay visibly unassigned (CS0165) with the note attached.
+                    // slot cannot receive a &T value). The edge emits nothing:
+                    // any value stood in for it - even a bare diagnostic read -
+                    // is an invented definition the binary does not prove. The
+                    // destination's reads on this path stay unassigned (CS0165);
+                    // when no surviving edge stores the destination at all, its
+                    // own reads carry the named Undefined local diagnostic.
                     if (destination is LocalVariable destinationLocal
                         && source is LocalVariable sourceLocal
                         && LocalVariables.NoLegalManagedCopy(destinationLocal, sourceLocal))
-                        source = UnspellableEdgeValue(destinationLocal);
+                        continue;
 
                     moves.Add(new Instruction(-1, OpCode.Move, destination, source));
                 }
@@ -666,12 +667,4 @@ public class SsaForm
         block.Instructions.InsertRange(insertAt, moves);
     }
 
-    // A register that no instruction anywhere stores and that never joins the
-    // method's locals: it carries the destination's type only for readability,
-    // and its read emits the named diagnostic alone - the edge is left without
-    // a store, exactly the skip the decompiler reports as unassigned.
-    private static LocalVariable UnspellableEdgeValue(LocalVariable destination) =>
-        new($"unspellable_edge_{destination.Name}",
-            new Register(null, $"unspellable_edge_{destination.Register.Name}_{destination.Register.Version}"),
-            destination.Type);
 }
