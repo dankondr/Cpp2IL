@@ -740,6 +740,7 @@ public static class MetadataResolver
             .GroupBy(i => (LocalVariable)i.Destination!)
             .Where(g => g.Count() == 1).ToDictionary(g => g.Key, g => g.Single());
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>>? uses = null;
         var changed = false;
         foreach (var instruction in instructions)
         for (var i = 0; i < instruction.Operands.Count; i++)
@@ -756,7 +757,8 @@ public static class MetadataResolver
             var folded = memory;
             folded.Base = root;
             folded.Addend = offset;
-            if (!ResolvesToKnownAccess(rootType, folded, pointerSize, method, instruction, i))
+            if (!ResolvesToKnownAccess(rootType, folded, pointerSize, method, instruction, i,
+                    () => uses ??= ArrayRecovery.CollectUses(method.ControlFlowGraph!)))
                 continue;
             instruction.SetOperand(i, folded);
             changed = true;
@@ -793,11 +795,12 @@ public static class MetadataResolver
     }
 
     private static bool ResolvesToKnownAccess(TypeAnalysisContext owner, MemoryOperand memory, int pointerSize,
-        MethodAnalysisContext method, Instruction instruction, int operandIndex)
+        MethodAnalysisContext method, Instruction instruction, int operandIndex,
+        Func<Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>>> uses)
     {
         if (owner is SzArrayTypeAnalysisContext arrayType)
             return ArrayRecovery.ResolvesAccess(memory, arrayType, pointerSize,
-                method, instruction, operandIndex);
+                method, instruction, operandIndex, uses);
 
         if (owner is StaticFieldStorageTypeAnalysisContext staticStorage)
             return memory.Index == null && memory.Scale == 0

@@ -47,6 +47,7 @@ public static class ArrayRecovery
     {
         var cfg = method.ControlFlowGraph!;
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        Dictionary<LocalVariable, Instruction?>? definitions = null;
         foreach (var instruction in cfg.Instructions.ToList())
         {
             if (instruction is not { OpCode: OpCode.Move,
@@ -70,41 +71,60 @@ public static class ArrayRecovery
             var elementEnd = elementStart + stride;
             instruction.SetOperands(new ArrayAccess(array, new Immediate(relative / stride)), value);
 
-            foreach (var chunk in cfg.Instructions)
-                if (!ReferenceEquals(chunk, instruction) && chunk is
-                    { OpCode: OpCode.Move, Operands: [MemoryOperand { Base: LocalVariable chunkArray,
-                        Index: null, Scale: 0, Addend: var chunkOffset }, _] }
-                    && ReferenceEquals(chunkArray, array)
-                    && chunkOffset >= elementStart && chunkOffset < elementEnd)
-                    MakeNop(chunk);
+            // Drop the copy's remaining piece stores: instructions beside the anchor in
+            // the same block that write another slice of the same element from the same
+            // slice of the stored value. A same-span store whose source is not provably
+            // [value + offset] is a real write (e.g. arr[i].field = x beside arr[i] = v)
+            // and ends the contiguous piece run.
+            var block = cfg.Blocks.FirstOrDefault(b => b.Instructions.Contains(instruction));
+            if (block == null)
+                continue;
+            definitions ??= SingleDefinitions(cfg);
+            var anchor = block.Instructions.IndexOf(instruction);
+            for (var step = -1; step <= 1; step += 2)
+            for (var i = anchor + step; i >= 0 && i < block.Instructions.Count; i += step)
+            {
+                var chunk = block.Instructions[i];
+                if (chunk is not { OpCode: OpCode.Move,
+                        Operands: [MemoryOperand { Base: LocalVariable chunkArray,
+                            Index: null, Scale: 0, Addend: var chunkOffset }, var chunkSource] }
+                    || !ReferenceEquals(chunkArray, array)
+                    || chunkOffset < elementStart || chunkOffset >= elementEnd)
+                    continue;
+                if (!IsSameValueSlice(chunkSource, value, chunkOffset - elementStart, definitions))
+                    break;
+                MakeNop(chunk);
+            }
         }
 
-        // The earlier RecoverAccesses call in the SSA phase resolves the same
-        // whole-element stores to ArrayAccess before this pass sees them; drop
-        // their redundant chunk stores the same way.
-        foreach (var instruction in cfg.Instructions)
-        {
-            if (instruction is not { OpCode: OpCode.Move,
-                    Operands: [ArrayAccess { Array: LocalVariable { Type: SzArrayTypeAnalysisContext arrayType } array,
-                        Index: Immediate { Value: var index } }, _] }
-                || !arrayType.ElementType.IsValueType
-                || ElementSize(arrayType.ElementType, pointerSize) != 0)
-                continue;
+    }
 
-            var stride = MetadataElementSize(arrayType.ElementType, pointerSize);
-            if (stride <= 0)
-                continue;
+    // Whether `source` provably reads the `sliceOffset`-byte slice of `value` —
+    // [value + sliceOffset] directly or through single-definition Move chains, or
+    // through the same &stack alias ResolveStackAlias resolves a stack local from.
+    private static bool IsSameValueSlice(IOperand source, LocalVariable value, long sliceOffset,
+        Dictionary<LocalVariable, Instruction?> definitions)
+    {
+        var seen = new HashSet<LocalVariable>();
+        while (source is LocalVariable local && seen.Add(local)
+                && definitions.TryGetValue(local, out var definition)
+                && definition is { OpCode: OpCode.Move, Operands: [_, { } next] })
+            source = next;
 
-            var elementStart = ElementsOffset(pointerSize) + index * stride;
-            var elementEnd = elementStart + stride;
-            foreach (var chunk in cfg.Instructions)
-                if (!ReferenceEquals(chunk, instruction) && chunk is
-                    { OpCode: OpCode.Move, Operands: [MemoryOperand { Base: LocalVariable chunkArray,
-                        Index: null, Scale: 0, Addend: var chunkOffset }, _] }
-                    && ReferenceEquals(chunkArray, array)
-                    && chunkOffset >= elementStart && chunkOffset < elementEnd)
-                    MakeNop(chunk);
-        }
+        if (source is not MemoryOperand { Base: LocalVariable sliceBase, Index: null, Scale: 0,
+                Addend: var addend })
+            return false;
+
+        if (ReferenceEquals(sliceBase, value))
+            return addend == sliceOffset;
+
+        return definitions.TryGetValue(sliceBase, out var pointerDefinition)
+            && pointerDefinition is { OpCode: OpCode.Move,
+                Operands: [_, AddressOf { Target: LocalVariable origin }] }
+            && ((ReferenceEquals(origin, value) && addend == sliceOffset)
+                || (StackOffset(origin.Register.Name) is { } originOffset
+                    && StackOffset(value.Register.Name) is { } valueOffset
+                    && originOffset + addend == valueOffset + sliceOffset));
     }
 
     private static LocalVariable? ResolveStackAlias(MemoryOperand memory, MethodAnalysisContext method,
@@ -445,7 +465,7 @@ public static class ArrayRecovery
     // fold must never strand an operand RecoverAccesses will then refuse.
     internal static bool ResolvesAccess(MemoryOperand memory, SzArrayTypeAnalysisContext arrayType, int pointerSize,
         MethodAnalysisContext method, Instruction instruction, int operandIndex,
-        Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>>? uses = null)
+        Func<Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>>> uses)
     {
         if (memory.Index == null && memory.Scale == 0 && memory.Addend == LengthOffset(pointerSize))
             return true;
@@ -454,7 +474,7 @@ public static class ArrayRecovery
             return true;
 
         return ResolveStructElementAccess(instruction, operandIndex, memory, arrayType, pointerSize,
-            () => uses ?? CollectUses(method.ControlFlowGraph!)) != null;
+            uses) != null;
     }
 
     internal static void RecoverAccesses(MethodAnalysisContext method)
@@ -984,7 +1004,7 @@ public static class ArrayRecovery
         return definitions;
     }
 
-    private static Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>> CollectUses(ISILControlFlowGraph cfg)
+    internal static Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>> CollectUses(ISILControlFlowGraph cfg)
     {
         var uses = new Dictionary<LocalVariable, List<(Instruction, int)>>();
 

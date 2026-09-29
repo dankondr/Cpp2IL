@@ -154,6 +154,77 @@ public class ArrayElementFieldAccessTests
     }
 
     [Test]
+    public void MemberStoreBesideWholeElementStoreIsNotDropped()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var single = app.SystemTypes.SystemSingleType;
+        var module = new ModuleDefinition("AdjacentElementStore.dll");
+        SeedCorLibTypes(app, module, single, app.SystemTypes.SystemValueTypeType,
+            app.SystemTypes.SystemVoidType);
+        var element = SeedElement(app, module, "Pair", ("x", 0), ("y", 4));
+        var array = new LocalVariable("array", new Register(null, "array"))
+            { Type = new SzArrayTypeAnalysisContext(element) };
+        var pair = new LocalVariable("pair", new Register(null, "pair")) { Type = element };
+        var y = new LocalVariable("y", new Register(null, "y")) { Type = single };
+        // array[0] = pair; array[0].y = y — the second store is a real write to
+        // the same element span and must survive beside the whole-element store.
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, new MemoryOperand(array, addend: 32, accessSize: 8), pair),
+            new(1, OpCode.Move, new MemoryOperand(array, addend: 36, accessSize: 4), y),
+            new(2, OpCode.Return)], [array, pair, y]);
+
+        ArrayRecovery.Run(caller);
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldelema), Is.True,
+                () => Emit(caller, method, il));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stfld
+                    && i.Operand?.ToString().Contains("y") == true), Is.True,
+                () => Emit(caller, method, il));
+        });
+    }
+
+    [Test]
+    public void SliceStoreBesideWholeElementStoreIsDropped()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var single = app.SystemTypes.SystemSingleType;
+        var module = new ModuleDefinition("SliceElementStore.dll");
+        SeedCorLibTypes(app, module, single, app.SystemTypes.SystemValueTypeType,
+            app.SystemTypes.SystemVoidType);
+        var element = SeedElement(app, module, "Pair", ("x", 0), ("y", 4));
+        var array = new LocalVariable("array", new Register(null, "array"))
+            { Type = new SzArrayTypeAnalysisContext(element) };
+        var pair = new LocalVariable("pair", new Register(null, "pair")) { Type = element };
+        // array[0] = pair lowered to a whole store plus a leftover piece store of
+        // the same value's second slice — the piece is redundant and must go.
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, new MemoryOperand(array, addend: 32, accessSize: 8), pair),
+            new(1, OpCode.Move, new MemoryOperand(array, addend: 36, accessSize: 4),
+                new MemoryOperand(pair, addend: 4, accessSize: 4)),
+            new(2, OpCode.Return)], [array, pair]);
+
+        ArrayRecovery.Run(caller);
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stelem), Is.True,
+                () => Emit(caller, method, il));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stfld), Is.False,
+                () => Emit(caller, method, il));
+        });
+    }
+
+    [Test]
     public void InteriorOffsetWithoutMemberKeepsDiagnostic()
     {
         Cpp2IlApi.ResetInternalState();
