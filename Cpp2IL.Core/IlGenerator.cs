@@ -319,6 +319,8 @@ public static class IlGenerator
         // try, and the handler carries base.Finalize + endfinally.
         Analysis.FinalizerEhRecovery.Apply(context, definition, instructionMap);
 
+        RemoveDiscardedDefaults(definition, writeLine);
+
         // Nothing may fall off the physical end of a body: a conditional branch
         // (or any other fall-through-capable opcode) as the last instruction
         // makes the verifier index a fall-through block past the code end. The
@@ -1129,7 +1131,39 @@ public static class IlGenerator
                 var structCallee = !targetMethod.IsStatic && targetMethod.DeclaringType is { IsValueType: true } structDeclaring
                     ? structDeclaring
                     : null;
+
+                // Non-.ctor targets are final here, so a hidden shared-generic
+                // argument in any parameter slot is known before the receiver
+                // or earlier arguments are pushed; failing now leaves nothing
+                // stranded ahead of the throw.
+                if (targetMethod.Name != ".ctor")
+                {
+                    var scanParamIndex = instruction.OpCode == OpCode.Call
+                        ? (targetMethod.IsStatic ? 2 : 3)
+                        : (targetMethod.IsStatic ? 1 : 2);
+                    var scanArgs = instruction.Operands.Count - scanParamIndex;
+                    var sharedGenericAbort = false;
+                    for (var i = 0; i < targetMethod.Parameters.Count && i < scanArgs; i++)
+                    {
+                        var parameterType = targetMethod.Parameters[i].ParameterType;
+                        if (!OperandFeedsParameter(instruction.Operands[scanParamIndex + i], parameterType))
+                        {
+                            EmitUnrecoverableOperation(method, writeLine,
+                                $"A hidden shared-generic argument landed in parameter slot {parameterType.FullName}; the real argument was dropped upstream.");
+                            sharedGenericAbort = true;
+                            break;
+                        }
+                    }
+                    if (sharedGenericAbort)
+                        break;
+                }
+
                 var isOwnThis = false;
+                // Where each pushed call value (receiver, then each argument)
+                // began emitting: if emission aborts underneath them, the pushes
+                // strand beneath the throw and the synthetic ones are stripped.
+                var callArgsStart = instructions.Count;
+                var receiverPushStart = targetMethod.IsStatic ? -1 : callArgsStart;
                 if (!targetMethod.IsStatic) // Load 'this' param
                 {
                     var referenceTypeConstructor = targetMethod.Name == ".ctor"
@@ -1301,6 +1335,9 @@ public static class IlGenerator
                 // unknown-callee convention gave it, which may be fewer than the method actually takes.
                 // The stack still has to match the signature, so anything missing gets a placeholder.
                 var availableArgs = instruction.Operands.Count - callParamIndex;
+                var callAborted = false;
+                var abortSlot = "";
+                List<int> argPushStarts = [];
                 for (var i = 0; i < targetMethod.Parameters.Count; i++)
                 {
                     var parameterType = targetMethod.Parameters[i].ParameterType;
@@ -1308,35 +1345,46 @@ public static class IlGenerator
                     if (i < availableArgs)
                     {
                         var argumentOperand = instruction.Operands[callParamIndex + i];
-                        var operandFeedsParameter = argumentOperand switch
-                        {
-                            RuntimeMethodInfoAnalysisContext => parameterType.FullName
-                                is "System.RuntimeMethodHandle" or "System.IntPtr" or "System.UIntPtr",
-                            RuntimeFieldInfoAnalysisContext => parameterType.FullName
-                                is "System.RuntimeFieldHandle" or "System.IntPtr" or "System.UIntPtr",
-                            RuntimeClassTypeAnalysisContext => parameterType.FullName
-                                is "System.RuntimeTypeHandle" or "System.Type" or "System.Object"
-                                    or "System.IntPtr" or "System.UIntPtr",
-                            RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext
-                                or StaticFieldStorageTypeAnalysisContext => parameterType.FullName
-                                is "System.IntPtr" or "System.UIntPtr",
-                            _ => true,
-                        };
-                        if (!operandFeedsParameter)
+                        if (!OperandFeedsParameter(argumentOperand, parameterType))
                         {
                             // A hidden shared-generic argument (MethodInfo*/klass*/rgctx) landed in a
-                            // real parameter slot; the actual argument was dropped upstream. Stub the
-                            // slot rather than emit a wrongly-typed placeholder.
-                            PushDefaultOf(parameterType, method, instructions, context,
-                                $"A hidden shared-generic argument landed in parameter slot {parameterType.FullName}; the real argument was dropped upstream.");
+                            // real parameter slot; the actual argument was dropped upstream, so the
+                            // call can never be made honestly - fail rather than stub the slot.
+                            callAborted = true;
+                            abortSlot = parameterType.FullName;
+                            break;
                         }
-                        else if (!TryEmitDelegateCtorPointer(argumentOperand, parameterType,
+                        argPushStarts.Add(instructions.Count);
+                        if (!TryEmitDelegateCtorPointer(argumentOperand, parameterType,
                                      targetMethod, context, instructions))
                             LoadOperandIntoSlot(argumentOperand, parameterType, context, method, locals, writeLine,
                                 keepFieldToken: IsInitializeArrayFieldSlot(targetMethod, parameterType));
                     }
                     else
+                    {
+                        argPushStarts.Add(instructions.Count);
                         PushDefaultOf(parameterType, method, instructions, context);
+                    }
+                }
+
+                // The abort can also arrive from inside a load (an unmanaged
+                // operand throws where it is pushed), not just the slot check:
+                // a throw anywhere in the pushed range strands what came before.
+                var threwMidEmission = false;
+                for (var k = callArgsStart; k < instructions.Count; k++)
+                    if (instructions[k].OpCode == CilOpCodes.Throw)
+                    {
+                        threwMidEmission = true;
+                        break;
+                    }
+                if (callAborted || threwMidEmission)
+                    RemoveStrandedSyntheticArgs(method, receiverPushStart, argPushStarts, writeLine);
+
+                if (callAborted)
+                {
+                    EmitUnrecoverableOperation(method, writeLine,
+                        $"A hidden shared-generic argument landed in parameter slot {abortSlot}; the real argument was dropped upstream.");
+                    break;
                 }
 
                 if (ctorReinitReceiver != null)
@@ -6092,56 +6140,20 @@ public static class IlGenerator
     // emitted type even though the memory operand itself declares none.
     private static TypeAnalysisContext? StoreContract(IOperand destination, MethodAnalysisContext context)
     {
-        // `this` is the one local whose declared type is not what `stloc` sees:
-        // ldarg.0/stloc on a struct method's this moves a managed pointer, so the
-        // store contract is the emitted type, not the bare struct.
-        var declared = destination is LocalVariable { IsThis: true }
-            ? null
-            : DestinationType(destination);
-        // A shared-generic erased instantiation (List<object>) is not the local
-        // the emitted body declares when sharpening recovered the concrete one;
-        // the contract must agree with the declaration or the store coerces the
-        // operand into a type the slot does not accept.
-        if (declared is GenericInstanceTypeAnalysisContext declaredInstance
-            && declaredInstance.GenericArguments.Any(ContainsErasedSharedArgument)
-            && destination is LocalVariable destinationLocal
-            && EmittedLocalTypeCore(destinationLocal, context, []) is GenericInstanceTypeAnalysisContext
-                {
-                    GenericType: { } sharpenedDefinition,
-                    GenericArguments: { } sharpenedArguments
-                } sharpenedContract
-            && ThisConstructorCallPlan.SameTypeIdentity(sharpenedDefinition, declaredInstance.GenericType)
-            && !sharpenedArguments.Any(argument =>
-                ContainsUnusableSharpenedArgument(argument, context)))
-            return sharpenedContract;
-        if (declared is ByRefTypeAnalysisContext declaredByRef
-            && IsErasedSharedArgument(declaredByRef.ElementType)
-            && destination is LocalVariable byRefLocal
-            && EmittedLocalType(byRefLocal, context) is ByRefTypeAnalysisContext sharpenedByRef
-            && !IsErasedSharedArgument(sharpenedByRef.ElementType))
-            return sharpenedByRef;
-        if (declared == context.AppContext.SystemTypes.SystemObjectType
-            && destination is LocalVariable objectLocal
-            && EmittedLocalType(objectLocal, context) is { } concreteContract
-            && concreteContract != context.AppContext.SystemTypes.SystemObjectType)
-            return concreteContract;
-        // A call-defined contract only describes the slot when it agrees with the
-        // emitted local type: a rep that declares another concrete type (e.g. the
-        // `this` declaring type) still has to receive the store through that slot,
-        // so the emitted contract wins whenever they conflict.
-        if (destination is LocalVariable callLocal
-            && CallDefinedLocalType(callLocal, context) is { } callContract
-            && (EmittedLocalType(callLocal, context) is not { } emittedContract
-                || ThisConstructorCallPlan.SameTypeIdentity(emittedContract, callContract)
-                || emittedContract == context.AppContext.SystemTypes.SystemObjectType))
-            return callContract;
+        // StoreToOperand lowers a local destination to `stloc`, so the slot can
+        // only hold the type the .locals signature declares. Any sharper
+        // analysis type - a recovered instantiation, a call-defined type - that
+        // the declaration erased back is not a type the verifier accepts at the
+        // store; the declared slot wins.
+        if (destination is LocalVariable slotLocal)
+            return EmittableLocalType(EmittedLocalType(slotLocal, context), context);
+        var declared = DestinationType(destination);
         if (declared != null)
             return declared;
         return destination switch
         {
-            LocalVariable local => EmittedLocalType(local, context),
             MemoryOperand { Index: null, Addend: 0, Scale: 0, Base: LocalVariable { Type: not ByRefTypeAnalysisContext } baseLocal }
-                => EmittedLocalType(baseLocal, context),
+                => EmittableLocalType(EmittedLocalType(baseLocal, context), context),
             _ => null
         };
     }
@@ -6399,6 +6411,256 @@ public static class IlGenerator
             }
         }
     }
+
+    // A slot whose operand was never produced is filled with a synthetic
+    // default (a note plus ldnull/ldc/default(T)); a destination with no store
+    // spelling then reports the drop by popping that value right back off, and
+    // the pair decompiles to `_ = <expr>` (CS8183 for `_ = null`). The
+    // diagnostics already name the site, so cut the discarded value and its
+    // pop out of the emitted sequence entirely.
+    private static void RemoveDiscardedDefaults(MethodDefinition method, IMethodDescriptor writeLine)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+
+        // Every instruction another instruction or handler boundary points at
+        // is a label target; removing one of those would orphan the label.
+        HashSet<CilInstruction> referenced = [];
+        foreach (var instruction in instructions)
+        {
+            switch (instruction.Operand)
+            {
+                case CilInstructionLabel { Instruction: { } labelTarget }:
+                    referenced.Add(labelTarget);
+                    break;
+                case CilInstruction directTarget:
+                    referenced.Add(directTarget);
+                    break;
+                case IEnumerable<ICilLabel> labels:
+                    foreach (var label in labels)
+                        if (label is CilInstructionLabel { Instruction: { } switchTarget })
+                            referenced.Add(switchTarget);
+                    break;
+            }
+        }
+        foreach (var handler in method.CilMethodBody.ExceptionHandlers)
+        {
+            foreach (var boundary in new ICilLabel?[]
+                     {
+                         handler.TryStart, handler.TryEnd,
+                         handler.HandlerStart, handler.HandlerEnd,
+                         handler.FilterStart,
+                     })
+            {
+                if (boundary is CilInstructionLabel { Instruction: { } boundaryTarget })
+                    referenced.Add(boundaryTarget);
+            }
+        }
+
+        for (var i = instructions.Count - 1; i >= 0; i--)
+        {
+            if (instructions[i].OpCode != CilOpCodes.Pop)
+                continue;
+            // Walk back from the pop over the discarded sequence. Note pairs
+            // are skipped wherever they sit ("Store into unknown operand" and
+            // friends land between the default and the pop) and are kept in
+            // place - only the default-push instructions and the pop are
+            // removed. The walk must bottom out on the note that names the
+            // slot: that pair is what proves the value is synthetic.
+            List<int> remove = [i];
+            var foundDefault = false;
+            var endsOnNote = false;
+            var j = i - 1;
+            while (j >= 0)
+            {
+                if (j >= 1 && IsDecompilerNotePair(instructions[j - 1], instructions[j], writeLine))
+                {
+                    j -= 2;
+                    endsOnNote = true;
+                    continue;
+                }
+                var part = DefaultPushPartLength(instructions, j);
+                if (part == 0)
+                    break;
+                for (var k = j - part + 1; k <= j; k++)
+                    remove.Add(k);
+                j -= part;
+                foundDefault = true;
+                endsOnNote = false;
+            }
+            if (!foundDefault || !endsOnNote)
+                continue;
+            if (remove.Any(k => referenced.Contains(instructions[k]))
+                && !RetargetRemoved(method, instructions, remove))
+                continue;
+            remove.Sort((a, b) => b - a);
+            foreach (var k in remove)
+                instructions.RemoveAt(k);
+            i = j + 1; // resume below the note pair in case discards chained
+        }
+    }
+
+    // When a call's emission aborts after the receiver or earlier arguments
+    // were already pushed, every pushed value is stranded beneath the throw.
+    // A push that is only a synthetic default (its slot note plus the default
+    // instructions) is stripped back to the note; a push carrying a real
+    // operand stays - the decompiler renders it as the honest discard it is.
+    private static void RemoveStrandedSyntheticArgs(MethodDefinition method,
+        int receiverStart, List<int> argStarts, IMethodDescriptor writeLine)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        List<int> starts = [.. argStarts];
+        if (receiverStart >= 0)
+            starts.Add(receiverStart);
+        if (starts.Count == 0)
+            return;
+        starts.Sort();
+
+        List<int> remove = [];
+        for (var p = 0; p < starts.Count; p++)
+        {
+            var start = starts[p];
+            var end = p + 1 < starts.Count ? starts[p + 1] : instructions.Count;
+            var k = start;
+            var spanRemove = new List<int>();
+            var synthetic = true;
+            while (k < end)
+            {
+                if (k + 1 < end && IsDecompilerNotePair(instructions[k], instructions[k + 1], writeLine))
+                {
+                    k += 2;
+                    continue;
+                }
+                var part = DefaultPushPartLength(instructions, k);
+                if (part == 0)
+                {
+                    synthetic = false;
+                    break;
+                }
+                for (var m = k; m < k + part; m++)
+                    spanRemove.Add(m);
+                k += part;
+            }
+            if (synthetic)
+                remove.AddRange(spanRemove);
+        }
+        if (remove.Count == 0 || !RetargetRemoved(method, instructions, remove))
+            return;
+        remove.Sort((a, b) => b - a);
+        foreach (var k in remove)
+            instructions.RemoveAt(k);
+    }
+
+    // A label or handler boundary landing on a removed instruction is
+    // redirected to the first kept instruction after it: the removed pushes
+    // are dead, so jumping to one is jumping past them. Returns false when a
+    // removed instruction has no kept successor to land on.
+    private static bool RetargetRemoved(MethodDefinition? method,
+        CilInstructionCollection instructions, List<int> remove)
+    {
+        var removeSet = new HashSet<int>(remove);
+        var afterOf = new Dictionary<CilInstruction, CilInstruction>();
+        foreach (var k in remove)
+        {
+            var next = k + 1;
+            while (removeSet.Contains(next))
+                next++;
+            if (next >= instructions.Count)
+                return false;
+            afterOf[instructions[k]] = instructions[next];
+        }
+
+        foreach (var instruction in instructions)
+        {
+            switch (instruction.Operand)
+            {
+                case CilInstructionLabel { Instruction: { } labelTarget } label
+                    when afterOf.TryGetValue(labelTarget, out var afterLabel):
+                    label.Instruction = afterLabel;
+                    break;
+                case CilInstruction directTarget
+                    when afterOf.TryGetValue(directTarget, out var afterDirect):
+                    instruction.Operand = afterDirect;
+                    break;
+                case IEnumerable<ICilLabel> labels:
+                    foreach (var label in labels)
+                        if (label is CilInstructionLabel { Instruction: { } switchTarget } switchLabel
+                            && afterOf.TryGetValue(switchTarget, out var afterSwitch))
+                            switchLabel.Instruction = afterSwitch;
+                    break;
+            }
+        }
+        if (method == null)
+            return true;
+        foreach (var handler in method.CilMethodBody!.ExceptionHandlers)
+        {
+            foreach (var boundary in new ICilLabel?[]
+                     {
+                         handler.TryStart, handler.TryEnd,
+                         handler.HandlerStart, handler.HandlerEnd,
+                         handler.FilterStart,
+                     })
+            {
+                if (boundary is CilInstructionLabel { Instruction: { } boundaryTarget } boundaryLabel
+                    && afterOf.TryGetValue(boundaryTarget, out var afterBoundary))
+                    boundaryLabel.Instruction = afterBoundary;
+            }
+        }
+        return true;
+    }
+
+    // Whether an operand can honestly feed a parameter slot: the hidden
+    // shared-generic contexts (MethodInfo*/klass*/rgctx tables) only spell the
+    // handle shapes IL2CPP actually passes them in; anything else means the
+    // real argument was dropped upstream and the operand array shifted.
+    private static bool OperandFeedsParameter(IOperand argumentOperand, TypeAnalysisContext? parameterType)
+        => argumentOperand switch
+        {
+            RuntimeMethodInfoAnalysisContext => parameterType?.FullName
+                is "System.RuntimeMethodHandle" or "System.IntPtr" or "System.UIntPtr",
+            RuntimeFieldInfoAnalysisContext => parameterType?.FullName
+                is "System.RuntimeFieldHandle" or "System.IntPtr" or "System.UIntPtr",
+            RuntimeClassTypeAnalysisContext => parameterType?.FullName
+                is "System.RuntimeTypeHandle" or "System.Type" or "System.Object"
+                    or "System.IntPtr" or "System.UIntPtr",
+            RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext
+                or StaticFieldStorageTypeAnalysisContext => parameterType?.FullName
+                is "System.IntPtr" or "System.UIntPtr",
+            _ => true,
+        };
+
+    private static bool IsDecompilerNotePair(CilInstruction text, CilInstruction call, IMethodDescriptor writeLine)
+        => text.OpCode == CilOpCodes.Ldstr && call.OpCode == CilOpCodes.Call
+            && call.Operand is IMethodDescriptor callee && callee.FullName == writeLine.FullName;
+
+    // How many instructions ending at index `end` form one default-push part:
+    // ldnull for references, a ldc.* constant optionally followed by
+    // conv.i/conv.u for primitives and pointers, a bare ldloca for a defaulted
+    // address slot, or the ldloca/initobj/ldloc triple for whole value types.
+    // Anything else is a real push and returns 0.
+    private static int DefaultPushPartLength(CilInstructionCollection instructions, int end)
+    {
+        var last = instructions[end];
+        if (last.OpCode.Code is CilCode.Ldloc or CilCode.Ldloc_0 or CilCode.Ldloc_1
+                or CilCode.Ldloc_2 or CilCode.Ldloc_3 or CilCode.Ldloc_S
+            && end - 2 >= 0
+            && instructions[end - 1].OpCode == CilOpCodes.Initobj
+            && instructions[end - 2].OpCode.Code is CilCode.Ldloca or CilCode.Ldloca_S
+            && Equals(instructions[end - 2].Operand, last.Operand))
+            return 3;
+        if (last.OpCode.Code is CilCode.Conv_I or CilCode.Conv_U
+            && end - 1 >= 0 && IsConstantDefaultPush(instructions[end - 1]))
+            return 2;
+        if (IsConstantDefaultPush(last) || last.OpCode == CilOpCodes.Ldloca)
+            return 1;
+        return 0;
+    }
+
+    private static bool IsConstantDefaultPush(CilInstruction instruction)
+        => instruction.OpCode.Code is CilCode.Ldnull
+            or CilCode.Ldc_I4 or CilCode.Ldc_I4_S or CilCode.Ldc_I4_0 or CilCode.Ldc_I4_1
+            or CilCode.Ldc_I4_2 or CilCode.Ldc_I4_3 or CilCode.Ldc_I4_4 or CilCode.Ldc_I4_5
+            or CilCode.Ldc_I4_6 or CilCode.Ldc_I4_7 or CilCode.Ldc_I4_8 or CilCode.Ldc_I4_M1
+            or CilCode.Ldc_I8 or CilCode.Ldc_R4 or CilCode.Ldc_R8;
 
     // Reason string for a substituted slot value. The ref-struct boundary
     // wording is preserved verbatim so diagnostics emitted before the note
@@ -9658,7 +9920,8 @@ public static class IlGenerator
                 if (!FieldReferenceUsableFrom(field, context, writeAccess: true))
                 {
                     // The value is already on the stack; the field cannot legally
-                    // be referenced here, so fail honestly.
+                    // be referenced here, so drop it and fail honestly.
+                    instructions.Add(CilOpCodes.Pop);
                     EmitUnrecoverableOperation(method, writeLine,
                         $"Inaccessible field store: {field.Field.DeclaringType?.FullName}.{field.Field.Name}");
                     break;
