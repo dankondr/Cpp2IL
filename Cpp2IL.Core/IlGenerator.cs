@@ -4836,9 +4836,8 @@ public static class IlGenerator
                 store: false, addressed: false))
             return false;
         var field = path.Field;
-        if (owner is GenericInstanceTypeAnalysisContext genericOwner
-            && field is not ConcreteGenericFieldAnalysisContext)
-            field = new ConcreteGenericFieldAnalysisContext(field, genericOwner);
+        if (field is not ConcreteGenericFieldAnalysisContext)
+            field = Analysis.MetadataResolver.BindResolvedFieldLeaf(owner, path.Containers, field);
         fieldReference = new FieldReference(field, local, (int)memory.Addend, path.Containers,
             memory.AccessSize);
         return true;
@@ -7074,11 +7073,9 @@ public static class IlGenerator
             if (found.Containers.Count > 0 && StoreReceiverIsOutParameter(local, context))
                 continue;
             var resolved = found.Field;
-            // Interior-path leaves already carry their declaring context's binding;
-            // only a flat leaf on a generic owner still needs it.
-            if (owner is GenericInstanceTypeAnalysisContext genericOwner
-                && resolved is not ConcreteGenericFieldAnalysisContext)
-                resolved = new ConcreteGenericFieldAnalysisContext(resolved, genericOwner);
+            if (resolved is not ConcreteGenericFieldAnalysisContext)
+                resolved = Analysis.MetadataResolver.BindResolvedFieldLeaf(owner, found.Containers,
+                    resolved);
             field = new FieldReference(resolved, local, (int)memory.Addend, found.Containers,
                 memory.AccessSize);
             if (FieldReferenceUsableFrom(field, context, writeAccess: true)
@@ -9149,6 +9146,10 @@ public static class IlGenerator
         if (!CanEmitFieldToken(field))
             return false;
         var attrs = field.Attributes;
+        // A literal (const) field has no writable slot at all: a store to it has
+        // no managed spelling from any caller, .cctor included.
+        if (writeAccess && (attrs & FieldAttributes.Literal) != 0)
+            return false;
         // The verifier splits initonly writes by storage class: stsfld belongs to
         // the field's .cctor, stfld to the field's own .ctor (and through `this`
         // itself - see RequiresThisPointerReceiver).
