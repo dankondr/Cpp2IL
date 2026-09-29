@@ -189,6 +189,17 @@ public static class MetadataResolver
             .Where(g => g.Count() == 1)
             .ToDictionary(g => g.Key, g => g.Single());
 
+        // Locals that are the base register of a raw memory load emit `&T`
+        // (or native int) because that use demands it. Replacing the def-source
+        // of such a local with a managed value can demote its emitted type to a
+        // reference and leave the surviving [v] loads with `ref` where they need
+        // `&`, so substitutions into those defs are not made here.
+        var loadBases = new HashSet<LocalVariable>();
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        foreach (var operand in instruction.Operands)
+            if (operand is MemoryOperand { Base: LocalVariable baseLocal })
+                loadBases.Add(baseLocal);
+
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             for (var i = 0; i < instruction.Operands.Count; i++)
@@ -199,7 +210,7 @@ public static class MetadataResolver
                     continue;
 
                 if (memory.Base is not LocalVariable local
-                    || EffectiveObjectType(local, definitions) is not { } localType)
+                    || EffectiveObjectType(local, definitions, method.DeclaringType) is not { } localType)
                     continue;
 
                 // check if static field access
@@ -218,7 +229,9 @@ public static class MetadataResolver
                         try { offset = checked(memory.Addend + selectorValue * scale); }
                         catch (System.OverflowException) { choices.Clear(); break; }
 
-                        if (ResolveField(owner, staticOwner, offset, memory.AccessSize) is not { } selectedField)
+                        if (ResolveField(owner, staticOwner, offset, memory.AccessSize) is not { } selectedField
+                            || (staticOwner == null
+                                && !LocalSuppliesFieldBase(local, owner, method.DeclaringType, method)))
                         {
                             choices.Clear();
                             break;
@@ -251,6 +264,13 @@ public static class MetadataResolver
                 if (field == null) // TODO: Support nested fields (Field1.Field2.Field3)
                     continue;
 
+                // The produced reference pushes `local` as its ldfld/stfld base.
+                // When the local's declared type supplies neither `&host` nor a
+                // host-assignable reference the emission is invalid IL - keep the
+                // diagnostic instead. Static owners emit ldsfld and need no base.
+                if (staticOwner == null && !LocalSuppliesFieldBase(local, owner, method.DeclaringType, method))
+                    continue;
+
                 // make sure we have a full GIT for field access. open type is bad.
                 if (genericOwner != null && field is not ConcreteGenericFieldAnalysisContext)
                     field = new ConcreteGenericFieldAnalysisContext(field, genericOwner);
@@ -274,7 +294,333 @@ public static class MetadataResolver
             }
         }
 
+        changed |= ResolveAddressedStorageReads(method, definitions, loadBases);
         return changed;
+    }
+
+    /// <summary>
+    /// Rewrites [v + addend] unmanaged dereferences whose base register provably holds the
+    /// address of a managed storage location (v = &amp;t, plus constant displacements on it).
+    /// [&amp;t] is a plain `t` read; [&amp;t + k] reaches the sibling frame slot at that
+    /// offset; [&amp;f + k] reaches whatever field of f's host object sits at f's absolute
+    /// offset plus k (which includes f's own interior for value-typed f). Any site whose
+    /// storage cannot be proven keeps its MemoryOperand and its diagnostic.
+    /// </summary>
+    private static bool ResolveAddressedStorageReads(MethodAnalysisContext method,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        HashSet<LocalVariable> loadBases)
+    {
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+
+        // Frame slots by fp-relative offset; [&stack_N + k] reads the slot at -N + k,
+        // which is a real local read only when exactly one local names that address.
+        // A slot carried by several SSA versions is ambiguous - the load's live version
+        // cannot be chosen from the address alone - so only single-version cells qualify.
+        var slots = new Dictionary<int, LocalVariable>();
+        foreach (var candidate in method.Locals)
+        {
+            if (LocalVariables.TryStackOffset(candidate.Register.Name) is not { } offset)
+                continue;
+            if (!slots.TryAdd(offset, candidate))
+                slots[offset] = null!; // several locals share the offset - ambiguous
+        }
+
+        var changed = false;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        for (var i = 0; i < instruction.Operands.Count; i++)
+        {
+            if (instruction.Operands[i] is not MemoryOperand
+                    { Base: LocalVariable baseLocal, Index: null, Scale: 0 } memory
+                || ResolveAddressedStorage(baseLocal, definitions, []) is not { } resolved)
+                continue;
+
+            long effective;
+            try
+            {
+                effective = checked(memory.Addend + resolved.Displacement);
+            }
+            catch (System.OverflowException)
+            {
+                continue;
+            }
+
+            switch (resolved.Storage)
+            {
+                case LocalVariable slot:
+                    if (effective == 0)
+                    {
+                        // *(&t) reads t's storage; a pointer-sized deref of a wider
+                        // struct local would silently truncate, so value types stay out.
+                        if (memory.AccessSize == pointerSize && slot.Type is not { IsValueType: true }
+                            && LoadsAsPointer(instruction, slot.Type)
+                            && !DemotesLoadBase(instruction, loadBases, slot.Type, method))
+                        {
+                            instruction.SetOperand(i, slot);
+                            changed = true;
+                        }
+                    }
+                    else if (memory.AccessSize == pointerSize
+                             && LocalVariables.TryStackOffset(slot.Register.Name) is { } slotOffset
+                             && slotOffset + effective is >= int.MinValue and <= int.MaxValue
+                             && slots.TryGetValue((int)(slotOffset + effective), out var siblingSlot)
+                             && siblingSlot != null
+                             && siblingSlot.Type is not { IsValueType: true }
+                             && LoadsAsPointer(instruction, siblingSlot.Type)
+                             && !DemotesLoadBase(instruction, loadBases, siblingSlot.Type, method))
+                    {
+                        instruction.SetOperand(i, siblingSlot);
+                        changed = true;
+                    }
+                    break;
+
+                case FieldReference addressed when !addressed.Field.IsStatic:
+                    if (effective == 0)
+                    {
+                        // *(&f) is f itself when f's storage is a single pointer slot.
+                        if (memory.AccessSize == pointerSize
+                            && addressed.Field.FieldType is { IsValueType: false }
+                                and not PointerTypeAnalysisContext
+                            && (addressed.Containers.Count > 0
+                                    ? addressed.Containers[0].DeclaringType
+                                    : addressed.Field.DeclaringType) is { } declaredOwner
+                            && LocalSuppliesFieldBase(addressed.Local, declaredOwner, method.DeclaringType, method)
+                            && LoadsAsPointer(instruction, addressed.Field.FieldType)
+                            && !DemotesLoadBase(instruction, loadBases, addressed.Field.FieldType, method))
+                        {
+                            instruction.SetOperand(i, addressed);
+                            changed = true;
+                        }
+                        break;
+                    }
+
+                    var host = EffectiveObjectType(addressed.Local, definitions, method.DeclaringType)
+                               ?? addressed.Field.DeclaringType;
+                    if (host == null
+                        // The produced reference's Local is pushed as the ldfld/stfld
+                        // base: `&host` for a value-type host, a host-assignable
+                        // reference otherwise. object/untyped supplies neither.
+                        || !LocalSuppliesFieldBase(addressed.Local, host, method.DeclaringType, method)
+                        || ResolveField(host, null, addressed.Offset + effective,
+                            memory.AccessSize) is not { } sibling
+                        || !LoadsAsPointer(instruction, sibling.Field.FieldType)
+                        || DemotesLoadBase(instruction, loadBases, sibling.Field.FieldType, method))
+                        break;
+                    instruction.SetOperand(i, new FieldReference(sibling.Field, addressed.Local,
+                        (int)(addressed.Offset + effective), sibling.Containers, memory.AccessSize));
+                    changed = true;
+                    break;
+            }
+        }
+        return changed;
+    }
+
+    // Chases a base register's single-definition Move/Add/Subtract chain to the
+    // addressed storage it carries (&t or &f), accumulating byte displacement.
+    private static (IOperand Storage, long Displacement)? ResolveAddressedStorage(
+        IOperand operand, IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        HashSet<LocalVariable> visiting)
+    {
+        switch (operand)
+        {
+            case AddressOf { Target: LocalVariable or FieldReference } address:
+                return (address.Target, 0);
+
+            case LocalVariable local:
+                if (!visiting.Add(local)
+                    || !definitions.TryGetValue(local, out var definition))
+                    return null;
+
+                (IOperand Storage, long Displacement)? resolved = definition switch
+                {
+                    { OpCode: OpCode.Move, Operands.Count: >= 2 }
+                        => ResolveAddressedStorage(definition.Operands[1], definitions, visiting),
+                    { OpCode: OpCode.Add or OpCode.Subtract, Operands: [_, { } source, Immediate displacement] }
+                        => ResolveAddressedStorage(source, definitions, visiting) is { } inner
+                            ? (inner.Storage, inner.Displacement
+                                + (definition.OpCode == OpCode.Subtract ? -displacement.Value : displacement.Value))
+                            : null,
+                    { OpCode: OpCode.Add, Operands: [_, Immediate displacement, { } source] }
+                        => ResolveAddressedStorage(source, definitions, visiting) is { } inner
+                            ? (inner.Storage, inner.Displacement + displacement.Value)
+                            : null,
+                    _ => null,
+                };
+
+                visiting.Remove(local);
+                return resolved;
+
+            default:
+                return null;
+        }
+    }
+
+    // The instruction's produced value lands in a local that other instructions
+    // may consume as an address (`[dest]` loads, `&dest`, ldfld receivers, cpblk,
+    // `in`/`ref` arguments, calli targets) rather than as a value. Substituting a
+    // managed operand for the unmanaged def-source changes the local's emitted
+    // type to the produced type, so every such consumer must still be satisfied:
+    // [dest + off] must resolve through the produced type's instance layout (they
+    // then resolve in this same pass - a bare [dest] deref of a reference type
+    // reads the object header, not a managed field, and ResolveField's offset-0
+    // miss keeps the diagnostic), a field receiver needs the produced type
+    // assignable to the declaring type, an arithmetic or pointer-demanding use
+    // needs a non-reference produced type, and `&`-positions need an exact type.
+    private static bool DemotesLoadBase(Instruction instruction, HashSet<LocalVariable> loadBases,
+        TypeAnalysisContext? producedType, MethodAnalysisContext method, bool checkMemoryBases = true)
+    {
+        if (instruction.Destination is not LocalVariable destination
+            || destination.Type is ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+            return false;
+        return BreaksConsumers(destination, producedType, method, [], checkMemoryBases);
+    }
+
+    private static bool BreaksConsumers(LocalVariable dest, TypeAnalysisContext? producedType,
+        MethodAnalysisContext method, HashSet<LocalVariable> visited, bool checkMemoryBases)
+    {
+        if (!visited.Add(dest))
+            return false;
+        foreach (var user in method.ControlFlowGraph!.Instructions)
+        for (var j = 0; j < user.Operands.Count; j++)
+        {
+            switch (user.Operands[j])
+            {
+                case MemoryOperand { Base: { } baseLocal } memory
+                    when checkMemoryBases && ReferenceEquals(baseLocal, dest):
+                    // The use's own host type wins over what this def alone
+                    // produces: a declared/propagated type is what emission sees.
+                    var host = dest.Type ?? producedType;
+                    if (host == null || memory.Index != null || memory.Scale != 0
+                        || ResolveField(host, null, memory.Addend, memory.AccessSize) == null)
+                        return true;
+                    break;
+                case AddressOf { Target: { } target } when ReferencesLocal(target, dest):
+                    // `&dest` forwards whatever address the produced operand's
+                    // storage carries; its consumer's exact type cannot be
+                    // established here, so the diagnostic stays.
+                    return true;
+                case FieldReference { Local: { } receiver } field
+                    when ReferenceEquals(receiver, dest):
+                    if (producedType == null
+                        || !ReceiverSatisfied(producedType, field.Field.DeclaringType))
+                        return true;
+                    break;
+                case SelectedFieldReference { Selector: LocalVariable selector }
+                    when ReferenceEquals(selector, dest):
+                    return true; // the selector slot is numeric, a reference cannot fill it
+                case ArrayAccess { Array: { } array } when ReferenceEquals(array, dest):
+                    if (producedType is not SzArrayTypeAnalysisContext)
+                        return true;
+                    break;
+                case LocalVariable local when ReferenceEquals(local, dest):
+                    if (BreaksValueUse(user, j, producedType, method, visited, checkMemoryBases))
+                        return true;
+                    break;
+            }
+        }
+        return false;
+    }
+
+    private static bool ReferencesLocal(IOperand operand, LocalVariable local) => operand switch
+    {
+        LocalVariable localOperand => ReferenceEquals(localOperand, local),
+        FieldReference { Local: { } fieldLocal } => ReferenceEquals(fieldLocal, local),
+        ArrayAccess { Array: { } array, Index: { } index } =>
+            ReferenceEquals(array, local) || index is LocalVariable indexLocal
+                && ReferenceEquals(indexLocal, local),
+        _ => false,
+    };
+
+    // A ldfld/stfld or instance-call receiver emits `&host` for a value-type
+    // host (ldloca on a host-typed local) or a host-assignable reference
+    // otherwise. `&` consumption needs the exact element type; a reference
+    // receiver accepts any subtype.
+    private static bool ReceiverSatisfied(TypeAnalysisContext producedType, TypeAnalysisContext? host)
+        => LocalVariables.ReceiverSatisfied(producedType, host);
+
+    private static bool BreaksValueUse(Instruction user, int operandIndex,
+        TypeAnalysisContext? producedType, MethodAnalysisContext method, HashSet<LocalVariable> visited,
+        bool checkMemoryBases)
+    {
+        switch (user.OpCode)
+        {
+            // `Move copy, dest` propagates the produced type to the copy - its
+            // consumers must satisfy it too.
+            case OpCode.Move:
+                return operandIndex != 0 && user.Destination is LocalVariable copy
+                       && BreaksConsumers(copy, producedType, method, visited, checkMemoryBases);
+            // Arithmetic and pointer-shaping ops need a numeric/`&` operand; a
+            // managed reference cannot fill them.
+            case OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+                or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And
+                or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
+                or OpCode.SignExtend32 or OpCode.VectorMin or OpCode.VectorMax or OpCode.NewArr:
+                return producedType is not { IsValueType: true }
+                       and not ByRefTypeAnalysisContext and not PointerTypeAnalysisContext
+                       and not GenericParameterTypeAnalysisContext;
+            // Raw-memory ops take `&`-positions; calli/jump targets a code pointer.
+            case OpCode.MemoryCopy or OpCode.MemorySet or OpCode.MemoryMove
+                or OpCode.IndirectCall or OpCode.IndirectJump:
+                return true;
+            case OpCode.Box:
+                return producedType is not { IsValueType: true };
+            case OpCode.Call or OpCode.CallVoid:
+                if (user.Operands[0] is not MethodAnalysisContext callee)
+                    return false;
+                var baseIndex = user.OpCode == OpCode.Call ? 2 : 1;
+                if (!callee.IsStatic)
+                {
+                    if (operandIndex == baseIndex)
+                        return producedType == null
+                               || !ReceiverSatisfied(producedType, callee.DeclaringType);
+                    baseIndex++;
+                }
+                var parameterIndex = operandIndex - baseIndex;
+                return parameterIndex >= 0 && parameterIndex < callee.Parameters.Count
+                       && callee.Parameters[parameterIndex].ParameterType
+                            is ByRefTypeAnalysisContext { ElementType: { } element }
+                       && (producedType == null || element.FullName != producedType.FullName);
+            default:
+                return false;
+        }
+    }
+
+    // Operand positions consumed as a raw address rather than a value slot:
+    // cpblk/initblk destinations and sources, and calli/jump targets. A local or
+    // field substituted there is only honest when its declared type already is a
+    // pointer - pushing an object reference and conv.u-ing it is invalid IL and
+    // would misread a reference as an address anyway.
+    private static bool LoadsAsPointer(Instruction instruction, TypeAnalysisContext? producedType)
+        => instruction.OpCode is not (OpCode.MemoryCopy or OpCode.MemorySet or OpCode.MemoryMove
+                or OpCode.IndirectCall or OpCode.IndirectJump)
+           || producedType is ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+               or { FullName: "System.IntPtr" or "System.UIntPtr" };
+
+    // A FieldReference's Local is pushed as the ldfld/stfld receiver: `&host` for
+    // a value-type host (ldloca on a T-declared local, or a &T local), or a
+    // reference assignable to the host. An object/untyped local supplies neither,
+    // so such sites keep their MemoryOperand and their diagnostic.
+    private static bool LocalSuppliesFieldBase(LocalVariable local, TypeAnalysisContext host,
+        TypeAnalysisContext? thisType, MethodAnalysisContext method)
+    {
+        // Mirrors EmittedLocalTypeCore's `this` arm: ldarg.0 pushes the declaring
+        // type (`&T` for value types), the self-instantiation on generic types.
+        TypeAnalysisContext? type;
+        if (local.IsThis && thisType != null)
+        {
+            var thisEmit = local.Type as GenericInstanceTypeAnalysisContext ?? thisType;
+            type = thisEmit.IsValueType ? new ByRefTypeAnalysisContext(thisEmit) : thisEmit;
+        }
+        else
+            type = local.Type;
+        var declaredSupplies = type is ByRefTypeAnalysisContext { ElementType: { } pointee }
+            ? pointee.IsAssignableTo(host)
+            : type != null && type.IsAssignableTo(host);
+        if (!declaredSupplies)
+            return false;
+        // The receiver pushes the local's emitted slot type - a `Move`-copy's
+        // source, a numeric view or an `&`-emission can differ from local.Type,
+        // and a ldfld on a mismatched `&` is invalid IL.
+        return ReceiverSatisfied(LocalVariables.EmittedSlotLocalType(local, method), host);
     }
 
     private static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)? ResolveField(
@@ -585,12 +931,16 @@ public static class MetadataResolver
         {
             if (instruction.Operands[i] is not MemoryOperand { Base: LocalVariable alias } memory
                 || !definitions.TryGetValue(alias, out var definition)
-                || definition is not { OpCode: OpCode.Add, Operands: [_, LocalVariable root, Immediate displacement] }
+                || definition is not { OpCode: OpCode.Add or OpCode.Subtract, Operands: [_, LocalVariable root, Immediate displacement] }
                 || ReferenceEquals(root, alias)
-                || EffectiveObjectType(root, definitions) is not { IsValueType: false } rootType)
+                || EffectiveObjectType(root, definitions, method.DeclaringType) is not { } rootType
+                || rootType.IsValueType && !root.IsThis)
                 continue;
+            // ldarg.0 of a struct method's own `this` is &T, so this + disp is interior
+            // addressing just like object + disp is for references.
+            var signed = definition.OpCode == OpCode.Subtract ? -displacement.Value : displacement.Value;
             long offset;
-            try { offset = checked(memory.Addend + displacement.Value); }
+            try { offset = checked(memory.Addend + signed); }
             catch (System.OverflowException) { continue; }
             var folded = memory;
             folded.Base = root;
@@ -604,14 +954,20 @@ public static class MetadataResolver
     }
 
     private static TypeAnalysisContext? EffectiveObjectType(LocalVariable local,
-        IReadOnlyDictionary<LocalVariable, Instruction> definitions) =>
-        EffectiveObjectType(local, definitions, []);
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        TypeAnalysisContext? thisType = null) =>
+        EffectiveObjectType(local, definitions, [], thisType);
 
     private static TypeAnalysisContext? EffectiveObjectType(LocalVariable local,
-        IReadOnlyDictionary<LocalVariable, Instruction> definitions, HashSet<LocalVariable> visiting)
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions, HashSet<LocalVariable> visiting,
+        TypeAnalysisContext? thisType)
     {
+        // `this` always denotes the declaring type's instance (byref interior on
+        // structs), which is strictly more informative than an erased placeholder
+        // annotation like System.Object.
+        var fallback = local.IsThis && thisType != null ? thisType : local.Type;
         if (!visiting.Add(local) || !definitions.TryGetValue(local, out var definition))
-            return local.Type;
+            return fallback;
 
         var recovered = definition switch
         {
@@ -623,12 +979,34 @@ public static class MetadataResolver
                 _ => null,
             },
             { OpCode: OpCode.Move, Operands: [_, LocalVariable source] }
-                => EffectiveObjectType(source, definitions, visiting),
+                => EffectiveObjectType(source, definitions, visiting, thisType),
+            // A local holding a field's / element's / cast's loaded value carries that
+            // value's managed type, even when the local itself was never annotated.
+            { OpCode: OpCode.Move, Operands: [_, FieldReference field] }
+                => field.Field.FieldType,
+            { OpCode: OpCode.Move, Operands: [_, SelectedFieldReference selected] }
+                => selected.FieldType,
+            { OpCode: OpCode.Move, Operands: [_, ReferenceCast cast] }
+                => cast.Type,
+            { OpCode: OpCode.Move, Operands: [_, ArrayAccess access] }
+                => EffectiveObjectType(access.Array, definitions, visiting, thisType) is SzArrayTypeAnalysisContext array
+                    ? array.ElementType : null,
+            // A local holding &valueTypeStorage addresses the storage interior:
+            // [v + off] reaches the container's field at off. Reference-typed storage
+            // is handled by ResolveAddressedStorageReads instead, where [v] is the
+            // slot's own value.
+            { OpCode: OpCode.Move, Operands: [_, AddressOf { Target: LocalVariable { Type: { IsValueType: true } addressedType } }] }
+                => addressedType,
+            { OpCode: OpCode.Move, Operands: [_, AddressOf { Target: FieldReference { Field.FieldType: { IsValueType: true } addressedFieldType } }] }
+                => addressedFieldType,
+            { OpCode: OpCode.Move, Operands: [_, AddressOf { Target: ArrayAccess element }] }
+                => EffectiveObjectType(element.Array, definitions, visiting, thisType) is SzArrayTypeAnalysisContext { ElementType: { IsValueType: true } elementType }
+                    ? elementType : null,
             _ => null,
         };
 
         visiting.Remove(local);
-        return recovered ?? local.Type;
+        return recovered ?? fallback;
     }
 
     private static bool ResolvesToKnownAccess(TypeAnalysisContext owner, MemoryOperand memory, int pointerSize)

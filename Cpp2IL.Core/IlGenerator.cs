@@ -6714,7 +6714,24 @@ public static class IlGenerator
 
         var resolved = found.Field;
         if (owner is GenericInstanceTypeAnalysisContext genericOwner)
-            resolved = new ConcreteGenericFieldAnalysisContext(resolved, genericOwner);
+        {
+            // The wrap instantiates the field type against the owner's generic arguments; that
+            // arity only matches when the field is declared directly on the owner. A field
+            // reached through container hops belongs to an inner generic definition whose
+            // parameters the outer instance cannot satisfy - leave that site to the raw-store
+            // diagnostic rather than substitute a mis-instantiated type.
+            if (found.Containers.Count != 0)
+                return false;
+            try
+            {
+                resolved = new ConcreteGenericFieldAnalysisContext(resolved, genericOwner);
+            }
+            catch (System.Exception ex) when (ex is System.ArgumentOutOfRangeException
+                or System.IndexOutOfRangeException)
+            {
+                return false;
+            }
+        }
         field = new FieldReference(resolved, local, (int)memory.Addend, found.Containers,
             memory.AccessSize);
         return FieldReferenceUsableFrom(field, context, writeAccess: true)
@@ -7813,7 +7830,13 @@ public static class IlGenerator
         var contentProvable = instruction.OpCode == OpCode.MemorySet
             ? Analysis.BlockMemoryImportRecovery.IsScalarOperand(content, context)
             : Analysis.BlockMemoryImportRecovery.IsPointerOperandRepresentable(content, context);
-        if (!Analysis.BlockMemoryImportRecovery.IsProvablyReferenceFreeRegion(destination, count, context)
+        // A literal-constant destination can never emit `&`, so initblk/cpblk/
+        // Buffer.MemoryCopy on it always lowers to a native-int address -
+        // unverifiable IL. A block write to a numeric literal has no provable
+        // managed meaning: keep the named diagnostic rather than emit
+        // guaranteed-invalid IL.
+        if (destination is Immediate
+            || !Analysis.BlockMemoryImportRecovery.IsProvablyReferenceFreeRegion(destination, count, context)
             || !contentProvable
             || !Analysis.BlockMemoryImportRecovery.IsScalarOperand(count, context))
         {

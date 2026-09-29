@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
@@ -909,7 +910,7 @@ public static class LocalVariables
         return new FieldReference(field, result, relativeOffset, accessSize: accessSize);
     }
 
-    private static int? TryStackOffset(string registerName)
+    internal static int? TryStackOffset(string registerName)
     {
         const string Prefix = "stack_";
         if (!registerName.StartsWith(Prefix, System.StringComparison.Ordinal))
@@ -2064,6 +2065,42 @@ public static class LocalVariables
             return null;
 
         return new FieldReference(lane, local, 0);
+    }
+
+    // A ldfld/stfld or instance-call receiver emits `&host` for a value-type
+    // host (ldloca on a host-typed local) or a host-assignable reference
+    // otherwise. `&` consumption needs the exact element type; a reference
+    // receiver accepts any subtype.
+    internal static bool ReceiverSatisfied(TypeAnalysisContext producedType, TypeAnalysisContext? host)
+    {
+        if (host == null)
+            return false;
+        var carried = producedType is ByRefTypeAnalysisContext { ElementType: { } pointee }
+            ? pointee
+            : producedType;
+        return host.IsValueType
+            ? carried.FullName == host.FullName
+            : carried.IsAssignableTo(host);
+    }
+
+    // Copy propagation (Simplifier, after SSA removal) forwards `Move`-copy
+    // destinations to their source local inside operands, so the slot a local
+    // ends up emitted through is its single-Move-definition source's slot, not
+    // its own. Following that chain gives the type a receiver position will
+    // actually carry.
+    internal static TypeAnalysisContext EmittedSlotLocalType(LocalVariable local,
+        MethodAnalysisContext method)
+    {
+        var visited = new HashSet<LocalVariable>();
+        while (visited.Add(local))
+        {
+            var definitions = method.ControlFlowGraph!.Instructions
+                .Where(instruction => ReferenceEquals(instruction.Destination, local)).ToList();
+            if (definitions is not [{ OpCode: OpCode.Move, Operands: [_, LocalVariable source, ..] }])
+                break;
+            local = source;
+        }
+        return IlGenerator.EmittedLocalType(local, method);
     }
 
     // The low lane of an aggregate local is its publicly visible offset-0 field of

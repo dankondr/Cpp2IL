@@ -313,8 +313,14 @@ public static class Simplifier
                         }
 
                         // The object a field is accessed on is an address just like a memory base.
+                        // The receiver slot is what the ldfld/stfld type contract reads: only
+                        // substitute when the replacement's emitted slot type can supply the
+                        // field's declaring type (`&Vector2` cannot feed `ldfld Vector3::x`).
                         else if (operand is FieldReference field && replacement is LocalVariable fieldReplacement &&
-                                 field.Local == local)
+                                 field.Local == local &&
+                                 LocalVariables.ReceiverSatisfied(
+                                     LocalVariables.EmittedSlotLocalType(fieldReplacement, _method),
+                                     field.Field.DeclaringType))
                         {
                             field.Local = fieldReplacement;
                         }
@@ -323,7 +329,10 @@ public static class Simplifier
                             if (selected.Selector == local)
                                 selected.Selector = selectedReplacement;
                             foreach (var choice in selected.Choices)
-                                if (choice.Field.Local == local)
+                                if (choice.Field.Local == local
+                                    && LocalVariables.ReceiverSatisfied(
+                                        LocalVariables.EmittedSlotLocalType(selectedReplacement, _method),
+                                        choice.Field.Field.DeclaringType))
                                     choice.Field.Local = selectedReplacement;
                         }
 

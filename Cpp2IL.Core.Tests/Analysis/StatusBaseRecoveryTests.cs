@@ -61,8 +61,9 @@ public class StatusBaseRecoveryTests
         else Assert.That(load.Operands[1],Is.EqualTo(original));
     }
 
-    [Test]
-    public void AddressAliasUsesConcreteNewobjTypeWhenLocalIsErasedObject()
+    [TestCase(true)] // a Closure-typed base can carry the stfld receiver
+    [TestCase(false)] // erased-object base cannot: keep the diagnostic
+    public void AddressAliasResolvesStoreOnlyWhenBaseCanSupplyFieldOwner(bool addressable)
     {
         var app=Cpp2IlApi.CurrentAppContext!;
         var owner=new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"],"Tests","Closure",app.SystemTypes.SystemObjectType,TypeAttributes.Public);
@@ -70,7 +71,8 @@ public class StatusBaseRecoveryTests
         owner.Fields.Add(field);
         var method=new InjectedMethodAnalysisContext(owner,"Store",app.SystemTypes.SystemVoidType,MethodAttributes.Static,[]);
         var closure=new LocalVariable("closure",new Register(null,"closure"),app.SystemTypes.SystemObjectType);
-        var alias=new LocalVariable("alias",new Register(null,"alias"),app.SystemTypes.SystemObjectType);
+        var alias=new LocalVariable("alias",new Register(null,"alias"),
+            addressable?owner:app.SystemTypes.SystemObjectType);
         var address=new LocalVariable("address",new Register(null,"address"));
         var value=new LocalVariable("value",new Register(null,"value"),app.SystemTypes.SystemStringType);
         var store=new Instruction(2,OpCode.Move,new MemoryOperand(address),value);
@@ -83,8 +85,12 @@ public class StatusBaseRecoveryTests
 
         MetadataResolver.ResolveFieldOffsets(method);
 
-        Assert.That(store.Operands[0],Is.TypeOf<FieldReference>());
-        Assert.That(((FieldReference)store.Operands[0]).Field,Is.SameAs(field));
+        if(addressable)
+        {
+            Assert.That(store.Operands[0],Is.TypeOf<FieldReference>());
+            Assert.That(((FieldReference)store.Operands[0]).Field,Is.SameAs(field));
+        }
+        else Assert.That(store.Operands[0],Is.TypeOf<MemoryOperand>());
     }
 
     [TestCase(false)]
