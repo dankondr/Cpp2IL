@@ -429,9 +429,11 @@ public class SsaForm
 
     // Unversioned register liveness for phi pruning: a register is live-in at a
     // block when some path from it reaches a read before any re-definition.
-    // Upward-exposed uses count bare registers, memory base/index registers and
-    // non-clobbering address-take targets (the take binds the live cell);
-    // definitions count assignments, implicit clobbers and clobbering takes.
+    // Upward-exposed uses count every register an instruction reads before the
+    // block re-defines it: bare registers, memory base/index registers,
+    // receiver and index registers inside compound destinations, and the cell a
+    // non-clobbering address-take names. Definitions count assigned registers,
+    // implicit clobbers and clobbering address-take targets.
     private Dictionary<Block, HashSet<int>> ComputeLiveIn(ISILControlFlowGraph graph)
     {
         var upwardExposedUse = new Dictionary<Block, HashSet<int>>();
@@ -444,19 +446,37 @@ public class SsaForm
 
             foreach (var instruction in block.Instructions)
             {
-                foreach (var source in instruction.Sources)
-                    foreach (var number in SourceRegisterNumbers(source,
-                                 !_clobbering.Contains(instruction)))
+                var clobbering = _clobbering.Contains(instruction);
+                var destination = instruction.Destination;
+
+                foreach (var operand in instruction.Operands)
+                {
+                    if (ReferenceEquals(operand, destination))
+                    {
+                        // A compound destination (memory cell, field store,
+                        // array slot) still reads the registers inside it;
+                        // only a bare register destination is a pure def.
+                        if (operand is not (Register or LocalVariable))
+                            foreach (var number in OperandRegisterNumbers(operand, false))
+                                if (!def.Contains(number))
+                                    use.Add(number);
+                        continue;
+                    }
+
+                    foreach (var number in OperandRegisterNumbers(operand, !clobbering))
                         if (!def.Contains(number))
                             use.Add(number);
+                }
 
-                if (instruction.Destination is Register destination)
-                    def.Add(destination.Number);
+                if (destination is Register destinationRegister)
+                    def.Add(destinationRegister.Number);
+                else if (destination is LocalVariable destinationLocal)
+                    def.Add(destinationLocal.Register.Number);
 
                 if (instruction.ImplicitDefinition is { } clobbered)
                     def.Add(clobbered.Number);
 
-                if (_clobbering.Contains(instruction))
+                if (clobbering)
                     foreach (var operand in instruction.Operands)
                         if (operand is AddressOf { Target: Register addressed })
                             def.Add(addressed.Number);
@@ -495,7 +515,11 @@ public class SsaForm
         return liveIn;
     }
 
-    private static IEnumerable<int> SourceRegisterNumbers(IOperand operand, bool includeAddressOfTargets)
+    // Every register an operand position reads. Mirrors LocalVariables.OperandLocals
+    // but on register numbers (locals may not be introduced yet at phi-insertion
+    // time). An address-take's target counts only when the caller asks for it -
+    // a clobbering take is a def of that cell, not a read.
+    private static IEnumerable<int> OperandRegisterNumbers(IOperand operand, bool includeAddressOfTargets)
     {
         switch (operand)
         {
@@ -505,14 +529,43 @@ public class SsaForm
             case LocalVariable local:
                 yield return local.Register.Number;
                 break;
-            case AddressOf { Target: Register addressed } when includeAddressOfTargets:
-                yield return addressed.Number;
+            case FieldReference field:
+                foreach (var number in OperandRegisterNumbers(field.Local, includeAddressOfTargets))
+                    yield return number;
+                break;
+            case SelectedFieldReference selected:
+                yield return selected.Selector.Register.Number;
+                foreach (var (_, choice) in selected.Choices)
+                    yield return choice.Local.Register.Number;
+                break;
+            case AddressOf { Target: { } target }:
+                if (includeAddressOfTargets || target is not Register)
+                    foreach (var number in OperandRegisterNumbers(target, includeAddressOfTargets))
+                        yield return number;
+                break;
+            case ArrayAccess access:
+                yield return access.Array.Register.Number;
+                foreach (var number in OperandRegisterNumbers(access.Index, includeAddressOfTargets))
+                    yield return number;
+                break;
+            case ArrayElementFieldReference elementField:
+                yield return elementField.Array.Register.Number;
+                foreach (var number in OperandRegisterNumbers(elementField.Index, includeAddressOfTargets))
+                    yield return number;
+                break;
+            case ArrayLength arrayLength:
+                yield return arrayLength.Array.Register.Number;
                 break;
             case MemoryOperand memory:
-                if (memory.Base is Register baseRegister)
-                    yield return baseRegister.Number;
-                if (memory.Index is Register indexRegister)
-                    yield return indexRegister.Number;
+                if (memory.Base is { } memoryBase)
+                    foreach (var number in OperandRegisterNumbers(memoryBase, includeAddressOfTargets))
+                        yield return number;
+                if (memory.Index is { } memoryIndex)
+                    foreach (var number in OperandRegisterNumbers(memoryIndex, includeAddressOfTargets))
+                        yield return number;
+                break;
+            case ReferenceCast cast:
+                yield return cast.Value.Register.Number;
                 break;
         }
     }
