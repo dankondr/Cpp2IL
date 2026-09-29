@@ -158,7 +158,9 @@ public static class IlGenerator
                 ? module.CorLibTypeFactory.Object
                 : emittedType == context.AppContext.SystemTypes.SystemBooleanType
                     ? module.CorLibTypeFactory.Boolean
-                    : emittedType.ToTypeSignature();
+                    : emittedType == context.AppContext.SystemTypes.SystemIntPtrType
+                        ? module.CorLibTypeFactory.IntPtr
+                        : emittedType.ToTypeSignature();
             var ilLocal = new CilLocalVariable(ilType);
             body.LocalVariables.Add(ilLocal);
             locals.Add(local, ilLocal);
@@ -523,9 +525,15 @@ public static class IlGenerator
                             LoadFieldReceiver(wholeValue, context, method, locals, writeLine);
                         LoadOperandIntoSlot(instruction.Operands[1], wholeValue.Field.FieldType,
                             context, method, locals, writeLine);
-                        instructions.Add(wholeValue.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
-                            wholeValue.Field.IsStatic ? wholeValue.Field.ToFieldDescriptor()
-                                : FieldDescriptorFor(wholeValue.Field, FieldReceiverType(wholeValue, context)));
+                        if (wholeValue.Field.FieldType is PointerTypeAnalysisContext)
+                            EmitPointerFieldStore(method, instructions, context,
+                                wholeValue.Field.IsStatic ? wholeValue.Field.ToFieldDescriptor()
+                                    : FieldDescriptorFor(wholeValue.Field, FieldReceiverType(wholeValue, context)),
+                                wholeValue.Field.IsStatic);
+                        else
+                            instructions.Add(wholeValue.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
+                                wholeValue.Field.IsStatic ? wholeValue.Field.ToFieldDescriptor()
+                                    : FieldDescriptorFor(wholeValue.Field, FieldReceiverType(wholeValue, context)));
                         break;
                     }
                     if (BackingFieldConversion(field, context) is { } conversion)
@@ -549,9 +557,15 @@ public static class IlGenerator
                             LoadOperandIntoSlot(instruction.Operands[1], conversion.Parameters[0].ParameterType,
                                 context, method, locals, writeLine);
                             instructions.Add(CilOpCodes.Call, conversion.ToMethodDescriptor());
-                            instructions.Add(outerField.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
-                                outerField.IsStatic ? outerField.ToFieldDescriptor()
-                                    : FieldDescriptorFor(outerField, FieldReceiverType(outer, context)));
+                            if (outerField.FieldType is PointerTypeAnalysisContext)
+                                EmitPointerFieldStore(method, instructions, context,
+                                    outerField.IsStatic ? outerField.ToFieldDescriptor()
+                                        : FieldDescriptorFor(outerField, FieldReceiverType(outer, context)),
+                                    outerField.IsStatic);
+                            else
+                                instructions.Add(outerField.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
+                                    outerField.IsStatic ? outerField.ToFieldDescriptor()
+                                        : FieldDescriptorFor(outerField, FieldReceiverType(outer, context)));
                             break;
                         }
                     }
@@ -576,9 +590,15 @@ public static class IlGenerator
                     }
 
                     LoadOperandIntoSlot(instruction.Operands[1], field.Field.FieldType, context, method, locals, writeLine);
-                    instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
-                        field.Field.IsStatic ? field.Field.ToFieldDescriptor()
-                            : FieldDescriptorFor(field.Field, FieldReceiverType(field, context)));
+                    if (field.Field.FieldType is PointerTypeAnalysisContext)
+                        EmitPointerFieldStore(method, instructions, context,
+                            field.Field.IsStatic ? field.Field.ToFieldDescriptor()
+                                : FieldDescriptorFor(field.Field, FieldReceiverType(field, context)),
+                            field.Field.IsStatic);
+                    else
+                        instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
+                            field.Field.IsStatic ? field.Field.ToFieldDescriptor()
+                                : FieldDescriptorFor(field.Field, FieldReceiverType(field, context)));
                     break;
                 }
 
@@ -1334,6 +1354,27 @@ public static class IlGenerator
                     && targetMethod.IsVirtual && !targetMethod.IsFinal
                     && targetMethod.DeclaringType is { IsSealed: false }
                     && !isOwnThis;
+                if (SignatureHasUnverifiablePointer(targetMethod))
+                {
+                    // A memberref whose signature names an unmanaged pointer can
+                    // never verify: drop the call, pop the pushed arguments, and
+                    // report its result as a diagnosed default.
+                    for (var pops = targetMethod.Parameters.Count + (targetMethod.IsStatic ? 0 : 1);
+                         pops > 0; pops--)
+                        instructions.Add(CilOpCodes.Pop);
+                    if (instruction.OpCode == OpCode.Call && !targetMethod.IsVoid)
+                    {
+                        PushDefaultOf(ErasePointer(targetMethod.ReturnType)!, method, instructions, context,
+                            $"Call dropped: signature names an unmanaged pointer ({targetMethod.Name})");
+                        EmitStackCoerceOrDefault(ErasePointer(EffectiveCallReturnType(targetMethod))!,
+                            StoreContract(instruction.Operands[1], context), method, context);
+                        StoreToOperand(instruction.Operands[1], method, locals, writeLine, context);
+                    }
+                    else
+                        EmitDecompilerNote(method, context,
+                            $"Call dropped: signature names an unmanaged pointer ({targetMethod.Name})");
+                    break;
+                }
                 instructions.Add(!targetMethod.IsStatic && retargetedBaseConstructor == null
                         && structCallee == null
                         && (instruction.IsVirtualDispatch || targetMethod.DeclaringType?.IsInterface == true
@@ -1517,11 +1558,10 @@ public static class IlGenerator
                         fieldResult = fieldContract;
                     }
                     else if (fieldContract == null
-                        || StackContractSatisfied(resolvedField.FieldType, fieldContract, context))
+                        || StackContractSatisfied(ErasePointer(resolvedField.FieldType), fieldContract, context))
                     {
-                        instructions.Add(resolvedField.IsStatic ? CilOpCodes.Ldsfld : CilOpCodes.Ldfld,
-                            resolvedField.ToFieldDescriptor());
-                        fieldResult = resolvedField.FieldType;
+                        EmitFieldValue(instructions, resolvedField, null);
+                        fieldResult = ErasePointer(resolvedField.FieldType);
                     }
                     else
                     {
@@ -4102,7 +4142,10 @@ public static class IlGenerator
                 LoadArrayBase(elementAddress.Array, method, locals, callingContext);
                 LoadOperandIntoSlot(elementAddress.Index, callingContext.AppContext.SystemTypes.SystemInt32Type,
                     callingContext, method, locals, writeLine);
-                instructions.Add(CilOpCodes.Ldelema, elementAddressType.ToTypeSignature().ToTypeDefOrRef());
+                // The array signature carries the erased element (nint for T*),
+                // so ldelema must name the emitted element type.
+                instructions.Add(CilOpCodes.Ldelema,
+                    EmittableLocalType(elementAddressType, callingContext).ToTypeSignature().ToTypeDefOrRef());
                 break;
             case AddressOf { Target: ArrayElementFieldReference elementFieldAddress }:
                 var addressedArrayElementType = ((SzArrayTypeAnalysisContext)elementFieldAddress.Array.Type!).ElementType;
@@ -4132,7 +4175,15 @@ public static class IlGenerator
                 LoadArrayBase(arrayAccess.Array, method, locals, callingContext);
                 LoadOperandIntoSlot(arrayAccess.Index, callingContext.AppContext.SystemTypes.SystemInt32Type,
                     callingContext, method, locals, writeLine);
-                if (LdelemOpCode(arrayElementType) is { } ldelemOpCode)
+                if (arrayElementType is PointerTypeAnalysisContext)
+                {
+                    // ldelem would push an unverifiable T*; & + ldind.i keeps
+                    // the erased native int instead.
+                    instructions.Add(CilOpCodes.Ldelema,
+                        EmittableLocalType(arrayElementType, callingContext).ToTypeSignature().ToTypeDefOrRef());
+                    instructions.Add(CilOpCodes.Ldind_I);
+                }
+                else if (LdelemOpCode(arrayElementType) is { } ldelemOpCode)
                     instructions.Add(ldelemOpCode);
                 else
                     instructions.Add(CilOpCodes.Ldelem, arrayElementType.ToTypeSignature().ToTypeDefOrRef());
@@ -4149,7 +4200,7 @@ public static class IlGenerator
                 LoadOperandIntoSlot(elementField.Index, callingContext.AppContext.SystemTypes.SystemInt32Type,
                     callingContext, method, locals, writeLine);
                 instructions.Add(CilOpCodes.Ldelema, containingElementType.ToTypeSignature().ToTypeDefOrRef());
-                instructions.Add(CilOpCodes.Ldfld, FieldDescriptorFor(elementField.Field, containingElementType));
+                EmitFieldValue(instructions, elementField.Field, containingElementType);
                 break;
             case FieldReference field:
                 if (TryEmitInlinedEnumeratorCurrent(field, callingContext, method, locals, writeLine))
@@ -4160,13 +4211,12 @@ public static class IlGenerator
                     && FieldReferenceUsableFrom(wholeValue, callingContext))
                 {
                     if (wholeValue.Field.IsStatic)
-                        instructions.Add(CilOpCodes.Ldsfld, wholeValue.Field.ToFieldDescriptor());
+                        EmitFieldValue(instructions, wholeValue.Field, null);
                     else
                     {
                         LoadFieldReceiver(wholeValue, callingContext, method, locals, writeLine);
-                        instructions.Add(CilOpCodes.Ldfld,
-                            FieldDescriptorFor(wholeValue.Field,
-                                FieldReceiverType(wholeValue, callingContext)));
+                        EmitFieldValue(instructions, wholeValue.Field,
+                            FieldReceiverType(wholeValue, callingContext));
                     }
                     break;
                 }
@@ -4180,13 +4230,12 @@ public static class IlGenerator
                 }
                 if (field.Field.IsStatic)
                 {
-                    instructions.Add(CilOpCodes.Ldsfld, field.Field.ToFieldDescriptor());
+                    EmitFieldValue(instructions, field.Field, null);
                     break;
                 }
 
                 LoadFieldReceiver(field, callingContext, method, locals, writeLine);
-                instructions.Add(CilOpCodes.Ldfld,
-                    FieldDescriptorFor(field.Field, FieldReceiverType(field, callingContext)));
+                EmitFieldValue(instructions, field.Field, FieldReceiverType(field, callingContext));
                 break;
             case SelectedFieldReference selected:
                 EmitSelectedFieldLoad(selected, method, locals, writeLine, expectedType, callingContext);
@@ -4843,10 +4892,17 @@ public static class IlGenerator
                 && !candidate.IsStatic && candidate.Parameters.Count == 0) is not { } getter)
             return false;
 
-        var currentType = current.FieldType;
-        var nestedReceiverType = field.Containers.Count == 1
-            ? currentType
-            : field.Containers.LastOrDefault()?.FieldType;
+        // The getter is instantiated on the receiver local's emitted
+        // instantiation, so everything downstream of the call binds on its
+        // return - the erased `_current` field type can name a different
+        // instantiation of the same generic definition.
+        var concreteGetter = new ConcreteGenericMethodAnalysisContext(getter, enumerator.GenericArguments, []);
+        var currentType = concreteGetter.ReturnType ?? current.FieldType;
+        TypeAnalysisContext? nestedReceiverType = currentType;
+        foreach (var container in field.Containers.Skip(1))
+            nestedReceiverType = nestedReceiverType == null
+                ? null
+                : ConcretizeFieldOnReceiver(container, nestedReceiverType).FieldType;
         var nestedGetter = field.Containers.Count > 0 && nestedReceiverType != null
             ? PublicFieldGetter(nestedReceiverType, field.Field)
             : null;
@@ -4859,7 +4915,6 @@ public static class IlGenerator
         if (!EmitManagedAddress(field.Local, method, context, locals, writeLine, enumerator))
             return false;
 
-        var concreteGetter = new ConcreteGenericMethodAnalysisContext(getter, enumerator.GenericArguments, []);
         var instructions = method.CilMethodBody!.Instructions;
         instructions.Add(CilOpCodes.Call, concreteGetter.ToMethodDescriptor());
         if (field.Containers.Count == 0)
@@ -4872,14 +4927,67 @@ public static class IlGenerator
         var receiverType = currentType;
         foreach (var container in field.Containers.Skip(1))
         {
-            instructions.Add(CilOpCodes.Ldflda, FieldDescriptorFor(container, receiverType));
-            receiverType = container.FieldType;
+            var bound = ConcretizeFieldOnReceiver(container, receiverType);
+            instructions.Add(CilOpCodes.Ldflda, FieldDescriptorFor(bound, receiverType));
+            receiverType = bound.FieldType;
         }
         if (nestedGetter != null)
             instructions.Add(CilOpCodes.Call, nestedGetter.ToMethodDescriptor());
         else
-            instructions.Add(CilOpCodes.Ldfld, FieldDescriptorFor(field.Field, receiverType));
+            EmitFieldValue(instructions,
+                ConcretizeFieldOnReceiver(field.Field, receiverType), receiverType);
         return true;
+    }
+
+    // Rebinds a field of the field path onto the generic instance the emitted
+    // receiver actually carries, so the member reference names the live
+    // instantiation instead of the erased one it was resolved against.
+    private static FieldAnalysisContext ConcretizeFieldOnReceiver(FieldAnalysisContext field,
+        TypeAnalysisContext? receiverType)
+    {
+        var instance = receiverType switch
+        {
+            GenericInstanceTypeAnalysisContext generic => generic,
+            ByRefTypeAnalysisContext { ElementType: GenericInstanceTypeAnalysisContext generic }
+                => generic,
+            _ => null,
+        };
+        if (instance == null
+            || GenericDefinition(field.DeclaringType) is not { } declaring
+            || !ThisConstructorCallPlan.SameTypeIdentity(declaring, instance.GenericType)
+            || field.DeclaringType.FullName == instance.FullName)
+            return field;
+        return field is ConcreteGenericFieldAnalysisContext concrete
+            ? concrete.BaseFieldContext.MakeConcreteGenericField(instance.GenericArguments)
+            : field.MakeConcreteGenericField(instance.GenericArguments);
+    }
+
+    // The stack type TryEmitInlinedEnumeratorCurrent produces: `call
+    // get_Current` on the receiver local's emitted instantiation for a flat
+    // `_current` read, or the leaf member bound on that same instantiation for
+    // a nested `_current.<member>` read - neither is the erased declared type
+    // the reference was resolved against.
+    private static TypeAnalysisContext? InlinedEnumeratorCurrentType(FieldReference field,
+        MethodAnalysisContext context)
+    {
+        var current = field.Field.Name == "_current" && field.Containers.Count == 0
+            ? field.Field
+            : field.Containers.FirstOrDefault();
+        if (current?.Name != "_current"
+            || EmittedLocalType(field.Local, context) is not GenericInstanceTypeAnalysisContext enumerator
+            || enumerator.GenericType.Methods.FirstOrDefault(candidate => candidate.Name == "get_Current"
+                && !candidate.IsStatic && candidate.Parameters.Count == 0) is not { } getter)
+            return null;
+        TypeAnalysisContext? receiver = new ConcreteGenericMethodAnalysisContext(
+            getter, enumerator.GenericArguments, []).ReturnType;
+        if (field.Containers.Count == 0)
+            return receiver;
+        foreach (var container in field.Containers.Skip(1))
+            receiver = receiver == null ? null : ConcretizeFieldOnReceiver(container, receiver).FieldType;
+        return receiver == null
+            ? null
+            : PublicFieldGetter(receiver, field.Field)?.ReturnType
+                ?? ConcretizeFieldOnReceiver(field.Field, receiver).FieldType;
     }
 
     private static MethodAnalysisContext? PublicFieldGetter(TypeAnalysisContext receiver,
@@ -4922,11 +5030,12 @@ public static class IlGenerator
         {
             // ref/out/in slots need a managed pointer; a fresh local is the only
             // honest default - the callee may write through it and the result is
-            // dropped, same as any other placeholder. The element is sanitized for
-            // the same reason locals are: the temp's declared type is a signature
-            // token too.
-            var elementType = EmittableLocalType(byRefParameter.ElementType, context);
-            if (TypeTokenUsableFrom(elementType, context))
+            // dropped, same as any other placeholder. The temp must carry the
+            // exact element type - `&U` never satisfies a `&T` slot, so erasing
+            // an unspellable element (EmittableLocalType) would emit `&int` for
+            // a `&T` contract and fail verification anyway.
+            var elementType = byRefParameter.ElementType;
+            if (elementType != null && CanEmitTypeToken(elementType))
             {
                 var tempLocal = new CilLocalVariable(elementType.ToTypeSignature());
                 method.CilMethodBody!.LocalVariables.Add(tempLocal);
@@ -5030,6 +5139,12 @@ public static class IlGenerator
     // object for anything else.
     private static TypeAnalysisContext EmittableLocalType(TypeAnalysisContext type, MethodAnalysisContext? context)
     {
+        // An unmanaged pointer can never appear in a verifiable signature: the
+        // local carries native int instead, and its pointer values load and
+        // store through & + ldind.i/stind.i.
+        if (type is PointerTypeAnalysisContext)
+            return type.AppContext.SystemTypes.SystemIntPtrType;
+
         // IL2CPP's shared-generic enum markers are absent from Unity's managed
         // runtime. Concrete evidence is sharpened before this point; unresolved
         // occurrences keep their wrapper shape over the underlying primitive.
@@ -5067,7 +5182,11 @@ public static class IlGenerator
             SzArrayTypeAnalysisContext array =>
                 new SzArrayTypeAnalysisContext(EmittableLocalType(array.ElementType, context)),
             ByRefTypeAnalysisContext byRef =>
-                new ByRefTypeAnalysisContext(EmittableLocalType(byRef.ElementType, context)),
+                new ByRefTypeAnalysisContext(byRef.ElementType is PointerTypeAnalysisContext
+                    // `&T*` is a managed pointer and stays verifiable - the
+                    // pointer rule above only applies to bare pointer values.
+                    ? byRef.ElementType
+                    : EmittableLocalType(byRef.ElementType, context)),
             PointerTypeAnalysisContext => context.AppContext.SystemTypes.SystemIntPtrType,
             { IsValueType: true } => type is { IsEnumType: true }
                 && type.DefaultEnumUnderlyingType is { } underlying
@@ -5233,7 +5352,9 @@ public static class IlGenerator
         return found && fieldType != null ? new ByRefTypeAnalysisContext(fieldType) : null;
     }
 
-    private static TypeAnalysisContext EmittedLocalTypeCore(LocalVariable local, MethodAnalysisContext context, HashSet<LocalVariable> visited)
+    // The local's recovered type before signature erasure - pointer element
+    // provenance still lives here where EmittedLocalType reports nint.
+    internal static TypeAnalysisContext EmittedLocalTypeCore(LocalVariable local, MethodAnalysisContext context, HashSet<LocalVariable> visited)
     {
         // `ldarg` always pushes the declared parameter type: when the lifter tagged the
         // parameter local with a different type (register reuse packs a Vector3 arg onto a
@@ -6083,7 +6204,11 @@ public static class IlGenerator
                     ? expectedType
                     : EmittedImmediateType(immediate, expectedType, context),
             LocalVariable local => EmittedLocalType(local, context),
-            FieldReference field => field.Field.FieldType,
+            // A `_current` read on an enumerator local is inlined as `call
+            // get_Current` instantiated on the receiver's emitted instantiation;
+            // report that concrete return, not the field's erased declared type.
+            FieldReference field => ErasePointer(InlinedEnumeratorCurrentType(field, context)
+                ?? field.Field.FieldType),
             // LoadOperand swaps each choice's offset-0 leaf field for the whole
             // container when the contract is the container type - report the
             // type that actually reaches the stack at the join.
@@ -6093,8 +6218,8 @@ public static class IlGenerator
                         && FieldReferenceUsableFrom(wholeValue, context))
                 ? expectedType
                 : selected.FieldType,
-            ArrayElementFieldReference elementField => elementField.Field.FieldType,
-            ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } => array.ElementType,
+            ArrayElementFieldReference elementField => ErasePointer(elementField.Field.FieldType),
+            ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } => ErasePointer(array.ElementType),
             ArrayLength => context.AppContext.SystemTypes.SystemInt32Type,
             // ldloca/ldflda/ldelema push a managed pointer, not a native int.
             AddressOf { Target: LocalVariable addressedLocal }
@@ -6102,7 +6227,7 @@ public static class IlGenerator
             AddressOf { Target: FieldReference addressedField }
                 => new ByRefTypeAnalysisContext(addressedField.Field.FieldType),
             AddressOf { Target: ArrayAccess { Array.Type: SzArrayTypeAnalysisContext addressedArray } }
-                => new ByRefTypeAnalysisContext(addressedArray.ElementType),
+                => new ByRefTypeAnalysisContext(EmittableLocalType(addressedArray.ElementType, context)),
             AddressOf { Target: ArrayElementFieldReference addressedElementField }
                 => new ByRefTypeAnalysisContext(addressedElementField.Field.FieldType),
             AddressOf => context.AppContext.SystemTypes.SystemIntPtrType,
@@ -6134,7 +6259,7 @@ public static class IlGenerator
             // A deterministic memory dereference pushes whatever LoadOperand emits:
             // ldind.i for pointer referents, ldobj/ldind.ref for managed ones.
             MemoryOperand memory => TryRecoverLateFieldReference(memory, context, out var lateField)
-                ? lateField.Field.FieldType
+                ? ErasePointer(InlinedEnumeratorCurrentType(lateField, context) ?? lateField.Field.FieldType)
                 : TryGetDeterministicMemoryReferent(memory, expectedType, out var referent)
                     ? referent is PointerTypeAnalysisContext or ByRefTypeAnalysisContext
                         ? context.AppContext.SystemTypes.SystemIntPtrType
@@ -6153,6 +6278,11 @@ public static class IlGenerator
             },
             _ => null
         };
+
+    // The stack type a pointer-typed member produces once its value reaches the
+    // stack through & + ldind.i: a native int, never the unmanaged pointer.
+    private static TypeAnalysisContext? ErasePointer(TypeAnalysisContext? type) =>
+        type is PointerTypeAnalysisContext ? type.AppContext.SystemTypes.SystemIntPtrType : type;
 
     private static TypeAnalysisContext? ResolveSystemType(MethodAnalysisContext context, string fullName) =>
         context.AppContext.GetAssemblyByName("mscorlib")?.GetTypeByFullName(fullName);
@@ -6879,7 +7009,7 @@ public static class IlGenerator
         }
         emitted = resolved is MemoryOperand memory
             && TryRecoverLateFieldReference(memory, context, out var lateField)
-                ? lateField.Field.FieldType
+                ? ErasePointer(InlinedEnumeratorCurrentType(lateField, context) ?? lateField.Field.FieldType)
                 : EmittedOperandType(resolved, context, contract);
         // A pointer chain ending in `unbox(arr) + K` carries the array's data
         // pointer; for a Span<T>/ReadOnlySpan<T> slot the honest operand is the
@@ -9000,6 +9130,54 @@ public static class IlGenerator
                 : field.DeclaringType;
     }
 
+    // ldfld/ldsfld on a T* field can never verify - the member's signature is
+    // unverifiable and the pointer it pushes has no managed spelling. The honest
+    // load goes through the field's managed address: `&` + ldind.i produces the
+    // erased native int the slot reports.
+    private static void EmitFieldValue(CilInstructionCollection instructions, FieldAnalysisContext field,
+        TypeAnalysisContext? receiverType)
+    {
+        var pointerField = field.FieldType is PointerTypeAnalysisContext;
+        instructions.Add(field.IsStatic
+                ? pointerField ? CilOpCodes.Ldsflda : CilOpCodes.Ldsfld
+                : pointerField ? CilOpCodes.Ldflda : CilOpCodes.Ldfld,
+            field.IsStatic ? field.ToFieldDescriptor() : FieldDescriptorFor(field, receiverType));
+        if (pointerField)
+            instructions.Add(CilOpCodes.Ldind_I);
+    }
+
+    // nint sig for scratch locals - the corlib factory, so it resolves even
+    // where the AppContext carries no resolvable System.IntPtr definition.
+    private static TypeSignature IntPtrSignature(MethodDefinition method) =>
+        method.DeclaringModule!.CorLibTypeFactory.IntPtr;
+
+    // stfld/stsfld on a T* field can never verify for the same reason. The value
+    // is already on the stack - park it, produce the member's managed address,
+    // and stind.i the erased native int through it.
+    private static void EmitPointerFieldStore(MethodDefinition method, CilInstructionCollection instructions,
+        MethodAnalysisContext context, IFieldDescriptor fieldDescriptor, bool isStatic)
+    {
+        var scratch = new CilLocalVariable(IntPtrSignature(method));
+        method.CilMethodBody!.LocalVariables.Add(scratch);
+        instructions.Add(CilOpCodes.Stloc, scratch);
+        instructions.Add(isStatic ? CilOpCodes.Ldsflda : CilOpCodes.Ldflda, fieldDescriptor);
+        instructions.Add(CilOpCodes.Ldloc, scratch);
+        instructions.Add(CilOpCodes.Stind_I);
+    }
+
+    // A memberref whose signature names an unmanaged pointer can never verify:
+    // T* has no managed spelling, so no call to it can produce valid IL. `&T*`
+    // stays legal - only bare pointer types are unemittable.
+    private static bool SignatureHasUnverifiablePointer(MethodAnalysisContext target) =>
+        ContainsUnverifiablePointer(target.ReturnType)
+            || target.Parameters.Any(parameter => ContainsUnverifiablePointer(parameter.ParameterType));
+
+    private static bool ContainsUnverifiablePointer(TypeAnalysisContext? type) =>
+        type is PointerTypeAnalysisContext
+            || type is SzArrayTypeAnalysisContext array && ContainsUnverifiablePointer(array.ElementType)
+            || type is GenericInstanceTypeAnalysisContext instance
+                && instance.GenericArguments.Any(ContainsUnverifiablePointer);
+
     // stfld on an initonly instance field only verifies when the receiver is the
     // literal `this` pointer (ILVerify requires actualThis.IsThisPtr) - a copy of
     // `this` parked in an ordinary local does not qualify even though it holds the
@@ -9220,6 +9398,22 @@ public static class IlGenerator
                 var parameter = ParameterForLocal(local, method, context);
                 if (EmittedLocalType(local, context) is { IsValueType: false } emittedType)
                 {
+                    if (parameter != null && emittedType is ByRefTypeAnalysisContext inByRef
+                        && AnalysisParameterForLocal(local, context)?.Attributes
+                            .HasFlag(ParameterAttributes.In) == true)
+                    {
+                        // ldarg on an `in` parameter pushes a readonly managed
+                        // pointer, which no mutable `&` slot accepts: deref and
+                        // materialize a defensive copy instead.
+                        var inLocal = new CilLocalVariable(inByRef.ElementType.ToTypeSignature());
+                        method.CilMethodBody!.LocalVariables.Add(inLocal);
+                        instructions.Add(CilOpCodes.Ldarg, parameter);
+                        instructions.Add(CilOpCodes.Ldobj,
+                            inByRef.ElementType.ToTypeSignature().ToTypeDefOrRef());
+                        instructions.Add(CilOpCodes.Stloc, inLocal);
+                        instructions.Add(CilOpCodes.Ldloca, inLocal);
+                        return true;
+                    }
                     if (parameter != null)
                         instructions.Add(CilOpCodes.Ldarg, parameter);
                     else
@@ -9233,8 +9427,14 @@ public static class IlGenerator
                     if (IsByRefLike(pointeeType)
                         || !TypeTokenUsableFrom(pointeeType, context))
                         return false;
-                    instructions.Add(CilOpCodes.Unbox,
+                    // unbox produces a readonly managed pointer, which no
+                    // mutable `&` slot accepts; materialize a mutable temp.
+                    var unboxed = new CilLocalVariable(pointeeType.ToTypeSignature());
+                    method.CilMethodBody!.LocalVariables.Add(unboxed);
+                    instructions.Add(CilOpCodes.Unbox_Any,
                         pointeeType.ToTypeSignature().ToTypeDefOrRef());
+                    instructions.Add(CilOpCodes.Stloc, unboxed);
+                    instructions.Add(CilOpCodes.Ldloca, unboxed);
                     return true;
                 }
                 else if (parameter != null)
@@ -9267,7 +9467,8 @@ public static class IlGenerator
                 LoadArrayBase(access.Array, method, locals, context);
                 LoadOperandIntoSlot(access.Index, context.AppContext.SystemTypes.SystemInt32Type,
                     context, method, locals, writeLine);
-                instructions.Add(CilOpCodes.Ldelema, array.ElementType.ToTypeSignature().ToTypeDefOrRef());
+                instructions.Add(CilOpCodes.Ldelema,
+                    EmittableLocalType(array.ElementType, context).ToTypeSignature().ToTypeDefOrRef());
                 return true;
             default:
                 return false;
@@ -9404,7 +9605,10 @@ public static class IlGenerator
 
                 if (field.Field.IsStatic)
                 {
-                    instructions.Add(CilOpCodes.Stsfld, fieldDescriptor);
+                    if (field.Field.FieldType is PointerTypeAnalysisContext)
+                        EmitPointerFieldStore(method, instructions, context, fieldDescriptor, true);
+                    else
+                        instructions.Add(CilOpCodes.Stsfld, fieldDescriptor);
                     break;
                 }
 
@@ -9426,8 +9630,19 @@ public static class IlGenerator
                     instructions.Add(CilOpCodes.Ldarg_0);
                 else
                     LoadFieldReceiver(field, context, method, locals, writeLine);
-                instructions.Add(CilOpCodes.Ldloc, scratch);
-                instructions.Add(CilOpCodes.Stfld, fieldDescriptor);
+                if (field.Field.FieldType is PointerTypeAnalysisContext)
+                {
+                    // stfld's signature cannot name T* - address the member and
+                    // store the erased native int through its managed pointer.
+                    instructions.Add(CilOpCodes.Ldflda, fieldDescriptor);
+                    instructions.Add(CilOpCodes.Ldloc, scratch);
+                    instructions.Add(CilOpCodes.Stind_I);
+                }
+                else
+                {
+                    instructions.Add(CilOpCodes.Ldloc, scratch);
+                    instructions.Add(CilOpCodes.Stfld, fieldDescriptor);
+                }
                 break;
 
             case ArrayAccess arrayAccess:
@@ -9442,18 +9657,33 @@ public static class IlGenerator
                         $"Inaccessible array element type: {elementType.FullName}");
                     break;
                 }
-                var elementScratch = new CilLocalVariable(elementType.ToTypeSignature());
+                var elementScratch = new CilLocalVariable(
+                    elementType is PointerTypeAnalysisContext
+                        ? IntPtrSignature(method)
+                        : EmittableLocalType(elementType, context).ToTypeSignature());
                 method.CilMethodBody!.LocalVariables.Add(elementScratch);
 
                 instructions.Add(CilOpCodes.Stloc, elementScratch);
                 LoadArrayBase(arrayAccess.Array, method, locals, context);
                 LoadOperandIntoSlot(arrayAccess.Index, context.AppContext.SystemTypes.SystemInt32Type,
                     context, method, locals, writeLine);
-                instructions.Add(CilOpCodes.Ldloc, elementScratch);
-                if (StelemOpCode(elementType) is { } storeElementOp)
-                    instructions.Add(storeElementOp);
+                if (elementType is PointerTypeAnalysisContext)
+                {
+                    // stelem on T* can never verify - store the erased native
+                    // int through the element's managed address.
+                    instructions.Add(CilOpCodes.Ldelema,
+                        EmittableLocalType(elementType, context).ToTypeSignature().ToTypeDefOrRef());
+                    instructions.Add(CilOpCodes.Ldloc, elementScratch);
+                    instructions.Add(CilOpCodes.Stind_I);
+                }
                 else
-                    instructions.Add(CilOpCodes.Stelem, elementType.ToTypeSignature().ToTypeDefOrRef());
+                {
+                    instructions.Add(CilOpCodes.Ldloc, elementScratch);
+                    if (StelemOpCode(elementType) is { } storeElementOp)
+                        instructions.Add(storeElementOp);
+                    else
+                        instructions.Add(CilOpCodes.Stelem, elementType.ToTypeSignature().ToTypeDefOrRef());
+                }
                 break;
 
             case MemoryOperand memory:

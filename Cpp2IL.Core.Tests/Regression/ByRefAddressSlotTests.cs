@@ -75,9 +75,15 @@ public class ByRefAddressSlotTests
                     && i.Operand is string text && text.Contains("System.Byte&&")), Is.True,
                 "the unrepresentable conversion keeps its named diagnostic\n"
                     + string.Join("\n", il.Select(i => i.ToString())));
+            // A memberref whose signature names Blob* can never verify, so the
+            // call itself is dropped with its own named diagnostic.
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call
                     && i.Operand is IMethodDescriptor named && named.Name?.ToString() == "Take"),
-                Is.True, () => string.Join("\n", il.Select(i => i.ToString())));
+                Is.False, () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("unmanaged pointer")), Is.True,
+                "the dropped call keeps its named diagnostic\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
         });
     }
 }

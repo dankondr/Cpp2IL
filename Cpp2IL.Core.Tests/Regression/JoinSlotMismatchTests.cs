@@ -244,6 +244,62 @@ public class JoinSlotMismatchTests
         });
     }
 
+    // A `_current` read on an enumerator local is inlined as `call get_Current`
+    // instantiated on the receiver's emitted instantiation. When that
+    // instantiation is concrete but the field reference was bound on the erased
+    // instance (reused register / erased declaration), the pushed type is the
+    // concrete `Current` - here Int32 - while the erased field type says
+    // object. Reporting the erased type makes the object-typed store a no-op
+    // and leaves a bare `int32` where `object` belongs (ILVerify
+    // StackUnexpected); reporting the getter's real return lets the coercion
+    // emit `box` instead.
+    [Test]
+    public void InlinedEnumeratorCurrentIntoErasedSlotEmitsBox()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var list = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var enumeratorDefinition = list.NestedTypes.Single(type => type.Name == "Enumerator");
+        var erased = new GenericInstanceTypeAnalysisContext(enumeratorDefinition,
+            [app.SystemTypes.SystemObjectType]);
+        var concrete = new GenericInstanceTypeAnalysisContext(enumeratorDefinition,
+            [app.SystemTypes.SystemInt32Type]);
+        var currentOnErased = new ConcreteGenericFieldAnalysisContext(
+            enumeratorDefinition.Fields.Single(field => field.Name == "_current"), erased);
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver")) { Type = concrete };
+        var destination = new LocalVariable("destination", new Register(null, "destination"))
+            { Type = app.SystemTypes.SystemObjectType };
+
+        var module = new ModuleDefinition("EnumeratorCurrent.dll");
+        var emittedEnumerator = new TypeDefinition("System.Collections.Generic", "Enumerator`1",
+            TypeAttributes.Public | TypeAttributes.SequentialLayout | TypeAttributes.Sealed,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType"));
+        emittedEnumerator.GenericParameters.Add(new GenericParameter("T"));
+        module.TopLevelTypes.Add(emittedEnumerator);
+        enumeratorDefinition.PutExtraData("AsmResolverType", emittedEnumerator);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemObjectType, app.SystemTypes.SystemVoidType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, destination, new FieldReference(currentOnErased, receiver, 0)),
+            new(1, OpCode.Return)], [receiver, destination]);
+        IlGenerator.GenerateIl(caller, method);
+        var il = method.CilMethodBody!.Instructions;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Call
+                    && instruction.Operand?.ToString().Contains("get_Current") == true), Is.True,
+                () => string.Join("\n", il.Select(instruction => instruction.ToString())));
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Box), Is.True,
+                () => string.Join("\n", il.Select(instruction => instruction.ToString())));
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Ldstr
+                    && instruction.Operand is string text && text.Contains("synthetic default")),
+                Is.False,
+                () => string.Join("\n", il.Select(instruction => instruction.ToString())));
+        });
+    }
+
     [Test]
     public void MoveWithoutConversionOperatorKeepsDiagnostic()
     {

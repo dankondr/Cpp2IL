@@ -16,10 +16,8 @@ namespace Cpp2IL.Core.Tests.Regression;
 // `[ref + K]` load or store resolved onto an instance field of a value type T
 // asks for a `&T` receiver: the field's declaring type is a value type, so
 // ldfld/stfld/ldobj/stobj need a managed pointer, not the bare reference the
-// local emits. `unbox` is the only verifier-legal ref -> &T bridge: it asserts
-// the reference boxes T and throws InvalidCastException when the assertion is
-// wrong instead of dereferencing a reference as a pointer (which ILSpy prints
-// as `*(T*)(nint)ref` -> CS0030).
+// local emits. `unbox`'s readonly `&` cannot feed those consumers, so the
+// emitted bridge is `unbox.any` + a materialized temp whose `&` is mutable.
 public class BoxedValueFieldAccessTests
 {
     // An enum with its `value__` slot plus the AsmResolver stubs the emitted IL
@@ -73,18 +71,25 @@ public class BoxedValueFieldAccessTests
         IlGenerator.GenerateIl(caller, method);
 
         var il = method.CilMethodBody!.Instructions;
-        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Unbox), Is.True,
-            () => string.Join("\n", il.Select(i => i.ToString())));
+        // unbox produces a readonly managed pointer, which no mutable `&`
+        // consumer accepts; the emitted bridge is unbox.any + a mutable temp.
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Unbox_Any), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Unbox), Is.False,
+                "a readonly-& unbox never reaches the stack");
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldloca), Is.True,
+                "the boxed value is materialized into a mutable temp");
+        });
 
         DecompilerMemberAccessRewrites.Apply(method);
 
         Assert.Multiple(() =>
         {
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Unbox_Any), Is.True,
-                () => "unbox + ldobj fuses to unbox.any\n"
-                    + string.Join("\n", il.Select(i => i.ToString())));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Unbox), Is.False,
-                "no bare unbox survives once its ldobj consumer fused");
+                "the boxed receiver is still unboxed after the member-access rewrites");
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stfld), Is.False);
         });
     }
 
@@ -109,19 +114,16 @@ public class BoxedValueFieldAccessTests
         IlGenerator.GenerateIl(caller, method);
 
         var il = method.CilMethodBody!.Instructions;
-        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Unbox), Is.True,
-            () => string.Join("\n", il.Select(i => i.ToString())));
-
-        DecompilerMemberAccessRewrites.Apply(method);
-
+        // A readonly-& unbox cannot feed stfld; the boxed value is copied into
+        // a mutable temp and the store goes through its managed address.
         Assert.Multiple(() =>
         {
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Unbox), Is.True,
-                "a store keeps the unboxed managed pointer - no unbox.any exists for it");
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stobj), Is.True,
-                "the value__ store survives on the managed pointer unbox produced");
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stfld
-                    && i.Operand == null), Is.False);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Unbox_Any), Is.True,
+                "unbox.any + stloc materializes a mutable copy");
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Unbox), Is.False);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldloca), Is.True);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stfld), Is.True,
+                "the value__ store writes through the temp's managed address");
         });
     }
 }
