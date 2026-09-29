@@ -1469,57 +1469,16 @@ public static class LocalVariables
     // [dest + off] memory bases. Pass allowByRefReinterpret at every site whose outcome is
     // forwarding (the source reaches the uses); keep the strict form where the copy itself
     // is emitted or the local sits under an address-of or field access.
-    internal static bool NoLegalManagedCopy(LocalVariable destination, LocalVariable source, bool allowByRefReinterpret = false)
-    {
-        if (destination.Type is not { } destinationType || source.Type is not { } sourceType
-            || destinationType.FullName == sourceType.FullName)
-            return false;
-
-        // Between value types the only legal stores are the numeric and float
-        // coercions EmitStackCoerce spells, or a lane view of the register's low
-        // field. A copy joining any other pair - an aggregate and a scalar it
-        // does not lane-fold to, Nullable<T> and T, two unrelated structs - is a
-        // bit-pattern merge: the register carried bytes of a different kind, and
-        // no managed store can move them into the destination's slot.
-        if (destinationType is { IsValueType: true } && sourceType is { IsValueType: true })
-            return !LegalScalarConversion(destinationType, sourceType)
-                && !LaneViewExists(destinationType, sourceType);
-
-        return destinationType is { IsValueType: false }
-            && sourceType is { IsValueType: false }
-            && !(allowByRefReinterpret && SamePointerKind(destinationType, sourceType))
-            && !sourceType.IsAssignableTo(destinationType)
-            && !destinationType.IsAssignableTo(sourceType);
-    }
+    internal static bool NoLegalManagedCopy(LocalVariable destination, LocalVariable source, bool allowByRefReinterpret = false) =>
+        destination.Type is { IsValueType: false } destinationType
+        && source.Type is { IsValueType: false } sourceType
+        && !(allowByRefReinterpret && SamePointerKind(destinationType, sourceType))
+        && !sourceType.IsAssignableTo(destinationType)
+        && !destinationType.IsAssignableTo(sourceType);
 
     private static bool SamePointerKind(TypeAnalysisContext destinationType, TypeAnalysisContext sourceType) =>
         (destinationType is ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
         && destinationType.GetType() == sourceType.GetType();
-
-    // Mirror of EmitStackCoerce's value-to-value arms: a numeric width change in
-    // either direction (native-int operands included), plus float<->int and
-    // float<->float.
-    private static bool LegalScalarConversion(TypeAnalysisContext destinationType, TypeAnalysisContext sourceType)
-    {
-        var destinationWidth = IlGenerator.IntegralStackWidth(destinationType);
-        var sourceWidth = IlGenerator.IntegralStackWidth(sourceType);
-        if (destinationWidth != 0 && sourceWidth != 0)
-            return true;
-
-        var destinationFloat = destinationType.FullName is "System.Single" or "System.Double";
-        var sourceFloat = sourceType.FullName is "System.Single" or "System.Double";
-        return sourceFloat && destinationWidth != 0
-            || destinationFloat && (sourceFloat || sourceWidth != 0);
-    }
-
-    // SplitMoveOperandViews keeps a copy representable when the scalar side can
-    // name a real lane-0 field of the aggregate side (`Vector3.x` for a Single,
-    // a leading int for an I4). With no such field the register's whole value
-    // cannot be narrowed honestly.
-    private static bool LaneViewExists(TypeAnalysisContext destinationType, TypeAnalysisContext sourceType) =>
-        IsScalarLaneType(destinationType)
-            ? !IsScalarLaneType(sourceType) && LaneZeroField(sourceType, destinationType) != null
-            : IsScalarLaneType(sourceType) && LaneZeroField(destinationType, sourceType) != null;
 
     // An integer operand makes the result an integer. Excludes bool operands so flag logic stays boolean.
     private static bool PropagateIntegerResult(Instruction instruction, MethodAnalysisContext method)
