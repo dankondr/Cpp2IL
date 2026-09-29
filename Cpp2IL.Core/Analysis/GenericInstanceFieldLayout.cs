@@ -70,6 +70,33 @@ public static class GenericInstanceFieldLayout
         return fallback > 0 ? (fallback, System.Math.Min(fallback, (long)pointerSize)) : null;
     }
 
+    // The bytes a field of this type occupies in its container's layout: the
+    // furthest member end when member offsets are known (metadata or injected
+    // fixtures), the metadata's boxed-minus-header size otherwise, else the
+    // computed sequential layout - references take the pointer size. 0 when
+    // the layout is unknowable (an open generic parameter, missing members).
+    internal static long FieldStorageSize(TypeAnalysisContext fieldType, int pointerSize)
+        => FieldStorageSize(fieldType, pointerSize, []);
+
+    private static long FieldStorageSize(TypeAnalysisContext fieldType, int pointerSize,
+        HashSet<TypeAnalysisContext> active)
+    {
+        if (!fieldType.IsValueType)
+            return pointerSize;
+        // Primitive structs carry a self-typed member (Int32.m_value): a cycle
+        // ends the extent computation, not the process.
+        if (!active.Add(fieldType))
+            return 0;
+        var extent = fieldType.Fields.Where(field => !field.IsStatic)
+            .Select(field => (field.BackingData?.FieldOffset ?? field.Offset)
+                + FieldStorageSize(field.FieldType, pointerSize, active))
+            .DefaultIfEmpty()
+            .Max();
+        active.Remove(fieldType);
+        var size = System.Math.Max(extent, TypeSizes.UnboxedSize(fieldType, pointerSize));
+        return size > 0 ? size : FieldLayout(fieldType, pointerSize)?.Size ?? 0;
+    }
+
     public static FieldAnalysisContext? FindFieldAtOffset(TypeAnalysisContext definition, long targetOffset)
         => FindFieldAtOffset(definition, targetOffset, false);
 
