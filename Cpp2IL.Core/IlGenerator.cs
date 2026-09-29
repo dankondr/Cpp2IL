@@ -8199,7 +8199,13 @@ public static class IlGenerator
         var contentProvable = instruction.OpCode == OpCode.MemorySet
             ? Analysis.BlockMemoryImportRecovery.IsScalarOperand(content, context)
             : Analysis.BlockMemoryImportRecovery.IsPointerOperandRepresentable(content, context);
-        if (!Analysis.BlockMemoryImportRecovery.IsProvablyReferenceFreeRegion(destination, count, context)
+        // A literal-constant destination can never emit `&`, so initblk/cpblk/
+        // Buffer.MemoryCopy on it always lowers to a native-int address -
+        // unverifiable IL. A block write to a numeric literal has no provable
+        // managed meaning: keep the named diagnostic rather than emit
+        // guaranteed-invalid IL.
+        if (destination is Immediate
+            || !Analysis.BlockMemoryImportRecovery.IsProvablyReferenceFreeRegion(destination, count, context)
             || !contentProvable
             || !Analysis.BlockMemoryImportRecovery.IsScalarOperand(count, context))
         {

@@ -1145,7 +1145,7 @@ public static class LocalVariables
         return new FieldReference(field, result, relativeOffset, accessSize: accessSize);
     }
 
-    private static int? TryStackOffset(string registerName)
+    internal static int? TryStackOffset(string registerName)
     {
         const string Prefix = "stack_";
         if (!registerName.StartsWith(Prefix, System.StringComparison.Ordinal))
@@ -2386,6 +2386,120 @@ public static class LocalVariables
             return null;
 
         return new FieldReference(lane, local, 0);
+    }
+
+    // A ldfld/stfld or instance-call receiver emits `&host` for a value-type
+    // host (ldloca on a host-typed local) or a host-assignable reference
+    // otherwise. `&` consumption needs the exact element type; a reference
+    // receiver accepts any subtype.
+    internal static bool ReceiverSatisfied(TypeAnalysisContext? producedType, TypeAnalysisContext? host)
+    {
+        if (host == null || producedType == null)
+            return false;
+        var carried = producedType is ByRefTypeAnalysisContext { ElementType: { } pointee }
+            ? pointee
+            : producedType;
+        return host.IsValueType
+            ? carried.FullName == host.FullName
+              // `this` on a generic value type emits `&T<TArgs>` - the member's
+              // declaring type is the open generic, which the instantiation's
+              // own definition satisfies (B<int> is-a B).
+              || carried is GenericInstanceTypeAnalysisContext { GenericType: { } definition }
+                 && definition.FullName == host.FullName
+            : carried.IsAssignableTo(host);
+    }
+
+    // The forward-gate view of the receiver contract: only a proven mismatch
+    // blocks substitution. An untyped slot emits System.Object and an erased
+    // generic parameter nothing concrete, so neither disproves the register
+    // held the host - the copy keeps upstream's forwarding for those.
+    internal static bool ReceiverProvenMismatched(TypeAnalysisContext? producedType,
+        TypeAnalysisContext? host)
+    {
+        if (host == null || producedType == null)
+            return false;
+        var carried = producedType is ByRefTypeAnalysisContext { ElementType: { } pointee }
+            ? pointee
+            : producedType;
+        if (carried.FullName == "System.Object" || carried is GenericParameterTypeAnalysisContext)
+            return false;
+        return !ReceiverSatisfied(producedType, host);
+    }
+
+    // Copy propagation (Simplifier, after SSA removal) forwards `Move`-copy
+    // destinations to their source local inside operands, so the slot a local
+    // ends up emitted through is its single-Move-definition source's slot, not
+    // its own. Following that chain gives the type a receiver position will
+    // actually carry.
+    internal static TypeAnalysisContext? EmittedSlotLocalType(LocalVariable local,
+        MethodAnalysisContext method)
+    {
+        // EmittedLocalType needs the application context; analysis-level callers
+        // without one cannot disprove a receiver type.
+        if (method.AppContext == null)
+            return null;
+        var visited = new HashSet<LocalVariable>();
+        while (visited.Add(local))
+        {
+            var definitions = method.ControlFlowGraph!.Instructions
+                .Where(instruction => ReferenceEquals(instruction.Destination, local)).ToList();
+            if (definitions is not [{ OpCode: OpCode.Move, Operands: [_, { } source, ..] }])
+                break;
+            switch (source)
+            {
+                case LocalVariable sourceLocal:
+                    local = sourceLocal;
+                    continue;
+                // A loaded field/selected-field value carries that value's type
+                // regardless of a transient slot annotation on the local.
+                case FieldReference fieldReference:
+                    return fieldReference.Field.FieldType;
+                case SelectedFieldReference selected:
+                    return selected.FieldType;
+                default:
+                    goto done;
+            }
+        }
+        done:
+        return IlGenerator.EmittedLocalType(local, method);
+    }
+
+    // The type a FieldReference's receiver must supply: the owner of the first
+    // container in a chained access (`v.a.b` needs `a`'s owner - the leaf field's
+    // declaring type applies only to a flat reference).
+    internal static TypeAnalysisContext? ReceiverHost(FieldReference field)
+        => field.Containers is [{ } firstContainer, ..]
+            ? firstContainer.DeclaringType
+            : field.Field.DeclaringType;
+
+    // A call operand's slot contract: a non-static call's `this` must emit the
+    // callee's declaring type (`&T` for value types, an assignable reference
+    // otherwise), and a byref parameter must emit exactly its element type -
+    // `ref`/`out`/`in` slots are invariant. Concrete emitted types that break
+    // the contract prove the forward wrong; untyped slots (uncomputable,
+    // System.Object, generic parameter) are the unproven case copy propagation
+    // is allowed to keep forwarding.
+    internal static bool CallOperandProvenMismatched(Instruction instruction, int operandIndex,
+        LocalVariable replacement, MethodAnalysisContext? method)
+    {
+        if (method == null
+            || instruction.OpCode is not (OpCode.Call or OpCode.CallVoid)
+            || instruction.Operands[0] is not MethodAnalysisContext callee)
+            return false;
+        var baseIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
+        if (!callee.IsStatic)
+        {
+            if (operandIndex == baseIndex)
+                return ReceiverProvenMismatched(EmittedSlotLocalType(replacement, method),
+                    callee.DeclaringType);
+            baseIndex++;
+        }
+        var parameterIndex = operandIndex - baseIndex;
+        if (parameterIndex < 0 || parameterIndex >= callee.Parameters.Count
+            || callee.Parameters[parameterIndex].ParameterType
+                is not ByRefTypeAnalysisContext { ElementType: { } element })
+            return false;
+        return ReceiverProvenMismatched(EmittedSlotLocalType(replacement, method), element);
     }
 
     // The low lane of an aggregate local is its publicly visible offset-0 field of
