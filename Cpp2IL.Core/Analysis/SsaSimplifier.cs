@@ -10,9 +10,14 @@ namespace Cpp2IL.Core.Analysis;
 /// </summary>
 public static class SsaSimplifier
 {
-    public static void Run(MethodAnalysisContext method) => Run(method.ControlFlowGraph!, method.ParameterLocals);
+    public static void Run(MethodAnalysisContext method) =>
+        Run(method.ControlFlowGraph!, method.ParameterLocals, method);
 
-    public static void Run(ISILControlFlowGraph cfg, List<LocalVariable> parameterLocals)
+    public static void Run(ISILControlFlowGraph cfg, List<LocalVariable> parameterLocals) =>
+        Run(cfg, parameterLocals, null);
+
+    private static void Run(ISILControlFlowGraph cfg, List<LocalVariable> parameterLocals,
+        MethodAnalysisContext? method)
     {
         // dest -> value for every forwardable copy/constant. SSA's single-assignment property means a
         // local is defined at most once, so there is never a conflicting entry for the same key.
@@ -51,7 +56,7 @@ public static class SsaSimplifier
         // One global substitution of every use.
         foreach (var block in cfg.Blocks)
             foreach (var instruction in block.Instructions)
-                ReplaceUses(instruction, resolved);
+                ReplaceUses(instruction, resolved, method);
 
         // A forwarded local is dead now - unless a use could not take its value (a constant cannot be
         // a memory base/index, so such a use keeps the original local). Drop the defining Move only
@@ -82,7 +87,8 @@ public static class SsaSimplifier
         return value;
     }
 
-    private static void ReplaceUses(Instruction instruction, Dictionary<LocalVariable, IOperand> resolved)
+    private static void ReplaceUses(Instruction instruction, Dictionary<LocalVariable, IOperand> resolved,
+        MethodAnalysisContext? method)
     {
         // The single definition position (a Move/Call destination local) must not be rewritten - only
         // reads are forwarded. In SSA the local being eliminated never appears as a use of itself, so
@@ -93,7 +99,10 @@ public static class SsaSimplifier
         {
             switch (instruction.Operands[i])
             {
-                case LocalVariable local when !ReferenceEquals(local, destination) && resolved.TryGetValue(local, out var value):
+                case LocalVariable local when !ReferenceEquals(local, destination) && resolved.TryGetValue(local, out var value)
+                    && (value is not LocalVariable localReplacement
+                        || !LocalVariables.CallOperandProvenMismatched(instruction, i,
+                            localReplacement, method)):
                     instruction.SetOperand(i, value);
                     break;
 
@@ -110,14 +119,20 @@ public static class SsaSimplifier
                 // Same as a memory base: the object a field is read from must stay a local, and
                 // its type must be able to serve as the receiver - a mismatched local would
                 // produce an invalid ldfld.
-                case FieldReference { Local: { } fieldLocal } field when resolved.TryGetValue(fieldLocal, out var fieldValue) && fieldValue is LocalVariable fieldReplacement && !LocalVariables.NoLegalManagedCopy(fieldLocal, fieldReplacement):
+                case FieldReference { Local: { } fieldLocal } field when resolved.TryGetValue(fieldLocal, out var fieldValue) && fieldValue is LocalVariable fieldReplacement && !LocalVariables.NoLegalManagedCopy(fieldLocal, fieldReplacement)
+                    && (method == null || !LocalVariables.ReceiverProvenMismatched(
+                        LocalVariables.EmittedSlotLocalType(fieldReplacement, method),
+                        LocalVariables.ReceiverHost(field))):
                     field.Local = fieldReplacement;
                     break;
                 case SelectedFieldReference selected:
                     if (resolved.TryGetValue(selected.Selector, out var selectorValue) && selectorValue is LocalVariable selectorReplacement)
                         selected.Selector = selectorReplacement;
                     foreach (var choice in selected.Choices)
-                        if (resolved.TryGetValue(choice.Field.Local, out var receiverValue) && receiverValue is LocalVariable receiverReplacement && !LocalVariables.NoLegalManagedCopy(choice.Field.Local, receiverReplacement))
+                        if (resolved.TryGetValue(choice.Field.Local, out var receiverValue) && receiverValue is LocalVariable receiverReplacement && !LocalVariables.NoLegalManagedCopy(choice.Field.Local, receiverReplacement)
+                            && (method == null || !LocalVariables.ReceiverProvenMismatched(
+                                LocalVariables.EmittedSlotLocalType(receiverReplacement, method),
+                                LocalVariables.ReceiverHost(choice.Field))))
                             choice.Field.Local = receiverReplacement;
                     break;
 
@@ -135,7 +150,7 @@ public static class SsaSimplifier
                 // names the old local after its definition is dropped, leaving a use of an
                 // unassigned local in the emitted IL.
                 case AddressOf address:
-                    SubstituteAddressTarget(address, resolved);
+                    SubstituteAddressTarget(address, resolved, method);
                     break;
             }
         }
@@ -145,7 +160,8 @@ public static class SsaSimplifier
     // cell a field/element is addressed through - take local replacements exactly like their
     // top-level counterparts. A bare local target (&v) is the cell's own identity rather than a
     // value inside it, so forwarding must not rewrite it.
-    private static void SubstituteAddressTarget(AddressOf address, Dictionary<LocalVariable, IOperand> resolved)
+    private static void SubstituteAddressTarget(AddressOf address, Dictionary<LocalVariable, IOperand> resolved,
+        MethodAnalysisContext? method)
     {
         switch (address.Target)
         {
@@ -157,14 +173,20 @@ public static class SsaSimplifier
                 address.Target = memory; // MemoryOperand is a struct, write the copy back
                 break;
             case FieldReference { Local: { } fieldLocal } field
-                when resolved.TryGetValue(fieldLocal, out var fieldValue) && fieldValue is LocalVariable fieldReplacement && !LocalVariables.NoLegalManagedCopy(fieldLocal, fieldReplacement):
+                when resolved.TryGetValue(fieldLocal, out var fieldValue) && fieldValue is LocalVariable fieldReplacement && !LocalVariables.NoLegalManagedCopy(fieldLocal, fieldReplacement)
+                     && (method == null || !LocalVariables.ReceiverProvenMismatched(
+                         LocalVariables.EmittedSlotLocalType(fieldReplacement, method),
+                         LocalVariables.ReceiverHost(field))):
                 field.Local = fieldReplacement;
                 break;
             case SelectedFieldReference selected:
                 if (resolved.TryGetValue(selected.Selector, out var selectorValue) && selectorValue is LocalVariable selectorReplacement)
                     selected.Selector = selectorReplacement;
                 foreach (var choice in selected.Choices)
-                    if (resolved.TryGetValue(choice.Field.Local, out var receiverValue) && receiverValue is LocalVariable receiverReplacement && !LocalVariables.NoLegalManagedCopy(choice.Field.Local, receiverReplacement))
+                    if (resolved.TryGetValue(choice.Field.Local, out var receiverValue) && receiverValue is LocalVariable receiverReplacement && !LocalVariables.NoLegalManagedCopy(choice.Field.Local, receiverReplacement)
+                        && (method == null || !LocalVariables.ReceiverProvenMismatched(
+                            LocalVariables.EmittedSlotLocalType(receiverReplacement, method),
+                            LocalVariables.ReceiverHost(choice.Field))))
                         choice.Field.Local = receiverReplacement;
                 break;
             case ArrayAccess access:
@@ -188,7 +210,7 @@ public static class SsaSimplifier
                 address.Target = new ReferenceCast(castReplacement, cast.Type, cast.NullOnFailure);
                 break;
             case AddressOf nested:
-                SubstituteAddressTarget(nested, resolved);
+                SubstituteAddressTarget(nested, resolved, method);
                 break;
         }
     }
