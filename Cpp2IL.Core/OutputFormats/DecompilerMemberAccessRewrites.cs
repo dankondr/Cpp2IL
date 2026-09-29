@@ -4,6 +4,7 @@ using AsmResolver;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.PE.DotNet.Cil;
+using AsmResolver.DotNet.Signatures;
 
 namespace Cpp2IL.Core.OutputFormats;
 
@@ -19,7 +20,21 @@ namespace Cpp2IL.Core.OutputFormats;
 /// is already a managed pointer to the enum, and an enum is interchangeable with
 /// its underlying type, so the same stack shape is produced by
 /// <c>ldobj</c>/<c>stobj</c> of the enum itself — which decompiles as the enum
-/// value rather than the unprintable field name.</item>
+/// value rather than the unprintable field name. The same applies to
+/// <c>ldflda</c>: <c>&amp;e.value__</c> is <c>&amp;e</c>, so the retagging
+/// <c>ldflda</c> is dropped and its <c>ldobj</c>/<c>stobj</c>/<c>ldind</c>/
+/// <c>stind</c> consumer retargets to the enum.</item>
+/// <item><c>ldflda</c>/<c>ldsflda</c> on a <c>&lt;X&gt;k__BackingField</c>.
+/// Recovered code takes the backing field's address to feed the load or store
+/// of a member access chain (an enum-typed property's payload, a struct
+/// property's member). When the immediate consumer moves the field's own
+/// value (<c>ldobj</c>/<c>stobj</c>/<c>ldind</c>/<c>stind</c> of the field
+/// type) the pair collapses to the accessor call that produced the same
+/// stack shape originally; when it reads a member of the field's value type
+/// (<c>ldfld</c> of a member declared on that type) the call still works
+/// because <c>ldfld</c> accepts a by-value struct. Other consumers need the
+/// managed pointer itself, which no accessor can produce, so the ldflda
+/// stays and the site's diagnostic or emitted member name stands.</item>
 /// <item>field access on a <c>&lt;X&gt;k__BackingField</c> whose declaring type
 /// still carries property <c>X</c> with the matching accessor. IL2CPP inline-
 /// expands auto-property accessors, so the access is the accessor call the
@@ -56,17 +71,24 @@ internal static class DecompilerMemberAccessRewrites
             {
                 case CilCode.Ldfld:
                     if (!TryRewriteEnumUnderlyingAccess(field, instruction, runtimeContext, load: true))
-                        RewriteBackingFieldAccess(method, field, instruction, runtimeContext, load: true);
+                        RewriteBackingFieldAccess(method, field, instruction, instructions, i, runtimeContext, load: true);
                     break;
                 case CilCode.Stfld:
                     if (!TryRewriteEnumUnderlyingAccess(field, instruction, runtimeContext, load: false))
-                        RewriteBackingFieldAccess(method, field, instruction, runtimeContext, load: false);
+                        RewriteBackingFieldAccess(method, field, instruction, instructions, i, runtimeContext, load: false);
                     break;
                 case CilCode.Ldsfld:
-                    RewriteBackingFieldAccess(method, field, instruction, runtimeContext, load: true);
+                    RewriteBackingFieldAccess(method, field, instruction, instructions, i, runtimeContext, load: true);
                     break;
                 case CilCode.Stsfld:
-                    RewriteBackingFieldAccess(method, field, instruction, runtimeContext, load: false);
+                    RewriteBackingFieldAccess(method, field, instruction, instructions, i, runtimeContext, load: false);
+                    break;
+                case CilCode.Ldflda:
+                case CilCode.Ldsflda:
+                    TryRewriteEnumUnderlyingAddress(field, instruction, instructions, i,
+                        runtimeContext);
+                    TryRewriteBackingFieldAddress(method, field, instruction, instructions, i,
+                        runtimeContext);
                     break;
             }
         }
@@ -154,42 +176,182 @@ internal static class DecompilerMemberAccessRewrites
         return true;
     }
 
-    private static void RewriteBackingFieldAccess(MethodDefinition method, IFieldDescriptor field,
-        CilInstruction instruction, RuntimeContext? runtimeContext, bool load)
+    // &e.value__ is the same address as &e: value__ is the enum's only instance
+    // member, at offset zero, so the ldflda exists only to retag the managed
+    // pointer to the underlying type. An immediately following ldobj, stobj,
+    // ldind or stind consumes that pointer to move exactly the enum's storage -
+    // the same bytes move under the enum's own name when the consumer retargets
+    // to the enum and the retagging ldflda is dropped.
+    private static void TryRewriteEnumUnderlyingAddress(IFieldDescriptor field, CilInstruction instruction,
+        CilInstructionCollection instructions, int index, RuntimeContext? runtimeContext)
+    {
+        if (field.Name?.Value != "value__" || field.DeclaringType is not ITypeDefOrRef declaringType)
+            return;
+        if (!TryResolveType(declaringType, runtimeContext, out var declaringDef) || declaringDef is not { IsEnum: true })
+            return;
+        if (index + 1 >= instructions.Count)
+            return;
+        var consumer = instructions[index + 1];
+        var load = consumer.OpCode.Code switch
+        {
+            CilCode.Ldobj or CilCode.Ldind_I or CilCode.Ldind_I1 or CilCode.Ldind_I2
+                or CilCode.Ldind_I4 or CilCode.Ldind_I8 or CilCode.Ldind_U1 or CilCode.Ldind_U2
+                or CilCode.Ldind_U4 or CilCode.Ldind_R4 or CilCode.Ldind_R8 or CilCode.Ldind_Ref => true,
+            CilCode.Stobj or CilCode.Stind_I or CilCode.Stind_I1 or CilCode.Stind_I2
+                or CilCode.Stind_I4 or CilCode.Stind_I8 or CilCode.Stind_R4 or CilCode.Stind_R8
+                or CilCode.Stind_Ref => false,
+            _ => (bool?)null,
+        };
+        if (load == null)
+            return;
+        instruction.OpCode = CilOpCodes.Nop;
+        instruction.Operand = null;
+        consumer.OpCode = load.Value ? CilOpCodes.Ldobj : CilOpCodes.Stobj;
+        consumer.Operand = declaringType;
+    }
+
+    // &x.<P>k__BackingField feeds the consumers a nested-path load or store
+    // emits: the field's own value (ldobj/stobj or the matching ldind/stind)
+    // or a member read of the field's value type (ldfld). Both collapse to the
+    // property accessor call that produced the stack shape originally -
+    // callvirt get_P pushes the same value ldobj would have loaded, and ldfld
+    // accepts a by-value struct where the code's member read expected the
+    // managed pointer. Consumers that need the pointer itself (ldflda, ldloc
+    // spill, stfld into the storage - a copy write an accessor call cannot
+    // make) keep the ldflda; there is no faithful call for them.
+    private static void TryRewriteBackingFieldAddress(MethodDefinition method, IFieldDescriptor field,
+        CilInstruction instruction, CilInstructionCollection instructions, int index,
+        RuntimeContext? runtimeContext)
     {
         var name = field.Name?.Value;
-        if (name == null || !name.StartsWith('<') || !name.EndsWith(BackingFieldSuffix))
+        if (name == null || !name.StartsWith('<') || !name.EndsWith(BackingFieldSuffix)
+            || index + 1 >= instructions.Count)
             return;
-        var propertyName = name.Substring(1, name.Length - 1 - BackingFieldSuffix.Length);
-        // The field reference may be scoped to a derived type while the field
-        // and its auto-property live on a base; find the property by walking
-        // the scope's hierarchy rather than trusting field resolution.
-        if (field.DeclaringType is not ITypeDefOrRef scopeRef
-            || !TryResolveType(scopeRef, runtimeContext, out var scopeDef) || scopeDef == null)
-            return;
-        var staticAccess = instruction.OpCode.Code is CilCode.Ldsfld or CilCode.Stsfld;
-        for (var declaringType = scopeDef; declaringType != null; declaringType = ResolveBase(declaringType, runtimeContext))
+        if (index > 0 && instructions[index - 1].OpCode.Code
+                is CilCode.Constrained or CilCode.Readonly or CilCode.Tailcall or CilCode.Volatile)
+            return; // a prefix bound to ldflda cannot bind to the call
+        var consumer = instructions[index + 1];
+        var fieldType = FieldTypeOf(field, runtimeContext);
+        // Store consumers (stobj/stind) keep ldflda: the value being written
+        // arrives after the address, so no single call at the ldflda position
+        // can spell it.
+        var operandMatch = consumer.OpCode.Code switch
         {
-            var property = declaringType.Properties.FirstOrDefault(p => p.Name?.Value == propertyName);
-            if (property == null)
-                continue;
-            var accessor = load ? property.GetMethod : property.SetMethod;
-            // The accessor's own body must keep its field access, or it would
-            // recurse; a static/instance mismatch means the property does not
-            // describe this field.
-            if (accessor != null && accessor != method && accessor.IsStatic == staticAccess
-                && AccessorCallableFrom(accessor, method, declaringType, runtimeContext))
-            {
-                instruction.OpCode = accessor.IsStatic || declaringType.IsValueType
-                    ? CilOpCodes.Call : CilOpCodes.Callvirt;
-                instruction.Operand = scopeRef is IMemberRefParent scope
-                        && !ReferenceEquals(scope, accessor.DeclaringType)
-                    ? scope.CreateMemberReference(accessor.Name!, accessor.Signature!)
-                    : accessor;
-            }
+            CilCode.Ldobj => SameType(consumer.Operand as ITypeDefOrRef, fieldType),
+            CilCode.Ldind_Ref => fieldType is not { IsValueType: true },
+            _ => false,
+        };
+        // ldfld needs its own verdict: a member read of the field's value type
+        // collapses onto the accessor call (ldfld accepts a by-value struct),
+        // except value__ on an enum, which the call already produced.
+        var keepConsumer = consumer.OpCode.Code == CilCode.Ldfld;
+        if (keepConsumer)
+        {
+            operandMatch = consumer.Operand is IFieldDescriptor inner
+                && inner.DeclaringType != null && SameType(inner.DeclaringType, fieldType);
+            keepConsumer = operandMatch && !IsEnumUnderlyingFieldRead((IFieldDescriptor)consumer.Operand!, runtimeContext);
+        }
+        if (!operandMatch)
             return;
+        if (!TryFindBackingAccessor(method, field, runtimeContext,
+                instruction.OpCode.Code == CilCode.Ldsflda, load: true,
+                out var accessor, out var declaringType))
+            return;
+        instruction.OpCode = accessor!.IsStatic || declaringType!.IsValueType
+            ? CilOpCodes.Call : CilOpCodes.Callvirt;
+        instruction.Operand = field.DeclaringType is IMemberRefParent scope
+                && !ReferenceEquals(scope, accessor.DeclaringType)
+            ? scope.CreateMemberReference(accessor.Name!, accessor.Signature!)
+            : accessor;
+        if (!keepConsumer)
+        {
+            consumer.OpCode = CilOpCodes.Nop;
+            consumer.Operand = null;
         }
     }
+
+    // `ldfld <enum>::value__` after a value-producing accessor call would just
+    // re-tag the enum it already returned; it folds away. (The enum-underlying
+    // rewrite above turns a surviving ldfld value__ into ldobj, which is only
+    // legal where the producer pushed &enum - after a call it pushed T.)
+    private static bool IsEnumUnderlyingFieldRead(IFieldDescriptor inner,
+        RuntimeContext? runtimeContext)
+        => inner.Name?.Value == "value__"
+            && inner.DeclaringType is ITypeDefOrRef declaringType
+            && TryResolveType(declaringType, runtimeContext, out var innerDef)
+            && innerDef is { IsEnum: true };
+
+    private static bool SameType(ITypeDescriptor? operand, TypeSignature? signature)
+        => operand != null && signature != null && operand.FullName == signature.FullName;
+
+    private static bool TryFindBackingAccessor(MethodDefinition method, IFieldDescriptor field,
+        RuntimeContext? runtimeContext, bool staticAccess, bool load,
+        out MethodDefinition? accessor, out TypeDefinition? declaringType)
+    {
+        accessor = null;
+        declaringType = null;
+        var name = field.Name?.Value;
+        if (name == null || !name.StartsWith('<') || !name.EndsWith(BackingFieldSuffix))
+            return false;
+        var propertyName = name.Substring(1, name.Length - 1 - BackingFieldSuffix.Length);
+        if (field.DeclaringType is not ITypeDefOrRef scopeRef
+            || !TryResolveType(scopeRef, runtimeContext, out var scopeDef) || scopeDef == null)
+            return false;
+        // The property may be absent from the emitted type (stripped metadata,
+        // an injected surface) while its accessor method still exists, so each
+        // level tries the property first and the accessor-name convention next.
+        var accessorName = (load ? "get_" : "set_") + propertyName;
+        for (var type = scopeDef; type != null; type = ResolveBase(type, runtimeContext))
+        {
+            var candidate = type.Properties.FirstOrDefault(p => p.Name?.Value == propertyName)
+                    is { } property ? load ? property.GetMethod : property.SetMethod : null;
+            candidate ??= type.Methods.FirstOrDefault(m => m.Name?.Value == accessorName
+                && m.IsStatic == staticAccess
+                && m.Parameters.Count == (load ? 0 : 1));
+            if (candidate != null && candidate != method && candidate.IsStatic == staticAccess
+                && AccessorCallableFrom(candidate, method, type, runtimeContext))
+            {
+                accessor = candidate;
+                declaringType = type;
+            }
+            if (candidate != null)
+                return accessor != null;
+        }
+        return false;
+    }
+
+    private static void RewriteBackingFieldAccess(MethodDefinition method, IFieldDescriptor field,
+        CilInstruction instruction, CilInstructionCollection instructions, int index,
+        RuntimeContext? runtimeContext, bool load)
+    {
+        // The field reference may be scoped to a derived type while the field
+        // and its auto-property live on a base; the accessor lookup walks the
+        // scope's hierarchy rather than trusting field resolution.
+        var staticAccess = instruction.OpCode.Code is CilCode.Ldsfld or CilCode.Stsfld;
+        if (!TryFindBackingAccessor(method, field, runtimeContext, staticAccess, load,
+                out var accessor, out var declaringType))
+            return;
+        instruction.OpCode = accessor!.IsStatic || declaringType!.IsValueType
+            ? CilOpCodes.Call : CilOpCodes.Callvirt;
+        instruction.Operand = field.DeclaringType is IMemberRefParent scope
+                && !ReferenceEquals(scope, accessor.DeclaringType)
+            ? scope.CreateMemberReference(accessor.Name!, accessor.Signature!)
+            : accessor;
+        if (load && index + 1 < instructions.Count
+            && instructions[index + 1] is { OpCode.Code: CilCode.Ldfld, Operand: IFieldDescriptor inner }
+            && SameType(inner.DeclaringType, FieldTypeOf(field, runtimeContext))
+            && IsEnumUnderlyingFieldRead(inner, runtimeContext))
+        {
+            var consumer = instructions[index + 1];
+            consumer.OpCode = CilOpCodes.Nop;
+            consumer.Operand = null;
+        }
+    }
+
+    private static TypeSignature? FieldTypeOf(IFieldDescriptor field, RuntimeContext? runtimeContext)
+        => field.Signature?.FieldType
+            ?? (field as FieldDefinition)?.Signature?.FieldType
+            ?? ((field as MemberReference)?.Resolve(runtimeContext) as FieldDefinition)?.Signature?.FieldType;
 
     private static TypeDefinition? ResolveBase(TypeDefinition type, RuntimeContext? runtimeContext)
     {
