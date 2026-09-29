@@ -633,10 +633,12 @@ public static class MetadataResolver
             : type != null && type.IsAssignableTo(host);
         var emitted = LocalVariables.EmittedSlotLocalType(local, method);
         if (!declaredSupplies)
-            // local.Type can be transiently unannotated mid-fixpoint; a concrete
-            // declared type is the contract and stays rejected, but an empty
-            // annotation proves nothing - the def-derived slot type decides.
-            return type == null && emitted != null && ReceiverSatisfied(emitted, host);
+            // local.Type can be transiently unannotated mid-fixpoint, and a
+            // System.Object slot is the erased default rather than a contract:
+            // only a concrete non-Object declared type proves a mismatch. For an
+            // empty or erased annotation the def-derived slot type decides.
+            return (type == null || type.FullName == "System.Object")
+                   && emitted != null && ReceiverSatisfied(emitted, host);
         // The receiver pushes the local's emitted slot type - a `Move`-copy's
         // source, a numeric view or an `&`-emission can differ from local.Type,
         // and a ldfld on a mismatched `&` is invalid IL.

@@ -1,9 +1,13 @@
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
+using AsmResolver.DotNet;
+using AsmResolver.PE.DotNet.Cil;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using static Cpp2IL.Core.Tests.Regression.SyntheticFixture;
 
 namespace Cpp2IL.Core.Tests.Regression;
 
@@ -723,6 +727,42 @@ public class AddressedStorageReadTests
                 "a slot that cannot supply the byref element type keeps the argument");
             Assert.That(copy.OpCode, Is.EqualTo(OpCode.Move),
                 "the copy must survive while the argument still reads its destination");
+        });
+    }
+
+    // A memset/cpblk whose destination is a literal constant has no provable
+    // managed meaning - pushing it as a native-int address lowers initblk to
+    // unverifiable IL. The emission keeps the named diagnostic instead.
+    [Test]
+    public void BlockMemoryWriteToLiteralAddressKeepsDiagnostic()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("BlockLiteral.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemVoidType);
+        var content = new LocalVariable("content", new Register(null, "content"))
+            { Type = app.SystemTypes.SystemInt32Type };
+        var count = new LocalVariable("count", new Register(null, "count"))
+            { Type = app.SystemTypes.SystemInt32Type };
+        var (caller, method) = ForeignCaller(app, module,
+        [
+            new(0, OpCode.MemorySet, new Immediate(0x2000), content, count),
+            new(1, OpCode.Return)
+        ], [content, count]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Initblk || i.OpCode == CilOpCodes.Cpblk),
+                Is.False, "a literal destination must not lower to block IL\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand?.ToString().Contains("block memory") == true), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
         });
     }
 }
