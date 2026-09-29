@@ -619,14 +619,30 @@ public class SsaForm
                     // Native registers can merge unrelated managed references at a
                     // control-flow join (especially normal and exception paths). Such
                     // a bit-pattern phi has no legal managed copy; emitting castclass
-                    // makes the normal path throw. Leave that edge at default instead.
-                    // Unlike the forwarding passes, this edge is emitted as a real store,
-                    // so copies between managed pointers of different element types stay
-                    // illegal here (a &U slot cannot receive a &T value).
+                    // makes the normal path throw. Unlike the forwarding passes, this
+                    // edge is emitted as a real store, so copies between managed
+                    // pointers of different element types stay illegal here (a &U
+                    // slot cannot receive a &T value). Skipping the edge entirely
+                    // leaves the destination without a store on this path and the
+                    // local reads as unassigned, so the edge instead copies from a
+                    // register that is never stored: the emitter spells that read
+                    // as the documented default for the destination's type.
                     if (destination is LocalVariable destinationLocal
                         && source is LocalVariable sourceLocal
                         && LocalVariables.NoLegalManagedCopy(destinationLocal, sourceLocal))
-                        continue;
+                    {
+                        // Except a managed-pointer slot: its only honest
+                        // defaults are the address of a fresh local (a `ref`
+                        // to a block-scoped temp, which the escape rules
+                        // reject) or the null pointer, which is not
+                        // verifier-legal. The edge stays unstoreable and the
+                        // destination's reads on this path keep the named
+                        // diagnostic instead.
+                        if (destinationLocal.Type is not ByRefTypeAnalysisContext)
+                            source = UnspellableEdgeValue(destinationLocal);
+                        else
+                            continue;
+                    }
 
                     moves.Add(new Instruction(-1, OpCode.Move, destination, source));
                 }
@@ -661,4 +677,12 @@ public class SsaForm
 
         block.Instructions.InsertRange(insertAt, moves);
     }
+
+    // A register that no instruction anywhere stores, carrying the destination's
+    // type so the emitter spells the read as that slot's documented default:
+    // note plus default, stored into the destination on this edge.
+    private static LocalVariable UnspellableEdgeValue(LocalVariable destination) =>
+        new($"unspellable_edge_{destination.Name}",
+            new Register(null, $"unspellable_edge_{destination.Register.Name}_{destination.Register.Version}"),
+            destination.Type);
 }

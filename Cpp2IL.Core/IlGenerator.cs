@@ -9347,44 +9347,44 @@ public static class IlGenerator
         return null;
     }
 
-    // Locals that appear in operands but no instruction in the method ever
-    // stores: an entry-version register (Version -1) whose content the binary
-    // never defines, or an SSA destination whose incoming copies were all
-    // dropped before emission. A managed read of such a local compiles as an
-    // unassigned-variable use; the documented default substitution keeps the
-    // read explicit instead. Addressable locals are excluded - their storage
-    // can be written through `&`, so their ldloc may carry a real value.
-    private static readonly ConditionalWeakTable<MethodAnalysisContext, HashSet<Register>> UndefinedLocalCache = new();
+    private static readonly ConditionalWeakTable<MethodAnalysisContext, HashSet<Register>> DefinedLocalRegisterCache = new();
 
-    // The register slots whose only-appearing locals have no definition, keyed
-    // by register rather than local instance: passes can wrap the same slot in
-    // a fresh LocalVariable (a lane-split field receiver, a coalesced copy), so
-    // identity follows the register.
-    private static HashSet<Register> UndefinedLocals(MethodAnalysisContext context) =>
-        UndefinedLocalCache.GetValue(context, static ctx =>
+    // Registers provably holding a value wherever they are read: parameter
+    // slots, the `this`/return/methodinfo slots, frame cells (frame_sp_/
+    // frame_fp_ locals model raw frame storage whose writes are MemoryOperand
+    // stores, never ISIL destinations), registers reachable under `&` (a
+    // pointer write can define them invisibly) and every register a real store
+    // writes. A read of a register absent from this set has no value to spell.
+    // Keyed by register rather than local instance because passes wrap the same
+    // slot in fresh LocalVariables (lane-split receivers, coalesced copies,
+    // inserted edge sources), so identity follows the register.
+    private static HashSet<Register> DefinedLocalRegisters(MethodAnalysisContext context) =>
+        DefinedLocalRegisterCache.GetValue(context, static ctx =>
         {
-            HashSet<Register> undefined = [];
-            foreach (var local in ctx.Locals)
-                if (!local.IsThis && !local.IsReturn && !local.IsMethodInfo
-                    // frame_sp_/frame_fp_ locals model raw frame cells, not
-                    // registers: their stores are MemoryOperand writes (or the
-                    // cell is live-in) and never appear as an ISIL destination.
-                    && !local.Register.Name.StartsWith("frame_", System.StringComparison.Ordinal))
-                    undefined.Add(local.Register);
-            if (undefined.Count == 0)
-                return undefined;
+            HashSet<Register> defined = [];
             foreach (var parameterLocal in ctx.ParameterLocals)
-                undefined.Remove(parameterLocal.Register);
-            var escapedRegisters = new HashSet<Register>();
+                defined.Add(parameterLocal.Register);
+            foreach (var local in ctx.Locals)
+                if (local.IsThis || local.IsReturn || local.IsMethodInfo
+                    || local.Register.Name.StartsWith("frame_", System.StringComparison.Ordinal))
+                    defined.Add(local.Register);
             foreach (var instruction in ctx.ControlFlowGraph!.Instructions)
             {
-                MarkStoreReceiverDefined(StoreReceiverOperand(instruction), undefined);
+                // A self-copy `Move L, L` is no definition: the register's only
+                // write is its own read, so it still holds no value.
+                if (!IsSelfCopy(instruction))
+                    MarkStoreReceiverDefined(StoreReceiverOperand(instruction), defined);
                 foreach (var operand in instruction.Operands)
-                    CollectEscapedRegisters(operand, escapedRegisters);
+                    CollectEscapedRegisters(operand, defined);
             }
-            undefined.ExceptWith(escapedRegisters);
-            return undefined;
+            return defined;
         });
+
+    private static bool IsSelfCopy(Instruction instruction) =>
+        instruction.OpCode is OpCode.Move
+        && instruction.Operands is [LocalVariable { Register: { } selfCopyDest },
+            LocalVariable { Register: { } selfCopySource }]
+        && selfCopyDest.Equals(selfCopySource);
 
     // The operand naming the storage a store-family instruction writes into.
     // Instruction.Destination answers the same question only for locals - a
@@ -9402,35 +9402,35 @@ public static class IlGenerator
             or OpCode.VectorMin or OpCode.VectorMax or OpCode.SignExtend32
             or OpCode.CheckEqual or OpCode.CheckGreater or OpCode.CheckLess
             or OpCode.CheckNotEqual or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual
-            or OpCode.Newobj or OpCode.Box or OpCode.Unbox
+            or OpCode.Newobj or OpCode.NewArr or OpCode.Box or OpCode.Unbox
             => instruction.Operands.Count > 0 ? instruction.Operands[0] : null,
         _ => null,
     };
 
     // A store defines the local it writes into, through whatever operand names
     // the storage: stloc, stfld into its field, or a write through its address.
-    private static void MarkStoreReceiverDefined(IOperand? destination, HashSet<Register> undefined)
+    private static void MarkStoreReceiverDefined(IOperand? destination, HashSet<Register> defined)
     {
         switch (destination)
         {
-            case LocalVariable defined:
-                undefined.Remove(defined.Register);
+            case LocalVariable receiverLocal:
+                defined.Add(receiverLocal.Register);
                 break;
             case FieldReference { Local: { } receiver }:
-                undefined.Remove(receiver.Register);
+                defined.Add(receiver.Register);
                 break;
             case SelectedFieldReference selected:
-                undefined.Remove(selected.Selector.Register);
+                defined.Add(selected.Selector.Register);
                 foreach (var (_, choiceField) in selected.Choices)
                     if (choiceField.Local is { } choiceReceiver)
-                        undefined.Remove(choiceReceiver.Register);
+                        defined.Add(choiceReceiver.Register);
                 break;
             case MemoryOperand { Base: LocalVariable baseLocal }:
-                undefined.Remove(baseLocal.Register);
+                defined.Add(baseLocal.Register);
                 break;
             case AddressOf { Target: { } target }:
                 foreach (var local in Analysis.LocalVariables.OperandLocals(target))
-                    undefined.Remove(local.Register);
+                    defined.Add(local.Register);
                 break;
         }
     }
@@ -9492,9 +9492,20 @@ public static class IlGenerator
 
         if (parameter != null)
             instructions.Add(CilOpCodes.Ldarg, parameter);
-        else if (UndefinedLocals(context).Contains(local.Register))
-            PushDefaultOf(EmittedLocalType(local, context), method, instructions, context,
+        else if (!DefinedLocalRegisters(context).Contains(local.Register))
+        {
+            var substitutedType = EmittedLocalType(local, context);
+            EmitDecompilerNote(method, context,
                 $"Undefined local {local}: no instruction in the method stores it, so the read has no value to spell.");
+            // The placeholder is consumed by whatever op follows the read - a
+            // pop, an array op, a stloc - so it must carry a real stack type:
+            // initobj on a typed temp pushes a typed default where the raw
+            // untyped ldnull/default literal cannot be used.
+            if (substitutedType is ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+                PushDefaultValue(substitutedType, method, instructions, context);
+            else
+                EmitDefaultValueLocal(substitutedType, method, instructions, context);
+        }
         else
             instructions.Add(CilOpCodes.Ldloc, locals[local]);
     }
