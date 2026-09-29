@@ -694,6 +694,77 @@ public static class MetadataResolver
         return null;
     }
 
+    // A native store can land strictly inside a value-typed instance field - the
+    // object the base operand names is only the outermost level: a state machine
+    // keeps struct awaiters, enumerators and wrapper structs as fields, so
+    // [this + K] may write `this.awaiter.cancellationToken`, not any field
+    // sitting at K directly. Descend through value-typed containers collecting
+    // every member boundary the access covers exactly, shallowest first; each
+    // candidate leaf is provably a member the binary writes, and the caller
+    // picks the one the stored value can actually carry (a whole struct write
+    // for a struct-typed source, or the member inside it for a primitive one).
+    // Anything else - past every field, inside reference-typed storage,
+    // part-way through a member, or a store whose width is unknown - yields no
+    // candidate and keeps its diagnostic.
+    internal static List<(FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)>?
+        FindInteriorInstanceFieldPaths(TypeAnalysisContext owner, long offset, int accessSize)
+    {
+        if (accessSize <= 0)
+            return null;
+
+        var pointerSize = owner.AppContext.Binary.PointerSizeBytes;
+        var paths = new List<(FieldAnalysisContext, IReadOnlyList<FieldAnalysisContext>)>();
+        var containers = new List<FieldAnalysisContext>();
+        var current = owner;
+        var relative = offset;
+        for (var depth = 0; depth < 8; depth++)
+        {
+            if (FindFieldCovering(current, relative, pointerSize) is not { } hit)
+                break;
+            var (field, fieldOffset, fieldSize) = hit;
+            if (fieldOffset == relative && fieldSize == accessSize)
+                paths.Add((field, containers.ToArray()));
+            if (!field.FieldType.IsValueType)
+                break;
+            containers.Add(field);
+            current = field.FieldType;
+            relative -= fieldOffset;
+        }
+
+        return paths.Count == 0 ? null : paths;
+    }
+
+    // The single instance field whose byte range covers the offset, on the type
+    // or any of its bases. Generic definitions and generic instances both keep
+    // placeholder metadata offsets, so their layout comes from
+    // GenericInstanceFieldLayout instead.
+    private static (FieldAnalysisContext Field, long Offset, long Size)? FindFieldCovering(
+        TypeAnalysisContext owner, long offset, int pointerSize)
+    {
+        for (var candidate = owner; candidate != null; candidate = candidate.BaseType)
+        {
+            if (candidate is GenericInstanceTypeAnalysisContext genericCandidate)
+            {
+                if (GenericInstanceFieldLayout.FindFieldContainingOffset(genericCandidate, offset)
+                    is { } genericHit)
+                    return genericHit;
+                continue;
+            }
+            if (candidate.GenericParameters.Count > 0)
+                continue;
+            foreach (var field in candidate.Fields.Where(f => !f.IsStatic
+                         && (f.Attributes & FieldAttributes.Literal) == 0))
+            {
+                var fieldOffset = field.BackingData?.FieldOffset ?? field.Offset;
+                var size = GenericInstanceFieldLayout.FieldStorageSize(field.FieldType, pointerSize);
+                if (size > 0 && offset >= fieldOffset && offset < fieldOffset + size)
+                    return (field, fieldOffset, size);
+            }
+        }
+
+        return null;
+    }
+
     private static int? PrimitiveStorageSize(TypeAnalysisContext type, int pointerSize)
     {
         if (!type.IsValueType)
