@@ -615,6 +615,31 @@ public static class IlGenerator
                     break;
                 }
 
+                // array[i].field = v takes the element address under the value
+                // like stelem takes the array, so it is emitted here rather
+                // than through StoreToOperand.
+                if (instruction.Operands[0] is ArrayElementFieldReference elementField
+                    && elementField.Array.Type is SzArrayTypeAnalysisContext { ElementType: { } containerType })
+                {
+                    if (!TypeTokenUsableFrom(containerType, context)
+                        || !FieldUsableFrom(elementField.Field, context, writeAccess: true,
+                            receiverType: containerType))
+                    {
+                        EmitUnrecoverableOperation(method, writeLine,
+                            $"Inaccessible array element field store: {containerType.FullName}.{elementField.Field.Name}");
+                        break;
+                    }
+                    LoadArrayBase(elementField.Array, method, locals, context);
+                    LoadOperandIntoSlot(elementField.Index, context.AppContext.SystemTypes.SystemInt32Type,
+                        context, method, locals, writeLine);
+                    instructions.Add(CilOpCodes.Ldelema, containerType.ToTypeSignature().ToTypeDefOrRef());
+                    LoadOperandIntoSlot(instruction.Operands[1], elementField.Field.FieldType,
+                        context, method, locals, writeLine);
+                    instructions.Add(CilOpCodes.Stfld,
+                        FieldDescriptorFor(elementField.Field, containerType));
+                    break;
+                }
+
                 // A method pointer stored into a local that no instruction ever
                 // loads is a dead store, so the whole Move drops out. Only a
                 // visible, non-.ctor pointer into an IntPtr local is dropped

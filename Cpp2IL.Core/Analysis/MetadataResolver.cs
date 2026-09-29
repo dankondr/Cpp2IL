@@ -740,7 +740,7 @@ public static class MetadataResolver
             var folded = memory;
             folded.Base = root;
             folded.Addend = offset;
-            if (!ResolvesToKnownAccess(rootType, folded, pointerSize))
+            if (!ResolvesToKnownAccess(rootType, folded, pointerSize, method, instruction, i))
                 continue;
             instruction.SetOperand(i, folded);
             changed = true;
@@ -776,10 +776,12 @@ public static class MetadataResolver
         return recovered ?? local.Type;
     }
 
-    private static bool ResolvesToKnownAccess(TypeAnalysisContext owner, MemoryOperand memory, int pointerSize)
+    private static bool ResolvesToKnownAccess(TypeAnalysisContext owner, MemoryOperand memory, int pointerSize,
+        MethodAnalysisContext method, Instruction instruction, int operandIndex)
     {
         if (owner is SzArrayTypeAnalysisContext arrayType)
-            return ArrayRecovery.ResolvesAccess(memory, arrayType, pointerSize);
+            return ArrayRecovery.ResolvesAccess(memory, arrayType, pointerSize,
+                method, instruction, operandIndex);
 
         if (owner is StaticFieldStorageTypeAnalysisContext staticStorage)
             return memory.Index == null && memory.Scale == 0

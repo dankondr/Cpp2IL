@@ -24,6 +24,10 @@ public static class ArrayRecovery
 
     public static void Run(MethodAnalysisContext method)
     {
+        // Whole-element stores are themselves resolved by RecoverAccesses, so the
+        // bulk-copy pass must run first or its redundant-chunk cleanup never sees
+        // the MemoryOperand shape it matches.
+        RecoverStructArrayBulkCopies(method);
         RecoverAccesses(method);
         RecoverElementPointerWalkers(method);
         RecoverReferenceArrayOffsetWalkers(method);
@@ -32,7 +36,6 @@ public static class ArrayRecovery
         RecoverFieldAddressAliases(method);
         RecoverValueTypeFieldAddresses(method);
         RecoverStructElementAddresses(method);
-        RecoverStructArrayBulkCopies(method);
         GroupInitialisers(method.ControlFlowGraph!);
     }
 
@@ -67,6 +70,33 @@ public static class ArrayRecovery
             var elementEnd = elementStart + stride;
             instruction.SetOperands(new ArrayAccess(array, new Immediate(relative / stride)), value);
 
+            foreach (var chunk in cfg.Instructions)
+                if (!ReferenceEquals(chunk, instruction) && chunk is
+                    { OpCode: OpCode.Move, Operands: [MemoryOperand { Base: LocalVariable chunkArray,
+                        Index: null, Scale: 0, Addend: var chunkOffset }, _] }
+                    && ReferenceEquals(chunkArray, array)
+                    && chunkOffset >= elementStart && chunkOffset < elementEnd)
+                    MakeNop(chunk);
+        }
+
+        // The earlier RecoverAccesses call in the SSA phase resolves the same
+        // whole-element stores to ArrayAccess before this pass sees them; drop
+        // their redundant chunk stores the same way.
+        foreach (var instruction in cfg.Instructions)
+        {
+            if (instruction is not { OpCode: OpCode.Move,
+                    Operands: [ArrayAccess { Array: LocalVariable { Type: SzArrayTypeAnalysisContext arrayType } array,
+                        Index: Immediate { Value: var index } }, _] }
+                || !arrayType.ElementType.IsValueType
+                || ElementSize(arrayType.ElementType, pointerSize) != 0)
+                continue;
+
+            var stride = MetadataElementSize(arrayType.ElementType, pointerSize);
+            if (stride <= 0)
+                continue;
+
+            var elementStart = ElementsOffset(pointerSize) + index * stride;
+            var elementEnd = elementStart + stride;
             foreach (var chunk in cfg.Instructions)
                 if (!ReferenceEquals(chunk, instruction) && chunk is
                     { OpCode: OpCode.Move, Operands: [MemoryOperand { Base: LocalVariable chunkArray,
@@ -409,19 +439,29 @@ public static class ArrayRecovery
     }
 
     // Whether RecoverAccesses would resolve this operand into an ArrayLength or
-    // ArrayAccess for the given array type.
-    internal static bool ResolvesAccess(MemoryOperand memory, SzArrayTypeAnalysisContext arrayType, int pointerSize)
+    // ArrayAccess for the given array type. Alias normalization folds displaced
+    // bases onto the array through this same predicate, so the full instruction
+    // context - sibling agreement and the lifted-lea discipline - applies: a
+    // fold must never strand an operand RecoverAccesses will then refuse.
+    internal static bool ResolvesAccess(MemoryOperand memory, SzArrayTypeAnalysisContext arrayType, int pointerSize,
+        MethodAnalysisContext method, Instruction instruction, int operandIndex,
+        Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>>? uses = null)
     {
         if (memory.Index == null && memory.Scale == 0 && memory.Addend == LengthOffset(pointerSize))
             return true;
 
-        return ElementIndex(memory, arrayType, pointerSize) != null;
+        if (ElementIndex(memory, arrayType, pointerSize) != null)
+            return true;
+
+        return ResolveStructElementAccess(instruction, operandIndex, memory, arrayType, pointerSize,
+            () => uses ?? CollectUses(method.ControlFlowGraph!)) != null;
     }
 
     internal static void RecoverAccesses(MethodAnalysisContext method)
     {
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
         var definitions = SingleDefinitions(method.ControlFlowGraph!);
+        Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>>? uses = null;
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
@@ -452,7 +492,16 @@ public static class ArrayRecovery
                 }
 
                 if (ElementIndex(memory, arrayType, pointerSize) is { } index)
+                {
                     instruction.SetOperand(i, new ArrayAccess(array, index));
+                    continue;
+                }
+
+                if (ResolveStructElementAccess(instruction, i, memory, arrayType, pointerSize,
+                        () => uses ??= CollectUses(method.ControlFlowGraph!)) is { } access)
+                    instruction.SetOperand(i, access.Field is { } elementField
+                        ? new ArrayElementFieldReference(array, access.Index, elementField)
+                        : new ArrayAccess(array, access.Index));
             }
         }
     }
@@ -641,6 +690,98 @@ public static class ArrayRecovery
             return memory.Scale == 0 ? new Immediate(offset / elementSize) : null;
 
         return memory.Scale == elementSize && offset == 0 ? memory.Index : null;
+    }
+
+    // A dereference into an array of value-typed elements lands on an element
+    // when the offset is past the header and element-aligned, on a member of
+    // the element when a flat field covers the access width exactly. The
+    // returned operand is the element index; field is null for a whole-element
+    // access. Nested members, interior gaps and widths no member covers stay
+    // unproven.
+    private static (IOperand Index, FieldAnalysisContext? Field)? StructElementAccess(
+        MemoryOperand memory, SzArrayTypeAnalysisContext arrayType, long accessWidth, int pointerSize)
+    {
+        var elementType = arrayType.ElementType;
+        if (!elementType.IsValueType || ElementSize(elementType, pointerSize) != 0)
+            return null;
+
+        var elementSize = MetadataElementSize(elementType, pointerSize);
+        if (elementSize <= 0)
+            return null;
+
+        var offset = memory.Addend - ElementsOffset(pointerSize);
+        if (offset < 0)
+            return null;
+
+        IOperand index;
+        long fieldOffset;
+        if (memory.Index == null)
+        {
+            if (memory.Scale != 0)
+                return null;
+            index = new Immediate(offset / elementSize);
+            fieldOffset = offset % elementSize;
+        }
+        else
+        {
+            if (memory.Scale != elementSize || offset >= elementSize)
+                return null;
+            index = memory.Index;
+            fieldOffset = offset;
+        }
+
+        if (fieldOffset == 0 && accessWidth == elementSize)
+            return (index, null);
+
+        if (accessWidth <= 0
+            || MetadataResolver.FindInstanceFieldPathAtOffset(elementType, fieldOffset, (int)accessWidth)
+                is not { Field: { } field, Containers: { Count: 0 } }
+            || PrimitiveElementFieldSize(field.FieldType, pointerSize) != accessWidth)
+            return null;
+
+        return (index, field);
+    }
+
+    // Wraps StructElementAccess with the instruction context a rewrite needs:
+    // the width of a load or store comes from its Move sibling when the operand
+    // itself records none, the sibling's declared type must agree with what is
+    // being read or written, and a Move source whose destination is only ever
+    // used as a pointer is a lifted lea - the element-address pass rewrites
+    // those into &array[i]. The uses table is computed lazily; most operands
+    // never need it.
+    private static (IOperand Index, FieldAnalysisContext? Field)? ResolveStructElementAccess(
+        Instruction instruction, int operandIndex, MemoryOperand memory,
+        SzArrayTypeAnalysisContext arrayType, int pointerSize,
+        Func<Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>>> uses)
+    {
+        var sibling = operandIndex <= 1 && instruction is { OpCode: OpCode.Move, Operands: [_, { }] }
+            ? instruction.Operands[1 - operandIndex]
+            : null;
+
+        if (operandIndex == 1 && sibling is LocalVariable destination
+            && uses().TryGetValue(destination, out var destinationUses)
+            && destinationUses.Count != 0
+            && destinationUses.All(use => use.Instruction.IsCall
+                || IsMemoryBase(use.Instruction.Operands[use.OperandIndex], destination)))
+            return null;
+
+        var accessWidth = memory.AccessSize != 0
+            ? memory.AccessSize
+            : sibling is LocalVariable { Type: { } siblingType }
+                ? (int)TypeSizes.MinimumUnboxedSize(siblingType, pointerSize)
+                : 0;
+
+        if (StructElementAccess(memory, arrayType, accessWidth, pointerSize) is not { } access)
+            return null;
+
+        var targetType = access.Field?.FieldType ?? arrayType.ElementType;
+        if (sibling is LocalVariable { Type: { } contract }
+            && (contract.IsValueType
+                ? contract.FullName != targetType.FullName
+                : targetType.IsValueType))
+            return null;
+
+        return access;
     }
 
     private static long ElementSize(TypeAnalysisContext elementType, int pointerSize)
