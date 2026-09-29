@@ -628,16 +628,19 @@ public static class MetadataResolver
         }
         else
             type = local.Type;
-        var declaredSupplies = type is ByRefTypeAnalysisContext { ElementType: { } pointee }
-            ? pointee.IsAssignableTo(host)
-            : type != null && type.IsAssignableTo(host);
+        var contract = type is ByRefTypeAnalysisContext { ElementType: { } pointee }
+            ? pointee
+            : type;
+        var declaredSupplies = contract != null && contract.IsAssignableTo(host);
         var emitted = LocalVariables.EmittedSlotLocalType(local, method);
         if (!declaredSupplies)
-            // local.Type can be transiently unannotated mid-fixpoint, and a
-            // System.Object slot is the erased default rather than a contract:
-            // only a concrete non-Object declared type proves a mismatch. For an
-            // empty or erased annotation the def-derived slot type decides.
-            return (type == null || type.FullName == "System.Object")
+            // local.Type can be transiently unannotated mid-fixpoint, and an
+            // erased annotation - System.Object, a shared-generic parameter,
+            // an instantiation with erased arguments like List<object> - is the
+            // lifter's placeholder rather than a contract: only a concrete
+            // non-erased declared type proves a mismatch. For an empty or
+            // erased annotation the def-derived slot type decides.
+            return (contract == null || IlGenerator.ContainsErasedSharedArgument(contract))
                    && EmittedValueSuppliesReceiver(emitted, host);
         // The receiver pushes the local's emitted slot type - a `Move`-copy's
         // source, a numeric view or an `&`-emission can differ from local.Type.
