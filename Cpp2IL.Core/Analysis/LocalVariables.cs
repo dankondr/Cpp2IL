@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using Cpp2IL.Core.Extensions;
+using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
@@ -589,6 +590,235 @@ public static class LocalVariables
             return arrayOperand != null;
         }
         return false;
+    }
+
+    // `new Span<T>(arr)`/`new ReadOnlySpan<T>(arr)` lowers to
+    // `arr == null ? default : new Span(arr)`, whose arms arrive as
+    // `spanLocal := arr + dataOffset` on the non-null edge and a literal
+    // `spanLocal := 0` on the null edge. Left as-is, the add's result emits as
+    // an uncoercible native-int store into the span local and the zero store
+    // is dropped as a default - two diagnosed losses for one managed value.
+    // When the local's non-null defs unwrap to an array operand and the zero
+    // store provably sits on that array's `== null` edge, both stores rewrite
+    // to `Move spanLocal := arr`, which emits `new Span(arr)`: on the null arm
+    // that evaluates to default - exactly the zero the binary wrote.
+    private static void RecoverArrayBackedSpanStores(MethodAnalysisContext method)
+    {
+        var graph = method.ControlFlowGraph!;
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        var instructions = graph.Instructions.ToList();
+        foreach (var instruction in instructions)
+        {
+            if (instruction.Destination is not LocalVariable destination
+                || destination.Type is not GenericInstanceTypeAnalysisContext
+                    { GenericType.FullName: "System.Span`1" or "System.ReadOnlySpan`1" } spanDestination)
+                continue;
+
+            if (instruction.OpCode == OpCode.Add
+                && instruction.Operands is [_, _, Immediate { Value: var offset }]
+                && offset == pointerSize * 4
+                && TryUnwrapArrayDataPointer(instruction, method, pointerSize, out var addArray)
+                && SpanElementMatches(addArray!, spanDestination, method))
+            {
+                instruction.OpCode = OpCode.Move;
+                instruction.SetOperands(destination, addArray!);
+                continue;
+            }
+
+            if (instruction.OpCode != OpCode.Move
+                || instruction.Operands is not [_, Immediate { Value: 0 }])
+                continue;
+            var siteBlock = graph.Blocks.FirstOrDefault(block => block.Instructions.Contains(instruction));
+            if (siteBlock == null)
+                continue;
+            foreach (var sibling in instructions.Where(definition =>
+                !ReferenceEquals(definition, instruction)
+                && ReferenceEquals(definition.Destination, destination)))
+            {
+                var candidate = sibling switch
+                {
+                    { OpCode: OpCode.Add } => UnwrapArrayOperand(sibling, method, pointerSize),
+                    { OpCode: OpCode.Move, Operands: [_, var moveSource] }
+                        => UnwrapArrayOperand(moveSource, method, pointerSize),
+                    _ => null,
+                };
+                if (candidate == null
+                    || !SpanElementMatches(candidate, spanDestination, method)
+                    || !OnNullEdge(instruction, siteBlock, candidate, method))
+                    continue;
+                instruction.SetOperand(1, candidate);
+                break;
+            }
+        }
+    }
+
+    private static IOperand? UnwrapArrayOperand(IOperand operand, MethodAnalysisContext method, int pointerSize) =>
+        TryUnwrapArrayDataPointer(operand, method, pointerSize, out var arrayOperand) ? arrayOperand
+        : IlGenerator.EmittedOperandType(operand, method) is SzArrayTypeAnalysisContext ? operand
+        : null;
+
+    private static bool SpanElementMatches(IOperand arrayOperand,
+        GenericInstanceTypeAnalysisContext spanDestination, MethodAnalysisContext method) =>
+        IlGenerator.EmittedOperandType(arrayOperand, method) is SzArrayTypeAnalysisContext
+            { ElementType: { } element }
+        && element.FullName == spanDestination.GenericArguments[0].FullName;
+
+    // The store must execute only on the `array == null` edge of a guard that
+    // compares the unwrapped array operand against zero: every predecessor
+    // whose incoming edge actually reaches the site is either such a guard or
+    // a block the site block itself dominates (a back-edge into the null arm),
+    // and nothing in the block may redefine the array between the edge and
+    // the store. An edge bypasses the site when its landing instruction sits
+    // after it in the block - a phi-edge copy at the head of a join block is
+    // reached only by the edge that targets it.
+    private static bool OnNullEdge(Instruction site, Block siteBlock, IOperand arrayOperand,
+        MethodAnalysisContext method)
+    {
+        var graph = method.ControlFlowGraph!;
+        var siteIndex = siteBlock.Instructions.IndexOf(site);
+        var sawGuard = false;
+        foreach (var predecessor in siteBlock.Predecessors)
+        {
+            if (ReferenceEquals(predecessor, siteBlock)
+                || method.DominatorInfo?.Dominates(siteBlock, predecessor) == true)
+                continue;
+            if (!EdgeReachesSite(predecessor, siteBlock, siteIndex, graph))
+                continue;
+            if (IsNullEdgeGuard(predecessor, siteBlock, siteIndex, arrayOperand, graph))
+            {
+                sawGuard = true;
+                continue;
+            }
+            return false;
+        }
+        if (!sawGuard)
+            return false;
+        foreach (var earlier in siteBlock.Instructions.TakeWhile(i => !ReferenceEquals(i, site)))
+        {
+            switch (arrayOperand)
+            {
+                case LocalVariable arrayLocal when ReferenceEquals(earlier.Destination, arrayLocal):
+                // A store through memory or into a field may alias the array
+                // field, so the null proof does not survive it.
+                case FieldReference when earlier.Destination is MemoryOperand or FieldReference:
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    // Does control entering `siteBlock` from `predecessor` reach `siteIndex`?
+    // Edges land on their target instruction (or the block head when the edge
+    // is a fallthrough or names a block); landing after the site bypasses it.
+    private static bool EdgeReachesSite(Block predecessor, Block siteBlock, int siteIndex,
+        ISILControlFlowGraph graph)
+    {
+        var terminator = predecessor.Instructions.LastOrDefault();
+        if (terminator is not { OpCode: OpCode.Jump or OpCode.ConditionalJump })
+            return true; // Fallthrough into the block head.
+        var taken = terminator.Operands[0];
+        var takenBlock = LandingBlock(taken, graph);
+        var fallthroughReaches = predecessor.Successors.Any(successor =>
+            ReferenceEquals(successor, siteBlock) && !ReferenceEquals(successor, takenBlock));
+        if (terminator.OpCode == OpCode.Jump)
+            return LandingIndex(taken, siteBlock, graph) <= siteIndex;
+        return (LandingIndex(taken, siteBlock, graph) <= siteIndex) || fallthroughReaches;
+    }
+
+    private static Block? LandingBlock(IOperand target, ISILControlFlowGraph graph) =>
+        target switch
+        {
+            Block blockTarget => blockTarget,
+            Instruction targetInstruction
+                => graph.Blocks.FirstOrDefault(b => b.Instructions.Contains(targetInstruction)),
+            _ => null,
+        };
+
+    private static int? LandingIndex(IOperand target, Block siteBlock, ISILControlFlowGraph graph) =>
+        target switch
+        {
+            Block blockTarget => ReferenceEquals(blockTarget, siteBlock) ? 0 : null,
+            Instruction targetInstruction
+                => siteBlock.Instructions.IndexOf(targetInstruction) is { } index && index >= 0
+                    ? index
+                    : null,
+            _ => null,
+        };
+
+    private static bool IsNullEdgeGuard(Block guard, Block siteBlock, int siteIndex,
+        IOperand arrayOperand, ISILControlFlowGraph graph)
+    {
+        if (guard.Instructions.Count == 0
+            || guard.Instructions[^1] is not { OpCode: OpCode.ConditionalJump } jump
+            || jump.Operands.Count < 2
+            || jump.Operands[1] is not LocalVariable condition
+            || ResolveNullCheck(condition, graph) is not { } check
+            || !SameOperand(ResolveAliasOperand(check.Compared, graph), arrayOperand))
+            return false;
+        var taken = jump.Operands[0];
+        var landing = LandingIndex(taken, siteBlock, graph);
+        var takenBlock = LandingBlock(taken, graph);
+        var fallthroughFeeds = guard.Successors.Any(successor =>
+            ReferenceEquals(successor, siteBlock) && !ReferenceEquals(successor, takenBlock));
+        // The null side is the taken edge for CheckEqual and the fallthrough
+        // for CheckNotEqual; the other edge of the same guard must not also
+        // feed the site.
+        if (check.NotEqual)
+            return fallthroughFeeds && (landing == null || landing > siteIndex);
+        return landing is { } reached && reached <= siteIndex && !fallthroughFeeds;
+    }
+
+    // The operand a comparison actually reads: a guard like `CheckEqual(v, 0)`
+    // often compares a `Move` copy of the value the span was built from, so
+    // single-definition Move chains resolve through to the ultimate operand.
+    // Locals on the chain must stay immutable - with more than one definition
+    // the comparison would prove nothing about the operand at the store.
+    private static IOperand ResolveAliasOperand(IOperand operand, ISILControlFlowGraph graph)
+    {
+        var visited = new HashSet<LocalVariable>();
+        while (operand is LocalVariable local && visited.Add(local)
+            && graph.Instructions.Where(i => i.IsAssignment && ReferenceEquals(i.Destination, local))
+                    .ToList() is [{ OpCode: OpCode.Move, Operands: [_, var moveSource] }])
+            operand = moveSource;
+        return operand;
+    }
+
+    // The condition feeding the null check, resolved through single-definition
+    // Move/Not chains: NotEqual is true when the null side is the
+    // condition-false edge (CheckNotEqual, or a negated CheckEqual).
+    private static (IOperand Compared, bool NotEqual)? ResolveNullCheck(LocalVariable condition,
+        ISILControlFlowGraph graph)
+    {
+        var visited = new HashSet<LocalVariable>();
+        var negated = false;
+        var current = condition;
+        while (visited.Add(current))
+        {
+            if (graph.Instructions.Where(i => i.IsAssignment && ReferenceEquals(i.Destination, current))
+                    .ToList() is not [var definition])
+                return null;
+            switch (definition)
+            {
+                case { OpCode: OpCode.Move, Operands: [_, LocalVariable moveSource] }:
+                    current = moveSource;
+                    continue;
+                case { OpCode: OpCode.Not, Operands: [_, LocalVariable notSource] }:
+                    negated = !negated;
+                    current = notSource;
+                    continue;
+                case { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual,
+                        Operands: [_, var left, var right] }:
+                    var compared = left is Immediate { Value: 0 } ? right
+                        : right is Immediate { Value: 0 } ? left
+                        : null;
+                    return compared == null
+                        ? null
+                        : (compared, (definition.OpCode == OpCode.CheckNotEqual) != negated);
+                default:
+                    return null;
+            }
+        }
+        return null;
     }
 
     private static bool SameOperand(IOperand left, IOperand right) =>
@@ -1303,6 +1533,10 @@ public static class LocalVariables
         // Same kind-splitting as in ResolveTypesAndFields, applied to the copies
         // SSA teardown and copy coalescing leave behind.
         SplitScalarOperandViews(method);
+
+        // The `arr == null`/`arr + 32` arm pairs of `new Span(arr)` only become
+        // visible after SSA teardown produces the edge copies.
+        RecoverArrayBackedSpanStores(method);
     }
 
     private static bool PropagateBooleanResult(Instruction instruction, MethodAnalysisContext method)
