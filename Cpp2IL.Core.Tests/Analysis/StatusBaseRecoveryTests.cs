@@ -111,6 +111,33 @@ public class StatusBaseRecoveryTests
         Assert.That(store.Operands[0],Is.TypeOf<MemoryOperand>());
     }
 
+    // A typed local produced by a call returning an unrelated reference type
+    // still resolves: its emitted slot coerces to the field's host through
+    // castclass - the real object reaches the ldfld receiver. Only a slot that
+    // cannot carry an object (byref, pointer, value type) masks the read.
+    [Test]
+    public void TypedBaseProducedByMismatchedCallStillResolvesFieldLoad()
+    {
+        var app=Cpp2IlApi.CurrentAppContext!;
+        var owner=new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"],"Tests","Holder",app.SystemTypes.SystemObjectType,TypeAttributes.Public);
+        var field=new InjectedFieldAnalysisContext("id",app.SystemTypes.SystemStringType,FieldAttributes.Public,owner,16);
+        owner.Fields.Add(field);
+        var producer=new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"],"Tests","Producer",app.SystemTypes.SystemObjectType,TypeAttributes.Public);
+        var callee=new InjectedMethodAnalysisContext(producer,"Make",app.SystemTypes.SystemStringType,MethodAttributes.Static,[]);
+        var method=new InjectedMethodAnalysisContext(owner,"Read",app.SystemTypes.SystemVoidType,MethodAttributes.Static,[]);
+        var receiver=new LocalVariable("receiver",new Register(null,"receiver"),owner);
+        var value=new LocalVariable("value",new Register(null,"value"),app.SystemTypes.SystemStringType);
+        var load=new Instruction(1,OpCode.Move,value,new MemoryOperand(receiver,addend:16));
+        method.ControlFlowGraph=new ISILControlFlowGraph([
+            new(0,OpCode.Call,receiver,callee),
+            load,
+            new(2,OpCode.Return)]);
+
+        MetadataResolver.ResolveFieldOffsets(method);
+
+        Assert.That(((FieldReference)load.Operands[1]).Field,Is.SameAs(field));
+    }
+
     [TestCase(false)]
     [TestCase(true)]
     public void VirtualTailCallIsResolvedWithoutUsingStaleReturnOperand(bool isVoid)

@@ -638,11 +638,27 @@ public static class MetadataResolver
             // only a concrete non-Object declared type proves a mismatch. For an
             // empty or erased annotation the def-derived slot type decides.
             return (type == null || type.FullName == "System.Object")
-                   && emitted != null && ReceiverSatisfied(emitted, host);
+                   && EmittedValueSuppliesReceiver(emitted, host);
         // The receiver pushes the local's emitted slot type - a `Move`-copy's
-        // source, a numeric view or an `&`-emission can differ from local.Type,
-        // and a ldfld on a mismatched `&` is invalid IL.
-        return emitted != null && ReceiverSatisfied(emitted, host);
+        // source, a numeric view or an `&`-emission can differ from local.Type.
+        return EmittedValueSuppliesReceiver(emitted, host);
+    }
+
+    // Whether the value the emitted slot carries can honestly reach an ldfld
+    // receiver for `host`. A value-type host needs `&host` (a `&T` slot or a T
+    // local ldloca'd); anything else makes the emitter substitute a default
+    // address - a masked read. A reference host takes the object itself, which
+    // any reference-typed slot supplies through a castclass bridge; a
+    // byref/pointer/value slot cannot reach an object receiver, so the emitter
+    // pushes a contract-typed default - again masked.
+    private static bool EmittedValueSuppliesReceiver(TypeAnalysisContext? emitted, TypeAnalysisContext host)
+    {
+        if (emitted == null)
+            return false;
+        if (host.IsValueType)
+            return ReceiverSatisfied(emitted, host);
+        return emitted is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+               && !emitted.IsValueType;
     }
 
     private static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)? ResolveField(
