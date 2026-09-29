@@ -595,7 +595,12 @@ public static class MetadataResolver
         var sameAssembly = callerType.DeclaringAssembly != null && declaring.DeclaringAssembly != null
             && (ReferenceEquals(callerType.DeclaringAssembly, declaring.DeclaringAssembly)
                 || callerType.DeclaringAssembly.Name == declaring.DeclaringAssembly.Name);
-        var derived = callerType.IsAssignableTo(declaring);
+        // A nested type spells members with its enclosing type's accessibility:
+        // protected access resolves when any type on the declaring chain
+        // derives from the accessor's declaring type.
+        var derived = false;
+        for (var t = callerType; t != null && !derived; t = t.DeclaringType)
+            derived = t.IsAssignableTo(declaring);
         return (accessor.Attributes & MethodAttributes.MemberAccessMask) switch
         {
             MethodAttributes.Public => true,

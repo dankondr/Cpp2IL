@@ -744,6 +744,53 @@ public class NestedFieldPathLoadTests
     }
 
     [Test]
+    public void NestedTypeCallerReadsEnclosingBaseProtectedGetterBackingField()
+    {
+        // MoveNext is nested in Derived, but <Level>k__BackingField and its
+        // protected getter live on Base: a nested type spells members with its
+        // enclosing type's accessibility, so the protected access still
+        // resolves - only the caller's own type being derived would refuse.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var baseType = InjectStruct(app, "Base");
+        var backing = new InjectedFieldAnalysisContext("<Level>k__BackingField",
+            app.SystemTypes.SystemInt32Type, R.FieldAttributes.Private, baseType, 0);
+        baseType.Fields.Add(backing);
+        baseType.InjectMethodContext("get_Level", app.SystemTypes.SystemInt32Type,
+            R.MethodAttributes.Family);
+        var derived = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"],
+            "Tests", "Derived", baseType,
+            R.TypeAttributes.Public | R.TypeAttributes.Sealed | R.TypeAttributes.SequentialLayout);
+        var module = new ModuleDefinition("Reads.dll");
+        Seed(module, app, baseType, derived);
+        SeedCorLibTypes(app, module, baseType, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemObjectType);
+
+        var sm = derived.InjectNestedType("Sm", app.SystemTypes.SystemValueTypeType,
+            R.TypeAttributes.NestedPrivate | R.TypeAttributes.Sealed);
+        var caller = sm.InjectMethodContext("MoveNext", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Private);
+        var local = Local("cfg", new ByRefTypeAnalysisContext(baseType));
+        var dst = Local("dst", app.SystemTypes.SystemInt32Type);
+        var load = new Instruction(0, OpCode.Move, dst,
+            new MemoryOperand(local, null, 0, 0, 4));
+        caller.ControlFlowGraph = new ISILControlFlowGraph([load, new(1, OpCode.Return)]);
+        caller.Locals = [local, dst];
+        caller.ParameterLocals = [local];
+        caller.AnalysisWarnings = [];
+
+        MetadataResolver.ResolveFieldOffsets(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(load.Operands[1], Is.TypeOf<FieldReference>(),
+                "a nested type inherits its enclosing chain's protected access");
+            Assert.That(((FieldReference)load.Operands[1]).Field, Is.SameAs(backing));
+        });
+    }
+
+    [Test]
     public void ErasedBaseNestedMemberReadResolvesViaSharpenedOwner()
     {
         // An object-typed local defined by a field read sharpens to that field's
