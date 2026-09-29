@@ -2510,7 +2510,16 @@ public static class IlGenerator
                 : constructor;
             var methodArguments = (constructor as ConcreteGenericMethodAnalysisContext)?.MethodGenericParameters
                 ?? (IReadOnlyList<TypeAnalysisContext>)[];
-            return new ConcreteGenericMethodAnalysisContext(baseConstructor, destination.GenericArguments, methodArguments);
+            var retargeted = new ConcreteGenericMethodAnalysisContext(baseConstructor,
+                destination.GenericArguments, methodArguments);
+            // The re-anchored parent instantiation must satisfy the generic
+            // definition's declared constraints: a destination whose argument
+            // does not fulfil them (an open parameter that fails an F-bounded
+            // constraint, say) spells a member reference the verifier rejects,
+            // so the callee's declared instantiation stays.
+            return Analysis.InaccessibleCalleeRecovery.SatisfiesDeclaredConstraints(retargeted)
+                ? retargeted
+                : null;
         }
 
         private static bool SameMethodIdentity(MethodAnalysisContext a, MethodAnalysisContext b)
@@ -2795,7 +2804,14 @@ public static class IlGenerator
         var solvedTypeArguments = typeArguments
             ?? (targetMethod as ConcreteGenericMethodAnalysisContext)?.TypeGenericParameters
             ?? [];
-        return new ConcreteGenericMethodAnalysisContext(open, solvedTypeArguments, methodArguments ?? []);
+        var solvedMethod = new ConcreteGenericMethodAnalysisContext(open, solvedTypeArguments,
+            methodArguments ?? []);
+        // A solved instantiation that violates the callee's declared generic
+        // constraints cannot be named either; keep the declared instantiation
+        // rather than retarget into a member reference the verifier rejects.
+        return Analysis.InaccessibleCalleeRecovery.SatisfiesDeclaredConstraints(solvedMethod)
+            ? solvedMethod
+            : null;
     }
 
     // Whether the emitted operand type still satisfies the open parameter pattern
@@ -4157,7 +4173,10 @@ public static class IlGenerator
                 }
                 if (!FieldReferenceUsableFrom(field, callingContext))
                 {
-                    PushDefaultOf(field.Field.FieldType, method, instructions, callingContext);
+                    PushDefaultOf(field.Field.FieldType, method, instructions, callingContext,
+                        IsAutoPropertyBackingField(field.Field)
+                            ? $"Operand slot of type {field.Field.FieldType.FullName} filled with a synthetic default value: {field.Field.Name} is a compiler-generated backing field"
+                            : null);
                     break;
                 }
                 if (field.Field.IsStatic)
@@ -4430,22 +4449,143 @@ public static class IlGenerator
         }
     }
 
-    private static TypeAnalysisContext? FieldReceiverType(FieldReference field, MethodAnalysisContext context) =>
-        field.Containers.Count == 0 ? EmittedOperandType(field.Local, context) : field.Containers[^1].FieldType;
+    private static TypeAnalysisContext? FieldReceiverType(FieldReference field, MethodAnalysisContext context)
+    {
+        if (field.Containers.Count == 0)
+            return EmittedOperandType(field.Local, context);
+        var receiverType = EmittedOperandType(field.Local, context);
+        var chainHead = true;
+        foreach (var container in field.Containers)
+        {
+            var effectiveReceiver = chainHead && !container.IsStatic
+                ? ResolvedFieldReceiverType(container, field.Local, receiverType, context)
+                : receiverType;
+            chainHead = false;
+            receiverType = container.IsStatic
+                ? container.FieldType
+                : EmittedContainerFieldType(container, effectiveReceiver);
+        }
+        return receiverType;
+    }
 
     private static bool FieldReferenceUsableFrom(FieldReference field, MethodAnalysisContext context,
         bool writeAccess = false)
     {
         var receiverType = EmittedOperandType(field.Local, context);
+        var chainHead = true;
         foreach (var container in field.Containers)
         {
-            if (!FieldUsableFrom(container, context, receiverType: receiverType))
+            // Only the chain head can substitute `this` or coerce the operand into
+            // the base contract; deeper links always receive &previous.FieldType.
+            var effectiveReceiver = chainHead && !container.IsStatic
+                ? ResolvedFieldReceiverType(container, field.Local, receiverType, context)
+                : receiverType;
+            chainHead = false;
+            if (!FieldUsableFrom(container, context, receiverType: effectiveReceiver))
                 return false;
-            receiverType = container.FieldType;
+            receiverType = container.IsStatic
+                ? container.FieldType
+                : EmittedContainerFieldType(container, effectiveReceiver);
         }
         return FieldUsableFrom(field.Field, context, writeAccess,
-            receiverType: field.Field.IsStatic ? null : receiverType);
+            receiverType: field.Field.IsStatic ? null
+                : field.Containers.Count == 0
+                    ? ResolvedFieldReceiverType(field.Field, field.Local, receiverType, context)
+                    : receiverType);
     }
+
+    // Mirrors what LoadBase actually pushes as the field receiver: `ldarg.0` when
+    // the operand cannot satisfy the base contract and `this` shares the owner's
+    // generic definition; otherwise the operand coerced into the contract - which
+    // always lands contract-shaped for a reference owner - or the operand's own
+    // managed address for a value owner.
+    private static TypeAnalysisContext? ResolvedFieldReceiverType(FieldAnalysisContext target,
+        IOperand receiverOperand, TypeAnalysisContext? receiverType, MethodAnalysisContext context)
+    {
+        var declaring = target.DeclaringType;
+        var contract = FieldBaseContract(target);
+        if (declaring != null && context.DeclaringType != null && !context.IsStatic
+            && ThisConstructorCallPlan.SameTypeIdentity(GenericDefinition(declaring),
+                GenericDefinition(context.DeclaringType))
+            && (!StackContractSatisfied(receiverType, contract, context)
+                || IsUndefinedOwnTypeReceiver(receiverOperand, context)))
+            return context.DeclaringType;
+        // LoadOperandIntoSlot coerces the operand into a reference owner's contract
+        // (or substitutes a contract-typed default), so the receiver always ends
+        // up assignable to the declaring type there. A value owner takes the
+        // operand's own managed address - its referent must be the owner.
+        if (contract is not ByRefTypeAnalysisContext byRefContract)
+            return declaring;
+        return receiverType switch
+        {
+            ByRefTypeAnalysisContext byRefReceiver => byRefReceiver.ElementType,
+            // `unbox` lands the reference as `&T` - the member binds to T.
+            _ when FieldReceiverUnboxes(receiverOperand, byRefContract.ElementType, context)
+                => byRefContract.ElementType,
+            _ => receiverType,
+        };
+    }
+
+    // Mirrors the `unbox` arm EmitManagedAddress applies to a local emitting as
+    // a true object reference under a `&T` contract: the stack then holds `&T`
+    // so the referent a member binds against is T. Any other operand pushes
+    // whatever it already is (`&U`, a raw pointer, or the reference itself).
+    private static bool FieldReceiverUnboxes(IOperand receiverOperand,
+        TypeAnalysisContext? pointeeType, MethodAnalysisContext context)
+        => receiverOperand is LocalVariable receiverLocal
+            && EmittedLocalType(receiverLocal, context) is { IsValueType: false } emittedReceiver
+            && IntegralStackWidth(emittedReceiver) == 0
+            && pointeeType is { IsValueType: true } or GenericParameterTypeAnalysisContext
+            && !IsByRefLike(pointeeType)
+            && TypeTokenUsableFrom(pointeeType, context);
+
+    // The field type the emitted container member actually carries, which is
+    // the next link's receiver and the field type a leaf's declaring check
+    // must agree with. FieldDescriptorFor binds the member onto the receiver's
+    // live instantiation whenever it can - a concrete value-type field
+    // re-concretizes (its field type was minted against a possibly stale
+    // instantiation, so the base signature is re-instantiated) and a plain
+    // field becomes a MemberReference on the receiver (its signature keeps the
+    // declaring definition's !T, instantiated by the receiver's arguments).
+    private static TypeAnalysisContext? EmittedContainerFieldType(FieldAnalysisContext container,
+        TypeAnalysisContext? resolvedReceiver)
+    {
+        var instance = resolvedReceiver switch
+        {
+            GenericInstanceTypeAnalysisContext i => i,
+            ByRefTypeAnalysisContext { ElementType: GenericInstanceTypeAnalysisContext i } => i,
+            _ => null,
+        };
+        if (instance == null)
+            return container.FieldType;
+        if (container is ConcreteGenericFieldAnalysisContext { DeclaringType.IsValueType: true } concrete)
+        {
+            if (GenericDefinition(concrete.DeclaringType) is { } boundDefinition
+                && ThisConstructorCallPlan.SameTypeIdentity(boundDefinition, instance.GenericType))
+                return GenericInstantiation.Instantiate(concrete.BaseFieldContext.FieldType,
+                    instance.GenericArguments, []);
+            return container.FieldType;
+        }
+        if (container.DeclaringType != null
+            && GenericDefinition(container.DeclaringType) is { } declaringDefinition
+            && ThisConstructorCallPlan.SameTypeIdentity(declaringDefinition, instance.GenericType)
+            && container.GetExtraData<FieldDefinition>("AsmResolverField") != null)
+            return GenericInstantiation.Instantiate(container.FieldType, instance.GenericArguments, []);
+        // No rebind: the member lands on the field's bound declaring context.
+        // When that context is itself a generic instance, its member
+        // signature's !T still resolves through the instance's arguments.
+        if (container.DeclaringType is GenericInstanceTypeAnalysisContext boundInstance)
+            return GenericInstantiation.Instantiate(container.FieldType, boundInstance.GenericArguments, []);
+        return container.FieldType;
+    }
+
+    // A `<Property>k__BackingField` member is always compiler-named, so no
+    // access level lets a decompiled reference spell it: ILSpy folds the field
+    // into its auto-property regardless of the widened access. Widening one
+    // here trades an honest diagnosed default for CS1061/CS0103 errors, so the
+    // declared-access path below keeps the default instead.
+    private static bool IsAutoPropertyBackingField(FieldAnalysisContext field)
+        => field.Name.StartsWith("<") && field.Name.EndsWith("k__BackingField");
 
     private static void EmitSelectedFieldLoad(SelectedFieldReference selected, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
@@ -4491,9 +4631,10 @@ public static class IlGenerator
                 method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldarg_0);
                 return;
             }
-            if (contract is ByRefTypeAnalysisContext)
+            if (contract is ByRefTypeAnalysisContext byRef)
             {
-                if (!EmitManagedAddress(field.Local, method, context, locals, writeLine))
+                if (!EmitManagedAddress(field.Local, method, context, locals, writeLine,
+                        byRef.ElementType))
                     PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context);
             }
             else
@@ -4517,11 +4658,22 @@ public static class IlGenerator
         }
         else
             LoadBase(first);
+        var chainHead = start == 0;
         foreach (var container in field.Containers.Skip(start))
         {
+            // FieldDescriptorFor binds the member onto the receiver actually on
+            // the stack (resolved the way LoadBase pushes it), and the emitted
+            // member's field type - not the bound one - is the next link's
+            // receiver.
+            var effectiveReceiver = chainHead && !container.IsStatic
+                ? ResolvedFieldReceiverType(container, field.Local, receiverType, context)
+                : receiverType;
+            chainHead = false;
             method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldflda,
-                FieldDescriptorFor(container, receiverType));
-            receiverType = container.FieldType;
+                FieldDescriptorFor(container, effectiveReceiver));
+            receiverType = container.IsStatic
+                ? container.FieldType
+                : EmittedContainerFieldType(container, effectiveReceiver);
         }
     }
 
@@ -4686,7 +4838,7 @@ public static class IlGenerator
                 || !FieldUsableFrom(field.Field, context, receiverType: nestedReceiverType)
                 && nestedGetter == null))
             return false;
-        if (!EmitManagedAddress(field.Local, method, context, locals, writeLine))
+        if (!EmitManagedAddress(field.Local, method, context, locals, writeLine, enumerator))
             return false;
 
         var concreteGetter = new ConcreteGenericMethodAnalysisContext(getter, enumerator.GenericArguments, []);
@@ -5126,7 +5278,15 @@ public static class IlGenerator
             if (local.Type == context.AppContext.SystemTypes.SystemObjectType
                 && SharpenedObjectAllocationType(local, context) is { } allocatedType)
                 return allocatedType;
-            return IsNativeHandleType(local.Type) ? context.AppContext.SystemTypes.SystemIntPtrType : local.Type;
+            // A cast source (isinst/castclass) must verify as a managed reference and
+            // no stack operation bridges native int into that operand, so a
+            // handle-typed local that feeds one emits object instead of IntPtr.
+            // Every other use position keeps its legal coerce-or-default bridge.
+            return IsNativeHandleType(local.Type)
+                ? UsedAsCastSource(local, context)
+                    ? context.AppContext.SystemTypes.SystemObjectType
+                    : context.AppContext.SystemTypes.SystemIntPtrType
+                : local.Type;
         }
         if (context.DeclaringType is { } declaringType
             && !context.IsStatic && ReferenceEquals(local, context.ParameterLocals.FirstOrDefault()))
@@ -5139,8 +5299,15 @@ public static class IlGenerator
             return untypedCallType;
         if (IsBooleanEmissionLocal(local, context))
             return context.AppContext.SystemTypes.SystemBooleanType;
+        // A cast source (isinst/castclass) must verify as a managed reference and no
+        // stack operation bridges native int into that operand, so a local that feeds
+        // one emits object instead of IntPtr. Its definitions substitute the same
+        // honest defaults the untyped path produces, and every other use position
+        // keeps its legal coerce-or-default bridge.
         if (IsNativePointerEmissionLocal(local, context))
-            return context.AppContext.SystemTypes.SystemIntPtrType;
+            return UsedAsCastSource(local, context)
+                ? context.AppContext.SystemTypes.SystemObjectType
+                : context.AppContext.SystemTypes.SystemIntPtrType;
         if (NumericLocalTypes(context).TryGetValue(local, out var numericType) && CanEmitTypeToken(numericType))
             return numericType;
         return context.AppContext.SystemTypes.SystemObjectType;
@@ -5182,6 +5349,26 @@ public static class IlGenerator
         }
         return sawCastUse;
     }
+
+    // True when the local appears as a cast operand's value - the one operand
+    // position that requires a managed reference and admits no stack bridge.
+    private static bool UsedAsCastSource(LocalVariable local, MethodAnalysisContext context) =>
+        context.ControlFlowGraph!.Instructions.Any(instruction =>
+            instruction.Operands.Any(operand => CastReferencesLocal(operand, local)));
+
+    private static bool CastReferencesLocal(IOperand? operand, LocalVariable local) => operand switch
+    {
+        ReferenceCast cast => OperandReferencesLocal(cast.Value, local),
+        MemoryOperand memory => CastReferencesLocal(memory.Base, local)
+            || CastReferencesLocal(memory.Index, local),
+        AddressOf address => CastReferencesLocal(address.Target, local),
+        ArrayAccess access => CastReferencesLocal(access.Array, local)
+            || CastReferencesLocal(access.Index, local),
+        ArrayElementFieldReference elementField => CastReferencesLocal(elementField.Array, local)
+            || CastReferencesLocal(elementField.Index, local),
+        ArrayLength length => CastReferencesLocal(length.Array, local),
+        _ => false,
+    };
 
     private static bool OperandReferencesLocal(IOperand? operand, LocalVariable local) => operand switch
     {
@@ -5315,12 +5502,25 @@ public static class IlGenerator
         if (method is not ConcreteGenericMethodAnalysisContext concrete
             || result is not GenericInstanceTypeAnalysisContext instance
             || instance.GenericArguments.Count != concrete.TypeGenericParameters.Count
-            || !instance.GenericArguments.All(IsErasedSharedArgument))
+            || !instance.GenericArguments.All(argument => IsErasedSharedArgument(argument)
+                && SubstitutableInCalleeScope(argument, concrete)))
             return result;
 
         return new GenericInstanceTypeAnalysisContext(instance.GenericType,
             concrete.TypeGenericParameters);
     }
+
+    // An erased instance argument may be re-instantiated with the callee's type
+    // arguments only when the placeholder belongs to that callee's generic
+    // scope: a generic parameter owned by a different generic context - the
+    // caller's own declaring type, say - is a real argument, not an erased
+    // slot, and substituting it by index spells a foreign instantiation
+    // (`G<CalleeArg>`) the callee never produced.
+    private static bool SubstitutableInCalleeScope(TypeAnalysisContext argument,
+        ConcreteGenericMethodAnalysisContext concrete) =>
+        argument is not GenericParameterTypeAnalysisContext parameter
+        || parameter.Owner is TypeAnalysisContext owner
+            && ThisConstructorCallPlan.SameTypeIdentity(owner, concrete.BaseMethodContext.DeclaringType);
 
     internal static MethodAnalysisContext RetargetToReceiverInstantiation(MethodAnalysisContext method,
         TypeAnalysisContext? receiverType) =>
@@ -5834,8 +6034,15 @@ public static class IlGenerator
             && EmittedLocalType(objectLocal, context) is { } concreteContract
             && concreteContract != context.AppContext.SystemTypes.SystemObjectType)
             return concreteContract;
+        // A call-defined contract only describes the slot when it agrees with the
+        // emitted local type: a rep that declares another concrete type (e.g. the
+        // `this` declaring type) still has to receive the store through that slot,
+        // so the emitted contract wins whenever they conflict.
         if (destination is LocalVariable callLocal
-            && CallDefinedLocalType(callLocal, context) is { } callContract)
+            && CallDefinedLocalType(callLocal, context) is { } callContract
+            && (EmittedLocalType(callLocal, context) is not { } emittedContract
+                || ThisConstructorCallPlan.SameTypeIdentity(emittedContract, callContract)
+                || emittedContract == context.AppContext.SystemTypes.SystemObjectType))
             return callContract;
         if (declared != null)
             return declared;
@@ -5909,6 +6116,13 @@ public static class IlGenerator
             AddressOf { Target: ArrayElementFieldReference addressedElementField }
                 => new ByRefTypeAnalysisContext(addressedElementField.Field.FieldType),
             AddressOf => context.AppContext.SystemTypes.SystemIntPtrType,
+            // isinst/castclass to a generic parameter lands `ref !0` on the stack
+            // (ECMA III.4.15) - a boxed-T-or-null reference, not the `value !0`
+            // the parameter's own kind declares. Reporting the raw parameter makes
+            // coercions emit `box !0` on a value that is already a reference,
+            // which the verifier rejects.
+            ReferenceCast { Type: GenericParameterTypeAnalysisContext genericCastTarget } genericCast
+                => EmittedGenericCastOperandType(genericCast, genericCastTarget, context),
             ReferenceCast cast => EmittableLocalType(cast.Type, context),
             StringLiteral => context.AppContext.SystemTypes.SystemStringType,
             FloatLiteral => context.AppContext.SystemTypes.SystemSingleType,
@@ -5952,6 +6166,22 @@ public static class IlGenerator
 
     private static TypeAnalysisContext? ResolveSystemType(MethodAnalysisContext context, string fullName) =>
         context.AppContext.GetAssemblyByName("mscorlib")?.GetTypeByFullName(fullName);
+
+    // The stack type a ReferenceCast to a generic parameter actually emits, mirroring
+    // the ReferenceCast case of LoadOperand: a replaced cast leaves a `value !0`
+    // default, an elided cast leaves the operand's own value, and a real
+    // isinst/castclass pushes `ref !0` - the boxed-T-or-null the verifier tracks.
+    private static TypeAnalysisContext? EmittedGenericCastOperandType(ReferenceCast cast,
+        GenericParameterTypeAnalysisContext castTarget, MethodAnalysisContext context)
+    {
+        var castValueType = EmittedOperandType(cast.Value, context);
+        if (castValueType is { IsValueType: true } or PointerTypeAnalysisContext or ByRefTypeAnalysisContext
+            || !TypeTokenUsableFrom(castTarget, context))
+            return EmittableLocalType(castTarget, context);
+        if (ThisConstructorCallPlan.SameTypeIdentity(castValueType, castTarget))
+            return castValueType;
+        return new BoxedTypeAnalysisContext(castTarget);
+    }
 
     // Mirrors the Immediate branch of LoadOperand: the reported stack type is whatever
     // the literal actually emits under the consumer's contract.
@@ -6131,11 +6361,33 @@ public static class IlGenerator
         if (to != null && IsNativeHandleType(to))
             to = to.AppContext.SystemTypes.SystemIntPtrType;
 
-        if (from == null || to == null || from.FullName == to.FullName)
+        if (from == null || to == null)
             return true;
 
-        // No stack op synthesizes a generic-parameter or byref value from another kind.
-        if (to is GenericParameterTypeAnalysisContext or ByRefTypeAnalysisContext)
+        // unbox.any is the canonical `ref !0` -> `value !0` conversion - and the
+        // only one: it is legal solely when the source proves `ref !0` for that
+        // same parameter (a boxed-T-or-null from isinst/castclass). A boxed type
+        // shares its element's name, so this must run before the identical-name
+        // early-out; any other source stays unbridgeable and gets diagnosed.
+        if (to is GenericParameterTypeAnalysisContext genericContract)
+        {
+            if (from is not BoxedTypeAnalysisContext && from.FullName == to.FullName)
+                return true;
+            if (from is BoxedTypeAnalysisContext { ElementType: { } boxedElement }
+                && ThisConstructorCallPlan.SameTypeIdentity(boxedElement, genericContract)
+                && TypeTokenUsableFrom(genericContract, context))
+            {
+                method.CilMethodBody!.Instructions.Add(CilOpCodes.Unbox_Any, to.ToTypeSignature().ToTypeDefOrRef());
+                return true;
+            }
+            return false;
+        }
+
+        if (from.FullName == to.FullName)
+            return true;
+
+        // No stack op synthesizes a byref value from another kind.
+        if (to is ByRefTypeAnalysisContext)
             return false;
 
         var instructions = method.CilMethodBody!.Instructions;
@@ -6324,6 +6576,29 @@ public static class IlGenerator
             return true;
         }
 
+        // `ref -> &T` is the managed-pointer sibling of the unbox.any arm
+        // above: `unbox` asserts the reference boxes T and pushes exactly the
+        // `&T` the slot wants. Other pointer contracts (`&ref`, `*`) have no
+        // legal bridge from a reference - and no castclass token either - so
+        // the caller defaults the slot. Only a true object reference
+        // (fromWidth 0) can unbox: `&T`, `*` and nint sources keep the existing
+        // arms (`&` satisfies `&` as-is; a pointer/nint is already a usable
+        // receiver).
+        if (fromWidth == 0 && to is ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+        {
+            var pointee = to is ByRefTypeAnalysisContext byRefTo ? byRefTo.ElementType : null;
+            if (pointee is { IsValueType: true } or GenericParameterTypeAnalysisContext
+                && !IsByRefLike(pointee))
+            {
+                if (!TypeTokenUsableFrom(pointee, context))
+                    return false;
+                instructions.Add(CilOpCodes.Unbox,
+                    pointee.ToTypeSignature().ToTypeDefOrRef());
+                return true;
+            }
+            return false;
+        }
+
         if (!from.IsValueType && !to.IsValueType)
         {
             // When the cast token cannot be emitted the value is left as-is: it may
@@ -6474,12 +6749,24 @@ public static class IlGenerator
         if (to != null && IsNativeHandleType(to))
             to = to.AppContext.SystemTypes.SystemIntPtrType;
 
-        if (from == null || to == null || from.FullName == to.FullName)
+        if (from == null || to == null)
             return true;
 
-        // No stack op synthesizes a generic-parameter or byref destination value;
-        // only the identical type already satisfies those slots.
-        if (to is GenericParameterTypeAnalysisContext or ByRefTypeAnalysisContext)
+        // Mirrors EmitStackCoerce: only a `ref !0` proven for that parameter - a
+        // boxed-T-or-null - reaches a `!0` slot, through unbox.any. The boxed
+        // wrapper shares the parameter's name, so check it before the
+        // identical-name early-out; every other source stays unbridgeable. A
+        // byref slot still takes only the identical pointer type.
+        if (to is GenericParameterTypeAnalysisContext genericContract)
+        {
+            if (from is BoxedTypeAnalysisContext { ElementType: { } boxedElement })
+                return ThisConstructorCallPlan.SameTypeIdentity(boxedElement, genericContract)
+                    && TypeTokenUsableFrom(genericContract, context);
+            return StackAssignableTo(from, to);
+        }
+        if (from.FullName == to.FullName)
+            return true;
+        if (to is ByRefTypeAnalysisContext)
             return StackAssignableTo(from, to);
 
         // A T source fits a managed reference through box T; nothing else is legal.
@@ -7976,7 +8263,8 @@ public static class IlGenerator
                 || IntegralStackWidth(addressField.FieldType) != 0
                     && destinationType is not ByRefTypeAnalysisContext and not PointerTypeAnalysisContext
                     && IntegralStackWidth(destinationType) != 0)
-            && EmitManagedAddress(address, method, context, locals, writeLine))
+            && EmitManagedAddress(address, method, context, locals, writeLine,
+                addressField.DeclaringType))
         {
             instructions.Add(CilOpCodes.Ldfld,
                 FieldDescriptorFor(addressField, EmittedOperandType(address, context)));
@@ -7989,7 +8277,8 @@ public static class IlGenerator
         if (TryGetPackedFieldAccess(instruction, context, out var packed, out var packedField, out var otherOperand)
             && FieldUsableFrom(packedField, context,
                 receiverType: packedField.IsStatic ? null : EmittedOperandType(packed, context))
-            && EmitManagedAddress(packed, method, context, locals, writeLine))
+            && EmitManagedAddress(packed, method, context, locals, writeLine,
+                packedField.DeclaringType))
         {
             var fieldType = packedField.FieldType;
             instructions.Add(CilOpCodes.Ldfld,
@@ -8661,6 +8950,42 @@ public static class IlGenerator
             field.Name, new FieldSignature(field.ToTypeSignature()));
     }
 
+    // The declaring context the emitted member actually carries, mirroring the
+    // same decisions FieldDescriptorFor makes: an outer-owner concrete field
+    // falls back to its base member, a concrete value-type field re-concretizes
+    // onto the receiver's live instantiation, and a plain field binds as a
+    // MemberReference on the receiver instance when its definition is
+    // referenceable. Anything else keeps the field's bound declaring context.
+    private static TypeAnalysisContext? EmittedMemberDeclaring(FieldAnalysisContext field,
+        TypeAnalysisContext? receiverType)
+    {
+        var instance = receiverType switch
+        {
+            GenericInstanceTypeAnalysisContext i => i,
+            ByRefTypeAnalysisContext { ElementType: GenericInstanceTypeAnalysisContext i } => i,
+            _ => null,
+        };
+        if (field is ConcreteGenericFieldAnalysisContext concrete)
+        {
+            if (GenericDefinition(concrete.BaseFieldContext.DeclaringType) is { } baseDeclaring
+                && GenericDefinition(concrete.DeclaringType) is { } concreteDeclaring
+                && !ThisConstructorCallPlan.SameTypeIdentity(baseDeclaring, concreteDeclaring))
+                return EmittedMemberDeclaring(concrete.BaseFieldContext, receiverType);
+            return concrete.DeclaringType.IsValueType && instance != null
+                && GenericDefinition(concrete.DeclaringType) is { } boundDeclaring
+                && ThisConstructorCallPlan.SameTypeIdentity(boundDeclaring, instance.GenericType)
+                && concrete.DeclaringType.FullName != instance.FullName
+                    ? instance
+                    : field.DeclaringType;
+        }
+        return instance != null
+            && GenericDefinition(field.DeclaringType) is { } declaringDefinition
+            && ThisConstructorCallPlan.SameTypeIdentity(declaringDefinition, instance.GenericType)
+            && field.GetExtraData<FieldDefinition>("AsmResolverField") != null
+                ? instance
+                : field.DeclaringType;
+    }
+
     // stfld on an initonly instance field only verifies when the receiver is the
     // literal `this` pointer (ILVerify requires actualThis.IsThisPtr) - a copy of
     // `this` parked in an ordinary local does not qualify even though it holds the
@@ -8766,6 +9091,17 @@ public static class IlGenerator
             || receiverType != null
                 && !Analysis.InaccessibleCalleeRecovery.IsVisibleType(receiverType, callerType))
             return false;
+        // The verifier binds ldfld/ldflda/stfld to the receiver's emitted type: the
+        // member's declaring instantiation must cover it. FieldDescriptorFor decides
+        // which declaring context the emitted member actually carries - a concrete
+        // value-type field may re-concretize onto the receiver's live instantiation,
+        // an outer-owner concrete falls back to its base field, and a plain field
+        // may bind as a MemberReference on the receiver - so this check compares
+        // the receiver against the declaring context emission will use, not the
+        // (possibly mistyped) bound one.
+        if (!field.IsStatic && receiverType != null
+            && !receiverType.IsAssignableTo(EmittedMemberDeclaring(field, receiverType) ?? declaring))
+            return false;
         // A direct native access proves that an inlined managed member reached a
         // same-assembly field. ToFieldDescriptor widens exactly that copied
         // definition, so private storage remains faithfully usable. Dependency
@@ -8785,7 +9121,7 @@ public static class IlGenerator
         var sameAssembly = Extensions.AccessibilityExtensions.SharesEmittedInternals(
             callerType.DeclaringAssembly, declaring.DeclaringAssembly);
         var sameType = ThisConstructorCallPlan.SameTypeIdentity(declaring, callerType);
-        return (attrs & FieldAttributes.FieldAccessMask) switch
+        var declaredAccess = (attrs & FieldAttributes.FieldAccessMask) switch
         {
             FieldAttributes.Public => true,
             FieldAttributes.Private => sameType,
@@ -8795,6 +9131,18 @@ public static class IlGenerator
             FieldAttributes.FamORAssem => sameAssembly || sameType || callerType.IsAssignableTo(declaring),
             _ => false,
         };
+        // A declared-access miss is still honest wherever the reference itself can widen
+        // the emitted member: ToFieldDescriptor passes every emitted field through
+        // MemberAccessibility.EnsureAccessible, which promotes the copied definition
+        // (and its declaring types) to the access the reference needs - the same fix the
+        // same-assembly shortcut above relies on. External runtime assemblies are
+        // frozen, their stubs mirror the real runtime surface, so a reference there
+        // must fit the declared access. Widening a compiler-generated backing field
+        // gains nothing either - no access level lets a reference spell the name -
+        // so those keep the diagnosed path as well.
+        return declaredAccess
+            || !Extensions.AccessibilityExtensions.IsExternalRuntimeAssembly(declaring.DeclaringAssembly?.Name)
+                && !IsAutoPropertyBackingField(field);
     }
 
     // Typed `stelem` requires the stack value to be exactly the element type, which
@@ -8830,12 +9178,16 @@ public static class IlGenerator
         _ => 0,
     };
 
-    // Pushes a managed address (`&`) or object reference that ldfld/ldflda can
-    // consume for the given storage operand. Returns false for anything that has
-    // no managed address.
+    // Emits a managed pointer to an operand's storage, or the reference that
+    // ldfld/ldflda can consume where no `&` is needed. `pointeeType` names the
+    // T of the caller's `&T` contract where it is knowable: a local that emits
+    // as a reference then claims to box T, and `unbox` is the only verifier-
+    // legal bridge from a reference to a managed pointer. A value-type pointee
+    // the caller cannot name here stays unrecoverable so the slot defaults
+    // honestly instead of leaving a bare reference where `&T` belongs.
     private static bool EmitManagedAddress(IOperand operand, MethodDefinition method,
         MethodAnalysisContext context, Dictionary<LocalVariable, CilLocalVariable> locals,
-        IMethodDescriptor writeLine)
+        IMethodDescriptor writeLine, TypeAnalysisContext? pointeeType = null)
     {
         var instructions = method.CilMethodBody!.Instructions;
         switch (operand)
@@ -8845,12 +9197,24 @@ public static class IlGenerator
                 return true;
             case LocalVariable local:
                 var parameter = ParameterForLocal(local, method, context);
-                if (EmittedLocalType(local, context) is { IsValueType: false })
+                if (EmittedLocalType(local, context) is { IsValueType: false } emittedType)
                 {
                     if (parameter != null)
                         instructions.Add(CilOpCodes.Ldarg, parameter);
                     else
                         instructions.Add(CilOpCodes.Ldloc, locals[local]);
+                    if (pointeeType is not ({ IsValueType: true } or GenericParameterTypeAnalysisContext)
+                        || IntegralStackWidth(emittedType) != 0)
+                        // A native or managed pointer (width -1) is already a
+                        // legal receiver for ldfld/ldobj - keep the push. Only a
+                        // true object reference (width 0) bridges via unbox.
+                        return true;
+                    if (IsByRefLike(pointeeType)
+                        || !TypeTokenUsableFrom(pointeeType, context))
+                        return false;
+                    instructions.Add(CilOpCodes.Unbox,
+                        pointeeType.ToTypeSignature().ToTypeDefOrRef());
+                    return true;
                 }
                 else if (parameter != null)
                     instructions.Add(CilOpCodes.Ldarga, parameter);
@@ -8867,7 +9231,8 @@ public static class IlGenerator
                     return false;
                 if (field.Containers.Count == 0)
                 {
-                    if (!EmitManagedAddress(field.Local, method, context, locals, writeLine))
+                    if (!EmitManagedAddress(field.Local, method, context, locals, writeLine,
+                            field.Field.DeclaringType))
                         return false;
                 }
                 else
@@ -8913,7 +9278,7 @@ public static class IlGenerator
                 context, method, locals, writeLine);
             return;
         }
-        if (EmitManagedAddress(operand, method, context, locals, writeLine))
+        if (EmitManagedAddress(operand, method, context, locals, writeLine, structType))
             return;
         LoadOperandIntoSlot(operand, structType, context, method, locals, writeLine);
         var scratch = new CilLocalVariable(structType.ToTypeSignature());

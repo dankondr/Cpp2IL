@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using Cpp2IL.Core.Extensions;
@@ -91,14 +92,59 @@ internal static class InaccessibleCalleeRecovery
         if (baseDeclaring != null)
             for (var i = 0; i < baseDeclaring.GenericParameters.Count && i < typeArguments.Count; i++)
                 if (!Utils.AsmResolver.ContextToMethodDescriptor.SatisfiesConstraints(
-                        typeArguments[i], baseDeclaring.GenericParameters[i], typeArguments, methodArguments))
+                        typeArguments[i], baseDeclaring.GenericParameters[i], typeArguments, methodArguments)
+                    || !SatisfiesOpenConstraints(typeArguments[i], baseDeclaring.GenericParameters[i],
+                        typeArguments, methodArguments))
                     return false;
 
         var genericParameters = concrete.BaseMethodContext.GenericParameters;
         for (var i = 0; i < genericParameters.Count && i < methodArguments.Count; i++)
             if (!Utils.AsmResolver.ContextToMethodDescriptor.SatisfiesConstraints(
-                    methodArguments[i], genericParameters[i], typeArguments, methodArguments))
+                    methodArguments[i], genericParameters[i], typeArguments, methodArguments)
+                || !SatisfiesOpenConstraints(methodArguments[i], genericParameters[i],
+                    typeArguments, methodArguments))
                 return false;
+
+        return true;
+    }
+
+    /// <summary>
+    /// The open-argument half of the constraint check: when the callee's argument is
+    /// itself a generic parameter, the verifier still evaluates constraints whose
+    /// substitution names a parameter (F-bounded shapes like `where T : C&lt;T&gt;`).
+    /// An open argument `U` satisfies `C&lt;U&gt;` only by declaring a constraint
+    /// assignable to it; the concrete-side check skips these substitutions because
+    /// they never close, which would let an argument like `ResultBase&lt;T&gt;`
+    /// slip through on a `T` that does not satisfy it.
+    /// </summary>
+    private static bool SatisfiesOpenConstraints(TypeAnalysisContext argument,
+        GenericParameterTypeAnalysisContext parameter,
+        IReadOnlyList<TypeAnalysisContext> typeArguments,
+        IReadOnlyList<TypeAnalysisContext> methodArguments)
+    {
+        if (argument is not GenericParameterTypeAnalysisContext argumentParameter)
+            return true;
+
+        foreach (var constraint in parameter.ConstraintTypes)
+        {
+            TypeAnalysisContext? substituted;
+            try
+            {
+                substituted = Utils.GenericInstantiation.Instantiate(constraint, typeArguments, methodArguments);
+            }
+            catch
+            {
+                // A constraint spelling an out-of-range parameter cannot be
+                // instantiated; the verifier skips it too.
+                continue;
+            }
+            if (!Utils.GenericInstantiation.HasAnyGenericParameters(substituted))
+                continue;
+            if (argumentParameter.FullName != substituted.FullName
+                && !argumentParameter.ConstraintTypes.Any(own =>
+                    own.FullName == substituted.FullName || own.IsAssignableTo(substituted)))
+                return false;
+        }
 
         return true;
     }

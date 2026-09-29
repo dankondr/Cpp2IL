@@ -1,6 +1,8 @@
+using System.Collections.Generic;
 using System.Linq;
 using AsmResolver;
 using AsmResolver.DotNet;
+using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.PE.DotNet.Cil;
 
 namespace Cpp2IL.Core.OutputFormats;
@@ -27,6 +29,12 @@ namespace Cpp2IL.Core.OutputFormats;
 /// inaccessible member would merely trade one compile error for another — and
 /// inside the accessor itself, where the field access is the accessor's own
 /// storage.</item>
+/// <item><c>unbox T</c> immediately followed by <c>ldobj T</c>. The pair is
+/// exactly <c>unbox.any T</c> — assert the reference is a boxed T, push its
+/// value — and only exists because <c>unbox</c> serves every managed-pointer
+/// consumer. Decompilers print <c>unbox.any</c> as the unboxing cast but have
+/// no C# spelling for the intermediate <c>&amp;T</c>, so the fused form is the
+/// only one whose printed operand types compile.</item>
 /// </list>
 /// </summary>
 internal static class DecompilerMemberAccessRewrites
@@ -61,6 +69,76 @@ internal static class DecompilerMemberAccessRewrites
                     RewriteBackingFieldAccess(method, field, instruction, runtimeContext, load: false);
                     break;
             }
+        }
+        FuseUnboxLoad(body);
+    }
+
+    // `unbox T; ldobj T` -> `unbox.any T`. Removing an instruction is only
+    // safe when neither instruction sits on a jump target or a protected-block
+    // boundary, so those positions are collected first; a body whose labels
+    // cannot all be resolved to instructions (an offset label) keeps the pair.
+    private static void FuseUnboxLoad(CilMethodBody body)
+    {
+        var instructions = body.Instructions;
+        var jumpTargets = new HashSet<CilInstruction>();
+        var foreignLabel = false;
+        foreach (var instruction in instructions)
+            switch (instruction.Operand)
+            {
+                case CilInstructionLabel label:
+                    if (label.Instruction != null)
+                        jumpTargets.Add(label.Instruction);
+                    else
+                        foreignLabel = true;
+                    break;
+                case CilInstruction target:
+                    jumpTargets.Add(target);
+                    break;
+                case IEnumerable<ICilLabel> labels:
+                    foreach (var label in labels)
+                        if (label is CilInstructionLabel instructionLabel && instructionLabel.Instruction != null)
+                            jumpTargets.Add(instructionLabel.Instruction);
+                        else
+                            foreignLabel = true;
+                    break;
+                case ICilLabel:
+                    foreignLabel = true;
+                    break;
+            }
+        foreach (var handler in body.ExceptionHandlers)
+            foreach (var edge in new ICilLabel?[]
+                     {
+                         handler.TryStart, handler.TryEnd, handler.HandlerStart,
+                         handler.HandlerEnd, handler.FilterStart
+                     })
+                switch (edge)
+                {
+                    case CilInstructionLabel label:
+                        if (label.Instruction != null)
+                            jumpTargets.Add(label.Instruction);
+                        else
+                            foreignLabel = true;
+                        break;
+                    case not null:
+                        foreignLabel = true;
+                        break;
+                }
+        if (foreignLabel)
+            return;
+        for (var i = 0; i < instructions.Count - 1; i++)
+        {
+            var unbox = instructions[i];
+            var ldobj = instructions[i + 1];
+            if (unbox.OpCode.Code != CilCode.Unbox || ldobj.OpCode.Code != CilCode.Ldobj
+                || jumpTargets.Contains(unbox) || jumpTargets.Contains(ldobj))
+                continue;
+            if (unbox.Operand is not ITypeDefOrRef unboxed
+                || ldobj.Operand is not ITypeDefOrRef loaded
+                || unboxed.FullName != loaded.FullName)
+                continue;
+            unbox.OpCode = CilOpCodes.Unbox_Any;
+            instructions.RemoveAt(i + 1);
+            i--;
         }
     }
 

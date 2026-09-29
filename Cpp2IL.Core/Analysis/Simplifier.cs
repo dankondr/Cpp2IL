@@ -110,6 +110,18 @@ public static class Simplifier
                                 continue;
                         }
 
+                        // A copy between locals that cannot hold each other's value - a slot
+                        // merging unrelated references across paths - has no legal managed
+                        // store, so the source cannot be forwarded into the destination's
+                        // typed positions. The move itself stays: the emitter fills the slot
+                        // with a noted synthetic default (a decompiler-issue call naming both
+                        // types), so the stored value is measured rather than silently
+                        // dropped. Copies between managed pointers (T& or T* on both sides)
+                        // are exempt - the value is the address itself.
+                        if (instruction.Operands[1] is LocalVariable incompatibleSource
+                            && LocalVariables.NoLegalManagedCopy(local, incompatibleSource, allowByRefReinterpret: true))
+                            continue;
+
                         if (IsLocalUsedAfterInstruction(block, i + 1, local, out var usedByMemory))
                         {
                             // This can't be inlined into memory operand
@@ -214,6 +226,15 @@ public static class Simplifier
                     // If it's move and it moves local to local, replace and remove it
                     if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable local, LocalVariable source] })
                     {
+                        // A copy between locals that cannot hold each other's value has no legal
+                        // managed store, so the source is never forwarded into the destination's
+                        // typed positions. The move stays for the emitter, which fills the slot
+                        // with a noted synthetic default instead of dropping the store silently.
+                        // Copies between managed pointers (T& or T* on both sides) are exempt -
+                        // the value is the address itself.
+                        if (LocalVariables.NoLegalManagedCopy(local, source, allowByRefReinterpret: true))
+                            continue;
+
                         // A local with several definitions is not in SSA form, so its value at a join
                         // depends on the path taken; don't carry this definition across that join.
                         var stopAtJoins = definitionCounts.TryGetValue(local, out var defs) && defs > 1;
@@ -312,13 +333,15 @@ public static class Simplifier
                             UpdateSourceCache(currentBlock, instruction);
                         }
 
-                        // The object a field is accessed on is an address just like a memory base.
-                        // The receiver slot is what the ldfld/stfld type contract reads: only
-                        // substitute when the replacement's emitted slot type can supply the
-                        // field's declaring type (`&Vector2` cannot feed `ldfld Vector3::x`).
+                        // The object a field is accessed on is an address just like a memory base,
+                        // and its type must be able to serve as the receiver - a mismatched local
+                        // would produce an invalid ldfld. The receiver slot is what the
+                        // ldfld/stfld type contract reads: the replacement's emitted slot type
+                        // must supply the field's declaring type (`&Vector2` cannot feed
+                        // `ldfld Vector3::x`) - a value-type mismatch NoLegalManagedCopy cannot see.
                         else if (operand is FieldReference field && replacement is LocalVariable fieldReplacement &&
-                                 field.Local == local &&
-                                 LocalVariables.ReceiverSatisfied(
+                                 field.Local == local && !LocalVariables.NoLegalManagedCopy(local, fieldReplacement) &&
+                                 !LocalVariables.ReceiverProvenMismatched(
                                      LocalVariables.EmittedSlotLocalType(fieldReplacement, _method),
                                      field.Field.DeclaringType))
                         {
@@ -329,11 +352,19 @@ public static class Simplifier
                             if (selected.Selector == local)
                                 selected.Selector = selectedReplacement;
                             foreach (var choice in selected.Choices)
-                                if (choice.Field.Local == local
-                                    && LocalVariables.ReceiverSatisfied(
+                                if (choice.Field.Local == local && !LocalVariables.NoLegalManagedCopy(local, selectedReplacement)
+                                    && !LocalVariables.ReceiverProvenMismatched(
                                         LocalVariables.EmittedSlotLocalType(selectedReplacement, _method),
                                         choice.Field.Field.DeclaringType))
                                     choice.Field.Local = selectedReplacement;
+                        }
+
+
+                        // An address-take's compound target (&receiver.field, &array[i].field,
+                        // &mem[base+index]) reads the locals inside it like any other operand.
+                        else if (operand is AddressOf address && replacement is LocalVariable addressReplacement)
+                        {
+                            SubstituteInAddressTarget(address, local, addressReplacement, _method);
                         }
 
                         // A reference cast's operand is a managed-reference slot just like a memory
@@ -363,6 +394,62 @@ public static class Simplifier
                     if (visited.Add(successor))
                         remaining.Push((successor, 0));
                 }
+            }
+        }
+
+        // Substitution inside an address-take's target mirrors the operand-level rules: compound
+        // positions (the object or memory cell a field/element is addressed through) take a local
+        // replacement exactly like their top-level counterparts. A bare local target (&v) is the
+        // cell's own identity rather than a value inside it, so it is never rewritten.
+        private static void SubstituteInAddressTarget(AddressOf address, LocalVariable local,
+            LocalVariable replacement, MethodAnalysisContext method)
+        {
+            switch (address.Target)
+            {
+                case MemoryOperand memory:
+                    if (memory.Base is LocalVariable memoryBase && memoryBase == local)
+                        memory.Base = replacement;
+                    if (memory.Index is LocalVariable memoryIndex && memoryIndex == local)
+                        memory.Index = replacement;
+                    address.Target = memory; // MemoryOperand is a struct, write the copy back
+                    break;
+                case FieldReference field when field.Local == local && !LocalVariables.NoLegalManagedCopy(local, replacement)
+                    && !LocalVariables.ReceiverProvenMismatched(
+                        LocalVariables.EmittedSlotLocalType(replacement, method),
+                        field.Field.DeclaringType):
+                    field.Local = replacement;
+                    break;
+                case SelectedFieldReference selected:
+                    if (selected.Selector == local)
+                        selected.Selector = replacement;
+                    foreach (var choice in selected.Choices)
+                        if (choice.Field.Local == local && !LocalVariables.NoLegalManagedCopy(local, replacement)
+                            && !LocalVariables.ReceiverProvenMismatched(
+                                LocalVariables.EmittedSlotLocalType(replacement, method),
+                                choice.Field.Field.DeclaringType))
+                            choice.Field.Local = replacement;
+                    break;
+                case ArrayAccess access:
+                    if (access.Array == local)
+                        access.Array = replacement;
+                    if (access.Index is LocalVariable arrayIndex && arrayIndex == local)
+                        access.Index = replacement;
+                    break;
+                case ArrayElementFieldReference elementField:
+                    if (elementField.Array == local)
+                        elementField.Array = replacement;
+                    if (elementField.Index is LocalVariable elementIndex && elementIndex == local)
+                        elementField.Index = replacement;
+                    break;
+                case ArrayLength length when length.Array == local:
+                    length.Array = replacement;
+                    break;
+                case ReferenceCast cast when cast.Value == local && IsManagedReferenceLocal(replacement):
+                    address.Target = new ReferenceCast(replacement, cast.Type, cast.NullOnFailure);
+                    break;
+                case AddressOf nested:
+                    SubstituteInAddressTarget(nested, local, replacement, method);
+                    break;
             }
         }
 
@@ -444,7 +531,7 @@ public static class Simplifier
                             return true;
                         }
 
-                        if (operand is AddressOf { Target: LocalVariable addressed } && addressed == local)
+                        if (operand is AddressOf address && LocalVariables.ContainsLocal(address.Target, local))
                         {
                             usedByMemory = true;
                             return true;
