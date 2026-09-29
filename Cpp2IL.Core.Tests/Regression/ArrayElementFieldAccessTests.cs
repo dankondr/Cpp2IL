@@ -69,6 +69,8 @@ public class ArrayElementFieldAccessTests
         var (caller, method) = ForeignCaller(app, module, [
             new(0, OpCode.Move, result, new MemoryOperand(array, addend: 36, accessSize: 4)),
             new(1, OpCode.Return)], [array, result]);
+        // The array models an entry-live value: nothing stores it in this body.
+        caller.ParameterLocals = [array];
 
         ArrayRecovery.Run(caller);
         IlGenerator.GenerateIl(caller, method);
@@ -104,6 +106,8 @@ public class ArrayElementFieldAccessTests
         var (caller, method) = ForeignCaller(app, module, [
             new(0, OpCode.Move, new MemoryOperand(array, addend: 36, accessSize: 4), value),
             new(1, OpCode.Return)], [array, value]);
+        // The array and the stored value model entry-live values.
+        caller.ParameterLocals = [array, value];
 
         ArrayRecovery.Run(caller);
         IlGenerator.GenerateIl(caller, method);
@@ -139,6 +143,8 @@ public class ArrayElementFieldAccessTests
         var (caller, method) = ForeignCaller(app, module, [
             new(0, OpCode.Move, result, new MemoryOperand(array, addend: 40, accessSize: 8)),
             new(1, OpCode.Return)], [array, result]);
+        // The array models an entry-live value: nothing stores it in this body.
+        caller.ParameterLocals = [array];
 
         ArrayRecovery.Run(caller);
         IlGenerator.GenerateIl(caller, method);

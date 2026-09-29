@@ -310,10 +310,11 @@ public class ManagedMemoryRecoveryTests
         var p = Local("p", 8);
         var v = Local("v", 10);
 
-        // pointer seeded into the array header, not at the elements
+        // pointer seeded into the array header, not at the elements - the bounds
+        // word, not the length word, which ArrayRecovery now resolves to ArrayLength
         caller.Locals.AddRange([p, v]);
         caller.ControlFlowGraph = new ISILControlFlowGraph([
-            new(0, OpCode.Add, p, array, new Immediate(24)),
+            new(0, OpCode.Add, p, array, new Immediate(16)),
             new(1, OpCode.Move, v, new MemoryOperand(p)),
             new(2, OpCode.Return, v),
         ]);
