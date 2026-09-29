@@ -153,6 +153,11 @@ public static class LocalVariables
             bufferLocal.Name = "returnBuffer";
             bufferLocal.Type = method.ReturnType;
         }
+
+        // Runs here, not with the rest of type resolution: the sibling
+        // `Move(Vn, …)` lane definitions it reads are removed by the first
+        // dead-code pass, which runs before ResolveTypesAndFields.
+        VectorLanePacking.Run(method);
     }
 
     public static void RemoveUnused(MethodAnalysisContext method)
