@@ -496,11 +496,15 @@ public static class IlGenerator
                     && ManagedPointerStoreWritable(store, instruction.Operands[1], referent, context))
                 {
                     LoadLocal(address, method, locals, context);
-                    LoadOperandIntoSlot(instruction.Operands[1], referent, context, method, locals, writeLine);
-                    if (referent is { IsValueType: true } or GenericParameterTypeAnalysisContext)
-                        instructions.Add(CilOpCodes.Stobj, referent.ToTypeSignature().ToTypeDefOrRef());
+                    if (LoadOperandIntoSlot(instruction.Operands[1], referent, context, method, locals, writeLine))
+                    {
+                        if (referent is { IsValueType: true } or GenericParameterTypeAnalysisContext)
+                            instructions.Add(CilOpCodes.Stobj, referent.ToTypeSignature().ToTypeDefOrRef());
+                        else
+                            instructions.Add(CilOpCodes.Stind_Ref);
+                    }
                     else
-                        instructions.Add(CilOpCodes.Stind_Ref);
+                        instructions.Add(CilOpCodes.Pop);
                     break;
                 }
 
@@ -523,27 +527,33 @@ public static class IlGenerator
                     {
                         if (!wholeValue.Field.IsStatic)
                             LoadFieldReceiver(wholeValue, context, method, locals, writeLine);
-                        LoadOperandIntoSlot(instruction.Operands[1], wholeValue.Field.FieldType,
-                            context, method, locals, writeLine);
-                        if (wholeValue.Field.FieldType is PointerTypeAnalysisContext)
-                            EmitPointerFieldStore(method, instructions, context,
-                                wholeValue.Field.IsStatic ? wholeValue.Field.ToFieldDescriptor()
-                                    : FieldDescriptorFor(wholeValue.Field, FieldReceiverType(wholeValue, context)),
-                                wholeValue.Field.IsStatic);
-                        else
-                            instructions.Add(wholeValue.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
-                                wholeValue.Field.IsStatic ? wholeValue.Field.ToFieldDescriptor()
-                                    : FieldDescriptorFor(wholeValue.Field, FieldReceiverType(wholeValue, context)));
+                        if (LoadOperandIntoSlot(instruction.Operands[1], wholeValue.Field.FieldType,
+                            context, method, locals, writeLine))
+                        {
+                            if (wholeValue.Field.FieldType is PointerTypeAnalysisContext)
+                                EmitPointerFieldStore(method, instructions, context,
+                                    wholeValue.Field.IsStatic ? wholeValue.Field.ToFieldDescriptor()
+                                        : FieldDescriptorFor(wholeValue.Field, FieldReceiverType(wholeValue, context)),
+                                    wholeValue.Field.IsStatic);
+                            else
+                                instructions.Add(wholeValue.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
+                                    wholeValue.Field.IsStatic ? wholeValue.Field.ToFieldDescriptor()
+                                        : FieldDescriptorFor(wholeValue.Field, FieldReceiverType(wholeValue, context)));
+                        }
+                        else if (!wholeValue.Field.IsStatic)
+                            instructions.Add(CilOpCodes.Pop);
                         break;
                     }
                     if (BackingFieldConversion(field, context) is { } conversion)
                     {
                         if (field.Containers.Count == 0)
                         {
-                            LoadOperandIntoSlot(instruction.Operands[1], conversion.Parameters[0].ParameterType,
-                                context, method, locals, writeLine);
-                            instructions.Add(CilOpCodes.Call, conversion.ToMethodDescriptor());
-                            StoreToOperand(field.Local, method, locals, writeLine, context);
+                            if (LoadOperandIntoSlot(instruction.Operands[1], conversion.Parameters[0].ParameterType,
+                                context, method, locals, writeLine))
+                            {
+                                instructions.Add(CilOpCodes.Call, conversion.ToMethodDescriptor());
+                                StoreToOperand(field.Local, method, locals, writeLine, context);
+                            }
                             break;
                         }
 
@@ -554,18 +564,22 @@ public static class IlGenerator
                         {
                             if (!outerField.IsStatic)
                                 LoadFieldReceiver(outer, context, method, locals, writeLine);
-                            LoadOperandIntoSlot(instruction.Operands[1], conversion.Parameters[0].ParameterType,
-                                context, method, locals, writeLine);
-                            instructions.Add(CilOpCodes.Call, conversion.ToMethodDescriptor());
-                            if (outerField.FieldType is PointerTypeAnalysisContext)
-                                EmitPointerFieldStore(method, instructions, context,
-                                    outerField.IsStatic ? outerField.ToFieldDescriptor()
-                                        : FieldDescriptorFor(outerField, FieldReceiverType(outer, context)),
-                                    outerField.IsStatic);
-                            else
-                                instructions.Add(outerField.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
-                                    outerField.IsStatic ? outerField.ToFieldDescriptor()
-                                        : FieldDescriptorFor(outerField, FieldReceiverType(outer, context)));
+                            if (LoadOperandIntoSlot(instruction.Operands[1], conversion.Parameters[0].ParameterType,
+                                context, method, locals, writeLine))
+                            {
+                                instructions.Add(CilOpCodes.Call, conversion.ToMethodDescriptor());
+                                if (outerField.FieldType is PointerTypeAnalysisContext)
+                                    EmitPointerFieldStore(method, instructions, context,
+                                        outerField.IsStatic ? outerField.ToFieldDescriptor()
+                                            : FieldDescriptorFor(outerField, FieldReceiverType(outer, context)),
+                                        outerField.IsStatic);
+                                else
+                                    instructions.Add(outerField.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
+                                        outerField.IsStatic ? outerField.ToFieldDescriptor()
+                                            : FieldDescriptorFor(outerField, FieldReceiverType(outer, context)));
+                            }
+                            else if (!outerField.IsStatic)
+                                instructions.Add(CilOpCodes.Pop);
                             break;
                         }
                     }
@@ -589,16 +603,20 @@ public static class IlGenerator
                             LoadFieldReceiver(field, context, method, locals, writeLine);
                     }
 
-                    LoadOperandIntoSlot(instruction.Operands[1], field.Field.FieldType, context, method, locals, writeLine);
-                    if (field.Field.FieldType is PointerTypeAnalysisContext)
-                        EmitPointerFieldStore(method, instructions, context,
-                            field.Field.IsStatic ? field.Field.ToFieldDescriptor()
-                                : FieldDescriptorFor(field.Field, FieldReceiverType(field, context)),
-                            field.Field.IsStatic);
-                    else
-                        instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
-                            field.Field.IsStatic ? field.Field.ToFieldDescriptor()
-                                : FieldDescriptorFor(field.Field, FieldReceiverType(field, context)));
+                    if (LoadOperandIntoSlot(instruction.Operands[1], field.Field.FieldType, context, method, locals, writeLine))
+                    {
+                        if (field.Field.FieldType is PointerTypeAnalysisContext)
+                            EmitPointerFieldStore(method, instructions, context,
+                                field.Field.IsStatic ? field.Field.ToFieldDescriptor()
+                                    : FieldDescriptorFor(field.Field, FieldReceiverType(field, context)),
+                                field.Field.IsStatic);
+                        else
+                            instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
+                                field.Field.IsStatic ? field.Field.ToFieldDescriptor()
+                                    : FieldDescriptorFor(field.Field, FieldReceiverType(field, context)));
+                    }
+                    else if (!field.Field.IsStatic)
+                        instructions.Add(CilOpCodes.Pop);
                     break;
                 }
 
@@ -611,9 +629,9 @@ public static class IlGenerator
                     && frameSlotLocals.TryGetValue(frameKey, out var frameSlot)
                     && FrameSlotStoreAgrees(frameStore, instruction.Operands[1], frameSlot, context))
                 {
-                    LoadOperandIntoSlot(instruction.Operands[1], frameSlot.Type, context, method,
-                        locals, writeLine);
-                    instructions.Add(CilOpCodes.Stloc, locals[frameSlot]);
+                    if (LoadOperandIntoSlot(instruction.Operands[1], frameSlot.Type, context, method,
+                        locals, writeLine))
+                        instructions.Add(CilOpCodes.Stloc, locals[frameSlot]);
                     break;
                 }
 
@@ -622,8 +640,17 @@ public static class IlGenerator
                 if (instruction.Operands[0] is ArrayAccess { Array.Type: SzArrayTypeAnalysisContext { ElementType: { } stored } } target)
                 {
                     LoadArrayBase(target.Array, method, locals, context);
-                    LoadOperandIntoSlot(target.Index, context.AppContext.SystemTypes.SystemInt32Type, context, method, locals, writeLine);
-                    LoadOperand(instruction.Operands[1], method, locals, writeLine, stored, context);
+                    if (!LoadOperandIntoSlot(target.Index, context.AppContext.SystemTypes.SystemInt32Type, context, method, locals, writeLine))
+                    {
+                        instructions.Add(CilOpCodes.Pop);
+                        break;
+                    }
+                    if (!LoadOperand(instruction.Operands[1], method, locals, writeLine, stored, context))
+                    {
+                        instructions.Add(CilOpCodes.Pop);
+                        instructions.Add(CilOpCodes.Pop);
+                        break;
+                    }
                     CoerceOrDefault(EmittedOperandType(instruction.Operands[1], context, stored), stored, method, context);
                     if (StelemOpCode(stored) is { } stelemOp)
                         instructions.Add(stelemOp);
@@ -653,8 +680,8 @@ public static class IlGenerator
                 }
 
                 var moveDestinationType = StoreContract(instruction.Operands[0], context);
-                LoadOperandIntoSlot(instruction.Operands[1], moveDestinationType, context, method, locals, writeLine);
-                StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
+                if (LoadOperandIntoSlot(instruction.Operands[1], moveDestinationType, context, method, locals, writeLine))
+                    StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 break;
 
             case OpCode.SignExtend32:
@@ -3912,7 +3939,11 @@ public static class IlGenerator
         _ => null,
     };
 
-    private static void LoadOperand(IOperand operand, MethodDefinition method,
+    /// <returns>False when the emission left nothing on the stack - the operand had no
+    /// managed load spelling, so only a diagnostic (or a throwing unrecoverable stub)
+    /// was emitted. Callers storing the value must skip the store rather than pop a
+    /// phantom.</returns>
+    private static bool LoadOperand(IOperand operand, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
         TypeAnalysisContext? expectedType, MethodAnalysisContext callingContext,
         bool keepFieldToken = false)
@@ -3934,7 +3965,7 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldnull);
             else
                 PushDefaultValue(expectedType!, method, instructions, callingContext);
-            return;
+            return true;
         }
 
         // Enums share the stack type of their underlying primitive, so literal
@@ -4066,8 +4097,7 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldstr, s.Value);
                 break;
             case LocalVariable local:
-                LoadLocal(local, method, locals, callingContext);
-                break;
+                return LoadLocal(local, method, locals, callingContext);
             case ReferenceCast referenceCast:
                 var castTarget = referenceCast.Type;
                 var castValueType = EmittedOperandType(referenceCast.Value, callingContext);
@@ -4276,7 +4306,7 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand));
                 instructions.Add(CilOpCodes.Newobj, exceptionCtor);
                 instructions.Add(CilOpCodes.Throw);
-                break;
+                return false;
             case RuntimeMethodInfoAnalysisContext runtimeMethod:
                 // A function pointer load is exactly ldftn, but ldftn only has a
                 // C# spelling for a plain static method - the decompiler prints
@@ -4495,6 +4525,7 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldnull);
                 break;
         }
+        return true;
     }
 
     private static TypeAnalysisContext? FieldReceiverType(FieldReference field, MethodAnalysisContext context)
@@ -6960,14 +6991,18 @@ public static class IlGenerator
     // operand's emitted type can never satisfy the contract (e.g. an int local in
     // a Vector3 argument slot) the operand is dropped and default(contract) is
     // emitted instead - the only honest filler for a value that was not recovered.
-    private static void LoadOperandIntoSlot(IOperand operand, TypeAnalysisContext? contract,
+    /// <returns>False when the operand left nothing on the stack (see
+    /// <see cref="LoadOperand"/>) - callers that then emit a store must skip it
+    /// instead of popping a phantom.</returns>
+    private static bool LoadOperandIntoSlot(IOperand operand, TypeAnalysisContext? contract,
         MethodAnalysisContext context, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
         bool convertByRef = false, bool keepFieldToken = false)
     {
         if (TryResolveSlotLoad(operand, contract, context, convertByRef, out var resolved, out var emitted))
         {
-            LoadOperand(resolved, method, locals, writeLine, contract, context, keepFieldToken);
+            if (!LoadOperand(resolved, method, locals, writeLine, contract, context, keepFieldToken))
+                return false;
             // The contract pre-check can still pass an operand whose coercion
             // then fails (e.g. a ref-struct element has no legal crossing).
             // Whatever its kind, an uncoercible value must not leak into the
@@ -6978,9 +7013,10 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Pop);
                 PushDefaultOf(contract, method, instructions, context, SlotDefaultReason(emitted, contract));
             }
-            return;
+            return true;
         }
         PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context, SlotDefaultReason(emitted, contract));
+        return true;
     }
 
     // Resolves the operand form a slot load emits and whether its emitted type
@@ -9565,7 +9601,140 @@ public static class IlGenerator
         return null;
     }
 
-    private static void LoadLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals,
+    private static readonly ConditionalWeakTable<MethodAnalysisContext, HashSet<Register>> DefinedLocalRegisterCache = new();
+
+    // Registers provably holding a value wherever they are read: parameter
+    // slots, the `this`/return/methodinfo slots, frame cells (frame_sp_/
+    // frame_fp_ locals model raw frame storage whose writes are MemoryOperand
+    // stores, never ISIL destinations), registers reachable under `&` (a
+    // pointer write can define them invisibly) and every register a real store
+    // writes. A read of a register absent from this set has no value to spell.
+    // Keyed by register rather than local instance because passes wrap the same
+    // slot in fresh LocalVariables (lane-split receivers, coalesced copies,
+    // inserted edge sources), so identity follows the register.
+    private static HashSet<Register> DefinedLocalRegisters(MethodAnalysisContext context) =>
+        DefinedLocalRegisterCache.GetValue(context, static ctx =>
+        {
+            HashSet<Register> defined = [];
+            foreach (var parameterLocal in ctx.ParameterLocals)
+                defined.Add(parameterLocal.Register);
+            foreach (var local in ctx.Locals)
+                if (local.IsThis || local.IsReturn || local.IsMethodInfo
+                    || local.Register.Name.StartsWith("frame_", System.StringComparison.Ordinal))
+                    defined.Add(local.Register);
+            foreach (var instruction in ctx.ControlFlowGraph!.Instructions)
+            {
+                // A self-copy `Move L, L` is no definition: the register's only
+                // write is its own read, so it still holds no value.
+                if (!IsSelfCopy(instruction))
+                    MarkStoreReceiverDefined(StoreReceiverOperand(instruction), defined);
+                foreach (var operand in instruction.Operands)
+                    CollectEscapedRegisters(operand, defined);
+            }
+            return defined;
+        });
+
+    private static bool IsSelfCopy(Instruction instruction) =>
+        instruction.OpCode is OpCode.Move
+        && instruction.Operands is [LocalVariable { Register: { } selfCopyDest },
+            LocalVariable { Register: { } selfCopySource }]
+        && selfCopyDest.Equals(selfCopySource);
+
+    // The operand naming the storage a store-family instruction writes into.
+    // Instruction.Destination answers the same question only for locals - a
+    // field or memory receiver counts as a constant there - so the raw operand
+    // is inspected here for every opcode that can store.
+    private static IOperand? StoreReceiverOperand(Instruction instruction) => instruction.OpCode switch
+    {
+        OpCode.Call or OpCode.IndirectCall
+            => instruction.Operands.Count > 1 ? instruction.Operands[1] : null,
+        OpCode.MemoryCopy or OpCode.MemorySet or OpCode.MemoryMove
+            => instruction.Operands.Count > 3 ? instruction.Operands[3] : null,
+        OpCode.Move or OpCode.Phi or OpCode.Add or OpCode.Subtract or OpCode.Multiply
+            or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight
+            or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
+            or OpCode.VectorMin or OpCode.VectorMax or OpCode.SignExtend32
+            or OpCode.CheckEqual or OpCode.CheckGreater or OpCode.CheckLess
+            or OpCode.CheckNotEqual or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual
+            or OpCode.Newobj or OpCode.NewArr or OpCode.Box or OpCode.Unbox
+            => instruction.Operands.Count > 0 ? instruction.Operands[0] : null,
+        _ => null,
+    };
+
+    // A store defines the local it writes into, through whatever operand names
+    // the storage: stloc, stfld into its field, or a write through its address.
+    private static void MarkStoreReceiverDefined(IOperand? destination, HashSet<Register> defined)
+    {
+        switch (destination)
+        {
+            case LocalVariable receiverLocal:
+                defined.Add(receiverLocal.Register);
+                break;
+            case FieldReference { Local: { } receiver }:
+                defined.Add(receiver.Register);
+                break;
+            case SelectedFieldReference selected:
+                defined.Add(selected.Selector.Register);
+                foreach (var (_, choiceField) in selected.Choices)
+                    if (choiceField.Local is { } choiceReceiver)
+                        defined.Add(choiceReceiver.Register);
+                break;
+            case MemoryOperand { Base: LocalVariable baseLocal }:
+                defined.Add(baseLocal.Register);
+                break;
+            case AddressOf { Target: { } target }:
+                foreach (var local in Analysis.LocalVariables.OperandLocals(target))
+                    defined.Add(local.Register);
+                break;
+        }
+    }
+
+    // Registers whose storage is addressable through an operand anywhere in the
+    // method - `&local`, `&local.field`, `&[local + n]`: a write through such a
+    // pointer can define the local without any visible store.
+    private static void CollectEscapedRegisters(IOperand operand, HashSet<Register> escaped)
+    {
+        switch (operand)
+        {
+            case AddressOf { Target: { } target }:
+                foreach (var local in Analysis.LocalVariables.OperandLocals(target))
+                    escaped.Add(local.Register);
+                break;
+            case FieldReference field:
+                CollectEscapedRegisters(field.Local, escaped);
+                break;
+            case SelectedFieldReference selected:
+                CollectEscapedRegisters(selected.Selector, escaped);
+                foreach (var (_, choiceField) in selected.Choices)
+                    CollectEscapedRegisters(choiceField.Local, escaped);
+                break;
+            case ArrayAccess access:
+                CollectEscapedRegisters(access.Array, escaped);
+                CollectEscapedRegisters(access.Index, escaped);
+                break;
+            case ArrayElementFieldReference elementField:
+                CollectEscapedRegisters(elementField.Array, escaped);
+                CollectEscapedRegisters(elementField.Index, escaped);
+                break;
+            case ArrayLength arrayLength:
+                CollectEscapedRegisters(arrayLength.Array, escaped);
+                break;
+            case MemoryOperand memory:
+                if (memory.Base is { } memoryBase)
+                    CollectEscapedRegisters(memoryBase, escaped);
+                if (memory.Index is { } memoryIndex)
+                    CollectEscapedRegisters(memoryIndex, escaped);
+                break;
+            case ReferenceCast cast:
+                CollectEscapedRegisters(cast.Value, escaped);
+                break;
+        }
+    }
+
+    /// <returns>False when the local has no value to push - an undeclared
+    /// never-stored local (the unspellable phi-edge source) leaves only its
+    /// diagnostic, so the caller's store is skipped instead of inventing one.</returns>
+    private static bool LoadLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals,
         MethodAnalysisContext context)
     {
         var instructions = method.CilMethodBody!.Instructions;
@@ -9573,15 +9742,35 @@ public static class IlGenerator
         if (local.IsThis)
         {
             instructions.Add(CilOpCodes.Ldarg_0);
-            return;
+            return true;
         }
 
         var parameter = ParameterForLocal(local, method, context);
 
         if (parameter != null)
+        {
             instructions.Add(CilOpCodes.Ldarg, parameter);
-        else
-            instructions.Add(CilOpCodes.Ldloc, locals[local]);
+            return true;
+        }
+
+        if (!DefinedLocalRegisters(context).Contains(local.Register))
+        {
+            // The binary holds a value here that has no managed spelling;
+            // substituting any default would invent a definition the binary
+            // does not prove. The read stays the local itself where it is
+            // declared - the compiler reports it unassigned (CS0165) next to
+            // the note. An undeclared local has no slot to load at all: only
+            // the diagnostic is emitted and the read reports no value.
+            EmitDecompilerNote(method, context,
+                $"Undefined local {local}: no instruction in the method stores it, so the read has no value to spell.");
+            if (!locals.TryGetValue(local, out var declaredLocal))
+                return false;
+            instructions.Add(CilOpCodes.Ldloc, declaredLocal);
+            return true;
+        }
+
+        instructions.Add(CilOpCodes.Ldloc, locals[local]);
+        return true;
     }
 
     private static void StoreToOperand(IOperand operand, MethodDefinition method,

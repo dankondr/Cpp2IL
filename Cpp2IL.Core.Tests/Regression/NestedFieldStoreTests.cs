@@ -76,6 +76,7 @@ public class NestedFieldStoreTests
         var (caller, method) = ForeignCaller(app, module, [
             new(0, OpCode.Move, new MemoryOperand(holder, addend: 0x18, accessSize: 4), value),
             new(1, OpCode.Return)], [holder, value]);
+        caller.ParameterLocals = [value];
 
         IlGenerator.GenerateIl(caller, method);
 
@@ -168,6 +169,7 @@ public class NestedFieldStoreTests
         var (caller, method) = ForeignCaller(app, module, [
             new(0, OpCode.Move, new MemoryOperand(holder, addend: 0x18, accessSize: 4), value),
             new(1, OpCode.Return)], [holder, value]);
+        caller.ParameterLocals = [value];
 
         IlGenerator.GenerateIl(caller, method);
 
@@ -352,6 +354,7 @@ public class NestedFieldStoreTests
             new(0, OpCode.Move, new MemoryOperand(ctx, addend: 0x18, accessSize: 4), value),
             new(1, OpCode.Return)], [ctx, value], ctxByRef,
             System.Reflection.ParameterAttributes.None);
+        caller.ParameterLocals = [ctx, value];
 
         IlGenerator.GenerateIl(caller, method);
 

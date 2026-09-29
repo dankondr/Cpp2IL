@@ -802,10 +802,15 @@ public class SsaForm
                     // Native registers can merge unrelated managed references at a
                     // control-flow join (especially normal and exception paths). Such
                     // a bit-pattern phi has no legal managed copy; emitting castclass
-                    // makes the normal path throw. Leave that edge at default instead.
-                    // Unlike the forwarding passes, this edge is emitted as a real store,
-                    // so copies between managed pointers of different element types stay
-                    // illegal here (a &U slot cannot receive a &T value).
+                    // makes the normal path throw. Unlike the forwarding passes, this
+                    // edge is emitted as a real store, so copies between managed
+                    // pointers of different element types stay illegal here (a &U
+                    // slot cannot receive a &T value). The edge emits nothing:
+                    // any value stood in for it - even a bare diagnostic read -
+                    // is an invented definition the binary does not prove. The
+                    // destination's reads on this path stay unassigned (CS0165);
+                    // when no surviving edge stores the destination at all, its
+                    // own reads carry the named Undefined local diagnostic.
                     if (destination is LocalVariable destinationLocal
                         && source is LocalVariable sourceLocal
                         && LocalVariables.NoLegalManagedCopy(destinationLocal, sourceLocal))
@@ -844,4 +849,5 @@ public class SsaForm
 
         block.Instructions.InsertRange(insertAt, moves);
     }
+
 }
