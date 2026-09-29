@@ -138,14 +138,15 @@ internal static class VectorLanePacking
         var move = block.Instructions[index];
         if (move.Operands.Count < 2)
             return;
-        // The whole-register rewrite is only honest where the receiving slot is
-        // itself a lane vector - metadata (a field's declared type) or a type
-        // the analysis already assigned (a return buffer). Any other slot
-        // keeps the scalar the forwarded definition carried.
+        // The whole-register rewrite is only honest where the receiving slot
+        // is a concrete store: a field's declared vector type pins the
+        // literal's shape and the literal never forwards further. A local
+        // destination forwards the literal into every later use - including
+        // scalarized lane ops whose operand has no vector slot for the
+        // constant to construct against - so those keep the scalar.
         var vectorDestination = move.Operands[0] switch
         {
             FieldReference { Field.FieldType: { } fieldType } => VectorLiteralSpellable(fieldType),
-            LocalVariable { Type: { } localType } => VectorLiteralSpellable(localType),
             _ => false,
         };
         if (!vectorDestination

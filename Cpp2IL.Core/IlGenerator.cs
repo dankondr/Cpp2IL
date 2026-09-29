@@ -4718,6 +4718,24 @@ public static class IlGenerator
         var start = 0;
         if (first.IsStatic)
         {
+            if ((first.Attributes & FieldAttributes.InitOnly) != 0)
+            {
+                // ldsflda on a readonly static never verifies - its address
+                // cannot be taken outside the .cctor. Push the value instead
+                // and read each remaining container hop as a field load; the
+                // caller's leaf ldfld then reads through the value on the
+                // stack. Only reached for reads: an initonly store is refused
+                // upstream before a receiver is ever loaded.
+                method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldsfld, first.ToFieldDescriptor());
+                receiverType = first.FieldType;
+                foreach (var container in field.Containers.Skip(1))
+                {
+                    method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldfld,
+                        FieldDescriptorFor(container, receiverType));
+                    receiverType = EmittedContainerFieldType(container, receiverType);
+                }
+                return;
+            }
             method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldsflda, first.ToFieldDescriptor());
             receiverType = first.FieldType;
             start = 1;

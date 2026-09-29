@@ -2403,6 +2403,11 @@ public static class LocalVariables
     private static IOperand? LaneOperand(IOperand operand, TypeAnalysisContext laneType,
         MethodAnalysisContext method)
     {
+        // A scalar view of a 128-bit vector constant is its first element:
+        // `fneg s1, s0` with `movi v0.4s, #x` reads lane S0 = X.
+        if (operand is Vector128Literal literal)
+            return new FloatLiteral(literal.X);
+
         // A scalar read of a resolved aggregate host (a struct field or a
         // register-view local) sees the host's lane-0 field: `ldr s0, [vec]`
         // reads `vec`'s first lane.
