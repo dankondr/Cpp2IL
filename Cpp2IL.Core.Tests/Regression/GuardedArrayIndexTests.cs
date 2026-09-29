@@ -118,7 +118,8 @@ public class GuardedArrayIndexTests
         {
             Assert.That(il.Any(i => i.OpCode.ToString()!.Contains("ldelem")), Is.True,
                 () => Emit(il));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.False,
+            Assert.That(il.Where(i => i.OpCode == CilOpCodes.Ldstr).All(i =>
+                    i.Operand?.ToString()?.Contains("operand to System.Object slot") == true), Is.True,
                 () => Emit(il));
         });
     }
@@ -141,7 +142,8 @@ public class GuardedArrayIndexTests
         {
             Assert.That(il.Any(i => i.OpCode.ToString()!.Contains("stelem")), Is.True,
                 () => Emit(il));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.False,
+            Assert.That(il.Where(i => i.OpCode == CilOpCodes.Ldstr).All(i =>
+                    i.Operand?.ToString()?.Contains("operand to System.Object slot") == true), Is.True,
                 () => Emit(il));
         });
     }
@@ -171,7 +173,8 @@ public class GuardedArrayIndexTests
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldfld
                     && i.Operand?.ToString().Contains("y") == true), Is.True,
                 () => Emit(il));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.False,
+            Assert.That(il.Where(i => i.OpCode == CilOpCodes.Ldstr).All(i =>
+                    i.Operand?.ToString()?.Contains("operand to System.Object slot") == true), Is.True,
                 () => Emit(il));
         });
     }

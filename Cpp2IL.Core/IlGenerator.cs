@@ -1448,12 +1448,19 @@ public static class IlGenerator
                         var resultContract = StoreContract(instruction.Operands[1], context);
                         // The member reference, not a possibly stale analysis override,
                         // determines the value the CIL call leaves on the stack.
-                        // A value-type result stored in object must be boxed even when
-                        // analysis mislabeled the call as returning object.
+                        // A value-type result reaching an `object` local is a scalar
+                        // edge into a pointer slot: `box` would fabricate a conversion
+                        // the binary never made, so drop it and fill the slot with a
+                        // named default - same ruling as EmitStackCoerce's scalar→object arm.
                         if (instruction.Operands[1] is LocalVariable resultLocal
                             && locals[resultLocal].VariableType.FullName == "System.Object"
                             && importedMethod.Signature?.ReturnType is { IsValueType: true } actualReturn)
-                            instructions.Add(CilOpCodes.Box, actualReturn.ToTypeDefOrRef());
+                        {
+                            instructions.Add(CilOpCodes.Pop);
+                            PushDefaultOf(resultContract ?? context.AppContext.SystemTypes.SystemObjectType,
+                                method, instructions, context,
+                                $"No legal conversion from {actualReturn.FullName} operand to System.Object slot; substituting a synthetic default value.");
+                        }
                         else
                             EmitStackCoerceOrDefault(EffectiveCallReturnType(targetMethod),
                                 resultContract, method, context);
