@@ -9565,22 +9565,17 @@ public static class IlGenerator
 
         if (parameter != null)
             instructions.Add(CilOpCodes.Ldarg, parameter);
-        else if (!DefinedLocalRegisters(context).Contains(local.Register))
-        {
-            var substitutedType = EmittedLocalType(local, context);
-            EmitDecompilerNote(method, context,
-                $"Undefined local {local}: no instruction in the method stores it, so the read has no value to spell.");
-            // The placeholder is consumed by whatever op follows the read - a
-            // pop, an array op, a stloc - so it must carry a real stack type:
-            // initobj on a typed temp pushes a typed default where the raw
-            // untyped ldnull/default literal cannot be used.
-            if (substitutedType is ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
-                PushDefaultValue(substitutedType, method, instructions, context);
-            else
-                EmitDefaultValueLocal(substitutedType, method, instructions, context);
-        }
         else
+        {
+            if (!DefinedLocalRegisters(context).Contains(local.Register))
+                // The binary holds a value here that has no managed spelling;
+                // substituting any default would invent a definition the binary
+                // does not prove, so the read stays the local itself and the
+                // compiler reports it unassigned (CS0165) next to the note.
+                EmitDecompilerNote(method, context,
+                    $"Undefined local {local}: no instruction in the method stores it, so the read has no value to spell.");
             instructions.Add(CilOpCodes.Ldloc, locals[local]);
+        }
     }
 
     private static void StoreToOperand(IOperand operand, MethodDefinition method,

@@ -11,20 +11,22 @@ using static Cpp2IL.Core.Tests.Regression.SyntheticFixture;
 namespace Cpp2IL.Core.Tests.Regression;
 
 // Recovery cluster: reads of locals no instruction ever defines
-// (castle-recovery#145). An entry-version register (Version -1) that is not a
-// parameter and is never stored has no value a managed read can spell - the
-// old emitter still emitted ldloc, so the decompiler reported the local as
-// unassigned (CS0165). The emitter now substitutes the documented default and
-// leaves a decompiler-issue note that names the missing value; locals whose
-// address is taken keep ldloc because a `&` write can still define them.
+// (castle-recovery#145). An entry-version register that is not a parameter and
+// is never stored has no value a managed read can spell - no default may be
+// invented for it, so the read stays a plain ldloc (CS0165 keeps the site
+// visible) behind a decompiler-issue note that names the missing value. A phi
+// edge whose merged value has no legal managed copy still stores from an
+// unspellable phantom register - the store existed in the binary - and the
+// phantom's read carries the same diagnostic. Locals whose address is taken
+// keep ldloc because a `&` write can still define them.
 public class UndefinedLocalReadTests
 {
     [Test]
-    public void UndefinedEntryRegisterReadSubstitutesDocumentedDefault()
+    public void UndefinedEntryRegisterReadKeepsTheRawLdloc()
     {
         // Move dest, entry where `entry` is an entry-version register that no
-        // instruction defines: the read has no proven value, so it must carry
-        // the diagnostic default rather than an unassigned ldloc.
+        // instruction defines: the read has no proven value, so it emits the
+        // named diagnostic and the local itself - never an invented default.
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
         var app = Cpp2IlApi.CurrentAppContext!;
@@ -46,12 +48,13 @@ public class UndefinedLocalReadTests
                     && i.Operand is string text && text.Contains("Undefined local")), Is.True,
                 () => string.Join("\n", il.Select(i => i.ToString())));
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call), Is.True,
-                "the substitution must emit the decompiler-issue call, not just a string");
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Initobj), Is.True,
-                "the placeholder is a typed default, not an untyped ldnull");
-            Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldloc),
-                Is.EqualTo(il.Count(i => i.OpCode == CilOpCodes.Initobj)),
-                "every ldloc must be a typed-default temp, never the never-stored local");
+                "the diagnostic must emit the decompiler-issue call, not just a string");
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Initobj), Is.False,
+                "no typed default may be invented for the unprovable read");
+            Assert.That(method.CilMethodBody.LocalVariables.Count, Is.EqualTo(2),
+                "no scratch temp local is added - the read is the local itself");
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldloc), Is.True,
+                "the read stays a plain ldloc so the compiler keeps CS0165 visible");
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stloc), Is.True,
                 "the destination keeps its real store");
         });
@@ -61,7 +64,7 @@ public class UndefinedLocalReadTests
     public void EscapedEntryRegisterReadKeepsLdloc()
     {
         // Taking a local's address makes its storage writable through the
-        // pointer, so the substitution must not fire for it: the & write can
+        // pointer, so the diagnostic must not fire for it: the & write can
         // be the local's real definition even with no visible store.
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
@@ -95,8 +98,8 @@ public class UndefinedLocalReadTests
     public void SelfCopyMoveLeavesTheLocalUndefined()
     {
         // `Move L, L` is not a definition: the register's only write is its own
-        // read, so it still holds no proven value. The source read substitutes
-        // the documented default rather than ldloc - the `x = x` shape that
+        // read, so it still holds no proven value. The source read emits the
+        // named diagnostic plus the raw ldloc - the `x = x` shape that
         // reported the self-init sites (castle-recovery#145).
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
@@ -117,21 +120,24 @@ public class UndefinedLocalReadTests
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
                     && i.Operand is string text && text.Contains("Undefined local")), Is.True,
                 () => string.Join("\n", il.Select(i => i.ToString())));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Initobj), Is.True,
-                "the substituted read is a typed default");
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Initobj), Is.False,
+                "no default may be invented for the self-referential read");
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldloc), Is.True,
+                "the read stays the raw ldloc - the `x = x` shape keeps CS0165");
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stloc), Is.True,
                 "the self-copy's store side is still emitted");
         });
     }
 
     [Test]
-    public void PhiEdgeWithNoLegalCopyStoresDocumentedDefault()
+    public void PhiEdgeWithNoLegalCopyStoresTheUnspellableRead()
     {
         // A bit-pattern phi whose incoming edge merges an incompatible managed
-        // reference: the edge has no legal copy, but skipping it leaves the
-        // merged local without a store on that path (CS0165). The edge copies
-        // from a never-stored register, which the emitter spells as the
-        // documented default, so every incoming path carries a store.
+        // reference: the edge has no legal copy, but skipping it would drop a
+        // store the binary does execute on that path. The edge copies from a
+        // never-stored phantom register, whose read emits the named diagnostic
+        // plus the raw ldloc - the store is kept and the merged value stays
+        // visibly unassigned.
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
         var app = Cpp2IlApi.CurrentAppContext!;
@@ -175,24 +181,27 @@ public class UndefinedLocalReadTests
         var il = method.CilMethodBody!.Instructions;
         Assert.Multiple(() =>
         {
-            Assert.That(il.Count(i => i.OpCode == CilOpCodes.Initobj), Is.EqualTo(2),
-                () => "each unspellable edge stores one typed default\n"
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Initobj), Is.False,
+                () => "no invented default may stand in for the merged value\n"
                     + string.Join("\n", il.Select(i => i.ToString())));
             Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldstr
                     && i.Operand is string text && text.Contains("Undefined local")),
-                Is.EqualTo(2), "each edge names its missing value");
+                Is.EqualTo(2), "each unspellable edge names its missing value");
             Assert.That(il.Count(i => i.OpCode == CilOpCodes.Stloc),
                 Is.GreaterThanOrEqualTo(3), "both edge stores plus the merge read");
+            Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldloc),
+                Is.GreaterThanOrEqualTo(3),
+                "each phantom source reads as its own ldloc, plus the merged dest");
         });
     }
 
     [Test]
     public void ByRefPhiEdgeSkipsTheUnstoreableCopy()
     {
-        // The unspellable-edge default does not apply to managed-pointer
-        // destinations: a `ref` to a block-scoped temp breaks the escape rules
-        // and a null managed pointer is not verifier-legal, so the edge stays
-        // unstoreable rather than inventing a `&` value.
+        // The unspellable-edge phantom does not apply to managed-pointer
+        // destinations: an invented `&` value has no honest form at all (a
+        // `ref` to a block-scoped temp breaks the escape rules, a null managed
+        // pointer is not verifier-legal), so the edge stays unstoreable.
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
         var app = Cpp2IlApi.CurrentAppContext!;
