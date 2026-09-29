@@ -524,7 +524,7 @@ public static class IlGenerator
                         && FieldReferenceUsableFrom(wholeValue, context, writeAccess: true))
                     {
                         if (!wholeValue.Field.IsStatic)
-                            LoadFieldReceiver(wholeValue, context, method, locals, writeLine);
+                            LoadFieldReceiver(wholeValue, context, method, locals, writeLine, forWrite: true);
                         if (LoadOperandIntoSlot(instruction.Operands[1], wholeValue.Field.FieldType,
                             context, method, locals, writeLine))
                             instructions.Add(wholeValue.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
@@ -553,7 +553,7 @@ public static class IlGenerator
                         if (FieldReferenceUsableFrom(outer, context, writeAccess: true))
                         {
                             if (!outerField.IsStatic)
-                                LoadFieldReceiver(outer, context, method, locals, writeLine);
+                                LoadFieldReceiver(outer, context, method, locals, writeLine, forWrite: true);
                             if (LoadOperandIntoSlot(instruction.Operands[1], conversion.Parameters[0].ParameterType,
                                 context, method, locals, writeLine))
                             {
@@ -584,7 +584,7 @@ public static class IlGenerator
                                 || ThisAliasLocals(context).Contains(field.Local)))
                             instructions.Add(CilOpCodes.Ldarg_0);
                         else
-                            LoadFieldReceiver(field, context, method, locals, writeLine);
+                            LoadFieldReceiver(field, context, method, locals, writeLine, forWrite: true);
                     }
 
                     if (LoadOperandIntoSlot(instruction.Operands[1], field.Field.FieldType, context, method, locals, writeLine))
@@ -4137,7 +4137,7 @@ public static class IlGenerator
                     break;
                 }
                 if (!addressedField.Field.IsStatic)
-                    LoadFieldReceiver(addressedField, callingContext, method, locals, writeLine);
+                    LoadFieldReceiver(addressedField, callingContext, method, locals, writeLine, forWrite: true);
                 instructions.Add(addressedField.Field.IsStatic ? CilOpCodes.Ldsflda : CilOpCodes.Ldflda,
                     addressedField.Field.IsStatic ? addressedField.Field.ToFieldDescriptor()
                         : FieldDescriptorFor(addressedField.Field,
@@ -4683,7 +4683,7 @@ public static class IlGenerator
     }
 
     private static void LoadFieldReceiver(FieldReference field, MethodAnalysisContext context, MethodDefinition method,
-        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine, bool forWrite = false)
     {
         void LoadBase(FieldAnalysisContext target)
         {
@@ -4718,13 +4718,15 @@ public static class IlGenerator
         var start = 0;
         if (first.IsStatic)
         {
-            if ((first.Attributes & FieldAttributes.InitOnly) != 0)
+            if (!forWrite && (first.Attributes & FieldAttributes.InitOnly) != 0)
             {
-                // ldsflda on a readonly static never verifies - its address
-                // cannot be taken outside the .cctor. Push the value instead
-                // and read each remaining container hop as a field load; the
-                // caller's leaf ldfld then reads through the value on the
-                // stack. Only reached for reads: an initonly store is refused
+                // ldsflda on a readonly static only verifies inside the
+                // declaring .cctor. For a read receiver, push the value
+                // instead and read each remaining container hop as a field
+                // load; the caller's leaf ldfld then reads through the value
+                // on the stack. Store and address consumers need `&`, which
+                // has no legal spelling here - they keep the ldsflda chain.
+                // Reached for reads only: an initonly store is refused
                 // upstream before a receiver is ever loaded.
                 method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldsfld, first.ToFieldDescriptor());
                 receiverType = first.FieldType;
@@ -9367,7 +9369,7 @@ public static class IlGenerator
                         return false;
                 }
                 else
-                    LoadFieldReceiver(field, context, method, locals, writeLine);
+                    LoadFieldReceiver(field, context, method, locals, writeLine, forWrite: true);
                 instructions.Add(CilOpCodes.Ldflda,
                     FieldDescriptorFor(field.Field, FieldReceiverType(field, context)));
                 return true;
@@ -9400,7 +9402,7 @@ public static class IlGenerator
             && nested.Offset == nested.Containers[^1].Offset
             && ThisConstructorCallPlan.SameTypeIdentity(nested.Containers[^1].FieldType, structType))
         {
-            LoadFieldReceiver(nested, context, method, locals, writeLine);
+            LoadFieldReceiver(nested, context, method, locals, writeLine, forWrite: true);
             return;
         }
         if (ReceiverEmitsStructAddress(operand, context, structType))
@@ -9688,7 +9690,7 @@ public static class IlGenerator
                         || ThisAliasLocals(context).Contains(field.Local)))
                     instructions.Add(CilOpCodes.Ldarg_0);
                 else
-                    LoadFieldReceiver(field, context, method, locals, writeLine);
+                    LoadFieldReceiver(field, context, method, locals, writeLine, forWrite: true);
                 instructions.Add(CilOpCodes.Ldloc, scratch);
                 instructions.Add(CilOpCodes.Stfld, fieldDescriptor);
                 break;
