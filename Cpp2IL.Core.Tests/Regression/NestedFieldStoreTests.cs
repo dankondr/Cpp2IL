@@ -1,7 +1,10 @@
+using System.Collections.Generic;
 using System.Linq;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
+using AsmResolver.PE.DotNet.Metadata.Tables;
+using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using static Cpp2IL.Core.Tests.Regression.SyntheticFixture;
@@ -251,6 +254,114 @@ public class NestedFieldStoreTests
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
                     && i.Operand is string text
                     && text.Contains("unmanaged memory form")), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+        });
+    }
+
+    // A nested store through a `ctx&` receiver spells `ctx.outer.point = v` —
+    // its first ldflda reads `ctx.outer`, which C# only allows once ctx is
+    // definitely assigned. On an `out` parameter it never is (CS0170), so the
+    // store keeps the diagnostic; on `ref` the caller assigns it, so the same
+    // shape still recovers.
+    private static (MethodAnalysisContext caller, MethodDefinition method)
+        ByRefCaller(ApplicationAnalysisContext app, ModuleDefinition module,
+            List<Instruction> instructions, List<LocalVariable> locals,
+            ByRefTypeAnalysisContext ctxByRef, System.Reflection.ParameterAttributes direction)
+    {
+        var callerType = new InjectedTypeAnalysisContext(
+            app.AssembliesByName["UnityEngine.CoreModule"], "Tests", "ForeignCaller",
+            app.SystemTypes.SystemObjectType,
+            System.Reflection.TypeAttributes.Public | System.Reflection.TypeAttributes.Class);
+        var caller = new InjectedMethodAnalysisContext(callerType, "Run",
+            app.SystemTypes.SystemVoidType,
+            System.Reflection.MethodAttributes.Public | System.Reflection.MethodAttributes.Static,
+            [ctxByRef], ["ctx"], [direction]);
+        callerType.Methods.Add(caller);
+        caller.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        caller.Locals = locals;
+        caller.ParameterLocals = [locals[0]];
+        caller.ParameterOperands = [locals[0].Register];
+        caller.AnalysisWarnings = [];
+        var type = new TypeDefinition("Tests", "ForeignCaller",
+            T.Public | T.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        type.Methods.Add(method);
+        return (caller, method);
+    }
+
+    private static (TypeAnalysisContext point, TypeAnalysisContext machine)
+        NestedFixture(ApplicationAnalysisContext app, ModuleDefinition module)
+    {
+        var int32 = app.SystemTypes.SystemInt32Type;
+        var int64 = app.SystemTypes.SystemInt64Type;
+        SeedCorLibTypes(app, module, int32, int64, app.SystemTypes.SystemValueTypeType,
+            app.SystemTypes.SystemVoidType);
+        var point = SeededOwner(app, module, "Point", app.SystemTypes.SystemValueTypeType);
+        SeedField(module, point, "x", int32, 0);
+        var wrapper = SeededOwner(app, module, "Wrapper", app.SystemTypes.SystemValueTypeType);
+        SeedField(module, wrapper, "point", point, 8);
+        var machine = SeededOwner(app, module, "Machine", app.SystemTypes.SystemObjectType);
+        SeedField(module, machine, "outer", wrapper, 0x10);
+        return (point, machine);
+    }
+
+    [Test]
+    public void StoreInsideOutParameterReceiverKeepsDiagnostic()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("OutParamStore.dll");
+        var (point, machine) = NestedFixture(app, module);
+        var ctxByRef = new ByRefTypeAnalysisContext(machine);
+        var ctx = new LocalVariable("ctx", new Register(null, "ctx")) { Type = ctxByRef };
+        var value = new LocalVariable("value", new Register(null, "value")) { Type = point };
+        var (caller, method) = ByRefCaller(app, module, [
+            new(0, OpCode.Move, new MemoryOperand(ctx, addend: 0x18, accessSize: 4), value),
+            new(1, OpCode.Return)], [ctx, value], ctxByRef,
+            System.Reflection.ParameterAttributes.Out);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stfld), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text
+                    && text.Contains("managed-pointer store")), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+        });
+    }
+
+    [Test]
+    public void StoreInsideRefParameterReceiverEmitsStfld()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("RefParamStore.dll");
+        var (point, machine) = NestedFixture(app, module);
+        var ctxByRef = new ByRefTypeAnalysisContext(machine);
+        var ctx = new LocalVariable("ctx", new Register(null, "ctx")) { Type = ctxByRef };
+        var value = new LocalVariable("value", new Register(null, "value")) { Type = point };
+        var (caller, method) = ByRefCaller(app, module, [
+            new(0, OpCode.Move, new MemoryOperand(ctx, addend: 0x18, accessSize: 4), value),
+            new(1, OpCode.Return)], [ctx, value], ctxByRef,
+            System.Reflection.ParameterAttributes.None);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stfld
+                    && i.Operand?.ToString().Contains("point") == true), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.False,
                 () => string.Join("\n", il.Select(i => i.ToString())));
         });
     }

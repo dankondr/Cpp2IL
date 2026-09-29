@@ -7007,6 +7007,15 @@ public static class IlGenerator
         {
             if (found.Containers.Count == 0 && !FieldStoreWidthMatches(memory, found.Field, context))
                 continue;
+            // A nested store spells `receiver.c1...cN.leaf = v`: the first
+            // ldflda reads `receiver.c1`, so the receiver itself must already
+            // be definitely assigned. The only receiver provably unassigned is
+            // an `out` parameter — assigning `ctx.c1.leaf` before the whole
+            // struct is assigned is CS0170, not spellable C# — so such stores
+            // keep the diagnostic. (Flat candidates are fine: `ctx.c1 = v` is
+            // the legal way to assign an out struct's member.)
+            if (found.Containers.Count > 0 && StoreReceiverIsOutParameter(local, context))
+                continue;
             var resolved = found.Field;
             // Interior-path leaves already carry their declaring context's binding;
             // only a flat leaf on a generic owner still needs it.
@@ -7018,6 +7027,28 @@ public static class IlGenerator
             if (FieldReferenceUsableFrom(field, context, writeAccess: true)
                 && TryResolveSlotLoad(source, field.Field.FieldType, context, false, out _, out _))
                 return true;
+        }
+        return false;
+    }
+
+    // Parameter locals keep the argument register they arrived in, so the
+    // receiver's register number maps it back to the parameter slot (a
+    // versioned SSA copy keeps its defining register's number). Only `out`
+    // carries ParameterAttributes.Out; `ref` arrives assigned.
+    private static bool StoreReceiverIsOutParameter(LocalVariable local, MethodAnalysisContext context)
+    {
+        var operandOffset = context.IsStatic ? 0 : 1;
+        var hasMethodInfo = context.ParameterOperands.Count - operandOffset > context.Parameters.Count;
+        for (var i = 0; i < context.Parameters.Count; i++)
+        {
+            var operandIndex = i + operandOffset;
+            if (hasMethodInfo && operandIndex == context.ParameterOperands.Count - 1)
+                break;
+            if (operandIndex >= context.ParameterOperands.Count
+                || context.ParameterOperands[operandIndex] is not Register reg
+                || reg.Number != local.Register.Number)
+                continue;
+            return context.Parameters[i].Attributes.HasFlag(ParameterAttributes.Out);
         }
         return false;
     }
