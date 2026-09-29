@@ -236,7 +236,7 @@ public static class MetadataResolver
 
                         var resolvedField = selectedField.Field;
                         if (genericOwner != null && resolvedField is not ConcreteGenericFieldAnalysisContext)
-                            resolvedField = new ConcreteGenericFieldAnalysisContext(resolvedField, genericOwner);
+                            resolvedField = BindResolvedFieldLeaf(owner, selectedField.Containers, resolvedField);
                         choices.Add((selectorValue,
                             new FieldReference(resolvedField, local, (int)offset, selectedField.Containers,
                                 memory.AccessSize)));
@@ -266,7 +266,7 @@ public static class MetadataResolver
 
                 // make sure we have a full GIT for field access. open type is bad.
                 if (genericOwner != null && field is not ConcreteGenericFieldAnalysisContext)
-                    field = new ConcreteGenericFieldAnalysisContext(field, genericOwner);
+                    field = BindResolvedFieldLeaf(owner, resolved.Value.Containers, field);
 
                 instruction.SetOperand(i, new FieldReference(field, local, (int)memory.Addend,
                     resolved!.Value.Containers, memory.AccessSize));
@@ -610,6 +610,22 @@ public static class MetadataResolver
             MethodAttributes.FamANDAssem => sameAssembly && derived,
             _ => false,
         };
+    }
+
+    // The instantiation a resolved-path leaf binds to: a flat path's leaf
+    // belongs to the owner the access was resolved against, but a nested
+    // path's leaf belongs to the innermost container's field type -
+    // `outer.inner.leaf` is a member of Inner, not of Outer. Binding a nested
+    // leaf to the outer generic instance mislabels its declaring type, which
+    // lets ctor-initonly and accessibility gates judge the member against the
+    // wrong owner (and emits the member on a type that never declared it).
+    internal static FieldAnalysisContext BindResolvedFieldLeaf(TypeAnalysisContext owner,
+        IReadOnlyList<FieldAnalysisContext> containers, FieldAnalysisContext leaf)
+    {
+        var leafOwner = containers.Count > 0 ? containers[^1].FieldType : owner;
+        return IlGenerator.GenericFieldOwnerInstance(leafOwner, leaf) is { } instance
+            ? new ConcreteGenericFieldAnalysisContext(leaf, instance)
+            : leaf;
     }
 
     internal static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)?
