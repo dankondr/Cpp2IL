@@ -4661,7 +4661,7 @@ public static class IlGenerator
     // instantiation, so the base signature is re-instantiated) and a plain
     // field becomes a MemberReference on the receiver (its signature keeps the
     // declaring definition's !T, instantiated by the receiver's arguments).
-    private static TypeAnalysisContext? EmittedContainerFieldType(FieldAnalysisContext container,
+    internal static TypeAnalysisContext? EmittedContainerFieldType(FieldAnalysisContext container,
         TypeAnalysisContext? resolvedReceiver)
     {
         var instance = resolvedReceiver switch
@@ -4766,24 +4766,12 @@ public static class IlGenerator
         var start = 0;
         if (first.IsStatic)
         {
+            // Reached for writes only inside the declaring .cctor: a store or
+            // address consumer has no legal spelling for initonly elsewhere,
+            // and its store is refused upstream before a receiver is loaded.
             if (!forWrite && (first.Attributes & FieldAttributes.InitOnly) != 0)
             {
-                // ldsflda on a readonly static only verifies inside the
-                // declaring .cctor. For a read receiver, push the value
-                // instead and read each remaining container hop as a field
-                // load; the caller's leaf ldfld then reads through the value
-                // on the stack. Store and address consumers need `&`, which
-                // has no legal spelling here - they keep the ldsflda chain.
-                // Reached for reads only: an initonly store is refused
-                // upstream before a receiver is ever loaded.
-                method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldsfld, first.ToFieldDescriptor());
-                receiverType = first.FieldType;
-                foreach (var container in field.Containers.Skip(1))
-                {
-                    method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldfld,
-                        FieldDescriptorFor(container, receiverType));
-                    receiverType = EmittedContainerFieldType(container, receiverType);
-                }
+                Analysis.InitonlyStaticFieldReceiver.PushValueChain(field, method);
                 return;
             }
             method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldsflda, first.ToFieldDescriptor());
@@ -9284,7 +9272,7 @@ public static class IlGenerator
                 .ToMethodDescriptor();
     }
 
-    private static IFieldDescriptor FieldDescriptorFor(FieldAnalysisContext field,
+    internal static IFieldDescriptor FieldDescriptorFor(FieldAnalysisContext field,
         TypeAnalysisContext? receiverType)
     {
         if (field is ConcreteGenericFieldAnalysisContext concrete)
