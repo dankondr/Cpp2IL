@@ -314,15 +314,15 @@ public class NestedFieldPathLoadTests
     }
 
     [Test]
-    public void NestedPathThroughBackingFieldContainerKeepsDiagnostic()
+    public void NestedPathThroughLastBackingFieldContainerResolvesThroughGetter()
     {
-        // [box +0x14] would be box.<Inner>k__BackingField.y - the container hop
-        // needs ldflda on the backing field, which no accessor call can spell,
-        // so the load keeps its diagnostic even though get_Inner is public.
+        // [box +0x14] is box.<Inner>k__BackingField.y: the backing field is the
+        // last container before a value-read leaf, so callvirt get_Inner +
+        // ldfld y spells the same stack shape and the path resolves.
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
         var app = Cpp2IlApi.CurrentAppContext!;
-        var (point, _, _) = Point2(app);
+        var (point, _, y) = Point2(app);
         var box = InjectClass(app, "Box");
         var backing = new InjectedFieldAnalysisContext("<Inner>k__BackingField",
             point, R.FieldAttributes.Private, box, 0x10);
@@ -330,11 +330,77 @@ public class NestedFieldPathLoadTests
         box.InjectMethodContext("get_Inner", point, R.MethodAttributes.Public);
         var module = new ModuleDefinition("Reads.dll");
         Seed(module, app, point, box);
-        SeedCorLibTypes(app, module, point, box, app.SystemTypes.SystemSingleType,
+        // Only the system types go to the corlib seeder - SeedCorLibTypes
+        // rewrites AsmResolverType with a bare definition, which would shadow
+        // the populated typedef the emitted member references bind to.
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemSingleType,
+            app.SystemTypes.SystemObjectType);
+        // The emitted surface must carry the accessor for the decompiler-facing
+        // rewrite to name it - mirroring the real pipeline's emitted method.
+        var boxDefinition = box.GetExtraData<TypeDefinition>("AsmResolverType")!;
+        var pointDefinition = point.GetExtraData<TypeDefinition>("AsmResolverType")!;
+        var innerDefinition = new PropertyDefinition("Inner", default,
+            PropertySignature.CreateInstance(pointDefinition.ToTypeSignature()));
+        boxDefinition.Properties.Add(innerDefinition);
+        var getInner = new MethodDefinition("get_Inner",
+            MethodAttributes.Public | MethodAttributes.HideBySig | MethodAttributes.SpecialName,
+            MethodSignature.CreateInstance(pointDefinition.ToTypeSignature()));
+        boxDefinition.Methods.Add(getInner);
+        innerDefinition.SetSemanticMethods(getInner, null);
+
+        var receiver = Local("box", box);
+        var dst = Local("dst", app.SystemTypes.SystemSingleType);
+        var load = new Instruction(0, OpCode.Move, dst,
+            new MemoryOperand(receiver, null, 0x14, 0, 4));
+        var (caller, method) = ForeignCaller(app, module, [load, new(1, OpCode.Return)], [receiver, dst]);
+
+        MetadataResolver.ResolveFieldOffsets(caller);
+        IlGenerator.GenerateIl(caller, method);
+        Cpp2IL.Core.OutputFormats.DecompilerMemberAccessRewrites.Apply(method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(load.Operands[1], Is.TypeOf<FieldReference>(),
+                "a last-hop backing-field container with a visible getter must resolve");
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Callvirt
+                    && i.Operand is IMethodDescriptor m && m.Name == "get_Inner"), Is.True,
+                () => Dump(method));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldfld
+                    && i.Operand is IFieldDescriptor f && f.Name == "y"), Is.True,
+                () => Dump(method));
+            Assert.That(EmitsUnmanagedLoadDiagnostic(method), Is.False, () => Dump(method));
+        });
+        Assert.That(backing, Is.Not.Null);
+        Assert.That(y, Is.Not.Null);
+    }
+
+    [Test]
+    public void NestedPathThroughNonLastBackingFieldContainerKeepsDiagnostic()
+    {
+        // [box +0x14] into box.<Inner>k__BackingField where Inner's member is
+        // itself a struct field: the backing-field hop would feed a further
+        // ldflda, which no accessor call can replace, so it keeps its
+        // diagnostic even though get_Inner is public.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var (point, _, _) = Point2(app);
+        var (frame, _) = Frame(app, point);
+        var box = InjectClass(app, "Box");
+        var backing = new InjectedFieldAnalysisContext("<Inner>k__BackingField",
+            frame, R.FieldAttributes.Private, box, 0x10);
+        box.Fields.Add(backing);
+        box.InjectMethodContext("get_Inner", frame, R.MethodAttributes.Public);
+        var module = new ModuleDefinition("Reads.dll");
+        Seed(module, app, point, frame, box);
+        SeedCorLibTypes(app, module, point, frame, box, app.SystemTypes.SystemSingleType,
             app.SystemTypes.SystemObjectType);
 
         var receiver = Local("box", box);
         var dst = Local("dst", app.SystemTypes.SystemSingleType);
+        // box.<Inner>k__BackingField.origin.y: backing field is NOT the last
+        // container (origin follows it), so the hop is unspellable.
         var load = new Instruction(0, OpCode.Move, dst,
             new MemoryOperand(receiver, null, 0x14, 0, 4));
         var (caller, _) = ForeignCaller(app, module, [load, new(1, OpCode.Return)], [receiver, dst]);
@@ -342,8 +408,55 @@ public class NestedFieldPathLoadTests
         MetadataResolver.ResolveFieldOffsets(caller);
 
         Assert.That(load.Operands[1], Is.TypeOf<MemoryOperand>(),
-            "a path through a backing-field container must keep its diagnostic operand");
+            "a non-last backing-field container hop must keep its diagnostic operand");
         Assert.That(backing, Is.Not.Null);
+    }
+
+    [Test]
+    public void BackingFieldAddressReadSpellsGetterCall()
+    {
+        // ldflda T::<P>k__BackingField + ldobj T' moves exactly the backing
+        // field's storage; with a public getter the pair collapses to the
+        // callvirt get_P that produced the stack shape originally.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("Reads.dll");
+        var holder = new TypeDefinition("Tests", "Holder",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(holder);
+        var backing = new FieldDefinition("<Group>k__BackingField",
+            FieldAttributes.Private, new FieldSignature(module.CorLibTypeFactory.Int32));
+        holder.Fields.Add(backing);
+        var property = new PropertyDefinition("Group", default,
+            PropertySignature.CreateInstance(module.CorLibTypeFactory.Int32));
+        holder.Properties.Add(property);
+        var getter = new MethodDefinition("get_Group",
+            MethodAttributes.Public | MethodAttributes.HideBySig | MethodAttributes.SpecialName,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Int32));
+        holder.Methods.Add(getter);
+        property.SetSemanticMethods(getter, null);
+        var method = new MethodDefinition("M",
+            MethodAttributes.Public, MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        holder.Methods.Add(method);
+        method.CilMethodBody = new CilMethodBody();
+        var instructions = method.CilMethodBody.Instructions;
+        instructions.Add(CilOpCodes.Ldarg_0);
+        instructions.Add(CilOpCodes.Ldflda, backing);
+        instructions.Add(CilOpCodes.Ldobj, module.CorLibTypeFactory.Int32.Type);
+        instructions.Add(CilOpCodes.Pop);
+        instructions.Add(CilOpCodes.Ret);
+
+        Cpp2IL.Core.OutputFormats.DecompilerMemberAccessRewrites.Apply(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(instructions[1].OpCode, Is.EqualTo(CilOpCodes.Callvirt),
+                "ldflda <P>k__BF + ldobj must collapse to the getter call");
+            Assert.That(instructions[1].Operand, Is.SameAs(getter));
+            Assert.That(instructions[2].OpCode, Is.EqualTo(CilOpCodes.Nop));
+        });
+        Assert.That(app, Is.Not.Null);
     }
 
     [Test]

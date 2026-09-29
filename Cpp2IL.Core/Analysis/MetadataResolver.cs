@@ -498,18 +498,29 @@ public static class MetadataResolver
                 || Extensions.AccessibilityExtensions.SharesEmittedInternals(declaringAssembly, callerAssembly));
     }
 
-    // A resolved path that must name a compiler-generated backing field can only
-    // be spelled through its property accessor: a load needs a getter visible
-    // from the caller, a store a visible setter. As a container hop or under an
-    // address-of the member emits ldflda, which no accessor can replace, so
-    // those paths stay diagnosed rather than naming a member the recovered
-    // source cannot write.
+    // A resolved path that must name a compiler-generated backing field can
+    // only be spelled through its property accessor: a load needs a getter
+    // visible from the caller, a store a visible setter. A backing field as a
+    // container hop emits ldflda, which the decompiler-facing rewrite can
+    // still turn into the getter call - but only when it is the last hop
+    // before a load leaf, so the call's by-value result feeds the member read
+    // (ldfld accepts a struct value where the pointer was). Any other
+    // container position, a store, or an addressed leaf keeps the managed
+    // pointer no call can produce, so those paths stay diagnosed rather than
+    // naming a member the recovered source cannot write.
     internal static bool MemberPathUnspellable(
         (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers) resolved,
         MethodAnalysisContext caller, bool store, bool addressed)
     {
-        if (resolved.Containers.Any(IsCompilerGeneratedBackingField))
-            return true;
+        var containers = resolved.Containers;
+        for (var i = 0; i < containers.Count; i++)
+        {
+            if (!IsCompilerGeneratedBackingField(containers[i]))
+                continue;
+            if (i != containers.Count - 1 || store || addressed
+                || !BackingAccessorVisible(containers[i], caller, store: false))
+                return true;
+        }
         var leaf = resolved.Field;
         return IsCompilerGeneratedBackingField(leaf)
             && (addressed || !BackingAccessorVisible(leaf, caller, store));
@@ -519,7 +530,7 @@ public static class MetadataResolver
         field.Name.StartsWith("<", System.StringComparison.Ordinal)
         && field.Name.EndsWith(">k__BackingField", System.StringComparison.Ordinal);
 
-    private static bool BackingAccessorVisible(FieldAnalysisContext field,
+    internal static bool BackingAccessorVisible(FieldAnalysisContext field,
         MethodAnalysisContext caller, bool store)
     {
         var property = field.Name[1..field.Name.IndexOf('>')];

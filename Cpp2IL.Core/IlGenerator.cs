@@ -4473,15 +4473,27 @@ public static class IlGenerator
     {
         var receiverType = EmittedOperandType(field.Local, context);
         var chainHead = true;
-        foreach (var container in field.Containers)
+        var containers = field.Containers;
+        for (var i = 0; i < containers.Count; i++)
         {
+            var container = containers[i];
             // Only the chain head can substitute `this` or coerce the operand into
             // the base contract; deeper links always receive &previous.FieldType.
             var effectiveReceiver = chainHead && !container.IsStatic
                 ? ResolvedFieldReceiverType(container, field.Local, receiverType, context)
                 : receiverType;
             chainHead = false;
-            if (!FieldUsableFrom(container, context, receiverType: effectiveReceiver))
+            if (IsAutoPropertyBackingField(container))
+            {
+                // The hop emits ldflda on the backing field; the decompiler-facing
+                // rewrite replaces it with the getter call only when its consumer
+                // reads the value leaf (ldfld accepts the call's by-value result),
+                // so the hop must be the last container and the access a load.
+                if (i != containers.Count - 1 || writeAccess
+                    || !Analysis.MetadataResolver.BackingAccessorVisible(container, context, store: false))
+                    return false;
+            }
+            else if (!FieldUsableFrom(container, context, receiverType: effectiveReceiver))
                 return false;
             receiverType = container.IsStatic
                 ? container.FieldType
@@ -9121,11 +9133,14 @@ public static class IlGenerator
         // same-assembly shortcut above relies on. External runtime assemblies are
         // frozen, their stubs mirror the real runtime surface, so a reference there
         // must fit the declared access. Widening a compiler-generated backing field
-        // gains nothing either - no access level lets a reference spell the name -
-        // so those keep the diagnosed path as well.
+        // gains nothing - no access level lets a reference spell the name - but a
+        // visible accessor does: the decompiler-facing rewrite turns the emitted
+        // access into the accessor call the original source made.
         return declaredAccess
             || !Extensions.AccessibilityExtensions.IsExternalRuntimeAssembly(declaring.DeclaringAssembly?.Name)
-                && !IsAutoPropertyBackingField(field);
+                && !IsAutoPropertyBackingField(field)
+            || IsAutoPropertyBackingField(field)
+                && Analysis.MetadataResolver.BackingAccessorVisible(field, context, writeAccess);
     }
 
     // Typed `stelem` requires the stack value to be exactly the element type, which
