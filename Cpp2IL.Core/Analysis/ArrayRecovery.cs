@@ -1274,9 +1274,15 @@ public static class ArrayRecovery
 
         var accessWidth = memory.AccessSize != 0
             ? memory.AccessSize
-            : sibling is LocalVariable { Type: { } siblingType }
-                ? (int)TypeSizes.MinimumUnboxedSize(siblingType, pointerSize)
-                : 0;
+            : sibling switch
+            {
+                // A SIMD store records no access size on the operand; a whole
+                // vector literal is always a full 16-byte element write.
+                Vector128Literal => 16,
+                LocalVariable { Type: { } siblingType }
+                    => (int)TypeSizes.MinimumUnboxedSize(siblingType, pointerSize),
+                _ => 0,
+            };
 
         if (StructElementAccess(memory, arrayType, accessWidth, pointerSize) is not { } access)
             return null;
