@@ -500,8 +500,11 @@ public static class MetadataResolver
                     return true;
                 case FieldReference { Local: { } receiver } field
                     when ReferenceEquals(receiver, dest):
+                    // The receiver supplies the first container's owner on a
+                    // chained access (`v.a.b` needs `a`'s declaring type), not
+                    // the leaf field's.
                     if (producedType == null
-                        || !ReceiverSatisfied(producedType, field.Field.DeclaringType))
+                        || !ReceiverSatisfied(producedType, LocalVariables.ReceiverHost(field)))
                         return true;
                     break;
                 case SelectedFieldReference { Selector: LocalVariable selector }
@@ -615,12 +618,16 @@ public static class MetadataResolver
         var declaredSupplies = type is ByRefTypeAnalysisContext { ElementType: { } pointee }
             ? pointee.IsAssignableTo(host)
             : type != null && type.IsAssignableTo(host);
+        var emitted = LocalVariables.EmittedSlotLocalType(local, method);
         if (!declaredSupplies)
-            return false;
+            // local.Type can be transiently unannotated mid-fixpoint; a concrete
+            // declared type is the contract and stays rejected, but an empty
+            // annotation proves nothing - the def-derived slot type decides.
+            return type == null && ReceiverSatisfied(emitted, host);
         // The receiver pushes the local's emitted slot type - a `Move`-copy's
         // source, a numeric view or an `&`-emission can differ from local.Type,
         // and a ldfld on a mismatched `&` is invalid IL.
-        return ReceiverSatisfied(LocalVariables.EmittedSlotLocalType(local, method), host);
+        return ReceiverSatisfied(emitted, host);
     }
 
     private static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)? ResolveField(
@@ -962,10 +969,14 @@ public static class MetadataResolver
         IReadOnlyDictionary<LocalVariable, Instruction> definitions, HashSet<LocalVariable> visiting,
         TypeAnalysisContext? thisType)
     {
-        // `this` always denotes the declaring type's instance (byref interior on
+        // `this` denotes the declaring type's instance (byref interior on
         // structs), which is strictly more informative than an erased placeholder
-        // annotation like System.Object.
-        var fallback = local.IsThis && thisType != null ? thisType : local.Type;
+        // annotation like System.Object. A real carried type - including the
+        // generic instantiation X<T0> the field layout needs - always wins.
+        var fallback = local.IsThis && thisType != null
+            && (local.Type == null || local.Type.FullName == "System.Object")
+            ? thisType
+            : local.Type;
         if (!visiting.Add(local) || !definitions.TryGetValue(local, out var definition))
             return fallback;
 

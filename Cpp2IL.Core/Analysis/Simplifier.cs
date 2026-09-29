@@ -312,7 +312,10 @@ public static class Simplifier
                     {
                         var operand = instruction.Operands[j];
 
-                        if (operand is LocalVariable usedLocal && usedLocal == local)
+                        if (operand is LocalVariable usedLocal && usedLocal == local
+                            && (replacement is not LocalVariable localReplacement
+                                || !LocalVariables.CallOperandProvenMismatched(instruction, j,
+                                    localReplacement, _method)))
                         {
                             instruction.SetOperand(j, replacement);
                             UpdateSourceCache(currentBlock, instruction);
@@ -343,7 +346,7 @@ public static class Simplifier
                                  field.Local == local && !LocalVariables.NoLegalManagedCopy(local, fieldReplacement) &&
                                  !LocalVariables.ReceiverProvenMismatched(
                                      LocalVariables.EmittedSlotLocalType(fieldReplacement, _method),
-                                     field.Field.DeclaringType))
+                                     LocalVariables.ReceiverHost(field)))
                         {
                             field.Local = fieldReplacement;
                         }
@@ -355,7 +358,7 @@ public static class Simplifier
                                 if (choice.Field.Local == local && !LocalVariables.NoLegalManagedCopy(local, selectedReplacement)
                                     && !LocalVariables.ReceiverProvenMismatched(
                                         LocalVariables.EmittedSlotLocalType(selectedReplacement, _method),
-                                        choice.Field.Field.DeclaringType))
+                                        LocalVariables.ReceiverHost(choice.Field)))
                                     choice.Field.Local = selectedReplacement;
                         }
 
@@ -416,7 +419,7 @@ public static class Simplifier
                 case FieldReference field when field.Local == local && !LocalVariables.NoLegalManagedCopy(local, replacement)
                     && !LocalVariables.ReceiverProvenMismatched(
                         LocalVariables.EmittedSlotLocalType(replacement, method),
-                        field.Field.DeclaringType):
+                        LocalVariables.ReceiverHost(field)):
                     field.Local = replacement;
                     break;
                 case SelectedFieldReference selected:
@@ -426,7 +429,7 @@ public static class Simplifier
                         if (choice.Field.Local == local && !LocalVariables.NoLegalManagedCopy(local, replacement)
                             && !LocalVariables.ReceiverProvenMismatched(
                                 LocalVariables.EmittedSlotLocalType(replacement, method),
-                                choice.Field.Field.DeclaringType))
+                                LocalVariables.ReceiverHost(choice.Field)))
                             choice.Field.Local = replacement;
                     break;
                 case ArrayAccess access:

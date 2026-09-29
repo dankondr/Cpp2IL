@@ -360,6 +360,45 @@ public class AddressedStorageReadTests
     }
 
     [Test]
+    public void FieldLoadResultTypesBaseForNextLoadWhenSlotUntyped()
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        var ownerType = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Owner",
+            app.SystemTypes.SystemObjectType, TypeAttributes.Public);
+        var innerType = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Inner",
+            app.SystemTypes.SystemObjectType, TypeAttributes.Public);
+        var outerField = new InjectedFieldAnalysisContext("inner", innerType,
+            FieldAttributes.Public, ownerType, 16);
+        var innerField = new InjectedFieldAnalysisContext("value", app.SystemTypes.SystemInt32Type,
+            FieldAttributes.Public, innerType, 8);
+        ownerType.Fields.Add(outerField);
+        innerType.Fields.Add(innerField);
+        var owner = new LocalVariable("owner", new Register(null, "owner"), ownerType);
+        var fieldRef = new FieldReference(outerField, owner, 16);
+        // The slot stays unannotated - the `value = owner.inner` producer alone
+        // proves `value` carries Inner, so [value + 8] is still owner.inner.value.
+        var value = new LocalVariable("value", new Register(null, "value"));
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var load = new Instruction(1, OpCode.Move, result,
+            new MemoryOperand(value, addend: 8, accessSize: 4));
+        var method = Method(ownerType, app, [
+            new(0, OpCode.Move, value, fieldRef), load, new(2, OpCode.Return)],
+            [owner, value, result]);
+
+        MetadataResolver.ResolveFieldOffsets(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(load.Operands[1], Is.TypeOf<FieldReference>(),
+                () => load.Operands[1]?.ToString() ?? "<null>");
+            var reference = (FieldReference)load.Operands[1];
+            Assert.That(reference.Field, Is.SameAs(innerField));
+            Assert.That(reference.Local, Is.SameAs(value));
+        });
+    }
+
+    [Test]
     public void FieldAddressOffsetOnObjectOwnerKeepsMemoryOperand()
     {
         Cpp2IlApi.ResetInternalState();
@@ -513,6 +552,177 @@ public class AddressedStorageReadTests
                 "a compatible slot type forwards into the receiver");
             Assert.That(copy.OpCode, Is.EqualTo(OpCode.Nop),
                 "the dead copy is dropped once the receiver no longer reads it");
+        });
+    }
+
+    // The same receiver contract binds call operands: an instance method's `this`
+    // emits `readonly &T` for a value-type callee, so a forwarded local whose slot
+    // type is not T makes the emitted call unverifiable. A byref parameter is
+    // invariant the same way (`in Vector3` needs exactly `&Vector3`).
+    [Test]
+    public void CopyPropagationKeepsCallReceiverWhoseSlotTypeCannotSupplyDeclaringType()
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        var ownerType = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Owner",
+            app.SystemTypes.SystemObjectType, TypeAttributes.Public);
+        var host = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Host",
+            app.SystemTypes.SystemValueTypeType, TypeAttributes.Public);
+        var other = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Other",
+            app.SystemTypes.SystemValueTypeType, TypeAttributes.Public);
+        var callee = new InjectedMethodAnalysisContext(host, "Length",
+            app.SystemTypes.SystemSingleType, MethodAttributes.Public, []);
+        var x = new LocalVariable("x", new Register(null, "x")) { Type = host };
+        var y = new LocalVariable("y", new Register(null, "y")) { Type = other };
+        var copy = new Instruction(0, OpCode.Move, x, y);
+        var call = new Instruction(1, OpCode.CallVoid, callee, x);
+        var method = Method(ownerType, app, [copy, call, new(2, OpCode.Return)], [x, y]);
+
+        Simplifier.Simplify(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(call.Operands[1], Is.SameAs(x),
+                "a slot that cannot supply the callee's declaring type keeps the `this` operand");
+            Assert.That(copy.OpCode, Is.EqualTo(OpCode.Move),
+                "the copy must survive while `this` still reads its destination");
+        });
+    }
+
+    [Test]
+    public void CopyPropagationForwardsCallReceiverWhoseSlotTypeSuppliesDeclaringType()
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        var ownerType = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Owner",
+            app.SystemTypes.SystemObjectType, TypeAttributes.Public);
+        var host = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Host",
+            app.SystemTypes.SystemValueTypeType, TypeAttributes.Public);
+        var callee = new InjectedMethodAnalysisContext(host, "Length",
+            app.SystemTypes.SystemSingleType, MethodAttributes.Public, []);
+        var x = new LocalVariable("x", new Register(null, "x")) { Type = host };
+        var y = new LocalVariable("y", new Register(null, "y")) { Type = host };
+        var copy = new Instruction(0, OpCode.Move, x, y);
+        var call = new Instruction(1, OpCode.CallVoid, callee, x);
+        var method = Method(ownerType, app, [copy, call, new(2, OpCode.Return)], [x, y]);
+
+        Simplifier.Simplify(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(call.Operands[1], Is.SameAs(y),
+                "a compatible slot type forwards into `this`");
+            Assert.That(copy.OpCode, Is.EqualTo(OpCode.Nop),
+                "the dead copy is dropped once `this` no longer reads it");
+        });
+    }
+
+    // A chained field access `v.a.b` needs the receiver to supply `a`'s owner,
+    // not `b`'s - a `v.inner.lane` store kept the copy alive when the leaf field's
+    // declaring type was compared instead of the container's.
+    [Test]
+    public void CopyPropagationKeepsChainedFieldReceiverWhoseSlotTypeCannotSupplyContainerOwner()
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        var ownerType = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Owner",
+            app.SystemTypes.SystemObjectType, TypeAttributes.Public);
+        var outer = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Outer",
+            app.SystemTypes.SystemValueTypeType, TypeAttributes.Public);
+        var inner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Inner",
+            app.SystemTypes.SystemValueTypeType, TypeAttributes.Public);
+        var other = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Other",
+            app.SystemTypes.SystemValueTypeType, TypeAttributes.Public);
+        var container = new InjectedFieldAnalysisContext("inner", inner,
+            FieldAttributes.Public, outer, offset: 0);
+        var leaf = new InjectedFieldAnalysisContext("lane", app.SystemTypes.SystemSingleType,
+            FieldAttributes.Public, inner, offset: 0);
+        var x = new LocalVariable("x", new Register(null, "x")) { Type = outer };
+        var y = new LocalVariable("y", new Register(null, "y")) { Type = other };
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var copy = new Instruction(0, OpCode.Move, x, y);
+        var receiver = new FieldReference(leaf, x, offset: 0, containers: [container]);
+        var method = Method(ownerType, app, [
+            copy, new(1, OpCode.Move, result, receiver),
+            new(2, OpCode.CallVoid, Str("sink"), result), new(3, OpCode.Return)],
+            [x, y, result]);
+
+        Simplifier.Simplify(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(receiver.Local, Is.SameAs(x),
+                "a slot that cannot supply the container's declaring type keeps the receiver");
+            Assert.That(copy.OpCode, Is.EqualTo(OpCode.Move),
+                "the copy must survive while the receiver still reads its destination");
+        });
+    }
+
+    [Test]
+    public void CopyPropagationForwardsChainedFieldReceiverWhoseSlotTypeSuppliesContainerOwner()
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        var ownerType = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Owner",
+            app.SystemTypes.SystemObjectType, TypeAttributes.Public);
+        var outer = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Outer",
+            app.SystemTypes.SystemValueTypeType, TypeAttributes.Public);
+        var inner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Inner",
+            app.SystemTypes.SystemValueTypeType, TypeAttributes.Public);
+        var container = new InjectedFieldAnalysisContext("inner", inner,
+            FieldAttributes.Public, outer, offset: 0);
+        var leaf = new InjectedFieldAnalysisContext("lane", app.SystemTypes.SystemSingleType,
+            FieldAttributes.Public, inner, offset: 0);
+        var x = new LocalVariable("x", new Register(null, "x")) { Type = outer };
+        var y = new LocalVariable("y", new Register(null, "y")) { Type = outer };
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var copy = new Instruction(0, OpCode.Move, x, y);
+        var receiver = new FieldReference(leaf, x, offset: 0, containers: [container]);
+        var method = Method(ownerType, app, [
+            copy, new(1, OpCode.Move, result, receiver),
+            new(2, OpCode.CallVoid, Str("sink"), result), new(3, OpCode.Return)],
+            [x, y, result]);
+
+        Simplifier.Simplify(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(receiver.Local, Is.SameAs(y),
+                "a slot typed for the container's owner forwards into the receiver");
+            Assert.That(copy.OpCode, Is.EqualTo(OpCode.Nop),
+                "the dead copy is dropped once the receiver no longer reads it");
+        });
+    }
+
+    [Test]
+    public void CopyPropagationKeepsByRefCallArgWhoseSlotTypeCannotSupplyElement()
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        var ownerType = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Owner",
+            app.SystemTypes.SystemObjectType, TypeAttributes.Public);
+        var host = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Host",
+            app.SystemTypes.SystemValueTypeType, TypeAttributes.Public);
+        var other = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Other",
+            app.SystemTypes.SystemValueTypeType, TypeAttributes.Public);
+        var callee = new InjectedMethodAnalysisContext(host, "Distance",
+            app.SystemTypes.SystemSingleType, MethodAttributes.Static,
+            [new ByRefTypeAnalysisContext(host), new ByRefTypeAnalysisContext(host)]);
+        var x = new LocalVariable("x", new Register(null, "x")) { Type = host };
+        var y = new LocalVariable("y", new Register(null, "y")) { Type = other };
+        var w = new LocalVariable("w", new Register(null, "w")) { Type = host };
+        var copy = new Instruction(0, OpCode.Move, x, y);
+        var call = new Instruction(1, OpCode.CallVoid, callee, x, w);
+        var method = Method(ownerType, app, [copy, call, new(2, OpCode.Return)], [x, y, w]);
+
+        Simplifier.Simplify(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(call.Operands[1], Is.SameAs(x),
+                "a slot that cannot supply the byref element type keeps the argument");
+            Assert.That(copy.OpCode, Is.EqualTo(OpCode.Move),
+                "the copy must survive while the argument still reads its destination");
         });
     }
 }

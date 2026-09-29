@@ -99,7 +99,10 @@ public static class SsaSimplifier
         {
             switch (instruction.Operands[i])
             {
-                case LocalVariable local when !ReferenceEquals(local, destination) && resolved.TryGetValue(local, out var value):
+                case LocalVariable local when !ReferenceEquals(local, destination) && resolved.TryGetValue(local, out var value)
+                    && (value is not LocalVariable localReplacement
+                        || !LocalVariables.CallOperandProvenMismatched(instruction, i,
+                            localReplacement, method)):
                     instruction.SetOperand(i, value);
                     break;
 
@@ -119,7 +122,7 @@ public static class SsaSimplifier
                 case FieldReference { Local: { } fieldLocal } field when resolved.TryGetValue(fieldLocal, out var fieldValue) && fieldValue is LocalVariable fieldReplacement && !LocalVariables.NoLegalManagedCopy(fieldLocal, fieldReplacement)
                     && (method == null || !LocalVariables.ReceiverProvenMismatched(
                         LocalVariables.EmittedSlotLocalType(fieldReplacement, method),
-                        field.Field.DeclaringType)):
+                        LocalVariables.ReceiverHost(field))):
                     field.Local = fieldReplacement;
                     break;
                 case SelectedFieldReference selected:
@@ -129,7 +132,7 @@ public static class SsaSimplifier
                         if (resolved.TryGetValue(choice.Field.Local, out var receiverValue) && receiverValue is LocalVariable receiverReplacement && !LocalVariables.NoLegalManagedCopy(choice.Field.Local, receiverReplacement)
                             && (method == null || !LocalVariables.ReceiverProvenMismatched(
                                 LocalVariables.EmittedSlotLocalType(receiverReplacement, method),
-                                choice.Field.Field.DeclaringType)))
+                                LocalVariables.ReceiverHost(choice.Field))))
                             choice.Field.Local = receiverReplacement;
                     break;
 
@@ -173,7 +176,7 @@ public static class SsaSimplifier
                 when resolved.TryGetValue(fieldLocal, out var fieldValue) && fieldValue is LocalVariable fieldReplacement && !LocalVariables.NoLegalManagedCopy(fieldLocal, fieldReplacement)
                      && (method == null || !LocalVariables.ReceiverProvenMismatched(
                          LocalVariables.EmittedSlotLocalType(fieldReplacement, method),
-                         field.Field.DeclaringType)):
+                         LocalVariables.ReceiverHost(field))):
                 field.Local = fieldReplacement;
                 break;
             case SelectedFieldReference selected:
@@ -183,7 +186,7 @@ public static class SsaSimplifier
                     if (resolved.TryGetValue(choice.Field.Local, out var receiverValue) && receiverValue is LocalVariable receiverReplacement && !LocalVariables.NoLegalManagedCopy(choice.Field.Local, receiverReplacement)
                         && (method == null || !LocalVariables.ReceiverProvenMismatched(
                             LocalVariables.EmittedSlotLocalType(receiverReplacement, method),
-                            choice.Field.Field.DeclaringType)))
+                            LocalVariables.ReceiverHost(choice.Field))))
                         choice.Field.Local = receiverReplacement;
                 break;
             case ArrayAccess access:
