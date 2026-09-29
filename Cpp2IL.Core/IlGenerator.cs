@@ -7582,6 +7582,16 @@ public static class IlGenerator
                 var (contract, opaque) = OperandUseContract(instruction, index, context);
                 if (opaque)
                     return false;
+                // A use on a fully-shared-marshaled cell cannot spell an adopted
+                // `!T`: the erased rep is a raw pointer move, so `castclass` to
+                // the placeholder fabricates a type check the binary never
+                // performs and the raw reference does not verify against an
+                // FSG-typed slot. The local keeps its erased type and the use
+                // keeps its named note instead.
+                if (today is { FullName: "Unity.IL2CPP.Metadata.__Il2CppFullySharedGenericType" }
+                    && contract is { FullName: "Unity.IL2CPP.Metadata.__Il2CppFullySharedGenericType" }
+                    && !ThisConstructorCallPlan.SameTypeIdentity(candidate, contract))
+                    return false;
                 if (contract != null && StackContractSatisfied(today, contract, context)
                     && !StackContractSatisfied(candidate, contract, context))
                     return false;
@@ -7711,12 +7721,22 @@ public static class IlGenerator
             {
                 var today = EmittableLocalType(existing.Type!, context);
                 for (var i = 0; i < uses.Count; i++)
+                {
+                    // An FSG-marshaled read cannot spell a resolved `!T` cell:
+                    // `castclass` to the placeholder is a type check the binary
+                    // never performs. The cell keeps its erased rep and the use
+                    // keeps its named note.
+                    if (today is { FullName: "Unity.IL2CPP.Metadata.__Il2CppFullySharedGenericType" }
+                        && contracts[i] is { FullName: "Unity.IL2CPP.Metadata.__Il2CppFullySharedGenericType" }
+                        && !ThisConstructorCallPlan.SameTypeIdentity(candidate, contracts[i]))
+                        return null;
                     if (contracts[i] != null
                         && SlotWidthAgrees((MemoryOperand)uses[i].Instruction.Operands[
                             uses[i].Index], candidate)
                         && StackContractSatisfied(today, contracts[i], context)
                         && !StackContractSatisfied(candidate, contracts[i], context))
                         return null;
+                }
                 if (slotStores.TryGetValue(key, out var stores))
                     foreach (var (destination, source) in stores)
                     {

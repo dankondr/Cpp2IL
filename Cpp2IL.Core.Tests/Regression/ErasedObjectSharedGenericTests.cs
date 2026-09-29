@@ -125,6 +125,77 @@ public class ErasedObjectSharedGenericTests
     }
 
     [Test]
+    public void FsgMarshaledUseKeepsErasedLocalAndNote()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("ErasedFsg.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemVoidType);
+        // The erased rep itself: a local already carrying the fully-shared
+        // placeholder type.
+        var fsgType = new InjectedTypeAnalysisContext(app.AssembliesByName["UnityEngine.CoreModule"],
+            "Unity.IL2CPP.Metadata", "__Il2CppFullySharedGenericType",
+            app.SystemTypes.SystemObjectType,
+            System.Reflection.TypeAttributes.Public | System.Reflection.TypeAttributes.Class);
+        SeedCorLibTypes(app, module, fsgType);
+        var spill = new LocalVariable("spill", new Register(null, "spill")) { Type = fsgType };
+        var proven = new LocalVariable("proven", new Register(null, "proven"));
+        var (caller, method, typeArgument, callerType) =
+            GenericHost(app, module, [spill, proven]);
+        proven.Type = typeArgument;
+        var take = InjectTake(callerType, module, method, typeArgument);
+        // A marshaled cell wants only the erased rep: passing the adopted `!T`
+        // value would emit a `castclass` to the FSG placeholder - a type check
+        // the binary never performs. The local keeps its erased type, the `!T`
+        // use keeps its note and the FSG use emits no fabricated cast.
+        var takeFsg = callerType.InjectMethodContext("TakeFsg",
+            app.SystemTypes.SystemVoidType,
+            System.Reflection.MethodAttributes.Public | System.Reflection.MethodAttributes.Static,
+            fsgType);
+        var takeFsgDefinition = new MethodDefinition("TakeFsg",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void,
+                [fsgType.ToTypeSignature()]));
+        method.DeclaringType!.Methods.Add(takeFsgDefinition);
+        takeFsg.PutExtraData("AsmResolverMethod", takeFsgDefinition);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(-1, OpCode.Move, proven, new Immediate(0)),
+            new(0, OpCode.Move, spill, proven),
+            new(1, OpCode.CallVoid, take, spill),
+            new(2, OpCode.CallVoid, takeFsg, spill),
+            new(3, OpCode.Return)]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var body = method.CilMethodBody!;
+        var instructions = body.Instructions;
+        // The FSG-cell use: the argument window feeding TakeFsg must contain no
+        // fabricated `castclass` to the placeholder. (The FSG-typed local's own
+        // definition site is a separate, pre-existing marshal and is not what
+        // this assertion measures.)
+        var takeFsgCallIndex = instructions
+            .Select((ins, i) => (ins, i))
+            .Where(x => x.ins.OpCode == CilOpCodes.Call
+                && x.ins.Operand?.ToString().Contains("TakeFsg") == true)
+            .Select(x => x.i).FirstOrDefault(-1);
+        Assert.That(takeFsgCallIndex, Is.GreaterThanOrEqualTo(0),
+            () => string.Join("\n", instructions.Select(i => i.ToString())));
+        var window = instructions.Skip(System.Math.Max(0, takeFsgCallIndex - 4)).Take(4).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(window.Any(i => i.OpCode == CilOpCodes.Castclass
+                    && i.Operand?.ToString().Contains("__Il2CppFullySharedGenericType") == true),
+                Is.False,
+                () => string.Join("\n", instructions.Select(i => i.ToString())));
+            Assert.That(instructions.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("operand to T")), Is.True,
+                () => string.Join("\n", instructions.Select(i => i.ToString())));
+        });
+    }
+
+    [Test]
     public void UnprovenProducerKeepsConversionDiagnostic()
     {
         Cpp2IlApi.ResetInternalState();
