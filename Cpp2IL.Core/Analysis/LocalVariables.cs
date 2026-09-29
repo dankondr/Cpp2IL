@@ -1268,7 +1268,7 @@ public static class LocalVariables
                 continue;
 
             if (instruction.Destination is LocalVariable destination
-                && MayClaimBoolean(destination, method, allDefinitions))
+                && TryClaimBoolean(destination, method, allDefinitions))
                 destination.Type = booleanType;
         }
     }
@@ -1480,11 +1480,30 @@ public static class LocalVariables
         LocalBooleanClaimConsistent(local, allDefinitions)
         || !AllUsesObjectCompatible(local, method, []);
 
+    private const string BooleanClaimVetoedKey = "BooleanClaimVetoed";
+
+    // A claim attempt the gate vetoes is recorded: the local falls back to an
+    // object slot, and IlGenerator wraps that slot's contract so any scalar
+    // edge reaching it keeps the named note the Boolean-typed slot emitted.
+    private static bool TryClaimBoolean(LocalVariable local, MethodAnalysisContext method,
+        IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>> allDefinitions)
+    {
+        if (MayClaimBoolean(local, method, allDefinitions))
+            return true;
+        if (method.GetExtraData<HashSet<LocalVariable>>(BooleanClaimVetoedKey) is not { } vetoed)
+            method.PutExtraData(BooleanClaimVetoedKey, vetoed = []);
+        vetoed.Add(local);
+        return false;
+    }
+
+    internal static bool CarriesVetoedBooleanClaim(LocalVariable local, MethodAnalysisContext context) =>
+        context.GetExtraData<HashSet<LocalVariable>>(BooleanClaimVetoedKey)?.Contains(local) == true;
+
     private static bool SetTypeRespectingBooleanClaim(LocalVariable local, TypeAnalysisContext? type,
         MethodAnalysisContext method,
         IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>> allDefinitions) =>
         type is { FullName: "System.Boolean" }
-            ? MayClaimBoolean(local, method, allDefinitions) && SetTypeIfUnknown(local, type)
+            ? TryClaimBoolean(local, method, allDefinitions) && SetTypeIfUnknown(local, type)
             : SetTypeIfUnknown(local, type);
 
     private static bool IsObjectSlotType(TypeAnalysisContext? type) =>
@@ -1991,7 +2010,7 @@ public static class LocalVariables
             if (loadDest.Type?.FullName == fieldType.FullName)
                 return false;
             if (fieldType.FullName == "System.Boolean")
-                return MayClaimBoolean(loadDest, method, allDefinitions)
+                return TryClaimBoolean(loadDest, method, allDefinitions)
                     && SetTypeIfUnknown(loadDest, fieldType);
             loadDest.Type = fieldType;
             return true;
@@ -2002,7 +2021,7 @@ public static class LocalVariables
             if (selectedDest.Type?.FullName == selectedField.FieldType.FullName)
                 return false;
             if (selectedField.FieldType.FullName == "System.Boolean")
-                return MayClaimBoolean(selectedDest, method, allDefinitions)
+                return TryClaimBoolean(selectedDest, method, allDefinitions)
                     && SetTypeIfUnknown(selectedDest, selectedField.FieldType);
             selectedDest.Type = selectedField.FieldType;
             return true;
@@ -2117,7 +2136,7 @@ public static class LocalVariables
                 if (phi.Operands[i] is LocalVariable { Type: { } inputType })
                 {
                     if (inputType.FullName != "System.Boolean"
-                        || MayClaimBoolean(destination, method, allDefinitions))
+                        || TryClaimBoolean(destination, method, allDefinitions))
                         changed = SetTypeIfUnknown(destination, inputType);
                     break;
                 }

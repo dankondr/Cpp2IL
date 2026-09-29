@@ -68,8 +68,7 @@ public class ArrayHeaderLengthTests
         {
             Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldlen), Is.EqualTo(1),
                 () => Emit(il));
-            Assert.That(il.Where(i => i.OpCode == CilOpCodes.Ldstr).All(i =>
-                    i.Operand?.ToString()?.Contains("operand to System.Object slot") == true), Is.True,
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.False,
                 () => Emit(il));
         });
     }
@@ -93,8 +92,7 @@ public class ArrayHeaderLengthTests
         {
             Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldlen), Is.EqualTo(1),
                 () => Emit(il));
-            Assert.That(il.Where(i => i.OpCode == CilOpCodes.Ldstr).All(i =>
-                    i.Operand?.ToString()?.Contains("operand to System.Object slot") == true), Is.True,
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.False,
                 () => Emit(il));
         });
     }

@@ -274,10 +274,7 @@ public class IlGeneratorTests
     [TestCase(1, false, OpCode.CheckEqual, false)]
     [TestCase(2, false, OpCode.CheckEqual, false)]
     [TestCase(3, false, OpCode.CheckEqual, false)]
-    // kind 4 compares an object-typed operand against a non-zero literal: the
-    // Int32 literal reaching the object slot is a scalar edge into a pointer
-    // slot, so the operand takes the named default (ldnull) instead of a box.
-    [TestCase(4, false, OpCode.CheckEqual, true)]
+    [TestCase(4, false, OpCode.CheckEqual, false)]
     [TestCase(5, false, OpCode.CheckEqual, false)]
     [TestCase(0, false, OpCode.Add, false)]
     public void OnlyReferenceEqualityWithLiteralZeroEmitsNull(int kind, bool reverse, OpCode opcode, bool expectsNull)
@@ -1932,14 +1929,14 @@ public class IlGeneratorTests
     }
 
     [Test]
-    public void ObjectDestinationSubstitutesIntegerValue()
+    public void ObjectDestinationBoxesIntegerValue()
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var source = new LocalVariable("source", new Register(null, "source")) { Type = app.SystemTypes.SystemInt32Type };
         var dest = new LocalVariable("dest", new Register(null, "dest")); // untyped
         // `dest` also flows to an object-typed call arg, which is boxing-compatible
         // and no longer disqualifies numeric inference: dest emits Int32 and the
-        // scalar->object edge is diagnosed at the call site instead.
+        // box happens at the object-typed call site instead.
         var target = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Take",
             app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static,
             [app.SystemTypes.SystemObjectType]);
@@ -1974,20 +1971,14 @@ public class IlGeneratorTests
         {
             Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
             Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.Stloc));
-            // `dest` keeps its inferred Int32 type so its store is clean; the
-            // Int32 edge reaching the `Take` object parameter has no legal
-            // conversion and keeps a named note and a default, not a box.
-            Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldstr
-                && i.Operand?.ToString()?.Contains("operand to System.Object slot") == true), Is.EqualTo(1),
-                () => string.Join("\n", il));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Box), Is.False);
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call
-                && i.Operand?.ToString()?.Contains("Take") == true), Is.True);
+            Assert.That(il[4].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+            Assert.That(il[5].OpCode, Is.EqualTo(CilOpCodes.Box));
+            Assert.That(il[6].OpCode, Is.EqualTo(CilOpCodes.Call));
         });
     }
 
     [Test]
-    public void CallNotesValueTypeReturnStoredToObjectLocal()
+    public void CallUsesEmittedValueTypeReturnWhenAnalysisSaysObject()
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var result = new LocalVariable("result", new Register(null, "result"))
@@ -2018,19 +2009,14 @@ public class IlGeneratorTests
 
         IlGenerator.GenerateIl(context, caller);
 
-        var il = caller.CilMethodBody!.Instructions;
-        Assert.Multiple(() =>
-        {
-            Assert.That(il.Any(instruction =>
-                instruction.OpCode == CilOpCodes.Ldstr
-                && instruction.Operand?.ToString()?.Contains("operand to System.Object slot") == true), Is.True,
-                () => string.Join("\n", il));
-            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Box), Is.False);
-        });
+        Assert.That(caller.CilMethodBody!.Instructions.Any(instruction =>
+            instruction.OpCode == CilOpCodes.Box
+            && instruction.Operand?.ToString()?.Contains("Boolean") == true), Is.True,
+            () => string.Join("\n", caller.CilMethodBody.Instructions));
     }
 
     [Test]
-    public void ObjectArgumentSubstitutesBooleanWithoutTypeMapping()
+    public void ObjectArgumentBoxesBooleanWithoutTypeMapping()
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var source = new LocalVariable("source", new Register(null, "source"))
@@ -2061,15 +2047,10 @@ public class IlGeneratorTests
 
         IlGenerator.GenerateIl(context, method);
 
-        var il = method.CilMethodBody!.Instructions;
-        Assert.Multiple(() =>
-        {
-            Assert.That(il.Any(instruction =>
-                instruction.OpCode == CilOpCodes.Ldstr
-                && instruction.Operand?.ToString()?.Contains("operand to System.Object slot") == true), Is.True,
-                () => string.Join("\n", il));
-            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Box), Is.False);
-        });
+        Assert.That(method.CilMethodBody!.Instructions.Any(instruction =>
+            instruction.OpCode == CilOpCodes.Box
+            && instruction.Operand?.ToString()?.Contains("Boolean") == true), Is.True,
+            () => string.Join("\n", method.CilMethodBody.Instructions));
     }
 
     [Test]

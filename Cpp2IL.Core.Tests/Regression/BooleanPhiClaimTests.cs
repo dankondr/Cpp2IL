@@ -60,27 +60,27 @@ public class BooleanPhiClaimTests
         SeedCorLibTypes(app, module, app.SystemTypes.SystemObjectType,
             app.SystemTypes.SystemVoidType, app.SystemTypes.SystemBooleanType,
             app.SystemTypes.SystemStringType);
-        var owner = new LocalVariable("owner", new Register(null, "owner"));
-        var merged = new LocalVariable("merged", new Register(null, "merged"));
         var arg = new LocalVariable("arg", new Register(null, "arg"))
             { Type = app.SystemTypes.SystemObjectType };
-        var (caller, method) = ForeignCaller(app, module, [], [owner, merged, arg]);
+        // A spill local is declared object in .locals - the vetoed Boolean
+        // claim marks its contract, not its declared type.
+        var merged = new LocalVariable("merged", new Register(null, "merged"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var (caller, method) = ForeignCaller(app, module, [], [arg, merged]);
         var callerType = (InjectedTypeAnalysisContext)caller.DeclaringType!;
         callerType.PutExtraData("AsmResolverType", method.DeclaringType!);
-        var flagField = new InjectedFieldAnalysisContext("flag", app.SystemTypes.SystemBooleanType,
-            R.FieldAttributes.Public, callerType, 16);
-        callerType.Fields.Add(flagField);
         var getOwner = InjectStatic(callerType, module, method, "GetOwner", callerType);
         var take = InjectStatic(callerType, module, method, "Take",
             app.SystemTypes.SystemVoidType, app.SystemTypes.SystemObjectType);
-        // One register carries a flag load that is dead - overwritten by a
+        // One register carries a flag result that is dead - overwritten by a
         // proven reference before the object consumer sees it. The consumer is
         // object-compatible, so no manufactured Boolean claim: the reference
-        // edge flows without box, cast or note.
+        // edge flows without box or cast; the dead flag edge keeps its named
+        // note (a scalar reaching the object slot).
         var instructions = new List<Instruction>
         {
-            new(0, OpCode.Call, getOwner, owner),
-            new(1, OpCode.Move, merged, new FieldReference(flagField, owner, 16)),
+            new(0, OpCode.Call, getOwner, arg),
+            new(1, OpCode.CheckEqual, merged, arg, new Immediate(0)),
             new(2, OpCode.Move, merged, arg),
             new(3, OpCode.CallVoid, take, merged),
             new(4, OpCode.Return),
@@ -118,28 +118,25 @@ public class BooleanPhiClaimTests
         SeedCorLibTypes(app, module, app.SystemTypes.SystemObjectType,
             app.SystemTypes.SystemVoidType, app.SystemTypes.SystemBooleanType,
             app.SystemTypes.SystemInt64Type);
-        var owner = new LocalVariable("owner", new Register(null, "owner"));
-        var merged = new LocalVariable("merged", new Register(null, "merged"));
-        var count = new LocalVariable("count", new Register(null, "count"))
-            { Type = app.SystemTypes.SystemInt64Type };
-        var (caller, method) = ForeignCaller(app, module, [], [owner, merged, count]);
+        var arg = new LocalVariable("arg", new Register(null, "arg"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var merged = new LocalVariable("merged", new Register(null, "merged"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var (caller, method) = ForeignCaller(app, module, [], [arg, merged]);
         var callerType = (InjectedTypeAnalysisContext)caller.DeclaringType!;
         callerType.PutExtraData("AsmResolverType", method.DeclaringType!);
-        var flagField = new InjectedFieldAnalysisContext("flag", app.SystemTypes.SystemBooleanType,
-            R.FieldAttributes.Public, callerType, 16);
-        callerType.Fields.Add(flagField);
         var getOwner = InjectStatic(callerType, module, method, "GetOwner", callerType);
         var take = InjectStatic(callerType, module, method, "Take",
             app.SystemTypes.SystemVoidType, app.SystemTypes.SystemObjectType);
-        // The register carries flag and wide-integer scalars on different paths;
-        // both reach an object-only consumer. The binary moved raw bits, so
-        // each scalar edge keeps a named note rather than a fabricated `box`.
+        // A vetoed Boolean claim leaves the register an object slot; a scalar
+        // edge that still reaches it (a literal the binary moved into the same
+        // register) keeps a named note rather than a fabricated `box`.
         var instructions = new List<Instruction>
         {
-            new(0, OpCode.Call, getOwner, owner),
-            new(1, OpCode.Move, merged, new FieldReference(flagField, owner, 16)),
-            new(2, OpCode.Move, count, new Immediate(5)),
-            new(3, OpCode.Move, merged, count),
+            new(0, OpCode.Call, getOwner, arg),
+            new(1, OpCode.CheckEqual, merged, arg, new Immediate(0)),
+            new(2, OpCode.Move, merged, arg),
+            new(3, OpCode.Move, merged, new Immediate(5)),
             new(4, OpCode.CallVoid, take, merged),
             new(5, OpCode.Return),
         };

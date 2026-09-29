@@ -1448,19 +1448,12 @@ public static class IlGenerator
                         var resultContract = StoreContract(instruction.Operands[1], context);
                         // The member reference, not a possibly stale analysis override,
                         // determines the value the CIL call leaves on the stack.
-                        // A value-type result reaching an `object` local is a scalar
-                        // edge into a pointer slot: `box` would fabricate a conversion
-                        // the binary never made, so drop it and fill the slot with a
-                        // named default - same ruling as EmitStackCoerce's scalar→object arm.
+                        // A value-type result stored in object must be boxed even when
+                        // analysis mislabeled the call as returning object.
                         if (instruction.Operands[1] is LocalVariable resultLocal
                             && locals[resultLocal].VariableType.FullName == "System.Object"
                             && importedMethod.Signature?.ReturnType is { IsValueType: true } actualReturn)
-                        {
-                            instructions.Add(CilOpCodes.Pop);
-                            PushDefaultOf(resultContract ?? context.AppContext.SystemTypes.SystemObjectType,
-                                method, instructions, context,
-                                $"No legal conversion from {actualReturn.FullName} operand to System.Object slot; substituting a synthetic default value.");
-                        }
+                            instructions.Add(CilOpCodes.Box, actualReturn.ToTypeDefOrRef());
                         else
                             EmitStackCoerceOrDefault(EffectiveCallReturnType(targetMethod),
                                 resultContract, method, context);
@@ -6133,7 +6126,16 @@ public static class IlGenerator
         // the declaration erased back is not a type the verifier accepts at the
         // store; the declared slot wins.
         if (destination is LocalVariable slotLocal)
-            return EmittableLocalType(EmittedLocalType(slotLocal, context), context);
+        {
+            var localContract = EmittableLocalType(EmittedLocalType(slotLocal, context), context);
+            // A local whose manufactured Boolean claim was vetoed falls back to
+            // an object slot: mark its contract so a scalar edge reaching it
+            // keeps the named note the Boolean-typed slot emitted.
+            return localContract.FullName == "System.Object"
+                && Analysis.LocalVariables.CarriesVetoedBooleanClaim(slotLocal, context)
+                    ? new Analysis.BooleanClaimVetoedSlotTypeAnalysisContext(localContract)
+                    : localContract;
+        }
         var declared = DestinationType(destination);
         if (declared != null)
             return declared;
@@ -6831,12 +6833,11 @@ public static class IlGenerator
             return false;
         }
 
-        // A scalar reaching `System.Object` is a value the binary moved as raw
-        // bits into a pointer slot: `box` fabricates a conversion the binary
-        // never made (and a `box(false)`/`box(0)` edge can silently satisfy a
-        // null test downstream). There is no legal honest conversion - the
-        // caller drops the operand and fills the slot with a named default.
-        if (from.IsValueType && to.FullName == "System.Object")
+        // A scalar reaching a vetoed-Boolean object slot is a value the binary
+        // moved as raw bits into a pointer slot: `box` fabricates a conversion
+        // the binary never made. Only these marked slots - not any ordinary
+        // System.Object contract - keep the note the bool-typed slot emitted.
+        if (from.IsValueType && to is Analysis.BooleanClaimVetoedSlotTypeAnalysisContext)
             return false;
 
         // Some recovered corlib contexts lose their value-type flag even though
@@ -7156,10 +7157,10 @@ public static class IlGenerator
             return true;
         if (to.FullName is "System.Single" or "System.Double")
             return from.FullName is "System.Single" or "System.Double" || fromWidth != 0;
-        // Mirrors EmitStackCoerce: a scalar reaching `System.Object` has no
-        // honest conversion - `box` would fabricate one the binary never made,
-        // so the slot takes the diagnosed default instead.
-        if (from.IsValueType && to.FullName == "System.Object")
+        // Mirrors EmitStackCoerce: a scalar reaching a vetoed-Boolean object
+        // slot has no honest conversion - `box` would fabricate one the binary
+        // never made, so the slot takes the diagnosed default instead.
+        if (from.IsValueType && to is Analysis.BooleanClaimVetoedSlotTypeAnalysisContext)
             return false;
         if (from.IsValueType && !to.IsValueType)
             // box, plus castclass when the reference target narrows - both need
