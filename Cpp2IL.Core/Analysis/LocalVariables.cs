@@ -929,7 +929,7 @@ public static class LocalVariables
                 continue;
             var field = resolved.Field;
             if (field is not ConcreteGenericFieldAnalysisContext)
-                field = new ConcreteGenericFieldAnalysisContext(field, emitted);
+                field = MetadataResolver.BindResolvedFieldLeaf(emitted, resolved.Containers, field);
             var replacement = new FieldReference(field, reference.Local, reference.Offset,
                 resolved.Containers, reference.AccessSize);
             instruction.SetOperand(i, addressed ? new AddressOf(replacement) : replacement);
