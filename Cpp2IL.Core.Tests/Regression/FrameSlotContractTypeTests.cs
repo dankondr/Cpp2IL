@@ -76,6 +76,7 @@ public class FrameSlotContractTypeTests
         // diagnostic; afterwards the slot, the store and the call all agree
         // on T.
         caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(-1, OpCode.Move, proven, new Immediate(0)),
             new(0, OpCode.Move, spill, proven),
             new(1, OpCode.Move, memory, spill),
             new(2, OpCode.CallVoid, take, memory),

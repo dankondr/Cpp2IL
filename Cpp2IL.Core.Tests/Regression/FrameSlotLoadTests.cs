@@ -44,6 +44,7 @@ public class FrameSlotLoadTests
         // [x29 - 0x18] = value; result = [x29 - 0x18] — a store then a load of
         // the same slot, both 4-byte: they share one synthesized local.
         var (caller, method) = ForeignCaller(app, module, [
+            new(-1, OpCode.Move, value, new Immediate(5)),
             new(0, OpCode.Move, new MemoryOperand(frame, addend: -0x18, accessSize: 4), value),
             new(1, OpCode.Move, result, new MemoryOperand(frame, addend: -0x18, accessSize: 4)),
             new(2, OpCode.Return)], [frame, value, result]);
@@ -78,6 +79,7 @@ public class FrameSlotLoadTests
         // [stack_40_v2] — the real shape carries the slot offset in the
         // register name with no addend at all.
         var (caller, method) = ForeignCaller(app, module, [
+            new(-1, OpCode.Move, value, new Immediate(5)),
             new(0, OpCode.Move, new MemoryOperand(stack, addend: 0, accessSize: 4), value),
             new(1, OpCode.Move, result, new MemoryOperand(stack, addend: 0, accessSize: 4)),
             new(2, OpCode.Return)], [stack, value, result]);
