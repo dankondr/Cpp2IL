@@ -638,9 +638,13 @@ public static class MetadataResolver
             // erased annotation - System.Object, a shared-generic parameter,
             // an instantiation with erased arguments like List<object> - is the
             // lifter's placeholder rather than a contract: only a concrete
-            // non-erased declared type proves a mismatch. For an empty or
-            // erased annotation the def-derived slot type decides.
-            return (contract == null || IlGenerator.ContainsErasedSharedArgument(contract))
+            // non-erased declared type proves a mismatch. A wider annotation the
+            // host is itself assignable to (UnityEngine.Object on a
+            // T:UnityEngine.Object-erased copy, a shared interface) is equally
+            // non-contradicting - a contract-typed slot can still hold the host
+            // value - so it too defers to the produced type.
+            return (contract == null || IlGenerator.ContainsErasedSharedArgument(contract)
+                    || host.IsAssignableTo(contract))
                    && EmittedValueSuppliesReceiver(emitted, host);
         // The receiver pushes the local's emitted slot type - a `Move`-copy's
         // source, a numeric view or an `&`-emission can differ from local.Type.

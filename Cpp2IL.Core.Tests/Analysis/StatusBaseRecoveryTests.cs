@@ -138,6 +138,35 @@ public class StatusBaseRecoveryTests
         Assert.That(((FieldReference)load.Operands[1]).Field,Is.SameAs(field));
     }
 
+    // A base-annotated slot whose producer proves a derived type is not a
+    // contradictory contract - a WideBase variable can hold a Holder - so the
+    // produced type supplies the receiver and the field load resolves.
+    [Test]
+    public void WiderBaseAnnotationDoesNotContradictProducedReceiverType()
+    {
+        var app=Cpp2IlApi.CurrentAppContext!;
+        var wide=new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"],"Tests","WideBase",app.SystemTypes.SystemObjectType,TypeAttributes.Public);
+        var owner=new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"],"Tests","Holder",wide,TypeAttributes.Public);
+        var field=new InjectedFieldAnalysisContext("id",app.SystemTypes.SystemStringType,FieldAttributes.Public,owner,16);
+        owner.Fields.Add(field);
+        var producer=new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"],"Tests","Producer",app.SystemTypes.SystemObjectType,TypeAttributes.Public);
+        var srcField=new InjectedFieldAnalysisContext("src",owner,FieldAttributes.Public,producer,16);
+        producer.Fields.Add(srcField);
+        var method=new InjectedMethodAnalysisContext(owner,"Read",app.SystemTypes.SystemVoidType,MethodAttributes.Static,[]);
+        var src=new LocalVariable("srcObj",new Register(null,"srcObj"),producer);
+        var receiver=new LocalVariable("receiver",new Register(null,"receiver"),wide);
+        var value=new LocalVariable("value",new Register(null,"value"),app.SystemTypes.SystemStringType);
+        var load=new Instruction(1,OpCode.Move,value,new MemoryOperand(receiver,addend:16));
+        method.ControlFlowGraph=new ISILControlFlowGraph([
+            new(0,OpCode.Move,receiver,new FieldReference(srcField,src,16)),
+            load,
+            new(2,OpCode.Return)]);
+
+        MetadataResolver.ResolveFieldOffsets(method);
+
+        Assert.That(((FieldReference)load.Operands[1]).Field,Is.SameAs(field));
+    }
+
     [TestCase(false)]
     [TestCase(true)]
     public void VirtualTailCallIsResolvedWithoutUsingStaleReturnOperand(bool isVoid)
