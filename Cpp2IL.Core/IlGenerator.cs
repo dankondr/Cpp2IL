@@ -6998,11 +6998,17 @@ public static class IlGenerator
                 or PointerTypeAnalysisContext)
             return false;
 
-        var candidates = Analysis.MetadataResolver.FindInstanceFieldPathAtOffset(owner,
-                memory.Addend, memory.AccessSize) is { } flat
-            ? [flat]
-            : Analysis.MetadataResolver.FindInteriorInstanceFieldPaths(owner, memory.Addend,
-                memory.AccessSize) ?? [];
+        // Interior paths list every member boundary the access covers,
+        // shallowest first — a whole-member store beats a refused deeper leaf
+        // (e.g. a private field nested inside the member the binary writes).
+        // The flat resolution is appended as the fallback: it still reaches
+        // leaves inside reference-typed members, which interior never descends.
+        var candidates = Analysis.MetadataResolver.FindInteriorInstanceFieldPaths(owner,
+            memory.Addend, memory.AccessSize) ?? [];
+        if (Analysis.MetadataResolver.FindInstanceFieldPathAtOffset(owner, memory.Addend,
+                memory.AccessSize) is { } flat
+            && candidates.All(c => c.Field != flat.Field))
+            candidates.Add(flat);
         foreach (var found in candidates)
         {
             if (found.Containers.Count == 0 && !FieldStoreWidthMatches(memory, found.Field, context))
