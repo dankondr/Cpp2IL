@@ -4501,15 +4501,29 @@ public static class IlGenerator
     {
         var receiverType = EmittedOperandType(field.Local, context);
         var chainHead = true;
-        foreach (var container in field.Containers)
+        var containers = field.Containers;
+        for (var i = 0; i < containers.Count; i++)
         {
+            var container = containers[i];
             // Only the chain head can substitute `this` or coerce the operand into
             // the base contract; deeper links always receive &previous.FieldType.
+            // A write must be writable at every link: a readonly container makes
+            // any store beneath it unspellable in C# (CS1648/CS1650 family).
             var effectiveReceiver = chainHead && !container.IsStatic
                 ? ResolvedFieldReceiverType(container, field.Local, receiverType, context)
                 : receiverType;
             chainHead = false;
-            if (!FieldUsableFrom(container, context, receiverType: effectiveReceiver))
+            if (IsAutoPropertyBackingField(container))
+            {
+                // The hop emits ldflda on the backing field; the decompiler-facing
+                // rewrite replaces it with the getter call only when its consumer
+                // reads the value leaf (ldfld accepts the call's by-value result),
+                // so the hop must be the last container and the access a load.
+                if (i != containers.Count - 1 || writeAccess
+                    || !Analysis.MetadataResolver.BackingAccessorVisible(container, context, store: false))
+                    return false;
+            }
+            else if (!FieldUsableFrom(container, context, writeAccess, receiverType: effectiveReceiver))
                 return false;
             receiverType = container.IsStatic
                 ? container.FieldType
@@ -4815,12 +4829,18 @@ public static class IlGenerator
             || (CallDefinedLocalType(local, context) ?? ObjectDefinitionType(local, context)) is not { } owner
             || owner == context.AppContext.SystemTypes.SystemObjectType)
             return false;
-        var field = Analysis.MetadataResolver.FindInstanceFieldAtOffset(owner, memory.Addend);
-        if (field == null)
+        var resolved = Analysis.MetadataResolver.FindInstanceFieldPathAtOffset(
+            owner, memory.Addend, memory.AccessSize);
+        if (resolved is not { } path
+            || Analysis.MetadataResolver.MemberPathUnspellable(path, context,
+                store: false, addressed: false))
             return false;
-        if (owner is GenericInstanceTypeAnalysisContext genericOwner)
+        var field = path.Field;
+        if (owner is GenericInstanceTypeAnalysisContext genericOwner
+            && field is not ConcreteGenericFieldAnalysisContext)
             field = new ConcreteGenericFieldAnalysisContext(field, genericOwner);
-        fieldReference = new FieldReference(field, local, (int)memory.Addend);
+        fieldReference = new FieldReference(field, local, (int)memory.Addend, path.Containers,
+            memory.AccessSize);
         return true;
     }
 
@@ -7026,19 +7046,68 @@ public static class IlGenerator
             : CallDefinedLocalType(local, context) ?? ObjectDefinitionType(local, context);
         if (owner == null || owner == systemObject
             || owner is SzArrayTypeAnalysisContext or GenericParameterTypeAnalysisContext
-                or PointerTypeAnalysisContext
-            || Analysis.MetadataResolver.FindInstanceFieldPathAtOffset(owner, memory.Addend,
-                memory.AccessSize) is not { } found
-            || found.Containers.Count == 0 && !FieldStoreWidthMatches(memory, found.Field, context))
+                or PointerTypeAnalysisContext)
             return false;
 
-        var resolved = found.Field;
-        if (owner is GenericInstanceTypeAnalysisContext genericOwner)
-            resolved = new ConcreteGenericFieldAnalysisContext(resolved, genericOwner);
-        field = new FieldReference(resolved, local, (int)memory.Addend, found.Containers,
-            memory.AccessSize);
-        return FieldReferenceUsableFrom(field, context, writeAccess: true)
-            && TryResolveSlotLoad(source, field.Field.FieldType, context, false, out _, out _);
+        // Interior paths list every member boundary the access covers,
+        // shallowest first — a whole-member store beats a refused deeper leaf
+        // (e.g. a private field nested inside the member the binary writes).
+        // The flat resolution is appended as the fallback: it still reaches
+        // leaves inside reference-typed members, which interior never descends.
+        var candidates = Analysis.MetadataResolver.FindInteriorInstanceFieldPaths(owner,
+            memory.Addend, memory.AccessSize) ?? [];
+        if (Analysis.MetadataResolver.FindInstanceFieldPathAtOffset(owner, memory.Addend,
+                memory.AccessSize) is { } flat
+            && candidates.All(c => c.Field != flat.Field))
+            candidates.Add(flat);
+        foreach (var found in candidates)
+        {
+            if (found.Containers.Count == 0 && !FieldStoreWidthMatches(memory, found.Field, context))
+                continue;
+            // A nested store spells `receiver.c1...cN.leaf = v`: the first
+            // ldflda reads `receiver.c1`, so the receiver itself must already
+            // be definitely assigned. The only receiver provably unassigned is
+            // an `out` parameter — assigning `ctx.c1.leaf` before the whole
+            // struct is assigned is CS0170, not spellable C# — so such stores
+            // keep the diagnostic. (Flat candidates are fine: `ctx.c1 = v` is
+            // the legal way to assign an out struct's member.)
+            if (found.Containers.Count > 0 && StoreReceiverIsOutParameter(local, context))
+                continue;
+            var resolved = found.Field;
+            // Interior-path leaves already carry their declaring context's binding;
+            // only a flat leaf on a generic owner still needs it.
+            if (owner is GenericInstanceTypeAnalysisContext genericOwner
+                && resolved is not ConcreteGenericFieldAnalysisContext)
+                resolved = new ConcreteGenericFieldAnalysisContext(resolved, genericOwner);
+            field = new FieldReference(resolved, local, (int)memory.Addend, found.Containers,
+                memory.AccessSize);
+            if (FieldReferenceUsableFrom(field, context, writeAccess: true)
+                && TryResolveSlotLoad(source, field.Field.FieldType, context, false, out _, out _))
+                return true;
+        }
+        return false;
+    }
+
+    // Parameter locals keep the argument register they arrived in, so the
+    // receiver's register number maps it back to the parameter slot (a
+    // versioned SSA copy keeps its defining register's number). Only `out`
+    // carries ParameterAttributes.Out; `ref` arrives assigned.
+    private static bool StoreReceiverIsOutParameter(LocalVariable local, MethodAnalysisContext context)
+    {
+        var operandOffset = context.IsStatic ? 0 : 1;
+        var hasMethodInfo = context.ParameterOperands.Count - operandOffset > context.Parameters.Count;
+        for (var i = 0; i < context.Parameters.Count; i++)
+        {
+            var operandIndex = i + operandOffset;
+            if (hasMethodInfo && operandIndex == context.ParameterOperands.Count - 1)
+                break;
+            if (operandIndex >= context.ParameterOperands.Count
+                || context.ParameterOperands[operandIndex] is not Register reg
+                || reg.Number != local.Register.Number)
+                continue;
+            return context.Parameters[i].Attributes.HasFlag(ParameterAttributes.Out);
+        }
+        return false;
     }
 
     // Frame-pointer- and stack-slot-relative stores ([x29 - N], [stack_N + K])
@@ -9148,11 +9217,14 @@ public static class IlGenerator
         // same-assembly shortcut above relies on. External runtime assemblies are
         // frozen, their stubs mirror the real runtime surface, so a reference there
         // must fit the declared access. Widening a compiler-generated backing field
-        // gains nothing either - no access level lets a reference spell the name -
-        // so those keep the diagnosed path as well.
+        // gains nothing - no access level lets a reference spell the name - but a
+        // visible accessor does: the decompiler-facing rewrite turns the emitted
+        // access into the accessor call the original source made.
         return declaredAccess
             || !Extensions.AccessibilityExtensions.IsExternalRuntimeAssembly(declaring.DeclaringAssembly?.Name)
-                && !IsAutoPropertyBackingField(field);
+                && !IsAutoPropertyBackingField(field)
+            || IsAutoPropertyBackingField(field)
+                && Analysis.MetadataResolver.BackingAccessorVisible(field, context, writeAccess);
     }
 
     // Typed `stelem` requires the stack value to be exactly the element type, which
