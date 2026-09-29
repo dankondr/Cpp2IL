@@ -192,8 +192,8 @@ public class UndefinedLocalReadTests
                 "the destination is never stored, so its own read keeps the diagnostic");
             Assert.That(il.Count(i => i.OpCode == CilOpCodes.Stloc), Is.EqualTo(3),
                 "the two slot moves plus the merge read; each edge stores nothing");
-            Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldloc), Is.EqualTo(1),
-                "only the merge's read of the never-stored destination loads");
+            Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldloc), Is.EqualTo(4),
+                "the two slot reads, the branch condition, and the merge's read of the never-stored destination");
             Assert.That(method.CilMethodBody.LocalVariables.Count, Is.EqualTo(7),
                 "no phantom local is declared for the skipped edges");
         });
