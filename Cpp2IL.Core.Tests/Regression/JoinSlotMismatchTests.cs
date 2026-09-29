@@ -4,8 +4,6 @@ using AsmResolver.DotNet;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
 using AsmResolver.PE.DotNet.Metadata.Tables;
-using Cpp2IL.Core.Analysis;
-using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using R = System.Reflection;
@@ -13,45 +11,20 @@ using static Cpp2IL.Core.Tests.Regression.SyntheticFixture;
 
 namespace Cpp2IL.Core.Tests.Regression;
 
-// Recovery cluster: typed local -> mismatched slot (castle-recovery#143). A phi
-// at a join the register is dead past materializes edge copies between
-// differently-typed reuse versions of the same register - bit-pattern merges no
-// managed store can spell, so they always carry the "no legal conversion"
-// diagnostic and its synthetic default. Pruned insertion never emits those
-// copies. The remaining pins lock the no-fabrication rule: a mismatched
-// value-type move keeps the named diagnostic and the default even when the pair
-// carries a user-defined conversion operator, because emitting `call
+// Recovery cluster: typed local -> mismatched slot (castle-recovery#143). The
+// store contract for a local destination used to return a sharpened analysis
+// type (a recovered instantiation or a call-defined type) even where the
+// .locals signature declared something the sharpened type could not spell, so
+// values storing into the slot failed its contract: "no legal conversion"
+// diagnostics plus a synthetic default. The declared slot type now wins -
+// StoreToOperand lowers to stloc, and the verifier only accepts what the
+// signature declares. These pins lock the no-fabrication rule: a mismatched
+// value-type move keeps the named diagnostic and the default even when the
+// pair carries a user-defined conversion operator, because emitting `call
 // op_Implicit`/`op_Explicit` there would fabricate a computation the binary
 // never ran.
 public class JoinSlotMismatchTests
 {
-    // The same register defined on both arms of a diamond but never read after
-    // the join used to get a phi at the join anyway - SsaForm.Remove then
-    // materialized a dead edge copy whose mismatched types produced a
-    // "no legal conversion" diagnostic. Pruned insertion skips the dead join
-    // entirely: no copy, no diagnostic, nothing substituted.
-    [Test]
-    public void DeadJoinOfReusedRegisterInsertsNoPhi()
-    {
-        var instructions = new List<Instruction>();
-        void Add(int index, OpCode opCode, params object[] operands)
-            => instructions.Add(new Instruction(index, opCode, Ops(operands)));
-        Add(0, OpCode.Move, new Register(null, "x"), 0);
-        Add(1, OpCode.ConditionalJump, 4, new Register(null, "cond"));
-        Add(2, OpCode.Move, new Register(null, "x"), 1);
-        Add(3, OpCode.Jump, 5);
-        Add(4, OpCode.Move, new Register(null, "x"), 2);
-        Add(5, OpCode.Return);
-        foreach (var instruction in instructions)
-            if (instruction.OpCode is OpCode.Jump or OpCode.ConditionalJump)
-                instruction.SetOperand(0, instructions[(int)((Immediate)instruction.Operands[0]).Value]);
-        var graph = new ISILControlFlowGraph(instructions.ToList());
-
-        SsaForm.Build(graph, new DominatorInfo(graph));
-
-        Assert.That(graph.Instructions.Count(instruction => instruction.OpCode == OpCode.Phi),
-            Is.EqualTo(0));
-    }
     private static InjectedTypeAnalysisContext InjectStruct(ApplicationAnalysisContext app, string name) =>
         new(app.AssembliesByName["UnityEngine.CoreModule"], "Tests", name,
             app.SystemTypes.SystemValueTypeType,

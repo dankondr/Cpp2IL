@@ -386,219 +386,36 @@ public class SsaForm
     private void InsertPhiFunctions(ISILControlFlowGraph graph, DominatorInfo dominance)
     {
         var defSites = GetDefinitionSites(graph);
-        var hasPhi = new Dictionary<int, HashSet<Block>>();
 
-        // Iterate insertion and liveness to a fixpoint: a phi the gate keeps
-        // makes the register used on its predecessor edges, so a join that was
-        // dead before the phi existed can become live. Only-adding-phis keeps
-        // the loop monotone, so it terminates.
-        var inserted = true;
-        while (inserted)
+        foreach (var entry in defSites)
         {
-            inserted = false;
-            var liveIn = ComputeLiveIn(graph);
+            var regNumber = entry.Key;
+            var sites = entry.Value;
 
-            foreach (var entry in defSites)
+            var workList = new Queue<Block>(sites);
+            var onWorkList = new HashSet<Block>(sites);
+            var hasPhi = new HashSet<Block>();
+
+            while (workList.Count > 0)
             {
-                var regNumber = entry.Key;
-                var sites = entry.Value;
-                if (!hasPhi.TryGetValue(regNumber, out var keeps))
-                    keeps = hasPhi[regNumber] = new HashSet<Block>();
+                var block = workList.Dequeue();
 
-                var workList = new Queue<Block>(sites);
-                var onWorkList = new HashSet<Block>(sites);
+                if (!dominance.DominanceFrontier.TryGetValue(block, out var frontier))
+                    continue;
 
-                while (workList.Count > 0)
+                foreach (var frontierBlock in frontier)
                 {
-                    var block = workList.Dequeue();
-
-                    if (!dominance.DominanceFrontier.TryGetValue(block, out var frontier))
+                    // Only one phi per (block, register).
+                    if (!hasPhi.Add(frontierBlock))
                         continue;
 
-                    foreach (var frontierBlock in frontier)
-                    {
-                        // Pruned SSA: a phi is only worth materializing where the
-                        // register is live-in - a join no path can read would emit
-                        // dead edge copies (often between differently-typed reuse
-                        // versions of the same register).
-                        if (!liveIn[frontierBlock].Contains(regNumber))
-                            continue;
+                    InsertPhiSkeleton(frontierBlock, regNumber);
 
-                        // Only one phi per (block, register).
-                        if (!keeps.Add(frontierBlock))
-                            continue;
-
-                        InsertPhiSkeleton(frontierBlock, regNumber);
-                        inserted = true;
-
-                        // Inserting a phi is itself a definition, so propagate to its frontier too.
-                        if (onWorkList.Add(frontierBlock))
-                            workList.Enqueue(frontierBlock);
-                    }
+                    // Inserting a phi is itself a definition, so propagate to its frontier too.
+                    if (onWorkList.Add(frontierBlock))
+                        workList.Enqueue(frontierBlock);
                 }
             }
-        }
-    }
-
-    // Unversioned register liveness for phi pruning: a register is live-in at a
-    // block when some path from it reaches a read before any re-definition.
-    // Upward-exposed uses count every register an instruction reads before the
-    // block re-defines it: bare registers, memory base/index registers,
-    // receiver and index registers inside compound destinations, and the cell a
-    // non-clobbering address-take names. Definitions count assigned registers,
-    // implicit clobbers and clobbering address-take targets.
-    private Dictionary<Block, HashSet<int>> ComputeLiveIn(ISILControlFlowGraph graph)
-    {
-        var upwardExposedUse = new Dictionary<Block, HashSet<int>>();
-        var defs = new Dictionary<Block, HashSet<int>>();
-
-        foreach (var block in graph.Blocks)
-        {
-            var use = new HashSet<int>();
-            var def = new HashSet<int>();
-
-            foreach (var instruction in block.Instructions)
-            {
-                var clobbering = _clobbering.Contains(instruction);
-                var destination = instruction.Destination;
-                // Match the destination by position, not identity: a phi
-                // skeleton repeats one Register instance in every operand slot
-                // and only its first slot is the def.
-                var destinationIndex = -1;
-                if (destination != null)
-                    for (var i = 0; i < instruction.Operands.Count; i++)
-                        if (ReferenceEquals(instruction.Operands[i], destination))
-                        {
-                            destinationIndex = i;
-                            break;
-                        }
-
-                for (var i = 0; i < instruction.Operands.Count; i++)
-                {
-                    var operand = instruction.Operands[i];
-
-                    if (i == destinationIndex)
-                    {
-                        // A compound destination (memory cell, field store,
-                        // array slot) still reads the registers inside it;
-                        // only a bare register destination is a pure def.
-                        if (operand is not (Register or LocalVariable))
-                            foreach (var number in OperandRegisterNumbers(operand, false))
-                                if (!def.Contains(number))
-                                    use.Add(number);
-                        continue;
-                    }
-
-                    foreach (var number in OperandRegisterNumbers(operand, !clobbering))
-                        if (!def.Contains(number))
-                            use.Add(number);
-                }
-
-                // A phi destination is a join, not a kill: it forwards the
-                // reaching version, so it must not block liveness flowing
-                // through the block to phi uses downstream.
-                if (instruction.OpCode != OpCode.Phi)
-                {
-                    if (destination is Register destinationRegister)
-                        def.Add(destinationRegister.Number);
-                    else if (destination is LocalVariable destinationLocal)
-                        def.Add(destinationLocal.Register.Number);
-                }
-
-                if (instruction.ImplicitDefinition is { } clobbered)
-                    def.Add(clobbered.Number);
-
-                if (clobbering)
-                    foreach (var operand in instruction.Operands)
-                        if (operand is AddressOf { Target: Register addressed })
-                            def.Add(addressed.Number);
-            }
-
-            upwardExposedUse[block] = use;
-            defs[block] = def;
-        }
-
-        var liveIn = graph.Blocks.ToDictionary(block => block, _ => new HashSet<int>());
-        var liveOut = graph.Blocks.ToDictionary(block => block, _ => new HashSet<int>());
-        var pending = new Queue<Block>(graph.Blocks);
-
-        while (pending.Count > 0)
-        {
-            var block = pending.Dequeue();
-
-            var outSet = new HashSet<int>();
-            foreach (var successor in block.Successors)
-                outSet.UnionWith(liveIn[successor]);
-            liveOut[block] = outSet;
-
-            var inSet = new HashSet<int>(upwardExposedUse[block]);
-            foreach (var number in outSet)
-                if (!defs[block].Contains(number))
-                    inSet.Add(number);
-
-            if (inSet.SetEquals(liveIn[block]))
-                continue;
-
-            liveIn[block] = inSet;
-            foreach (var predecessor in block.Predecessors)
-                pending.Enqueue(predecessor);
-        }
-
-        return liveIn;
-    }
-
-    // Every register an operand position reads. Mirrors LocalVariables.OperandLocals
-    // but on register numbers (locals may not be introduced yet at phi-insertion
-    // time). An address-take's target counts only when the caller asks for it -
-    // a clobbering take is a def of that cell, not a read.
-    private static IEnumerable<int> OperandRegisterNumbers(IOperand operand, bool includeAddressOfTargets)
-    {
-        switch (operand)
-        {
-            case Register register:
-                yield return register.Number;
-                break;
-            case LocalVariable local:
-                yield return local.Register.Number;
-                break;
-            case FieldReference field:
-                foreach (var number in OperandRegisterNumbers(field.Local, includeAddressOfTargets))
-                    yield return number;
-                break;
-            case SelectedFieldReference selected:
-                yield return selected.Selector.Register.Number;
-                foreach (var (_, choice) in selected.Choices)
-                    yield return choice.Local.Register.Number;
-                break;
-            case AddressOf { Target: { } target }:
-                if (includeAddressOfTargets || target is not Register)
-                    foreach (var number in OperandRegisterNumbers(target, includeAddressOfTargets))
-                        yield return number;
-                break;
-            case ArrayAccess access:
-                yield return access.Array.Register.Number;
-                foreach (var number in OperandRegisterNumbers(access.Index, includeAddressOfTargets))
-                    yield return number;
-                break;
-            case ArrayElementFieldReference elementField:
-                yield return elementField.Array.Register.Number;
-                foreach (var number in OperandRegisterNumbers(elementField.Index, includeAddressOfTargets))
-                    yield return number;
-                break;
-            case ArrayLength arrayLength:
-                yield return arrayLength.Array.Register.Number;
-                break;
-            case MemoryOperand memory:
-                if (memory.Base is { } memoryBase)
-                    foreach (var number in OperandRegisterNumbers(memoryBase, includeAddressOfTargets))
-                        yield return number;
-                if (memory.Index is { } memoryIndex)
-                    foreach (var number in OperandRegisterNumbers(memoryIndex, includeAddressOfTargets))
-                        yield return number;
-                break;
-            case ReferenceCast cast:
-                yield return cast.Value.Register.Number;
-                break;
         }
     }
 

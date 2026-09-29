@@ -3495,10 +3495,11 @@ public class IlGeneratorTests
         var il = method.CilMethodBody!.Instructions;
         Assert.Multiple(() =>
         {
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Throw), Is.True,
-                () => string.Join("\n", il.Select(i => i.ToString())));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Newobj && i.Operand?.ToString()?.Contains("List") == true),
-                Is.False, "newobj List<Int32Enum>::.ctor cannot be named by the caller");
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Newobj
+                    && i.Operand?.ToString()?.Contains("List`1<System.Int32>") == true),
+                Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString()))
+                    + "\n- the store slot declares List<Int32>, so newobj retargets onto the erased instantiation");
         });
         AssertNoTokenNamesMarker(method);
     }
