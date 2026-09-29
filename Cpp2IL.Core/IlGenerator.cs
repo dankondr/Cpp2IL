@@ -6824,6 +6824,14 @@ public static class IlGenerator
             return false;
         }
 
+        // A scalar reaching `System.Object` is a value the binary moved as raw
+        // bits into a pointer slot: `box` fabricates a conversion the binary
+        // never made (and a `box(false)`/`box(0)` edge can silently satisfy a
+        // null test downstream). There is no legal honest conversion - the
+        // caller drops the operand and fills the slot with a named default.
+        if (from.IsValueType && to.FullName == "System.Object")
+            return false;
+
         // Some recovered corlib contexts lose their value-type flag even though
         // their stack kind and name remain exact. A primitive entering any managed
         // reference slot still must be boxed; key this off the canonical name, not
@@ -7141,6 +7149,11 @@ public static class IlGenerator
             return true;
         if (to.FullName is "System.Single" or "System.Double")
             return from.FullName is "System.Single" or "System.Double" || fromWidth != 0;
+        // Mirrors EmitStackCoerce: a scalar reaching `System.Object` has no
+        // honest conversion - `box` would fabricate one the binary never made,
+        // so the slot takes the diagnosed default instead.
+        if (from.IsValueType && to.FullName == "System.Object")
+            return false;
         if (from.IsValueType && !to.IsValueType)
             // box, plus castclass when the reference target narrows - both need
             // tokens the caller can legally name. A byref-like source cannot be

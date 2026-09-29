@@ -20,7 +20,9 @@ namespace Cpp2IL.Core.Tests.Regression;
 // condition, a comparison, arithmetic, a typed slot). A register merely reused
 // for a bool load on one path and an unrelated value on another is not a bool
 // slot; claiming it manufactured truthiness conversions on disagreeing
-// producers.
+// producers. A scalar edge into a System.Object slot is equally unproven: the
+// binary moved raw bits, so `box` would fabricate a conversion it never made -
+// the edge keeps a named note instead.
 public class BooleanPhiClaimTests
 {
     private static MethodAnalysisContext InjectStatic(InjectedTypeAnalysisContext callerType,
@@ -49,12 +51,70 @@ public class BooleanPhiClaimTests
     }
 
     [Test]
-    public void ReusedRegisterAcrossBoolLoadAndWideIntegerKeepsHonestType()
+    public void DeadBoolDefOverwrittenByReferenceEmitsObjectWithNoBox()
     {
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
         var app = Cpp2IlApi.CurrentAppContext!;
         var module = new ModuleDefinition("BooleanPhi.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemVoidType, app.SystemTypes.SystemBooleanType,
+            app.SystemTypes.SystemStringType);
+        var owner = new LocalVariable("owner", new Register(null, "owner"));
+        var merged = new LocalVariable("merged", new Register(null, "merged"));
+        var arg = new LocalVariable("arg", new Register(null, "arg"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var (caller, method) = ForeignCaller(app, module, [], [owner, merged, arg]);
+        var callerType = (InjectedTypeAnalysisContext)caller.DeclaringType!;
+        callerType.PutExtraData("AsmResolverType", method.DeclaringType!);
+        var flagField = new InjectedFieldAnalysisContext("flag", app.SystemTypes.SystemBooleanType,
+            R.FieldAttributes.Public, callerType, 16);
+        callerType.Fields.Add(flagField);
+        var getOwner = InjectStatic(callerType, module, method, "GetOwner", callerType);
+        var take = InjectStatic(callerType, module, method, "Take",
+            app.SystemTypes.SystemVoidType, app.SystemTypes.SystemObjectType);
+        // One register carries a flag load that is dead - overwritten by a
+        // proven reference before the object consumer sees it. The consumer is
+        // object-compatible, so no manufactured Boolean claim: the reference
+        // edge flows without box, cast or note.
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Call, getOwner, owner),
+            new(1, OpCode.Move, merged, new FieldReference(flagField, owner, 16)),
+            new(2, OpCode.Move, merged, arg),
+            new(3, OpCode.CallVoid, take, merged),
+            new(4, OpCode.Return),
+        };
+        ResolveJumpTargets(instructions);
+        caller.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+
+        LocalVariables.ResolveTypesAndFields(caller);
+        LocalVariables.ResolveLateGeneratedTypes(caller);
+        IlGenerator.GenerateIl(caller, method);
+
+        var body = method.CilMethodBody!;
+        Assert.Multiple(() =>
+        {
+            Assert.That(body.Instructions.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("operand to System.Boolean")), Is.False,
+                () => string.Join("\n", body.Instructions.Select(i => i.ToString())));
+            Assert.That(body.Instructions.Any(i => i.OpCode == CilOpCodes.Box), Is.False,
+                () => string.Join("\n", body.Instructions.Select(i => i.ToString())));
+            Assert.That(body.Instructions.Any(i => i.OpCode == CilOpCodes.Castclass), Is.False,
+                () => string.Join("\n", body.Instructions.Select(i => i.ToString())));
+            Assert.That(body.Instructions.Any(i => i.OpCode == CilOpCodes.Call
+                    && i.Operand?.ToString().Contains("Take") == true), Is.True,
+                () => string.Join("\n", body.Instructions.Select(i => i.ToString())));
+        });
+    }
+
+    [Test]
+    public void ScalarEdgeIntoObjectSlotKeepsNamedNote()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("BooleanPhiScalar.dll");
         SeedCorLibTypes(app, module, app.SystemTypes.SystemObjectType,
             app.SystemTypes.SystemVoidType, app.SystemTypes.SystemBooleanType,
             app.SystemTypes.SystemInt64Type);
@@ -71,10 +131,9 @@ public class BooleanPhiClaimTests
         var getOwner = InjectStatic(callerType, module, method, "GetOwner", callerType);
         var take = InjectStatic(callerType, module, method, "Take",
             app.SystemTypes.SystemVoidType, app.SystemTypes.SystemObjectType);
-        // One register carries the loaded flag on one path and a wide integer on
-        // another: the register is reused, not a bool slot. The first typed
-        // definition (the bool load) must not pin the slot when a later
-        // definition cannot produce a flag.
+        // The register carries flag and wide-integer scalars on different paths;
+        // both reach an object-only consumer. The binary moved raw bits, so
+        // each scalar edge keeps a named note rather than a fabricated `box`.
         var instructions = new List<Instruction>
         {
             new(0, OpCode.Call, getOwner, owner),
@@ -95,13 +154,9 @@ public class BooleanPhiClaimTests
         Assert.Multiple(() =>
         {
             Assert.That(body.Instructions.Any(i => i.OpCode == CilOpCodes.Ldstr
-                    && i.Operand is string text && text.Contains("operand to System.Boolean")), Is.False,
+                    && i.Operand is string text && text.Contains("operand to System.Object")), Is.True,
                 () => string.Join("\n", body.Instructions.Select(i => i.ToString())));
-            Assert.That(body.Instructions.Any(i => i.OpCode == CilOpCodes.Box
-                    && i.Operand?.ToString() == "System.Int64"), Is.True,
-                () => string.Join("\n", body.Instructions.Select(i => i.ToString())));
-            Assert.That(body.Instructions.Any(i => i.OpCode == CilOpCodes.Call
-                    && i.Operand?.ToString().Contains("Take") == true), Is.True,
+            Assert.That(body.Instructions.Any(i => i.OpCode == CilOpCodes.Box), Is.False,
                 () => string.Join("\n", body.Instructions.Select(i => i.ToString())));
         });
     }
