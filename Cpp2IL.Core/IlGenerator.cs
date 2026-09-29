@@ -7454,6 +7454,8 @@ public static class IlGenerator
         var localStores = new Dictionary<LocalVariable,
             List<((bool StackRelative, long Offset) Key, MemoryOperand Destination)>>();
         var localVetoed = new HashSet<LocalVariable>();
+        var localDefs = new Dictionary<string, List<Instruction>>();
+        var memoryBaseLocals = new HashSet<LocalVariable>();
 
         static void Add<TKey, TValue>(Dictionary<TKey, List<TValue>> map, TKey key, TValue value)
             where TKey : notnull
@@ -7465,12 +7467,16 @@ public static class IlGenerator
 
         foreach (var instruction in instructions)
         {
+            if (instruction.Destination is LocalVariable destinationLocal)
+                Add(localDefs, destinationLocal.Name, instruction);
             var operands = instruction.Operands;
             for (var i = 0; i < operands.Count; i++)
             {
                 var operand = operands[i];
                 if (operand is MemoryOperand memory)
                 {
+                    if (memory.Base is LocalVariable memoryBase)
+                        memoryBaseLocals.Add(memoryBase);
                     if (FrameSlotKey(memory, context) is { } key)
                     {
                         if (instruction.OpCode == OpCode.Move && operands.Count == 2 && i == 0)
@@ -7484,8 +7490,19 @@ public static class IlGenerator
                 }
                 if (operand is LocalVariable local)
                 {
-                    if (local.Type != null || local.IsThis
+                    // Untyped locals take whatever the evidence names. Locals
+                    // already typed to the fully-shared marshaling erasure
+                    // (object or __Il2CppFullySharedGenericType) can still be
+                    // retyped when a `!T` contract proves their content: under
+                    // IL2CPP shared generics the marshaled form of an erased
+                    // argument is exactly those bits.
+                    if (local.IsThis || local.IsReturn || local.IsMethodInfo
+                        || local.HiddenReturnBuffer != null
                         || context.ParameterLocals.Contains(local))
+                        continue;
+                    if (local.Type != null
+                        && local.Type.FullName is not ("System.Object"
+                            or "Unity.IL2CPP.Metadata.__Il2CppFullySharedGenericType"))
                         continue;
                     if (instruction.OpCode == OpCode.Move && operands.Count == 2 && i == 1
                         && operands[0] is MemoryOperand storeDestination
@@ -7636,12 +7653,29 @@ public static class IlGenerator
             _ => FrameSlotSourceType(source, context),
         };
 
+        // The erased marshaling markers - object and the fully-shared generic
+        // placeholder - name the rep, not a type; neither conflicts with a
+        // `!T` the rest of the evidence proves.
+        static bool ErasedMarshalingMarker(TypeAnalysisContext type) =>
+            type.FullName is "System.Object"
+                or "Unity.IL2CPP.Metadata.__Il2CppFullySharedGenericType";
+
+        // A generic-parameter contract names a marshaled shared-generic
+        // argument: the fully-shared ABI reads and writes it at pointer
+        // width, so a pointer-sized access still matches even though `!T`
+        // has no measurable unboxed size. Narrower accesses prove nothing.
+        bool SlotWidthAgrees(MemoryOperand memory, TypeAnalysisContext slotType) =>
+            FrameSlotWidthMatches(memory, slotType, pointerSize)
+            || (slotType is GenericParameterTypeAnalysisContext
+                && memory.AccessSize == pointerSize);
+
         TypeAnalysisContext? EvaluateSlot((bool StackRelative, long Offset) key)
         {
             if (!slotUses.TryGetValue(key, out var uses))
                 return null;    // a store-only slot is proven by its stores alone
             var contracts = new List<TypeAnalysisContext?>();
             var evidence = new List<TypeAnalysisContext?>();
+            var genericEvidence = new List<GenericParameterTypeAnalysisContext>();
             foreach (var (instruction, index) in uses)
             {
                 var (contract, opaque) = OperandUseContract(instruction, index, context);
@@ -7650,21 +7684,36 @@ public static class IlGenerator
                 // A narrower or wider access than the proven type keeps the
                 // unmanaged-load diagnostic - it proves nothing about the cell.
                 if (contract != null && instruction.Operands[index] is MemoryOperand read
-                    && !FrameSlotWidthMatches(read, contract, pointerSize))
+                    && !SlotWidthAgrees(read, contract))
                     contract = null;
                 contracts.Add(contract);
                 if (EvidenceBearing(instruction))
                     evidence.Add(contract);
+                // A `!T` contract names marshaled content outright: a
+                // generic-parameter contract can only come from a callee's
+                // own generic context, never from an arbitrary local.
+                if (contract is GenericParameterTypeAnalysisContext genericContract)
+                    genericEvidence.Add(genericContract);
             }
-            if (UnanimousEvidence(evidence) is not { } candidate)
+            var candidate = UnanimousEvidence(evidence);
+            if (candidate == null && genericEvidence.Count > 0
+                && genericEvidence.All(other =>
+                    ThisConstructorCallPlan.SameTypeIdentity(genericEvidence[0], other))
+                && TypeTokenUsableFrom(genericEvidence[0], context)
+                && !evidence.Any(contract => contract != null
+                    && !ErasedMarshalingMarker(EmittableLocalType(contract, context))
+                    && !ThisConstructorCallPlan.SameTypeIdentity(
+                        EmittableLocalType(contract, context), genericEvidence[0])))
+                candidate = genericEvidence[0];
+            if (candidate == null)
                 return null;
             if (slots.TryGetValue(key, out var existing))
             {
                 var today = EmittableLocalType(existing.Type!, context);
                 for (var i = 0; i < uses.Count; i++)
                     if (contracts[i] != null
-                        && FrameSlotWidthMatches((MemoryOperand)uses[i].Instruction.Operands[
-                            uses[i].Index], candidate, pointerSize)
+                        && SlotWidthAgrees((MemoryOperand)uses[i].Instruction.Operands[
+                            uses[i].Index], candidate)
                         && StackContractSatisfied(today, contracts[i], context)
                         && !StackContractSatisfied(candidate, contracts[i], context))
                         return null;
@@ -7673,7 +7722,7 @@ public static class IlGenerator
                     {
                         if (!FrameSlotStoreAgrees(destination, source, existing, context))
                             continue;   // already a store diagnostic; nothing regresses
-                        var agrees = FrameSlotWidthMatches(destination, candidate, pointerSize)
+                        var agrees = SlotWidthAgrees(destination, candidate)
                             && (source is Immediate
                                 ? TryResolveSlotLoad(source, candidate, context, false, out _, out _)
                                 : source is LocalVariable { Type: null } sourceLocal
@@ -7693,6 +7742,7 @@ public static class IlGenerator
             if (localVetoed.Contains(local))
                 return null;
             var evidence = new List<TypeAnalysisContext?>();
+            var genericEvidence = new List<GenericParameterTypeAnalysisContext>();
             if (localUses.TryGetValue(local, out var uses))
                 foreach (var (instruction, index) in uses)
                 {
@@ -7701,17 +7751,192 @@ public static class IlGenerator
                         return null;
                     if (EvidenceBearing(instruction))
                         evidence.Add(contract);
+                    // A `!T` contract names marshaled content outright: a
+                    // generic-parameter contract can only come from a
+                    // callee's own generic context, never from an arbitrary
+                    // local.
+                    if (contract is GenericParameterTypeAnalysisContext genericContract)
+                        genericEvidence.Add(genericContract);
                 }
             // A slot's resolved type is proven content for whatever stores
             // into it; the store itself only checks identity.
             if (localStores.TryGetValue(local, out var edges))
                 foreach (var (key, _) in edges)
                     evidence.Add(ResolvedSlotType(key));
-            if (UnanimousEvidence(evidence) is not { } candidate)
+            // An erased-marker local that bases a memory operand must keep
+            // the marker: `[v+off]` late field recovery reads `object` hosts,
+            // and any retyping loses it. Untyped locals are unaffected.
+            if (local.Type != null && memoryBaseLocals.Contains(local))
                 return null;
             var today = EmittedOperandType(local, context) ?? objectType;
-            return LocalUsesAccept(local, today, candidate)
-                && LocalStoresAccept(local, candidate) ? candidate : null;
+            var candidate = UnanimousEvidence(evidence);
+            if (local.Type != null)
+            {
+                // An erased-marker local may only adopt `!T`, and only via
+                // the def-checked marshaled-content path: adopting a
+                // concrete type - or a `!T` whose defs are unproven - makes
+                // the def sites coerce object-typed producers into the new
+                // type, a conversion the binary does not perform. Untyped
+                // locals keep the previous unrestricted adoption.
+                if (candidate is GenericParameterTypeAnalysisContext genericCandidate)
+                    genericEvidence.Add(genericCandidate);
+                candidate = null;
+            }
+            if (candidate != null)
+            {
+                if (!LocalUsesAccept(local, today, candidate)
+                    || !LocalStoresAccept(local, candidate))
+                    return null;
+                return candidate;
+            }
+            return SharedGenericSlotCandidate(local, genericEvidence, evidence, today);
+        }
+
+        // The operand's uses prove its marshaled content is `!T`: every move
+        // or phi edge naming a generic-parameter contract agrees on the same
+        // parameter, that parameter is emittable from this method's generic
+        // context, and no typed contract disagrees. The value itself must
+        // be marshaled-`!T` content - a frame cell's spill, an undisturbed
+        // move chain, or `&`-rooted pointer arithmetic (the `&T` rep the
+        // fully-shared ABI already consumes); any other definition (a call
+        // returning object, a computed integer, a deref) describes content
+        // of some other shape.
+        TypeAnalysisContext? SharedGenericSlotCandidate(LocalVariable local,
+            List<GenericParameterTypeAnalysisContext> genericEvidence,
+            List<TypeAnalysisContext?> typedEvidence, TypeAnalysisContext today)
+        {
+            if (genericEvidence.Count == 0)
+                return null;
+            var candidate = genericEvidence[0];
+            if (genericEvidence.Any(other
+                    => !ThisConstructorCallPlan.SameTypeIdentity(candidate, other)))
+                return null;
+            // `!T`/`!!T` is honest only where the method's own generic context
+            // can name it; an unemittable token would be a guess, not proof.
+            if (!TypeTokenUsableFrom(candidate, context))
+                return null;
+            foreach (var contract in typedEvidence)
+            {
+                if (contract == null)
+                    continue;
+                var emitted = EmittableLocalType(contract, context);
+                if (CanEmitTypeToken(emitted)
+                    && !ErasedMarshalingMarker(emitted)
+                    && !ThisConstructorCallPlan.SameTypeIdentity(emitted, candidate))
+                    return null;
+            }
+            if (localDefs.TryGetValue(local.Name, out var defs))
+                foreach (var def in defs)
+                {
+                    switch (def.OpCode)
+                    {
+                        case OpCode.Move:
+                        case OpCode.Phi:
+                            foreach (var source in def.Operands.Skip(1))
+                                if (!SharedGenericContentProven(source, candidate, null))
+                                    return null;
+                            break;
+                        case OpCode.Add:
+                        case OpCode.Subtract:
+                            if (def.Operands.Count < 3
+                                || !AddressProvenOperand(def.Operands[1], null))
+                                return null;
+                            break;
+                        case OpCode.Call:
+                            // The producer's return is itself a contract:
+                            // a callee declaring the same `!T` returns
+                            // marshaled content for it.
+                            if (def.Operands[0] is not MethodAnalysisContext callee
+                                || !ThisConstructorCallPlan.SameTypeIdentity(
+                                    callee.ReturnType, candidate))
+                                return null;
+                            break;
+                        default:
+                            return null;
+                    }
+                }
+            if (!LocalUsesAccept(local, today, candidate)
+                || !LocalStoresAccept(local, candidate)
+                || !NoConflictingEvidence(local, candidate, null, null))
+                return null;
+            return candidate;
+        }
+
+        // Marshaled-`!T` content a move source already spells or can carry:
+        // the operand projects `!T` (an adopted sibling local or cell), it is
+        // `&`-rooted (the `&T` rep is the same marshaling), or it is content
+        // nothing concretely types - a frame cell or an undisturbed move
+        // chain - so the `!T` the destination proves propagates through.
+        bool SharedGenericContentProven(IOperand source,
+            GenericParameterTypeAnalysisContext candidate,
+            HashSet<LocalVariable>? visiting)
+        {
+            if (ProjectedSourceType(source) is { } projected
+                && ThisConstructorCallPlan.SameTypeIdentity(projected, candidate))
+                return true;
+            if (AddressProvenOperand(source, null))
+                return true;
+            switch (source)
+            {
+                case MemoryOperand sourceMemory:
+                    // A read through a `&`-rooted base is `&T`-rep content:
+                    // the address is proven even where nothing names the
+                    // cell's element type.
+                    if (sourceMemory.Base is { } memoryBase
+                        && AddressProvenOperand(memoryBase, null))
+                        return true;
+                    return FrameSlotKey(sourceMemory, context) is { } sourceKey
+                        && (ResolvedSlotType(sourceKey) is { } sourceSlotType
+                            ? ThisConstructorCallPlan.SameTypeIdentity(sourceSlotType, candidate)
+                                || sourceSlotType.FullName is "System.Object"
+                                    or "Unity.IL2CPP.Metadata.__Il2CppFullySharedGenericType"
+                            : true);
+                case LocalVariable sourceLocal
+                    when (visiting ??= []).Add(sourceLocal)
+                        && !localVetoed.Contains(sourceLocal)
+                        && !sourceLocal.IsThis && !sourceLocal.IsReturn
+                        && !sourceLocal.IsMethodInfo
+                        && sourceLocal.HiddenReturnBuffer == null
+                        && !context.ParameterLocals.Contains(sourceLocal)
+                        && sourceLocal.Type is null or { FullName: "System.Object"
+                            or "Unity.IL2CPP.Metadata.__Il2CppFullySharedGenericType" }:
+                    return !localDefs.TryGetValue(sourceLocal.Name, out var sourceDefs)
+                        || sourceDefs.All(def => def.OpCode switch
+                        {
+                            OpCode.Move or OpCode.Phi => def.Operands.Skip(1).All(
+                                nested => SharedGenericContentProven(nested, candidate, visiting)),
+                            OpCode.Add or OpCode.Subtract => def.Operands.Count >= 3
+                                && AddressProvenOperand(def.Operands[1], null),
+                            _ => false,
+                        });
+                default:
+                    return false;
+            }
+        }
+
+        // `&`-proven operands: an AddressOf outright, an operand that emits
+        // `&` (a byref-typed local or param), or a local whose own
+        // definitions are `&`-rooted pointer arithmetic and moves.
+        bool AddressProvenOperand(IOperand operand, HashSet<LocalVariable>? visiting)
+        {
+            switch (operand)
+            {
+                case AddressOf:
+                    return true;
+                case LocalVariable baseLocal
+                    when localDefs.TryGetValue(baseLocal.Name, out var baseDefs)
+                        && baseDefs.Count > 0 && (visiting ??= []).Add(baseLocal):
+                    return baseDefs.All(def => def.OpCode switch
+                    {
+                        OpCode.Move or OpCode.Phi => def.Operands.Skip(1)
+                            .All(source => AddressProvenOperand(source, visiting)),
+                        OpCode.Add or OpCode.Subtract => def.Operands.Count >= 3
+                            && AddressProvenOperand(def.Operands[1], visiting),
+                        _ => false,
+                    });
+                default:
+                    return EmittedOperandType(operand, context) is ByRefTypeAnalysisContext;
+            }
         }
 
         // Slots seed locals over the store edge, locals let slots keep their
@@ -7793,6 +8018,17 @@ public static class IlGenerator
                     false);
             case OpCode.Return:
                 return (context.ReturnType, false);
+            case OpCode.Box:
+                // `box typeof(T)` requires a `T`: the box's own type argument
+                // is the contract for its value operand.
+                return (index == 2
+                    ? instruction.Operands[1] switch
+                    {
+                        RuntimeClassTypeAnalysisContext runtimeClass => runtimeClass.RepresentedType,
+                        TypeAnalysisContext typeArgument => typeArgument,
+                        _ => null,
+                    }
+                    : null, false);
             default:
                 return (null, true);
         }

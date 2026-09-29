@@ -1,0 +1,166 @@
+using System.Collections.Generic;
+using System.Linq;
+using AsmResolver.DotNet;
+using AsmResolver.DotNet.Code.Cil;
+using AsmResolver.DotNet.Signatures;
+using AsmResolver.PE.DotNet.Cil;
+using AsmResolver.PE.DotNet.Metadata.Tables;
+using Cpp2IL.Core.Graphs;
+using Cpp2IL.Core.Utils.AsmResolver;
+using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Model.Contexts;
+using LibCpp2IL.BinaryStructures;
+using static Cpp2IL.Core.Tests.Regression.SyntheticFixture;
+
+namespace Cpp2IL.Core.Tests.Regression;
+
+// Recovery cluster: ISIL→IL emission — the "erased object → shared T" coercion
+// shape. IL2CPP shared generics marshal `!T` arguments through locals the
+// lifter typed as object (or the fully-shared placeholder). When a callee's
+// generic-parameter contract proves the marshaled content and every producer
+// is marshaled-`!T` content (an undisturbed move chain, a frame cell, or a
+// call whose return declares the same `!T`), the erased local is retyped to
+// `!T` and the argument emits cleanly. When the producer cannot prove `!T`
+// (e.g. a call returning object), the site keeps its named diagnostic.
+public class ErasedObjectSharedGenericTests
+{
+    private static (MethodAnalysisContext caller, MethodDefinition method,
+        GenericParameterTypeAnalysisContext typeArgument, InjectedTypeAnalysisContext callerType)
+        GenericHost(ApplicationAnalysisContext app, ModuleDefinition module,
+            List<LocalVariable> locals)
+    {
+        var (caller, method) = ForeignCaller(app, module, [], locals);
+        var callerType = (InjectedTypeAnalysisContext)caller.DeclaringType!;
+        var typeArgument = new GenericParameterTypeAnalysisContext("T", 0,
+            Il2CppTypeEnum.IL2CPP_TYPE_VAR, 0, callerType);
+        callerType.GenericParameters.Add(typeArgument);
+        return (caller, method, typeArgument, callerType);
+    }
+
+    private static MethodAnalysisContext InjectTake(InjectedTypeAnalysisContext callerType,
+        ModuleDefinition module, MethodDefinition hostMethod,
+        GenericParameterTypeAnalysisContext argumentType)
+    {
+        var take = callerType.InjectMethodContext("Take", argumentType.AppContext.SystemTypes.SystemVoidType,
+            System.Reflection.MethodAttributes.Public | System.Reflection.MethodAttributes.Static,
+            argumentType);
+        var takeDefinition = new MethodDefinition("Take",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void,
+                [argumentType.ToTypeSignature()]));
+        hostMethod.DeclaringType!.Methods.Add(takeDefinition);
+        take.PutExtraData("AsmResolverMethod", takeDefinition);
+        return take;
+    }
+
+    [Test]
+    public void ProvenMarshaledContentAdoptsSharedGenericContract()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("ErasedObject.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemVoidType);
+        // spill carries the erased marshaling rep; proven already spells `!T`.
+        var spill = new LocalVariable("spill", new Register(null, "spill"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var proven = new LocalVariable("proven", new Register(null, "proven"));
+        var (caller, method, typeArgument, callerType) =
+            GenericHost(app, module, [spill, proven]);
+        proven.Type = typeArgument;
+        var take = InjectTake(callerType, module, method, typeArgument);
+        // spill := a `!T`-typed local, then feeds Take's `!T` parameter. Before
+        // the erased-object recovery, the object-typed local hits a
+        // conversion diagnostic at the argument; afterwards it adopts `!T`
+        // and the call emits without any note.
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(-1, OpCode.Move, proven, new Immediate(0)),
+            new(0, OpCode.Move, spill, proven),
+            new(1, OpCode.CallVoid, take, spill),
+            new(2, OpCode.Return)]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var body = method.CilMethodBody!;
+        Assert.Multiple(() =>
+        {
+            Assert.That(body.Instructions.Any(i => i.OpCode == CilOpCodes.Call
+                    && i.Operand?.ToString().Contains("Take") == true), Is.True,
+                () => string.Join("\n", body.Instructions.Select(i => i.ToString())));
+            Assert.That(body.Instructions.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.False,
+                () => string.Join("\n", body.Instructions.Select(i => i.ToString())));
+        });
+    }
+
+    [Test]
+    public void ErasedSpillOfSharedGenericCellAdoptsContract()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("ErasedCell.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemVoidType);
+        var stack = new LocalVariable("stack", new Register(null, "stack_-180"));
+        // The dominant r241 producer: an object-typed local defined by a
+        // frame-cell read, where both the cell and the copy feed `!T` slots.
+        var spill = new LocalVariable("spill", new Register(null, "spill"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var (caller, method, typeArgument, callerType) =
+            GenericHost(app, module, [stack, spill]);
+        var take = InjectTake(callerType, module, method, typeArgument);
+        var cell = new MemoryOperand(stack, addend: 0, accessSize: 8);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, spill, cell),
+            new(1, OpCode.CallVoid, take, cell),
+            new(2, OpCode.CallVoid, take, spill),
+            new(3, OpCode.Return)]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var body = method.CilMethodBody!;
+        Assert.That(body.Instructions.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.False,
+            () => string.Join("\n", body.Instructions.Select(i => i.ToString())));
+    }
+
+    [Test]
+    public void UnprovenProducerKeepsConversionDiagnostic()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("ErasedUnproven.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemVoidType);
+        // produced holds a call's object return - it cannot prove `!T`, so the
+        // erased local must stay erased and the argument keeps its note.
+        var spill = new LocalVariable("spill", new Register(null, "spill"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var produced = new LocalVariable("produced", new Register(null, "produced"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var (caller, method, typeArgument, callerType) =
+            GenericHost(app, module, [spill, produced]);
+        var take = InjectTake(callerType, module, method, typeArgument);
+        var provide = callerType.InjectMethodContext("Provide",
+            app.SystemTypes.SystemObjectType,
+            System.Reflection.MethodAttributes.Public | System.Reflection.MethodAttributes.Static);
+        var provideDefinition = new MethodDefinition("Provide",
+            MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Object));
+        method.DeclaringType!.Methods.Add(provideDefinition);
+        provide.PutExtraData("AsmResolverMethod", provideDefinition);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Call, provide, produced),
+            new(1, OpCode.Move, spill, produced),
+            new(2, OpCode.CallVoid, take, spill),
+            new(3, OpCode.Return)]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var body = method.CilMethodBody!;
+        Assert.That(body.Instructions.Any(i => i.OpCode == CilOpCodes.Ldstr
+                && i.Operand is string text && text.Contains("operand to T")), Is.True,
+            () => string.Join("\n", body.Instructions.Select(i => i.ToString())));
+    }
+}
