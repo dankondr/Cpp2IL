@@ -507,6 +507,8 @@ public static class ArrayRecovery
                     else if (GuardedIndexAccess(method, instruction, i, memory, pointerSize, definitions,
                                  () => uses ??= CollectUses(method.ControlFlowGraph!), guardContext) is { } guardedDerived)
                         instruction.SetOperand(i, guardedDerived);
+                    else if (LengthWordLoad(instruction, i, memory, pointerSize, definitions) is { } lengthArray)
+                        instruction.SetOperand(i, new ArrayLength(lengthArray));
                     continue;
                 }
 
@@ -568,6 +570,66 @@ public static class ArrayRecovery
             && definition is { OpCode: OpCode.Move, Operands: [_, var source] }
                 ? ResolveArray(source, definitions, depth + 1)
                 : null;
+    }
+
+    // A read of the array header's length word through an address chain: the
+    // binary materializes `array + 0x18` into its own local and dereferences
+    // `[p]` or `[p + k]`, so the base resolves to the array only when the
+    // touched word lands exactly on max_length. Only load positions qualify -
+    // writing the word has no ldlen spelling and keeps its store diagnostic.
+    private static LocalVariable? LengthWordLoad(
+        Instruction instruction, int operandIndex, MemoryOperand memory, int pointerSize,
+        Dictionary<LocalVariable, Instruction?> definitions)
+    {
+        if (memory.Index != null || memory.Scale != 0 || IsStorePosition(instruction, operandIndex)
+            || EvaluateHeaderBase(memory.Base, definitions, 0) is not
+                { Root: LocalVariable { Type: SzArrayTypeAnalysisContext } array, Multiplier: 1 } headerBase
+            || headerBase.Offset + memory.Addend != LengthOffset(pointerSize))
+            return null;
+        return array;
+    }
+
+    private static bool IsStorePosition(Instruction instruction, int operandIndex) =>
+        operandIndex == 0 && instruction.OpCode
+            is OpCode.Move or OpCode.MemoryCopy or OpCode.MemorySet or OpCode.MemoryMove;
+
+    // The base address as `root + constant` through definition chains that are
+    // provably address arithmetic: `Move` copies and `Add`/`Subtract` immediates.
+    // A `Move` from a MemoryOperand is a real load - the value is the word that
+    // was read (e.g. the class pointer), not the address it came from - so it
+    // makes the local an opaque root rather than `array + 0`. A local typed as
+    // the array proves itself; anything else is an opaque root the caller's
+    // array-type test rejects.
+    private static Affine? EvaluateHeaderBase(IOperand? operand,
+        Dictionary<LocalVariable, Instruction?> definitions, int depth)
+    {
+        if (depth > 8)
+            return null;
+
+        switch (operand)
+        {
+            case null:
+                return null;
+            case Immediate { Value: var value }:
+                return new Affine(null, 0, value);
+            case LocalVariable { Type: SzArrayTypeAnalysisContext } array:
+                return new Affine(array, 1, 0);
+            case LocalVariable local:
+                if (!definitions.TryGetValue(local, out var definition) || definition == null)
+                    return new Affine(local, 1, 0);
+                return definition switch
+                {
+                    { OpCode: OpCode.Move, Operands: [_, var source] } when source is not MemoryOperand
+                        => EvaluateHeaderBase(source, definitions, depth + 1),
+                    { OpCode: OpCode.Add or OpCode.Subtract, Operands: [_, var left, var right] }
+                        => Sum(EvaluateHeaderBase(left, definitions, depth + 1),
+                               ScaleBy(EvaluateHeaderBase(right, definitions, depth + 1),
+                                   definition.OpCode is OpCode.Subtract ? -1 : 1)),
+                    _ => new Affine(local, 1, 0),
+                };
+            default:
+                return null;
+        }
     }
 
     // Element accesses where the element-region offset is folded into the base
