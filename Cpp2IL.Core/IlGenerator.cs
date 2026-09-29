@@ -1349,7 +1349,14 @@ public static class IlGenerator
                 {
                     if (instruction.OpCode == OpCode.Call)
                     {
-                        var resultContract = StoreContract(instruction.Operands[1], context);
+                        // The store has to satisfy the local's declared signature,
+                        // not a sharpened contract: when EmittedLocalType keeps the
+                        // erased instantiation while StoreContract returns the
+                        // concrete one, coercing to the concrete contract would
+                        // leave a stloc the .locals slot cannot hold.
+                        var resultContract = instruction.Operands[1] is LocalVariable contractLocal
+                            ? (TypeAnalysisContext?)EmittedLocalType(contractLocal, context)
+                            : StoreContract(instruction.Operands[1], context);
                         // The member reference, not a possibly stale analysis override,
                         // determines the value the CIL call leaves on the stack.
                         // A value-type result stored in object must be boxed even when
