@@ -350,17 +350,7 @@ public static class AsmResolverAssemblyPopulator
         // On a generic declaring type the field operand must be the type's own
         // generic instance (a TypeSpec `C<T>`), not the bare typedef — that is
         // the shape the compiler emits and the only one the verifier accepts.
-        IFieldDescriptor fieldOperand = backingField;
-        if (declaringType.GenericParameters.Count > 0)
-        {
-            var selfInstance = new GenericInstanceTypeSignature(
-                declaringType, declaringType.IsValueType,
-                declaringType.GenericParameters
-                    .Select((_, i) => (TypeSignature)new GenericParameterSignature(GenericParameterType.Type, i))
-                    .ToArray());
-            fieldOperand = new MemberReference(
-                new TypeSpecification(selfInstance), backingField.Name, backingField.Signature);
-        }
+        IFieldDescriptor fieldOperand = AutoPropertyFieldOperand(backingField, declaringType);
 
         var body = new CilMethodBody();
         var instructions = body.Instructions;
@@ -381,6 +371,22 @@ public static class AsmResolverAssemblyPopulator
         accessor.CilMethodBody = body;
 
         return accessor;
+    }
+
+    // The field operand an auto-property accessor body carries: the bare field
+    // definition on a closed declaring type, a member reference over the type's
+    // own generic instance on a generic one.
+    internal static IFieldDescriptor AutoPropertyFieldOperand(FieldDefinition backingField, TypeDefinition declaringType)
+    {
+        if (declaringType.GenericParameters.Count == 0)
+            return backingField;
+        var selfInstance = new GenericInstanceTypeSignature(
+            declaringType, declaringType.IsValueType,
+            declaringType.GenericParameters
+                .Select((_, i) => (TypeSignature)new GenericParameterSignature(GenericParameterType.Type, i))
+                .ToArray());
+        return new MemberReference(
+            new TypeSpecification(selfInstance), backingField.Name, backingField.Signature);
     }
 
     private static void CopyCustomAttributes(HasCustomAttributes source, IList<CustomAttribute> destination)
