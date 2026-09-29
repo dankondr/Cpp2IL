@@ -726,6 +726,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         MetadataInitGuardRemover.RewriteUnguardedInits(this);
         DeadCodeEliminator.Run(this);
 
+        // Ref-alias copies that survive every earlier pass spell `ref` binds against ref
+        // parameters, which C# cannot express - so their uses read the shared root instead.
+        ByrefAliasForwarding.Run(this);
+
         LocalVariables.RemoveUnused(this);
 
     }
