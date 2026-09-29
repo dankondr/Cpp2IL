@@ -207,7 +207,9 @@ public static class BlockMemoryImportRecovery
     /// </summary>
     internal static bool IsPointerOperandRepresentable(IOperand operand, MethodAnalysisContext context) =>
         operand is Immediate
-        || IlGenerator.EmittedOperandType(operand, context) is { } emitted
+        || (operand is not AddressOf { Target: FieldReference addressField }
+            || !InteriorFieldProvenance(addressField))
+            && IlGenerator.EmittedOperandType(operand, context) is { } emitted
             && (IlGenerator.IntegralStackWidth(emitted) != 0
                 || emitted is { IsValueType: false }
                     and not GenericParameterTypeAnalysisContext
@@ -249,7 +251,10 @@ public static class BlockMemoryImportRecovery
             case AddressOf { Target: LocalVariable local }:
                 return IsReferenceFree(IlGenerator.EmittedLocalType(local, context));
             case AddressOf { Target: FieldReference field }:
-                return IsReferenceFree(field.Field.FieldType);
+                // A pointer into a nested member or a byref referent's field resolves
+                // only through interior-field provenance; the & it emits cannot spell
+                // a verifiable void*/cpblk address, so the call keeps its diagnostic.
+                return !InteriorFieldProvenance(field) && IsReferenceFree(field.Field.FieldType);
             case AddressOf { Target: ArrayAccess access }:
                 return access.Array.Type is SzArrayTypeAnalysisContext array
                     && IsReferenceFree(array.ElementType);
@@ -281,7 +286,7 @@ public static class BlockMemoryImportRecovery
                 // A field's value used directly as the address. The referent region is
                 // whatever the field's declared type describes; an integral field
                 // cannot be traced to a referent, so it is unproven.
-                return field.Field.FieldType switch
+                return !InteriorFieldProvenance(field) && field.Field.FieldType switch
                 {
                     PointerTypeAnalysisContext pointer => IsReferenceFree(pointer.ElementType),
                     ByRefTypeAnalysisContext byRef => IsReferenceFree(byRef.ElementType),
@@ -297,6 +302,13 @@ public static class BlockMemoryImportRecovery
                 return false;
         }
     }
+
+    // An address resolvable only through interior-field provenance - a nested member
+    // path or a field inside a byref referent. Taking its address emits a managed
+    // pointer (&) that cpblk consumes unverifiably and conv.u cannot convert, so the
+    // block op must stay a diagnosed call rather than recover to invalid IL.
+    private static bool InteriorFieldProvenance(FieldReference field) =>
+        field.Containers.Count > 0 || field.Local.Type is ByRefTypeAnalysisContext;
 
     // The destinations a still-integral local can be loaded from: every definition
     // must produce a pointer value into a provably reference-free region.
