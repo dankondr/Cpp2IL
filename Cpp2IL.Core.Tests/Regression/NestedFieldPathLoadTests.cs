@@ -6,6 +6,7 @@ using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
 using AsmResolver.PE.DotNet.Metadata.Tables;
 using Cpp2IL.Core.Analysis;
+using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using R = System.Reflection;
@@ -460,6 +461,111 @@ public class NestedFieldPathLoadTests
     }
 
     [Test]
+    public void BackingFieldAddressEnumReadSpellsGetterCall()
+    {
+        // ldflda T::<E>k__BackingField + ldfld E::value__ is the compiler's
+        // `&(e.E) -> int` expansion for an auto-property enum read. The getter
+        // already produces the enum, so the value__ consumer folds away - if it
+        // survived, the enum-underlying rewrite would turn it into ldobj on a
+        // value the accessor call left, which is invalid IL.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("Reads.dll");
+        var enumDefinition = new TypeDefinition("Tests", "E",
+            TypeAttributes.Public | TypeAttributes.Sealed,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "Enum"));
+        enumDefinition.Fields.Add(new FieldDefinition("value__",
+            FieldAttributes.Public | FieldAttributes.SpecialName | FieldAttributes.RuntimeSpecialName,
+            new FieldSignature(module.CorLibTypeFactory.Int32)));
+        module.TopLevelTypes.Add(enumDefinition);
+        var enumSig = enumDefinition.ToTypeSignature();
+        var holder = new TypeDefinition("Tests", "Holder",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(holder);
+        var backing = new FieldDefinition("<E>k__BackingField",
+            FieldAttributes.Private, new FieldSignature(enumSig));
+        holder.Fields.Add(backing);
+        var property = new PropertyDefinition("E", default,
+            PropertySignature.CreateInstance(enumSig));
+        holder.Properties.Add(property);
+        var getter = new MethodDefinition("get_E",
+            MethodAttributes.Public | MethodAttributes.HideBySig | MethodAttributes.SpecialName,
+            MethodSignature.CreateInstance(enumSig));
+        holder.Methods.Add(getter);
+        property.SetSemanticMethods(getter, null);
+        var method = new MethodDefinition("M",
+            MethodAttributes.Public, MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        holder.Methods.Add(method);
+        method.CilMethodBody = new CilMethodBody();
+        var instructions = method.CilMethodBody.Instructions;
+        instructions.Add(CilOpCodes.Ldarg_0);
+        instructions.Add(CilOpCodes.Ldflda, backing);
+        instructions.Add(CilOpCodes.Ldfld, enumDefinition.Fields[0]);
+        instructions.Add(CilOpCodes.Pop);
+        instructions.Add(CilOpCodes.Ret);
+
+        Cpp2IL.Core.OutputFormats.DecompilerMemberAccessRewrites.Apply(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(instructions[1].OpCode, Is.EqualTo(CilOpCodes.Callvirt),
+                "ldflda <E>k__BF + ldfld value__ must collapse to the getter call");
+            Assert.That(instructions[1].Operand, Is.SameAs(getter));
+            Assert.That(instructions[2].OpCode, Is.EqualTo(CilOpCodes.Nop),
+                "the value__ read folds away: the getter produced the enum");
+        });
+        Assert.That(app, Is.Not.Null);
+    }
+
+    [Test]
+    public void BackingFieldAddressStoreKeepsAddress()
+    {
+        // ldflda T::<P>k__BackingField + stobj P' writes through the field's
+        // address. The value being written is pushed after the address, so no
+        // single call at the ldflda position can spell it - the pair stays.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("Reads.dll");
+        var holder = new TypeDefinition("Tests", "Holder",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(holder);
+        var backing = new FieldDefinition("<Group>k__BackingField",
+            FieldAttributes.Private, new FieldSignature(module.CorLibTypeFactory.Int32));
+        holder.Fields.Add(backing);
+        var property = new PropertyDefinition("Group", default,
+            PropertySignature.CreateInstance(module.CorLibTypeFactory.Int32));
+        holder.Properties.Add(property);
+        var setter = new MethodDefinition("set_Group",
+            MethodAttributes.Public | MethodAttributes.HideBySig | MethodAttributes.SpecialName,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void,
+                [module.CorLibTypeFactory.Int32]));
+        holder.Methods.Add(setter);
+        property.SetSemanticMethods(null, setter);
+        var method = new MethodDefinition("M",
+            MethodAttributes.Public, MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        holder.Methods.Add(method);
+        method.CilMethodBody = new CilMethodBody();
+        var instructions = method.CilMethodBody.Instructions;
+        instructions.Add(CilOpCodes.Ldarg_0);
+        instructions.Add(CilOpCodes.Ldflda, backing);
+        instructions.Add(CilOpCodes.Ldc_I4_0);
+        instructions.Add(CilOpCodes.Stobj, module.CorLibTypeFactory.Int32.Type);
+        instructions.Add(CilOpCodes.Ret);
+
+        Cpp2IL.Core.OutputFormats.DecompilerMemberAccessRewrites.Apply(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(instructions[1].OpCode, Is.EqualTo(CilOpCodes.Ldflda),
+                "stobj after ldflda cannot collapse to a setter call in place");
+            Assert.That(instructions[3].OpCode, Is.EqualTo(CilOpCodes.Stobj));
+        });
+        Assert.That(app, Is.Not.Null);
+    }
+
+    [Test]
     public void EnumUnderlyingAddressReadSpellsLdobjEnum()
     {
         // ldflda E::value__ + ldobj int32 pushes the same bytes as ldobj E on
@@ -497,6 +603,144 @@ public class NestedFieldPathLoadTests
             Assert.That(instructions[1].Operand, Is.SameAs(enumDefinition));
         });
         Assert.That(app, Is.Not.Null);
+    }
+
+    private static (InjectedMethodAnalysisContext accessor, MethodDefinition method)
+        AccessorCaller(InjectedTypeAnalysisContext declaring, string name,
+            TypeAnalysisContext returnType, TypeAnalysisContext? param, ModuleDefinition module,
+            List<Instruction> instructions, List<LocalVariable> locals)
+    {
+        var accessor = declaring.InjectMethodContext(name, returnType,
+            R.MethodAttributes.Public, param is { } p ? new[] { p } : []);
+        accessor.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        accessor.Locals = locals;
+        accessor.ParameterLocals = locals.Take(param is { } ? 2 : 1).ToList();
+        accessor.AnalysisWarnings = [];
+        var signature = param is { }
+            ? MethodSignature.CreateInstance(module.CorLibTypeFactory.Void,
+                new[] { module.CorLibTypeFactory.Int32 })
+            : MethodSignature.CreateInstance(module.CorLibTypeFactory.Int32);
+        var method = new MethodDefinition(name,
+            AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Public
+                | AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.HideBySig, signature);
+        module.TopLevelTypes.First(t => t.Name == declaring.Name).Methods.Add(method);
+        return (accessor, method);
+    }
+
+    [Test]
+    public void GetterReadsOwnBackingFieldKeepsFieldAccess()
+    {
+        // get_Level's own body reads <Level>k__BackingField - the one place the
+        // backing field may be spelled directly. Refusing it strips the
+        // recovered getter back to a throwing stub, and every assignment to
+        // the get-only auto-property then fails CS0200.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var (cfg, backing) = Cfg(app);
+        var module = new ModuleDefinition("Reads.dll");
+        Seed(module, app, cfg);
+        SeedCorLibTypes(app, module, cfg, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemObjectType);
+
+        var thisLocal = Local("this", new ByRefTypeAnalysisContext(cfg));
+        var dst = Local("dst", app.SystemTypes.SystemInt32Type);
+        var load = new Instruction(0, OpCode.Move, dst, new MemoryOperand(thisLocal, null, 0, 0, 4));
+        var (accessor, method) = AccessorCaller(cfg, "get_Level",
+            app.SystemTypes.SystemInt32Type, null, module,
+            [load, new(1, OpCode.Return)], [thisLocal, dst]);
+
+        MetadataResolver.ResolveFieldOffsets(accessor);
+        IlGenerator.GenerateIl(accessor, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldfld
+                    && i.Operand is IFieldDescriptor f && f.Name == "<Level>k__BackingField"),
+                Is.True, () => Dump(method));
+            Assert.That(EmitsUnmanagedLoadDiagnostic(method), Is.False, () => Dump(method));
+            Assert.That(backing, Is.Not.Null);
+        });
+    }
+
+    [Test]
+    public void SetterWritesOwnBackingFieldKeepsFieldAccess()
+    {
+        // The mirror image: set_Level's own body writes <Level>k__BackingField
+        // and must keep the stfld - refusing it strips the setter to a throw.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var (cfg, backing) = Cfg(app);
+        var module = new ModuleDefinition("Reads.dll");
+        Seed(module, app, cfg);
+        SeedCorLibTypes(app, module, cfg, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemObjectType);
+
+        var thisLocal = Local("this", new ByRefTypeAnalysisContext(cfg));
+        var src = Local("src", app.SystemTypes.SystemInt32Type);
+        var store = new Instruction(0, OpCode.Move,
+            new MemoryOperand(thisLocal, null, 0, 0, 4), src);
+        var (accessor, method) = AccessorCaller(cfg, "set_Level",
+            app.SystemTypes.SystemVoidType, app.SystemTypes.SystemInt32Type, module,
+            [store, new(1, OpCode.Return)], [thisLocal, src]);
+
+        MetadataResolver.ResolveFieldOffsets(accessor);
+        IlGenerator.GenerateIl(accessor, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stfld
+                    && i.Operand is IFieldDescriptor f && f.Name == "<Level>k__BackingField"),
+                Is.True, () => Dump(method));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call
+                    || i.OpCode == CilOpCodes.Callvirt), Is.False, () => Dump(method));
+            Assert.That(backing, Is.Not.Null);
+        });
+    }
+
+    [Test]
+    public void NestedTypeCallerReadsEnclosingPrivateGetterBackingField()
+    {
+        // A state machine's MoveNext reads this.<Level>k__BackingField through
+        // the enclosing Config: the getter is private, but a nested type can
+        // spell its enclosing type's privates, so the load resolves rather
+        // than keeping its diagnostic. (Siblings and parents get no such
+        // access - the rule only walks the caller's declaring chain.)
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var (cfg, backing) = Cfg(app);
+        cfg.InjectMethodContext("get_Level", app.SystemTypes.SystemInt32Type,
+            R.MethodAttributes.Private);
+        var module = new ModuleDefinition("Reads.dll");
+        Seed(module, app, cfg);
+        SeedCorLibTypes(app, module, cfg, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemObjectType);
+
+        var sm = cfg.InjectNestedType("Sm", app.SystemTypes.SystemValueTypeType,
+            R.TypeAttributes.NestedPrivate | R.TypeAttributes.Sealed);
+        var caller = sm.InjectMethodContext("MoveNext", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Private);
+        var local = Local("cfg", new ByRefTypeAnalysisContext(cfg));
+        var dst = Local("dst", app.SystemTypes.SystemInt32Type);
+        var load = new Instruction(0, OpCode.Move, dst,
+            new MemoryOperand(local, null, 0, 0, 4));
+        caller.ControlFlowGraph = new ISILControlFlowGraph([load, new(1, OpCode.Return)]);
+        caller.Locals = [local, dst];
+        caller.ParameterLocals = [local];
+        caller.AnalysisWarnings = [];
+
+        MetadataResolver.ResolveFieldOffsets(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(load.Operands[1], Is.TypeOf<FieldReference>(),
+                "a nested type can spell its enclosing type's private accessor");
+            Assert.That(((FieldReference)load.Operands[1]).Field, Is.SameAs(backing));
+        });
     }
 
     [Test]

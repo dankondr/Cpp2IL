@@ -507,7 +507,10 @@ public static class MetadataResolver
     // (ldfld accepts a struct value where the pointer was). Any other
     // container position, a store, or an addressed leaf keeps the managed
     // pointer no call can produce, so those paths stay diagnosed rather than
-    // naming a member the recovered source cannot write.
+    // naming a member the recovered source cannot write. One exception:
+    // inside the accessor's own body the access is a plain field access
+    // (get_P reads <P>k__BackingField, set_P writes it) - refusing it would
+    // strip the recovered accessor back to a throwing stub.
     internal static bool MemberPathUnspellable(
         (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers) resolved,
         MethodAnalysisContext caller, bool store, bool addressed)
@@ -517,21 +520,24 @@ public static class MetadataResolver
         {
             if (!IsCompilerGeneratedBackingField(containers[i]))
                 continue;
-            if (i != containers.Count - 1 || store || addressed
-                || !BackingAccessorVisible(containers[i], caller, store: false))
+            if (i != containers.Count - 1 || addressed
+                || (store && !IsOwnBackingAccessor(containers[i], caller, store: true))
+                || !(BackingAccessorVisible(containers[i], caller, store: false)
+                     || IsOwnBackingAccessor(containers[i], caller, store)))
                 return true;
         }
         var leaf = resolved.Field;
         return IsCompilerGeneratedBackingField(leaf)
-            && (addressed || !BackingAccessorVisible(leaf, caller, store));
+            && (addressed
+                || !(BackingAccessorVisible(leaf, caller, store)
+                     || IsOwnBackingAccessor(leaf, caller, store)));
     }
 
     private static bool IsCompilerGeneratedBackingField(FieldAnalysisContext field) =>
         field.Name.StartsWith("<", System.StringComparison.Ordinal)
         && field.Name.EndsWith(">k__BackingField", System.StringComparison.Ordinal);
 
-    internal static bool BackingAccessorVisible(FieldAnalysisContext field,
-        MethodAnalysisContext caller, bool store)
+    private static MethodAnalysisContext? FindBackingAccessor(FieldAnalysisContext field, bool store)
     {
         var property = field.Name[1..field.Name.IndexOf('>')];
         var accessorName = (store ? "set_" : "get_") + property;
@@ -542,10 +548,22 @@ public static class MetadataResolver
                 && m.IsStatic == field.IsStatic
                 && m.Parameters.Count == (store ? 1 : 0));
             if (accessor != null)
-                return AccessorAccessibleFrom(accessor, caller);
+                return accessor;
         }
-        return false;
+        return null;
     }
+
+    internal static bool BackingAccessorVisible(FieldAnalysisContext field,
+        MethodAnalysisContext caller, bool store)
+        => FindBackingAccessor(field, store) is { } accessor
+            && AccessorAccessibleFrom(accessor, caller);
+
+    // True when the calling method is the field's own accessor - get_P for a
+    // read, set_P for a write. The accessor body spells the access as the
+    // field access it already is, not as a call to itself.
+    private static bool IsOwnBackingAccessor(FieldAnalysisContext field,
+        MethodAnalysisContext caller, bool store)
+        => ReferenceEquals(FindBackingAccessor(field, store), caller);
 
     // Mirrors the emission pass's accessor reachability (a declared-access check
     // against the calling type) closely enough to decide whether the recovered
@@ -561,12 +579,19 @@ public static class MetadataResolver
         var declaring = accessor.DeclaringType;
         if (callerType == null || declaring == null)
             return false;
-        var callerDef = callerType is GenericInstanceTypeAnalysisContext callerInstance
-            ? callerInstance.GenericType : callerType;
         var declaringDef = declaring is GenericInstanceTypeAnalysisContext declaringInstance
             ? declaringInstance.GenericType : declaring;
-        if (ReferenceEquals(callerDef, declaringDef))
-            return true;
+        // A type nested inside the accessor's declaring type can spell its
+        // private members (C# grants enclosing access down the DeclaringType
+        // chain only - siblings and parents cannot see a nested type's
+        // privates).
+        for (var t = callerType; t != null; t = t.DeclaringType)
+        {
+            var callerDef = t is GenericInstanceTypeAnalysisContext callerInstance
+                ? callerInstance.GenericType : t;
+            if (ReferenceEquals(callerDef, declaringDef))
+                return true;
+        }
         var sameAssembly = callerType.DeclaringAssembly != null && declaring.DeclaringAssembly != null
             && (ReferenceEquals(callerType.DeclaringAssembly, declaring.DeclaringAssembly)
                 || callerType.DeclaringAssembly.Name == declaring.DeclaringAssembly.Name);
