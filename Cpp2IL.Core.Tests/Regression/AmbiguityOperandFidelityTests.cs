@@ -81,6 +81,7 @@ public class AmbiguityOperandFidelityTests
         var result = new LocalVariable("result", new Register(null, "result"))
             { Type = app.SystemTypes.SystemDoubleType };
         var (caller, method) = ForeignCaller(app, module, [
+            new(-1, OpCode.Move, arg, new Immediate(0)),
             new(0, OpCode.Call, f64, result, arg),
             new(1, OpCode.Return)], [arg, result]);
 
@@ -113,6 +114,7 @@ public class AmbiguityOperandFidelityTests
         var result = new LocalVariable("result", new Register(null, "result"))
             { Type = app.SystemTypes.SystemDoubleType };
         var (caller, method) = ForeignCaller(app, module, [
+            new(-1, OpCode.Move, num, new Immediate(5)),
             new(0, OpCode.Call, f64, result, num),
             new(1, OpCode.Return)], [num, result]);
 

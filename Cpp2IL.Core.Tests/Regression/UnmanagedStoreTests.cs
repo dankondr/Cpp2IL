@@ -62,6 +62,7 @@ public class UnmanagedStoreTests
         var holder = new LocalVariable("holder", new Register(null, "holder")) { Type = owner };
         var value = new LocalVariable("value", new Register(null, "value")) { Type = int32 };
         var (caller, method) = ForeignCaller(app, module, [
+            new(-1, OpCode.Move, value, new Immediate(7)),
             new(0, OpCode.Move, new MemoryOperand(holder, addend: 0x10, accessSize: 4), value),
             new(1, OpCode.Return)], [holder, value]);
 
@@ -94,6 +95,7 @@ public class UnmanagedStoreTests
         var buffer = new LocalVariable("buffer", new Register(null, "buffer")) { Type = owner };
         var value = new LocalVariable("value", new Register(null, "value")) { Type = int32 };
         var (caller, method) = ForeignCaller(app, module, [
+            new(-1, OpCode.Move, value, new Immediate(7)),
             new(0, OpCode.Move, new MemoryOperand(buffer, addend: 4, accessSize: 4), value),
             new(1, OpCode.Return)], [buffer, value]);
 
@@ -190,6 +192,7 @@ public class UnmanagedStoreTests
         // [x29 - 0x18] = a write into a frame slot; the slot becomes a local and
         // the store lowers to stloc.
         var (caller, method) = ForeignCaller(app, module, [
+            new(-1, OpCode.Move, value, new Immediate(7)),
             new(0, OpCode.Move, new MemoryOperand(frame, addend: -0x18, accessSize: 4), value),
             new(1, OpCode.Return)], [frame, value]);
 

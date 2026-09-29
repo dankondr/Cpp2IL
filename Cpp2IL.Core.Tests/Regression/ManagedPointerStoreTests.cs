@@ -27,6 +27,7 @@ public class ManagedPointerStoreTests
         var module = new ModuleDefinition("PtrStore.dll");
         SeedCorLibTypes(app, module, int32, app.SystemTypes.SystemVoidType);
         var (caller, method) = ForeignCaller(app, module, [
+            new(-1, OpCode.Move, value, new Immediate(7)),
             new(0, OpCode.Move, new MemoryOperand(pointer, accessSize: 4), value),
             new(1, OpCode.Return)], [pointer, value]);
 

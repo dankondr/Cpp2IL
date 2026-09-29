@@ -291,7 +291,9 @@ public class IlGeneratorTests
         var result=new LocalVariable("result",new Register(null,"result")){Type=app.SystemTypes.SystemBooleanType};
         IOperand right=kind==5?new LocalVariable("numeric",new Register(null,"numeric")){Type=app.SystemTypes.SystemInt32Type}:new Immediate(kind==4?1:0);
         var context=new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType,"Run",app.SystemTypes.SystemVoidType,ReflectionMethodAttributes.Static,[]);
-        context.ControlFlowGraph=new ISILControlFlowGraph([new(0,opcode,result,reverse?right:input,reverse?input:right),new(1,OpCode.Return)]);
+        context.ControlFlowGraph=new ISILControlFlowGraph(kind==4
+            ?[new(-1,OpCode.Move,input,new Immediate(7)),new(0,opcode,result,reverse?right:input,reverse?input:right),new(1,OpCode.Return)]
+            :[new(0,opcode,result,reverse?right:input,reverse?input:right),new(1,OpCode.Return)]);
         context.Locals=kind==5?[input,result,(LocalVariable)right]:[input,result];context.ParameterLocals=[];context.AnalysisWarnings=[];
         var module=new ModuleDefinition("NullComparison.dll");var type=new TypeDefinition("Tests","Comparison",TypeAttributes.Public,module.CorLibTypeFactory.Object.Type);module.TopLevelTypes.Add(type);
         foreach(var primitive in new[]{app.SystemTypes.SystemObjectType,app.SystemTypes.SystemInt32Type,app.SystemTypes.SystemBooleanType,app.SystemTypes.SystemStringType,list})
@@ -1856,8 +1858,9 @@ public class IlGeneratorTests
         var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
             app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
         context.ControlFlowGraph = new ISILControlFlowGraph([
-            new(0, OpCode.And, dest, value, new Immediate(0x100000000L)),
-            new(1, OpCode.Return)]);
+            new(0, OpCode.Move, value, new Immediate(0x11223344)),
+            new(1, OpCode.And, dest, value, new Immediate(0x100000000L)),
+            new(2, OpCode.Return)]);
         context.Locals = [value, dest];
         context.ParameterLocals = [];
         context.AnalysisWarnings = [];
@@ -1876,11 +1879,11 @@ public class IlGeneratorTests
         var il = method.CilMethodBody!.Instructions;
         Assert.Multiple(() =>
         {
-            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
-            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Ldc_I8));
-            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Conv_I4));
-            Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.And));
-            Assert.That(il[4].OpCode, Is.EqualTo(CilOpCodes.Stloc));
+            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+            Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.Ldc_I8));
+            Assert.That(il[4].OpCode, Is.EqualTo(CilOpCodes.Conv_I4));
+            Assert.That(il[5].OpCode, Is.EqualTo(CilOpCodes.And));
+            Assert.That(il[6].OpCode, Is.EqualTo(CilOpCodes.Stloc));
         });
     }
 
@@ -1895,8 +1898,9 @@ public class IlGeneratorTests
         var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller",
             app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
         caller.ControlFlowGraph = new ISILControlFlowGraph([
-            new(0, OpCode.CallVoid, target, arg),
-            new(1, OpCode.Return)]);
+            new(0, OpCode.Move, arg, new Immediate(9)),
+            new(1, OpCode.CallVoid, target, arg),
+            new(2, OpCode.Return)]);
         caller.Locals = [arg];
         caller.ParameterLocals = [];
         caller.AnalysisWarnings = [];
@@ -1918,9 +1922,9 @@ public class IlGeneratorTests
         var il = definition.CilMethodBody!.Instructions;
         Assert.Multiple(() =>
         {
-            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
-            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Conv_I8));
-            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Call));
+            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+            Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.Conv_I8));
+            Assert.That(il[4].OpCode, Is.EqualTo(CilOpCodes.Call));
         });
     }
 
@@ -1939,9 +1943,10 @@ public class IlGeneratorTests
         var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
             app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
         context.ControlFlowGraph = new ISILControlFlowGraph([
-            new(0, OpCode.Move, dest, source),
-            new(1, OpCode.CallVoid, target, dest),
-            new(2, OpCode.Return)]);
+            new(0, OpCode.Move, source, new Immediate(3)),
+            new(1, OpCode.Move, dest, source),
+            new(2, OpCode.CallVoid, target, dest),
+            new(3, OpCode.Return)]);
         context.Locals = [source, dest];
         context.ParameterLocals = [];
         context.AnalysisWarnings = [];
@@ -1964,11 +1969,11 @@ public class IlGeneratorTests
         var il = method.CilMethodBody!.Instructions;
         Assert.Multiple(() =>
         {
-            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
-            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Stloc));
             Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
-            Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.Box));
-            Assert.That(il[4].OpCode, Is.EqualTo(CilOpCodes.Call));
+            Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.Stloc));
+            Assert.That(il[4].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+            Assert.That(il[5].OpCode, Is.EqualTo(CilOpCodes.Box));
+            Assert.That(il[6].OpCode, Is.EqualTo(CilOpCodes.Call));
         });
     }
 
@@ -2105,8 +2110,9 @@ public class IlGeneratorTests
         var context = new InjectedMethodAnalysisContext(state, "MoveNext", app.SystemTypes.SystemVoidType,
             ReflectionMethodAttributes.Public, []);
         context.ControlFlowGraph = new ISILControlFlowGraph([
-            new(0, OpCode.Move, new FieldReference(field, reused, 0), value),
-            new(1, OpCode.Return)]);
+            new(0, OpCode.Move, value, new Immediate(42)),
+            new(1, OpCode.Move, new FieldReference(field, reused, 0), value),
+            new(2, OpCode.Return)]);
         context.Locals = [self, reused, value];
         context.ParameterLocals = [self];
         context.AnalysisWarnings = [];
@@ -2142,7 +2148,8 @@ public class IlGeneratorTests
         var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
             app.SystemTypes.SystemInt32Type, ReflectionMethodAttributes.Static, []);
         context.ControlFlowGraph = new ISILControlFlowGraph([
-            new(0, OpCode.Return, value)]);
+            new(0, OpCode.Move, value, new Immediate(0x1122334455667788L)),
+            new(1, OpCode.Return, value)]);
         context.Locals = [value];
         context.ParameterLocals = [];
         context.AnalysisWarnings = [];
@@ -2163,9 +2170,9 @@ public class IlGeneratorTests
         var il = method.CilMethodBody!.Instructions;
         Assert.Multiple(() =>
         {
-            Assert.That(il[0].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
-            Assert.That(il[1].OpCode, Is.EqualTo(CilOpCodes.Conv_I4));
-            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Ret));
+            Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
+            Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.Conv_I4));
+            Assert.That(il[4].OpCode, Is.EqualTo(CilOpCodes.Ret));
         });
     }
 
