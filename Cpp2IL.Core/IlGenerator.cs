@@ -3965,18 +3965,6 @@ public static class IlGenerator
                     instructions.Add(CilOpCodes.Ldc_I8, immediate.Value);
                 instructions.Add(CilOpCodes.Conv_I);
                 break;
-            // A literal that cannot be written as the slot's value type can still
-            // fill it when its emitted integer form converts legally (e.g. a
-            // user-defined op_Implicit); emit the literal so the caller's
-            // coercion applies the conversion to the real value.
-            case Immediate immediate when literalType is { IsValueType: true } or GenericParameterTypeAnalysisContext
-                    && StackContractSatisfied(EmittedImmediateType(immediate, expectedType, callingContext),
-                        literalType, callingContext):
-                if (immediate.Value is >= int.MinValue and <= int.MaxValue)
-                    instructions.Add(CilOpCodes.Ldc_I4, (int)immediate.Value);
-                else
-                    instructions.Add(CilOpCodes.Ldc_I8, immediate.Value);
-                break;
             // A literal in a non-primitive value-type or generic-parameter slot is a
             // dropped operand, not a real value; default(T) is the only honest filler.
             case Immediate when literalType is { IsValueType: true } or GenericParameterTypeAnalysisContext
@@ -6653,49 +6641,9 @@ public static class IlGenerator
             return true;
         }
 
-        // A user-defined conversion operator between the two value types is the
-        // conversion C# itself emits (`Vector3 v = v2` calls Vector2::op_Implicit,
-        // `(Vector2)v3` calls Vector3::op_Explicit); the call produces the
-        // correctly-typed real value for the slot instead of a synthetic default.
-        if (from.IsValueType && to.IsValueType
-            && FindConversionOperator(from, to, context) is { } conversionOp)
-        {
-            instructions.Add(CilOpCodes.Call, conversionOp.ToMethodDescriptor());
-            return true;
-        }
-
         // Different value types (or a pointer kind with no legal conversion): no
         // stack operation turns the emitted value into what the slot requires.
         return false;
-    }
-
-    // Resolves a public static op_Implicit (preferred: the source's contract is
-    // non-lossy) or op_Explicit on either of the two types whose sole parameter
-    // and return type match the conversion exactly. Generic-instance owners are
-    // searched on their definition and the match re-instantiated, so e.g.
-    // Nullable<Status> -> Status finds Nullable<T>::op_Explicit.
-    private static MethodAnalysisContext? FindConversionOperator(TypeAnalysisContext from,
-        TypeAnalysisContext to, MethodAnalysisContext? context)
-    {
-        foreach (var name in new[] { "op_Implicit", "op_Explicit" })
-        foreach (var owner in new[] { from, to })
-        {
-            var instance = owner as GenericInstanceTypeAnalysisContext;
-            var definition = instance?.GenericType ?? owner;
-            foreach (var candidate in definition.Methods)
-            {
-                if (candidate.Name != name || !candidate.IsStatic || candidate.Parameters.Count != 1)
-                    continue;
-                var concrete = instance == null ? candidate
-                    : new ConcreteGenericMethodAnalysisContext(candidate, instance.GenericArguments, []);
-                if (!ThisConstructorCallPlan.SameTypeIdentity(concrete.Parameters[0].ParameterType, from)
-                    || !ThisConstructorCallPlan.SameTypeIdentity(concrete.ReturnType, to))
-                    continue;
-                if (context == null || CalleeUsableFrom(concrete, context))
-                    return concrete;
-            }
-        }
-        return null;
     }
 
     // Coerces the emitted value into the slot's contract, or - when no stack
@@ -6913,11 +6861,6 @@ public static class IlGenerator
         if (!from.IsValueType && !to.IsValueType)
             // castclass narrows any reference pair - unless the caller cannot name it
             return IsAssignableToLoose(from, to) || !CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context);
-        // A user-defined conversion operator makes the pair legally
-        // convertible; EmitStackCoerce emits the call it resolves here.
-        if (from.IsValueType && to.IsValueType
-            && FindConversionOperator(from, to, context) != null)
-            return true;
         return StackAssignableTo(from, to);
     }
 

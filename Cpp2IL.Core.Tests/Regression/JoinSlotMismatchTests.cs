@@ -1,9 +1,11 @@
+using System.Collections.Generic;
 using System.Linq;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
 using AsmResolver.PE.DotNet.Metadata.Tables;
 using Cpp2IL.Core.Analysis;
+using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using R = System.Reflection;
@@ -12,14 +14,42 @@ using static Cpp2IL.Core.Tests.Regression.SyntheticFixture;
 namespace Cpp2IL.Core.Tests.Regression;
 
 // Recovery cluster: typed local -> mismatched slot (castle-recovery#143). A Move
-// between two differently-typed value types used to reach EmitStackCoerce's "no
-// legal conversion" fallthrough and substitute a synthetic default. When either
-// type defines a user-defined conversion operator for exactly that pair, C#
-// emits `call op_Implicit`/`op_Explicit` for the same operation - the recovered
-// conversion call fills the slot with the correctly-typed real value. Pairs
-// with no operator keep the named decompiler-issue diagnostic.
-public class ValueTypeConversionOperatorTests
+// between two differently-typed value types is a register move the lifter could
+// not prove converts - it keeps the "no legal conversion" diagnostic and the
+// synthetic default even when the pair happens to carry a user-defined
+// conversion operator, because emitting `call op_Implicit`/`op_Explicit` there
+// would fabricate a computation the binary never ran. The one honest recovery
+// covered here is the SelectedFieldReference join, where the emitted type now
+// mirrors the whole-container load LoadOperand actually performs.
+public class JoinSlotMismatchTests
 {
+    // The same register defined on both arms of a diamond but never read after
+    // the join used to get a phi at the join anyway - SsaForm.Remove then
+    // materialized a dead edge copy whose mismatched types produced a
+    // "no legal conversion" diagnostic. Pruned insertion skips the dead join
+    // entirely: no copy, no diagnostic, nothing substituted.
+    [Test]
+    public void DeadJoinOfReusedRegisterInsertsNoPhi()
+    {
+        var instructions = new List<Instruction>();
+        void Add(int index, OpCode opCode, params object[] operands)
+            => instructions.Add(new Instruction(index, opCode, Ops(operands)));
+        Add(0, OpCode.Move, new Register(null, "x"), 0);
+        Add(1, OpCode.ConditionalJump, 4, new Register(null, "cond"));
+        Add(2, OpCode.Move, new Register(null, "x"), 1);
+        Add(3, OpCode.Jump, 5);
+        Add(4, OpCode.Move, new Register(null, "x"), 2);
+        Add(5, OpCode.Return);
+        foreach (var instruction in instructions)
+            if (instruction.OpCode is OpCode.Jump or OpCode.ConditionalJump)
+                instruction.SetOperand(0, instructions[(int)((Immediate)instruction.Operands[0]).Value]);
+        var graph = new ISILControlFlowGraph(instructions.ToList());
+
+        SsaForm.Build(graph, new DominatorInfo(graph));
+
+        Assert.That(graph.Instructions.Count(instruction => instruction.OpCode == OpCode.Phi),
+            Is.EqualTo(0));
+    }
     private static InjectedTypeAnalysisContext InjectStruct(ApplicationAnalysisContext app, string name) =>
         new(app.AssembliesByName["UnityEngine.CoreModule"], "Tests", name,
             app.SystemTypes.SystemValueTypeType,
@@ -65,8 +95,12 @@ public class ValueTypeConversionOperatorTests
         return method.CilMethodBody!.Instructions;
     }
 
+    // Pins the no-fabrication rule: a mismatched value-type move keeps the named
+    // diagnostic and the default even when the types carry a matching
+    // op_Implicit - the binary executed a register move, not the operator's
+    // conversion body.
     [Test]
-    public void MoveIntoOperatorConvertedSlotEmitsConversionCall()
+    public void MoveIntoOperatorConvertedSlotKeepsDiagnostic()
     {
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
@@ -81,17 +115,17 @@ public class ValueTypeConversionOperatorTests
 
         Assert.Multiple(() =>
         {
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call
-                    && i.Operand?.ToString().Contains("op_Implicit") == true), Is.True,
-                () => string.Join("\n", il.Select(i => i.ToString())));
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
-                    && i.Operand is string text && text.Contains("synthetic default")), Is.False,
+                    && i.Operand is string text && text.Contains("synthetic default")), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call
+                    && i.Operand?.ToString().Contains("op_Implicit") == true), Is.False,
                 () => string.Join("\n", il.Select(i => i.ToString())));
         });
     }
 
     [Test]
-    public void MoveIntoOperatorConvertedSlotEmitsExplicitConversionCall()
+    public void MoveIntoExplicitOperatorConvertedSlotKeepsDiagnostic()
     {
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
@@ -104,17 +138,22 @@ public class ValueTypeConversionOperatorTests
 
         var il = GenerateMove(app, vec3, vec2, module);
 
-        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call
-                && i.Operand?.ToString().Contains("op_Explicit") == true), Is.True,
-            () => string.Join("\n", il.Select(i => i.ToString())));
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("synthetic default")), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call
+                    && i.Operand?.ToString().Contains("op_Explicit") == true), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+        });
     }
 
-    // A literal into a value-type slot the literal cannot fill directly is still
-    // recovered when its emitted integer form converts through a user-defined
-    // operator: the literal survives and the coercion runs op_Implicit on it
-    // instead of substituting a default for the slot.
+    // Same rule for a literal: a nonzero immediate in a value-type slot keeps
+    // the named diagnostic and the default - it is not op_Implicit(int) of the
+    // literal, whatever operators the slot's type declares.
     [Test]
-    public void MoveImmediateThroughConversionOperatorEmitsLiteralAndCall()
+    public void MoveImmediateIntoOperatorConvertedSlotKeepsDiagnostic()
     {
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
@@ -134,14 +173,11 @@ public class ValueTypeConversionOperatorTests
 
         Assert.Multiple(() =>
         {
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldc_I4
-                    && i.Operand?.ToString() == "7"), Is.True,
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("synthetic default")), Is.True,
                 () => string.Join("\n", il.Select(i => i.ToString())));
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call
-                    && i.Operand?.ToString().Contains("op_Implicit") == true), Is.True,
-                () => string.Join("\n", il.Select(i => i.ToString())));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
-                    && i.Operand is string text && text.Contains("cannot fill")), Is.False,
+                    && i.Operand?.ToString().Contains("op_Implicit") == true), Is.False,
                 () => string.Join("\n", il.Select(i => i.ToString())));
         });
     }

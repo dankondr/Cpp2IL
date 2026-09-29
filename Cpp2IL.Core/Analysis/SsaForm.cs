@@ -386,6 +386,7 @@ public class SsaForm
     private void InsertPhiFunctions(ISILControlFlowGraph graph, DominatorInfo dominance)
     {
         var defSites = GetDefinitionSites(graph);
+        var liveIn = ComputeLiveIn(graph);
 
         foreach (var entry in defSites)
         {
@@ -405,6 +406,13 @@ public class SsaForm
 
                 foreach (var frontierBlock in frontier)
                 {
+                    // Pruned SSA: a phi is only worth materializing where the
+                    // register is live-in - a join no path can read would emit
+                    // dead edge copies (often between differently-typed reuse
+                    // versions of the same register).
+                    if (!liveIn[frontierBlock].Contains(regNumber))
+                        continue;
+
                     // Only one phi per (block, register).
                     if (!hasPhi.Add(frontierBlock))
                         continue;
@@ -416,6 +424,96 @@ public class SsaForm
                         workList.Enqueue(frontierBlock);
                 }
             }
+        }
+    }
+
+    // Unversioned register liveness for phi pruning: a register is live-in at a
+    // block when some path from it reaches a read before any re-definition.
+    // Upward-exposed uses count bare registers, memory base/index registers and
+    // non-clobbering address-take targets (the take binds the live cell);
+    // definitions count assignments, implicit clobbers and clobbering takes.
+    private Dictionary<Block, HashSet<int>> ComputeLiveIn(ISILControlFlowGraph graph)
+    {
+        var upwardExposedUse = new Dictionary<Block, HashSet<int>>();
+        var defs = new Dictionary<Block, HashSet<int>>();
+
+        foreach (var block in graph.Blocks)
+        {
+            var use = new HashSet<int>();
+            var def = new HashSet<int>();
+
+            foreach (var instruction in block.Instructions)
+            {
+                foreach (var source in instruction.Sources)
+                    foreach (var number in SourceRegisterNumbers(source,
+                                 !_clobbering.Contains(instruction)))
+                        if (!def.Contains(number))
+                            use.Add(number);
+
+                if (instruction.Destination is Register destination)
+                    def.Add(destination.Number);
+
+                if (instruction.ImplicitDefinition is { } clobbered)
+                    def.Add(clobbered.Number);
+
+                if (_clobbering.Contains(instruction))
+                    foreach (var operand in instruction.Operands)
+                        if (operand is AddressOf { Target: Register addressed })
+                            def.Add(addressed.Number);
+            }
+
+            upwardExposedUse[block] = use;
+            defs[block] = def;
+        }
+
+        var liveIn = graph.Blocks.ToDictionary(block => block, _ => new HashSet<int>());
+        var liveOut = graph.Blocks.ToDictionary(block => block, _ => new HashSet<int>());
+        var pending = new Queue<Block>(graph.Blocks);
+
+        while (pending.Count > 0)
+        {
+            var block = pending.Dequeue();
+
+            var outSet = new HashSet<int>();
+            foreach (var successor in block.Successors)
+                outSet.UnionWith(liveIn[successor]);
+            liveOut[block] = outSet;
+
+            var inSet = new HashSet<int>(upwardExposedUse[block]);
+            foreach (var number in outSet)
+                if (!defs[block].Contains(number))
+                    inSet.Add(number);
+
+            if (inSet.SetEquals(liveIn[block]))
+                continue;
+
+            liveIn[block] = inSet;
+            foreach (var predecessor in block.Predecessors)
+                pending.Enqueue(predecessor);
+        }
+
+        return liveIn;
+    }
+
+    private static IEnumerable<int> SourceRegisterNumbers(IOperand operand, bool includeAddressOfTargets)
+    {
+        switch (operand)
+        {
+            case Register register:
+                yield return register.Number;
+                break;
+            case LocalVariable local:
+                yield return local.Register.Number;
+                break;
+            case AddressOf { Target: Register addressed } when includeAddressOfTargets:
+                yield return addressed.Number;
+                break;
+            case MemoryOperand memory:
+                if (memory.Base is Register baseRegister)
+                    yield return baseRegister.Number;
+                if (memory.Index is Register indexRegister)
+                    yield return indexRegister.Number;
+                break;
         }
     }
 
