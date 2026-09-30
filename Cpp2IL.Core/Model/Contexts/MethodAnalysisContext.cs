@@ -677,6 +677,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         DeadCodeEliminator.Run(this);
         finishInterfaceDispatchRecovery?.Invoke();
 
+        // A frame cell holding a copy of an address-taken struct's field is that field's storage;
+        // read it as the field before copies are forwarded.
+        FrameStructFieldReads.Run(this);
+
         // Copy/constant propagation belongs in SSA, where one definition dominates all uses and phis
         // make joins explicit, so forwarding a value is an unconditional global substitution.
         SsaSimplifier.Run(this);
