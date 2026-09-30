@@ -6134,7 +6134,16 @@ public static class IlGenerator
         // the declaration erased back is not a type the verifier accepts at the
         // store; the declared slot wins.
         if (destination is LocalVariable slotLocal)
-            return EmittableLocalType(EmittedLocalType(slotLocal, context), context);
+        {
+            var localContract = EmittableLocalType(EmittedLocalType(slotLocal, context), context);
+            // A local whose manufactured Boolean claim was vetoed falls back to
+            // an object slot: mark its contract so a scalar edge reaching it
+            // keeps the named note the Boolean-typed slot emitted.
+            return localContract.FullName == "System.Object"
+                && Analysis.LocalVariables.CarriesVetoedBooleanClaim(slotLocal, context)
+                    ? new Analysis.BooleanClaimVetoedSlotTypeAnalysisContext(localContract)
+                    : localContract;
+        }
         var declared = DestinationType(destination);
         if (declared != null)
             return declared;
@@ -6832,6 +6841,13 @@ public static class IlGenerator
             return false;
         }
 
+        // A scalar reaching a vetoed-Boolean object slot is a value the binary
+        // moved as raw bits into a pointer slot: `box` fabricates a conversion
+        // the binary never made. Only these marked slots - not any ordinary
+        // System.Object contract - keep the note the bool-typed slot emitted.
+        if (from.IsValueType && to is Analysis.BooleanClaimVetoedSlotTypeAnalysisContext)
+            return false;
+
         // Some recovered corlib contexts lose their value-type flag even though
         // their stack kind and name remain exact. A primitive entering any managed
         // reference slot still must be boxed; key this off the canonical name, not
@@ -7149,6 +7165,11 @@ public static class IlGenerator
             return true;
         if (to.FullName is "System.Single" or "System.Double")
             return from.FullName is "System.Single" or "System.Double" || fromWidth != 0;
+        // Mirrors EmitStackCoerce: a scalar reaching a vetoed-Boolean object
+        // slot has no honest conversion - `box` would fabricate one the binary
+        // never made, so the slot takes the diagnosed default instead.
+        if (from.IsValueType && to is Analysis.BooleanClaimVetoedSlotTypeAnalysisContext)
+            return false;
         if (from.IsValueType && !to.IsValueType)
             // box, plus castclass when the reference target narrows - both need
             // tokens the caller can legally name. A byref-like source cannot be
