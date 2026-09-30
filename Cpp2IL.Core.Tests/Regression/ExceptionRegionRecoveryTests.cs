@@ -150,8 +150,9 @@ public class ExceptionRegionRecoveryTests
         Assert.That(new NativeExceptionRegionProof(caller).Find().Count, Is.EqualTo(proven ? 1 : 0));
     }
 
-    [Test]
-    public void NestedNativeCleanupsProduceNestedFinallyClauses()
+    [TestCase(true)]
+    [TestCase(false)]
+    public void CleanupSequencesPreserveFlatOrNestedSemantics(bool nested)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Nested",
@@ -179,8 +180,10 @@ public class ExceptionRegionRecoveryTests
             At(0x3004, OpCode.CallVoid, outer),
             At(0x3008, OpCode.CallVoid, new StringLiteral("_Unwind_Resume"), exception)];
         caller.UnwindInfo = new EhFunctionInfo { Start = 0x1000, Size = 0x2010 };
-        foreach (var (start, pad) in new (ulong, ulong)[] { (0x1000, 0x3000), (0x1004, 0x2000), (0x1008, 0x3000) })
+        foreach (var (start, pad) in nested ? new (ulong, ulong)[] { (0x1000, 0x3000), (0x1004, 0x2000), (0x1008, 0x3000) }
+                     : new (ulong, ulong)[] { (0x1000, 0x2000), (0x1004, 0x2000) })
             caller.UnwindInfo.CallSites.Add(new EhCallSiteInfo(start, 4, pad, 0) { Actions = [new EhActionInfo(0, null)] });
+        if (!nested) caller.ConvertedIsil.RemoveRange(caller.ConvertedIsil.Count - 3, 3);
         EhRegionPartition.Partition(caller);
         var module = new ModuleDefinition("NestedRegions.dll");
         MethodDefinition Definition(string name) => new(name, AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Static,
@@ -203,13 +206,22 @@ public class ExceptionRegionRecoveryTests
         foreach (var instruction in map.Values.SelectMany(x => x)) definition.CilMethodBody.Instructions.Add(instruction);
         ExceptionRegionRecovery.Apply(caller, definition, map);
         var body = definition.CilMethodBody;
-        Assert.That(body.ExceptionHandlers, Has.Count.EqualTo(2));
+        Assert.That(body.ExceptionHandlers, Has.Count.EqualTo(nested ? 2 : 1));
         int Position(ICilLabel? label) => body.Instructions.ToList().FindIndex(i => ReferenceEquals(i, ((CilInstructionLabel)label!).Instruction));
         var clauses = body.ExceptionHandlers.OrderBy(c => Position(c.TryStart)).ToList();
-        Assert.That(Position(clauses[0].TryStart), Is.LessThan(Position(clauses[1].TryStart)));
-        Assert.That(Position(clauses[1].HandlerEnd), Is.LessThan(Position(clauses[0].TryEnd)));
-        Assert.That(body.Instructions[Position(clauses[0].HandlerStart)].Operand, Is.SameAs(outerDefinition));
-        Assert.That(body.Instructions[Position(clauses[1].HandlerStart)].Operand, Is.SameAs(innerDefinition));
+        if (nested)
+        {
+            Assert.That(Position(clauses[0].TryStart), Is.LessThan(Position(clauses[1].TryStart)));
+            Assert.That(Position(clauses[1].HandlerEnd), Is.LessThan(Position(clauses[0].TryEnd)));
+            Assert.That(body.Instructions[Position(clauses[0].HandlerStart)].Operand, Is.SameAs(outerDefinition));
+            Assert.That(body.Instructions[Position(clauses[1].HandlerStart)].Operand, Is.SameAs(innerDefinition));
+        }
+        else
+        {
+            var start = Position(clauses[0].HandlerStart);
+            Assert.That(body.Instructions[start].Operand, Is.SameAs(innerDefinition));
+            Assert.That(body.Instructions[start + 1].Operand, Is.SameAs(outerDefinition));
+        }
         Assert.That(caller.AnalysisWarnings, Is.Empty);
         Assert.That(body.ComputeMaxStack(), Is.EqualTo(0));
 
@@ -222,8 +234,11 @@ public class ExceptionRegionRecoveryTests
             | AsmResolver.PE.DotNet.Metadata.Tables.FieldAttributes.Static, module.CorLibTypeFactory.Int32);
         var fail = new FieldDefinition("Fail", AsmResolver.PE.DotNet.Metadata.Tables.FieldAttributes.Public
             | AsmResolver.PE.DotNet.Metadata.Tables.FieldAttributes.Static, module.CorLibTypeFactory.Boolean);
+        var failCleanup = new FieldDefinition("FailCleanup", AsmResolver.PE.DotNet.Metadata.Tables.FieldAttributes.Public
+            | AsmResolver.PE.DotNet.Metadata.Tables.FieldAttributes.Static, module.CorLibTypeFactory.Boolean);
         runtimeOwner.Fields.Add(trace);
         runtimeOwner.Fields.Add(fail);
+        runtimeOwner.Fields.Add(failCleanup);
         foreach (var (method, digit) in new[] { (workDefinition, 1), (innerDefinition, 2), (outerDefinition, 3) })
         {
             method.CilMethodBody = new();
@@ -238,6 +253,13 @@ public class ExceptionRegionRecoveryTests
                 il.Add(CilOpCodes.Newobj, module.DefaultImporter.ImportMethod(typeof(Exception).GetConstructor(Type.EmptyTypes)!));
                 il.Add(CilOpCodes.Throw); il.Add(done);
             }
+            else if (method == innerDefinition)
+            {
+                var done = new CilInstruction(CilOpCodes.Ret);
+                il.Add(CilOpCodes.Ldsfld, failCleanup); il.Add(CilOpCodes.Brfalse, new CilInstructionLabel(done));
+                il.Add(CilOpCodes.Newobj, module.DefaultImporter.ImportMethod(typeof(Exception).GetConstructor(Type.EmptyTypes)!));
+                il.Add(CilOpCodes.Throw); il.Add(done);
+            }
             else il.Add(CilOpCodes.Ret);
         }
         var runtimeType = Load(module).GetType("Tests.Nested")!;
@@ -248,6 +270,12 @@ public class ExceptionRegionRecoveryTests
         runtimeType.GetField("Fail")!.SetValue(null, true);
         Assert.That(Assert.Throws<R.TargetInvocationException>(() => run.Invoke(null, null))!.InnerException, Is.TypeOf<Exception>());
         Assert.That(runtimeType.GetField("Trace")!.GetValue(null), Is.EqualTo(1123), "exceptional exit preserves the same cleanup order");
+        runtimeType.GetField("Trace")!.SetValue(null, 0);
+        runtimeType.GetField("Fail")!.SetValue(null, false);
+        runtimeType.GetField("FailCleanup")!.SetValue(null, true);
+        Assert.That(Assert.Throws<R.TargetInvocationException>(() => run.Invoke(null, null))!.InnerException, Is.TypeOf<Exception>());
+        Assert.That(runtimeType.GetField("Trace")!.GetValue(null), Is.EqualTo(nested ? 1123 : 112),
+            "a failed inner finally still runs its parent; a failed first call in one finally skips the second call");
     }
 
     [TestCase(true)]

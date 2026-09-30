@@ -103,25 +103,74 @@ internal static class ExceptionRegionRecovery
         bool NativeCall(Unit u) => u.Source is { } i && (i.IsCall || i.OpCode is OpCode.IndirectCall or OpCode.Throw)
             && (context.UnderlyingPointer == 0 || nativeCalls.Contains(i.NativeAddress));
         var regions = new List<Region>();
-        var candidates = proofs.SelectMany(p => p.CleanupCalls.Select(c => (Calls: c, Proof: p)))
-            .GroupBy(p => string.Join(",", p.Calls.Order())).ToList();
+        // Effects with the same protected call sites belong to one finally body.
+        // A genuinely nested cleanup also protects the inner cleanup call, so its
+        // site set differs and it remains a separate enclosing region.
+        var effects = proofs.SelectMany(p => p.CleanupCalls.Select(c => (Calls: c, Proof: p)))
+            .GroupBy(p => string.Join(",", p.Calls.Order())).Select(g => new
+            {
+                Calls = g.First().Calls,
+                Proofs = g.Select(p => p.Proof).Distinct().ToList(),
+                Sites = g.SelectMany(p => p.Proof.Sites).Distinct().OrderBy(s => s.Start).ThenBy(s => s.End).ToList()
+            }).ToList();
+        var candidates = effects.GroupBy(e => string.Join(",", e.Sites.Select(s => $"{s.Start}:{s.End}:{s.LandingPad}")));
         foreach (var candidate in candidates)
         {
-            var sites = candidate.SelectMany(p => p.Proof.Sites).Distinct().ToList();
-            var cleanups = units.Where(u => u.Source != null && candidate.First().Calls.Contains(u.Source.NativeAddress)).ToList();
-            if (cleanups.Count == 0
-                || cleanups.Any(u => u.Source!.OpCode != OpCode.CallVoid || !instructionMap.ContainsKey(u.Source)))
-                continue;
-            var handler = instructionMap[cleanups[0].Source!];
-            if (handler.Count == 0 || handler.Count(i => i.OpCode.FlowControl == CilFlowControl.Call) != 1
-                || handler.Any(i => i.OpCode.FlowControl is CilFlowControl.Branch or CilFlowControl.ConditionalBranch
-                    or CilFlowControl.Return or CilFlowControl.Throw)
-                || cleanups.Any(u => !Equivalent(handler, instructionMap[u.Source!])
-                    || u.Source!.Operands[0] is not MethodAnalysisContext callee
-                    || instructionMap[u.Source].Single(i => i.OpCode.FlowControl == CilFlowControl.Call).Operand
-                        is not IMethodDescriptor emittedCallee
-                    || emittedCallee.FullName != callee.ToMethodDescriptor().FullName))
-                continue;
+            var sites = candidate.First().Sites;
+            var candidateProofs = candidate.SelectMany(e => e.Proofs).Distinct().ToList();
+            var order = candidateProofs[0].CleanupCalls;
+            var sequence = candidate.OrderBy(e => order.FindIndex(c => c.SequenceEqual(e.Calls))).ToList();
+            if (sequence.Any(e => !order.Any(c => c.SequenceEqual(e.Calls)))
+                || candidateProofs.Any(p => !p.CleanupCalls.Where(c => sequence.Any(e => c.SequenceEqual(e.Calls)))
+                    .Select(c => string.Join(",", c)).SequenceEqual(sequence.Select(e => string.Join(",", e.Calls))))) continue;
+            var copies = new List<List<Unit>>();
+            foreach (var first in units.Where(u => u.Source != null && sequence[0].Calls.Contains(u.Source.NativeAddress)))
+            {
+                var copy = new List<Unit> { first };
+                var current = first;
+                var valid = true;
+                foreach (var effect in sequence.Skip(1))
+                {
+                    do
+                    {
+                        if (current.Next.Count != 1) { valid = false; break; }
+                        current = current.Next.Single();
+                        if (copy.Contains(current) || current.Previous.Any(p => p != copy[^1])) { valid = false; break; }
+                        copy.Add(current);
+                        if (current.Source != null && effect.Calls.Contains(current.Source.NativeAddress)) break;
+                        if (current.Source is not { OpCode: OpCode.Nop or OpCode.Jump }
+                            && current.Source is not { OpCode: OpCode.Move, Destination: LocalVariable })
+                        { valid = false; break; }
+                    } while (true);
+                    if (!valid) break;
+                }
+                if (valid) copies.Add(copy);
+            }
+            if (copies.Count == 0) continue;
+            List<CilInstruction>? Handler(List<Unit> copy)
+            {
+                var result = new List<CilInstruction>();
+                foreach (var unit in copy)
+                {
+                    if (unit.Source is not { } source || !instructionMap.TryGetValue(source, out var emitted)) return null;
+                    if (source.OpCode is OpCode.Jump or OpCode.Nop) continue;
+                    if (emitted.Any(i => i.OpCode.FlowControl is CilFlowControl.Branch or CilFlowControl.ConditionalBranch
+                        or CilFlowControl.Return or CilFlowControl.Throw)) return null;
+                    var calls = emitted.Where(i => i.OpCode.FlowControl == CilFlowControl.Call).ToList();
+                    if (source.OpCode == OpCode.CallVoid)
+                    {
+                        if (calls.Count != 1 || source.Operands[0] is not MethodAnalysisContext callee
+                            || calls[0].Operand is not IMethodDescriptor target
+                            || target.FullName != callee.ToMethodDescriptor().FullName) return null;
+                    }
+                    else if (calls.Count != 0) return null;
+                    result.AddRange(emitted);
+                }
+                return result;
+            }
+            var handler = Handler(copies[0]);
+            if (handler is not { Count: > 0 } || copies.Any(c => Handler(c) is not { } other || !Equivalent(handler, other))) continue;
+            var cleanups = copies.SelectMany(c => c).Distinct().ToList();
             var allSeeds = units.Where(u => u.Source != null && dominators.ContainsKey(u) && sites.Any(s =>
                 u.Source.NativeAddress >= s.Start && u.Source.NativeAddress < s.End)).ToList();
             if (allSeeds.Count == 0) continue;
@@ -159,14 +208,14 @@ internal static class ExceptionRegionRecovery
                     || protectedUnits.Any(u => NativeCall(u)
                         && !sites.Any(s => u.Source!.NativeAddress >= s.Start && u.Source.NativeAddress < s.End)))
                     continue;
-                var exits = cleanups.Where(c => protectedUnits.Any(u => u.Next.Contains(c))).ToList();
+                var exits = copies.Where(c => protectedUnits.Any(u => u.Next.Contains(c[0]))).SelectMany(c => c).Distinct().ToList();
                 if (exits.Count == 0) continue;
-                planned.Add(new Region(entry, protectedUnits, exits, handler, candidate.Select(p => p.Proof).Distinct().ToList()));
+                planned.Add(new Region(entry, protectedUnits, exits, handler, candidateProofs));
             }
             // A shared normal copy can be erased only when every way of reaching it
             // exits one of these finally clauses.
             if (planned.SelectMany(r => r.Cleanups).Distinct().Any(c => c.Previous.Any(previous =>
-                    !planned.Any(r => r.Units.Contains(previous))))) continue;
+                    !planned.Any(r => r.Units.Contains(previous) || r.Cleanups.Contains(previous))))) continue;
             regions.AddRange(planned);
         }
         foreach (var (proof, handler) in catches ?? [])
@@ -206,7 +255,7 @@ internal static class ExceptionRegionRecovery
             var sequence = proof.CleanupCalls.Select(c => regions.FirstOrDefault(r => r.Units.Contains(seed)
                 && r.Cleanups.Any(u => c.Contains(u.Source!.NativeAddress)))).ToList();
             if (sequence.All(r => r != null) && sequence.Zip(sequence.Skip(1)).Any(pair =>
-                    !pair.First!.Units.IsProperSubsetOf(pair.Second!.Units))) return;
+                    pair.First != pair.Second && !pair.First!.Units.IsProperSubsetOf(pair.Second!.Units))) return;
         }
         foreach (var region in regions)
             region.Parent = regions.Where(r => region.Units.IsProperSubsetOf(r.Units))
