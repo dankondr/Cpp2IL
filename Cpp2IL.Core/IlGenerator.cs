@@ -7505,12 +7505,60 @@ public static class IlGenerator
             {
                 var instructions = method.CilMethodBody!.Instructions;
                 instructions.Add(CilOpCodes.Pop);
-                PushDefaultOf(contract, method, instructions, context, SlotDefaultReason(emitted, contract));
+                if (!TryEmitAwaiterCall(operand, emitted, contract, method, context, locals))
+                    PushDefaultOf(contract, method, instructions, context, SlotDefaultReason(emitted, contract));
             }
             return true;
         }
-        PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context, SlotDefaultReason(emitted, contract));
+        if (!TryEmitAwaiterCall(operand, emitted, contract, method, context, locals))
+            PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context, SlotDefaultReason(emitted, contract));
         return true;
+    }
+
+    // A value-typed source can only reach an awaiter-typed slot through the
+    // conversion the source-level await wrote: the awaitable's awaiter-producing
+    // call - T.GetAwaiter(), or DisposeAsync() for an `await using` disposable
+    // whose returned awaiter performs the switch. IL2CPP inlines that trivial
+    // wrapper - the binary moves the awaitable's bits into the awaiter slot -
+    // so where the operand's type declares a usable producer returning exactly
+    // the slot type, emitting the real call reproduces the conversion the
+    // binary made instead of standing a default in for it.
+    private static bool TryEmitAwaiterCall(IOperand operand, TypeAnalysisContext? emitted,
+        TypeAnalysisContext? contract, MethodDefinition method, MethodAnalysisContext context,
+        Dictionary<LocalVariable, CilLocalVariable> locals)
+    {
+        if (contract is not { IsValueType: true } or ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+            || emitted is not { IsValueType: true } or ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+            || ThisConstructorCallPlan.SameTypeIdentity(emitted, contract))
+            return false;
+        // Awaiter types sit nested inside the awaitable that produces them
+        // (UniTask.Awaiter, ReturnToSynchronizationContext.Awaiter). Requiring
+        // that pairing keeps this to the proven conversion - a parameterless
+        // method on an unrelated type could do real work, which a bit move
+        // never implies.
+        if (contract.DeclaringType is not { } contractDeclaring
+            || !ThisConstructorCallPlan.SameTypeIdentity(contractDeclaring, emitted))
+            return false;
+        if (operand is not LocalVariable local || !locals.TryGetValue(local, out var cilLocal))
+            return false;
+
+        var definition = (emitted as GenericInstanceTypeAnalysisContext)?.GenericType ?? emitted;
+        foreach (var candidate in definition.Methods)
+        {
+            if (candidate is not { IsStatic: false, Name: "GetAwaiter" or "DisposeAsync" } || candidate.Parameters.Count != 0)
+                continue;
+            var getAwaiter = emitted is GenericInstanceTypeAnalysisContext instance
+                ? new ConcreteGenericMethodAnalysisContext(candidate, instance.GenericArguments, [])
+                : candidate;
+            if (!ThisConstructorCallPlan.SameTypeIdentity(getAwaiter.ReturnType, contract)
+                || !CalleeUsableFrom(getAwaiter, context))
+                continue;
+            var instructions = method.CilMethodBody!.Instructions;
+            instructions.Add(CilOpCodes.Ldloca, cilLocal);
+            instructions.Add(CilOpCodes.Call, getAwaiter.ToMethodDescriptor());
+            return true;
+        }
+        return false;
     }
 
     // Resolves the operand form a slot load emits and whether its emitted type

@@ -1,5 +1,6 @@
 using System.Linq;
 using AsmResolver.DotNet;
+using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
 using AsmResolver.PE.DotNet.Metadata.Tables;
 using Cpp2IL.Core.Graphs;
@@ -225,6 +226,126 @@ public class AwaiterProvenanceTests
                 Is.True, () => string.Join("\n", il));
             Assert.That(il.Any(instruction =>
                     instruction.Operand?.ToString()?.Contains("covers one register") == true),
+                Is.True, () => string.Join("\n", il));
+        });
+    }
+
+    // An awaitable local moved into an awaiter-typed slot is the source's own
+    // awaiter-producing call inlined to a bit copy: where the awaitable type
+    // declares a usable instance producer (GetAwaiter, or DisposeAsync for an
+    // `await using` disposable) returning exactly the nested slot type, the
+    // emitted IL is the real call - `ldloca awaitable; call Producer` - not a
+    // synthetic default (castle-recovery#191).
+    [TestCase("GetAwaiter")]
+    [TestCase("DisposeAsync")]
+    public void AwaitableLocalIntoAwaiterSlotEmitsAwaiterProducerCall(string producerName)
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var awaitable = new InjectedTypeAnalysisContext(app.AssembliesByName["UnityEngine.CoreModule"],
+            "Tests", "Awaitable", app.SystemTypes.SystemValueTypeType,
+            System.Reflection.TypeAttributes.Public | System.Reflection.TypeAttributes.Sealed
+                | System.Reflection.TypeAttributes.SequentialLayout);
+        var contract = new InjectedTypeAnalysisContext(app.AssembliesByName["UnityEngine.CoreModule"],
+            "Tests", "Awaitable+Awaiter", app.SystemTypes.SystemValueTypeType,
+            System.Reflection.TypeAttributes.Public | System.Reflection.TypeAttributes.Sealed
+                | System.Reflection.TypeAttributes.SequentialLayout)
+            { DeclaringType = awaitable };
+        var getAwaiter = awaitable.InjectMethodContext(producerName, contract,
+            System.Reflection.MethodAttributes.Public);
+        var source = new LocalVariable("awaitable", new Register(null, "awaitable")) { Type = awaitable };
+        var slot = new LocalVariable("slot", new Register(null, "slot")) { Type = contract };
+        var (caller, method) = ForeignCaller(app, new ModuleDefinition("AwaiterProvenance.dll"), [
+            new(0, OpCode.Move, slot, source),
+            new(1, OpCode.Return)], [source, slot]);
+        var module = method.DeclaringModule!;
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemVoidType,
+            app.SystemTypes.SystemObjectType, app.SystemTypes.SystemStringType,
+            app.SystemTypes.SystemValueTypeType);
+        var awaitableDefinition = new TypeDefinition("Tests", "Awaitable",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType"));
+        var awaiterDefinition = new TypeDefinition("Tests", "Awaiter",
+            TypeAttributes.NestedPublic | TypeAttributes.Sealed | TypeAttributes.SequentialLayout,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType"));
+        awaitableDefinition.NestedTypes.Add(awaiterDefinition);
+        var getAwaiterDefinition = new MethodDefinition(producerName, MethodAttributes.Public,
+            MethodSignature.CreateInstance(awaiterDefinition.ToTypeSignature()));
+        awaitableDefinition.Methods.Add(getAwaiterDefinition);
+        awaitable.PutExtraData("AsmResolverType", awaitableDefinition);
+        contract.PutExtraData("AsmResolverType", awaiterDefinition);
+        getAwaiter.PutExtraData("AsmResolverMethod", getAwaiterDefinition);
+        module.TopLevelTypes.Add(awaitableDefinition);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(instruction =>
+                    instruction.OpCode == CilOpCodes.Call
+                    && instruction.Operand?.ToString()?.Contains(producerName) == true),
+                Is.True, () => string.Join("\n", il));
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Ldloca
+                    || instruction.OpCode == CilOpCodes.Ldloca_S),
+                Is.True, () => string.Join("\n", il));
+            Assert.That(il.All(instruction =>
+                    instruction.Operand?.ToString()?.Contains("No legal conversion") != true
+                    && instruction.Operand?.ToString()?.Contains("NoteDecompilerIssue") != true),
+                Is.True, () => string.Join("\n", il));
+        });
+    }
+
+    // The same move stays diagnosed when no producer on the operand's type
+    // returns the slot's awaiter type: the binary proves nothing about how the
+    // awaiter value was formed, so the slot keeps its named default.
+    [Test]
+    public void AwaitableLocalIntoForeignAwaiterSlotKeepsDecompilerNote()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var awaitable = new InjectedTypeAnalysisContext(app.AssembliesByName["UnityEngine.CoreModule"],
+            "Tests", "Awaitable", app.SystemTypes.SystemValueTypeType,
+            System.Reflection.TypeAttributes.Public | System.Reflection.TypeAttributes.Sealed
+                | System.Reflection.TypeAttributes.SequentialLayout);
+        var contract = new InjectedTypeAnalysisContext(app.AssembliesByName["UnityEngine.CoreModule"],
+            "Tests", "Awaitable+Awaiter", app.SystemTypes.SystemValueTypeType,
+            System.Reflection.TypeAttributes.Public | System.Reflection.TypeAttributes.Sealed
+                | System.Reflection.TypeAttributes.SequentialLayout)
+            { DeclaringType = awaitable };
+        awaitable.InjectMethodContext("GetAwaiter", Awaiter(app, app.SystemTypes.SystemStringType),
+            System.Reflection.MethodAttributes.Public);
+        var source = new LocalVariable("awaitable", new Register(null, "awaitable")) { Type = awaitable };
+        var slot = new LocalVariable("slot", new Register(null, "slot")) { Type = contract };
+        var (caller, method) = ForeignCaller(app, new ModuleDefinition("AwaiterProvenance.dll"), [
+            new(0, OpCode.Move, slot, source),
+            new(1, OpCode.Return)], [source, slot]);
+        var module = method.DeclaringModule!;
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemVoidType,
+            app.SystemTypes.SystemObjectType, app.SystemTypes.SystemStringType,
+            app.SystemTypes.SystemValueTypeType);
+        var awaitableDefinition = new TypeDefinition("Tests", "Awaitable",
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType"));
+        var awaiterDefinition = new TypeDefinition("Tests", "Awaiter",
+            TypeAttributes.NestedPublic | TypeAttributes.Sealed | TypeAttributes.SequentialLayout,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType"));
+        awaitableDefinition.NestedTypes.Add(awaiterDefinition);
+        awaitable.PutExtraData("AsmResolverType", awaitableDefinition);
+        contract.PutExtraData("AsmResolverType", awaiterDefinition);
+        module.TopLevelTypes.Add(awaitableDefinition);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(instruction =>
+                    instruction.Operand?.ToString()?.Contains("No legal conversion") == true),
+                Is.True, () => string.Join("\n", il));
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Initobj),
                 Is.True, () => string.Join("\n", il));
         });
     }
