@@ -1825,12 +1825,15 @@ public static class LocalVariables
         if (instruction.Operands is not [LocalVariable destination, var left, var right])
             return false;
 
+        // Lane-wise min/max are like add/subtract: no `VectorN min scalar` form
+        // exists, so a mixed pair is scalar lane math, not a vector op.
         if (instruction.OpCode is OpCode.VectorMin or OpCode.VectorMax
-            && (UnityVectorOperandType(left) ?? UnityVectorOperandType(right)) is { } vectorType)
+            && UnityVectorOperandType(left) is { } leftMinVector
+            && leftMinVector.FullName == UnityVectorOperandType(right)?.FullName)
         {
-            if (destination.Type == vectorType)
+            if (destination.Type == leftMinVector)
                 return false;
-            destination.Type = vectorType;
+            destination.Type = leftMinVector;
             return true;
         }
 
@@ -1838,13 +1841,31 @@ public static class LocalVariables
         // (op_Addition/op_Subtraction/op_Multiply/op_Division): the result register
         // holds the vector even when a consumer views it as a scalar. Fill only -
         // a seeded scalar destination is an honest lane view the operand splitter
-        // reads as vector.x.
+        // reads as vector.x. Add/Subtract have no `VectorN + scalar` form, so a
+        // mixed pair is scalar lane math (`fadd s0,s1,s2`), not a vector op -
+        // both operands must prove the same VectorN before the result claims it.
+        // Divide has no `float / VectorN`; Multiply keeps its `VectorN op float`
+        // forms.
         if (instruction.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
-            && destination.Type == null
-            && (UnityVectorOperandType(left) ?? UnityVectorOperandType(right)) is { } binopVectorType)
+            && destination.Type == null)
         {
-            destination.Type = binopVectorType;
-            return true;
+            var leftVectorType = UnityVectorOperandType(left);
+            var rightVectorType = UnityVectorOperandType(right);
+            var binopVectorType = instruction.OpCode switch
+            {
+                OpCode.Add or OpCode.Subtract
+                    when leftVectorType != null
+                        && leftVectorType.FullName == rightVectorType?.FullName
+                    => leftVectorType,
+                OpCode.Divide => leftVectorType,
+                OpCode.Multiply => leftVectorType ?? rightVectorType,
+                _ => null,
+            };
+            if (binopVectorType != null)
+            {
+                destination.Type = binopVectorType;
+                return true;
+            }
         }
 
         if (destination.Type != null)
@@ -1987,6 +2008,8 @@ public static class LocalVariables
             DoubleLiteral => method.AppContext.SystemTypes.SystemDoubleType,
             LocalVariable { Type: { FullName: "System.Single" } single } => single,
             LocalVariable { Type: { FullName: "System.Double" } @double } => @double,
+            FieldReference { Field.FieldType.FullName: "System.Single" } field => field.Field.FieldType,
+            FieldReference { Field.FieldType.FullName: "System.Double" } field => field.Field.FieldType,
             SelectedFieldReference { FieldType.FullName: "System.Single" } selected => selected.FieldType,
             SelectedFieldReference { FieldType.FullName: "System.Double" } selected => selected.FieldType,
             _ => null,
@@ -2115,6 +2138,16 @@ public static class LocalVariables
         };
     }
 
+    // The type an operand proves for typing flows - a local's own type or the
+    // field type a field read carries.
+    private static TypeAnalysisContext? OperandType(IOperand operand) => operand switch
+    {
+        LocalVariable { Type: { } type } => type,
+        FieldReference field => field.Field.FieldType,
+        SelectedFieldReference selected => selected.FieldType,
+        _ => null,
+    };
+
     // A phi is a copy from each predecessor's value, so types flow both ways across it - mirroring
     // the bidirectional Move copies it decays into once SSA is destroyed.
     private static bool PropagatePhi(Instruction phi, MethodAnalysisContext method,
@@ -2151,7 +2184,7 @@ public static class LocalVariables
         {
             for (var i = 1; i < phi.Operands.Count; i++)
             {
-                if (phi.Operands[i] is LocalVariable { Type: { } inputType })
+                if (OperandType(phi.Operands[i]) is { } inputType)
                 {
                     if (inputType.FullName != "System.Boolean"
                         || TryClaimBoolean(destination, method, allDefinitions))

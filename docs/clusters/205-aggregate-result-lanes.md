@@ -26,13 +26,29 @@ entry value.
 `AggregateResultLanes` (run inside the `LocalVariables` fixpoint) projects
 each lane local onto the field its bytes hold — `FindInstanceFieldPathAtOffset`
 must find a field of exactly the lane's width at the lane's offset — so a lane
-store spells `result.y`, not an undefined register. For defs attached after
-SSA (unversioned), the pass resolves the reaching lane call per use through
-immediate dominators. Aggregate parameters project entry-version lane reads
-onto the parameter the same way, materializing the parameter's lane-0 local
-only when a lane read exists. A lane that no callee return type or declared
-parameter type proves, or whose bytes no matching field covers, keeps its
-diagnostic — nothing is guessed.
+store spells `result.y`, not an undefined register. The lane local's own type
+is likewise the field's, not the whole aggregate's: a register holding 4 bytes
+of `y` typed `Vector2` is a smear (a copy, a phi merge, or the call's produced
+type filling the fill-only inference), and a scalar consumer then fails with an
+unspellable `VectorN` operand. The typing fills or unsmears exactly the
+aggregate type — a field projection that matched proves the stronger type.
+For defs attached after SSA (unversioned), the pass resolves the reaching lane
+call per use through immediate dominators. Aggregate parameters project
+entry-version lane reads onto the parameter the same way, materializing the
+parameter's lane-0 local only when a lane read exists. A lane that no callee
+return type or declared parameter type proves, or whose bytes no matching
+field covers, keeps its diagnostic — nothing is guessed.
+
+Downstream, the same smear had to stop at the result-typing site:
+`PropagateArithmetic` now requires the same evidence `SplitVectorBinopDefSites`
+demands — `Add`/`Subtract`/`VectorMin`/`VectorMax` claim a `VectorN` result
+only when both operands prove that `VectorN` (no `VectorN + scalar` operator
+exists; a mixed pair is scalar lane math like `fadd s0,s1,s2`), `Divide`
+requires the vector on the left, and `Multiply` keeps its `VectorN op float`
+forms. `PropagatePhi` reads field-typed inputs (`item.y` types a lane-merged
+phi `System.Single`), and `FloatOperandType` reads `FieldReference`s, so a
+scalar `Add` over projected lanes infers `Single` and
+`SplitScalarOperandViews` can narrow its aggregate-typed operand to `result.x`.
 
 `Arm64CallingConventionResolver.AddParameter` also now consumes
 `IntegerRegisterCount` slots for a composite parameter (2 for 9–16 bytes, 0
@@ -64,3 +80,7 @@ ISIL through the real pipeline (`SsaForm`, `CreateAll`,
   read spells `p.y`.
 - `Vector2ReturnRebuildsStructFromLanes` — `Return(V0,V1)` of a `Vector2`
   method returns a local whose `x`/`y` stores the lanes, no diagnostic.
+- `Vector2ResultLanesLiftAsSinglesInFloatArithmetic` — `FADD S2,S0,S1` after
+  a `Vector2` call lifts with `Single` operands (`result.x`/`result.y`), a
+  `Single` destination and no diagnostic note; no lane local carries the
+  aggregate type.

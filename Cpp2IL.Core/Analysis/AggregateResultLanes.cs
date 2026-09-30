@@ -70,6 +70,15 @@ internal static class AggregateResultLanes
                 var projection = LaneField(resultType, result, lane, pointerSize);
                 if (projection == null)
                     continue;
+                // The lane register holds this field's bytes alone, so the lane
+                // local's honest type is the field's. A whole-aggregate type on
+                // a lane register is a smear (a copy, a phi merge or the call's
+                // own produced type filling the fill-only inference): a scalar
+                // consumer cannot spell it and fails with an unspellable
+                // VectorN operand. Fill the untyped case and unsmear exactly
+                // the aggregate - anything else proven earlier stays.
+                if (laneLocal.Type == null || laneLocal.Type.FullName == resultType.FullName)
+                    laneLocal.Type = projection.Field.FieldType;
                 if (definition.Version > 0)
                     provenLanes[laneLocal] = projection;
                 else
@@ -126,8 +135,12 @@ internal static class AggregateResultLanes
             foreach (var (lane, laneLocal) in laneLocals)
             {
                 var projection = LaneField(method.Parameters[i].ParameterType, paramLocal, lane, pointerSize);
-                if (projection != null)
-                    entryLanes.TryAdd(laneLocal!, projection);
+                if (projection == null)
+                    continue;
+                if (laneLocal!.Type == null
+                    || laneLocal.Type.FullName == method.Parameters[i].ParameterType.FullName)
+                    laneLocal.Type = projection.Field.FieldType;
+                entryLanes.TryAdd(laneLocal!, projection);
             }
         }
 

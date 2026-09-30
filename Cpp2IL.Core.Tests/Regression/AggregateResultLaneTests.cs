@@ -344,6 +344,52 @@ public class AggregateResultLaneTests
     }
 
     [Test]
+    public void Vector2ResultLanesLiftAsSinglesInFloatArithmetic()
+    {
+        var vector2 = InjectStruct("Vector2", FloatFields("x", "y"));
+        var callerType = CallerTypeWithField("pos", vector2, 0x80);
+        var getItem = callerType.InjectMethodContext("GetItem", vector2,
+            R.MethodAttributes.Public | R.MethodAttributes.Static);
+
+        // fadd s2, s0, s1 after `bl GetItem`: both result lanes feed scalar
+        // float math, so each reads as the field at its offset - lane 0 as
+        // result.x, lane 1 as result.y - and no lane register carries the
+        // whole aggregate type.
+        var call = new Instruction(0x14, OpCode.Call, getItem, Reg("V0"));
+        call.ImplicitDefinitions.Add(Reg("V1"));
+        var add = new Instruction(0x18, OpCode.Add, Reg("V2"), Reg("V0"), Reg("V1"))
+        { NativeFloatWidthBits = 32 };
+        var caller = Drive(callerType, [
+            new Instruction(0x10, OpCode.Move, Reg("X19"), Reg("X0")),
+            call, add, new Instruction(0x1c, OpCode.Return)]);
+
+        var result = (LocalVariable)call.Destination!;
+        Assert.Multiple(() =>
+        {
+            Assert.That(add.Operands[1], Is.TypeOf<FieldReference>());
+            Assert.That(((FieldReference)add.Operands[1]).Field.Name, Is.EqualTo("x"));
+            Assert.That(((FieldReference)add.Operands[1]).Local, Is.SameAs(result));
+            Assert.That(add.Operands[2], Is.TypeOf<FieldReference>());
+            Assert.That(((FieldReference)add.Operands[2]).Field.Name, Is.EqualTo("y"));
+            Assert.That(((FieldReference)add.Operands[2]).Local, Is.SameAs(result));
+            Assert.That(((LocalVariable)add.Operands[0]).Type?.FullName,
+                Is.EqualTo("System.Single"));
+            var lane = caller.Locals.First(local => local.Register.Name == "V1"
+                && local.Register.Version == 1);
+            Assert.That(lane.Type?.FullName, Is.EqualTo("System.Single"));
+            Assert.That(caller.Locals.Count(local => local != result
+                && local.Type == vector2), Is.EqualTo(0),
+                "no local besides the result local carries the aggregate type");
+        });
+
+        var module = new ModuleDefinition("Lanes.dll");
+        SeedCallee(getItem, module, vector2);
+        var method = Emit(caller, module, callerType, vector2);
+        Assert.That(method.CilMethodBody!.Instructions.All(i => i.OpCode != CilOpCodes.Ldstr),
+            "the lane-typed add lifts with no diagnostic note");
+    }
+
+    [Test]
     public void Vector2ReturnRebuildsStructFromLanes()
     {
         var app = Cpp2IlApi.CurrentAppContext!;
