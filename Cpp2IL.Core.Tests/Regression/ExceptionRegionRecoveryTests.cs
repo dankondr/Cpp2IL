@@ -410,11 +410,12 @@ public class ExceptionRegionRecoveryTests
             "a failed inner finally still runs its parent; a failed first call in one finally skips the second call");
     }
 
-    [TestCase(true, false)]
-    [TestCase(false, false)]
-    [TestCase(true, true)]
-    [TestCase(false, true)]
-    public void RecognizedTypeTestProducesCatchAndLeavesToNormalMerge(bool recognizedTypeTest, bool classTest)
+    [TestCase(true, false, false)]
+    [TestCase(false, false, false)]
+    [TestCase(true, true, false)]
+    [TestCase(false, true, false)]
+    [TestCase(true, true, true)]
+    public void RecognizedTypeTestProducesCatchAndLeavesToNormalMerge(bool recognizedTypeTest, bool classTest, bool multipleCalls)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "CatchOwner",
@@ -433,7 +434,8 @@ public class ExceptionRegionRecoveryTests
         var exception = new Register(null, "X19");
         var condition = new Register(null, "condition");
         var protectedCall = At(0x1000, OpCode.CallVoid, work);
-        var merge = At(0x1004, OpCode.Return);
+        var secondCall = At(0x1004, OpCode.CallVoid, work);
+        var merge = At(0x1008, OpCode.Return);
         var mismatch = At(0x2020, OpCode.CallVoid, new StringLiteral("il2cpp_raise_exception"), exception);
         caller.ConvertedIsil = [protectedCall, merge,
             At(0x2000, OpCode.Call, new StringLiteral("__cxa_begin_catch"), x0, x0),
@@ -445,8 +447,9 @@ public class ExceptionRegionRecoveryTests
             At(0x2014, OpCode.CallVoid, report, exception),
             At(0x2018, OpCode.CallVoid, new StringLiteral("__cxa_end_catch")),
             At(0x201C, OpCode.Jump, merge), mismatch];
+        if (multipleCalls) caller.ConvertedIsil.Insert(1, secondCall);
         caller.UnwindInfo = new EhFunctionInfo { Start = 0x1000, Size = 0x1030 };
-        caller.UnwindInfo.CallSites.Add(new EhCallSiteInfo(0x1000, 4, 0x2000, 1)
+        caller.UnwindInfo.CallSites.Add(new EhCallSiteInfo(0x1000, multipleCalls ? 8UL : 4UL, 0x2000, 1)
             { Actions = [new EhActionInfo(1, 0xABC)] });
         EhRegionPartition.Partition(caller);
         // Synthetic RTTI fact. Actual action-chain and RTTI decoding is tested separately;
@@ -479,6 +482,12 @@ public class ExceptionRegionRecoveryTests
         {
             [protectedCall] = [new(CilOpCodes.Call, workDefinition)], [merge] = [new(CilOpCodes.Ret)]
         };
+        if (multipleCalls)
+        {
+            map.Remove(merge);
+            map[secondCall] = [new(CilOpCodes.Call, workDefinition)];
+            map[merge] = [new(CilOpCodes.Ret)];
+        }
         foreach (var instruction in map.Values.SelectMany(x => x)) definition.CilMethodBody.Instructions.Add(instruction);
         ExceptionRegionRecovery.Apply(caller, definition, map, new()
         {

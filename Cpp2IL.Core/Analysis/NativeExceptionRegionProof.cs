@@ -134,8 +134,15 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
             if (action == null || site.Actions!.Any(a => a.Filter < 0)) continue;
             var seeds = Seeds(site, states).ToList();
             var index = code.FindIndex(i => i.NativeAddress == site.LandingPad);
-            if (seeds.Count != 1 || index < 0) continue;
+            if (seeds.Count == 0 || index < 0 || seeds.Any(s => s.Sp != seeds[0].Sp)) continue;
             var state = seeds[0].Copy();
+            foreach (var seed in seeds.Skip(1))
+            {
+                Intersect(state.Registers, seed.Registers);
+                Intersect(state.Memory, seed.Memory);
+                Intersect(state.MemoryWidths, seed.MemoryWidths);
+                Intersect(state.StorageOrigins, seed.StorageOrigins);
+            }
             Clobber(state);
             state.Registers["X0"] = Exception;
             state.Registers["X1"] = Number(action.Filter);
