@@ -297,4 +297,132 @@ public class ScalarLanePackTests
                 () => string.Join("\n", il.Select(i => i.ToString())));
         });
     }
+
+    private static InjectedTypeAnalysisContext Vector2(ApplicationAnalysisContext app)
+    {
+        var vector = new InjectedTypeAnalysisContext(app.AssembliesByName["UnityEngine.CoreModule"],
+            "UnityEngine", "Vector2", app.SystemTypes.SystemValueTypeType,
+            R.TypeAttributes.Public | R.TypeAttributes.Sealed | R.TypeAttributes.SequentialLayout);
+        var offset = 0;
+        foreach (var name in new[] { "x", "y" })
+        {
+            vector.Fields.Add(new InjectedFieldAnalysisContext(name, app.SystemTypes.SystemSingleType,
+                R.FieldAttributes.Public, vector, offset));
+            offset += 4;
+        }
+
+        return vector;
+    }
+
+    [Test]
+    public void WholeRegisterLaneSourceSpellsLaneNotDefault()
+    {
+        // `fmul v0.2s, v9.2s, s2; fmul s1, s2, s2; ret v0` - the return packs
+        // (v0, v1) into a Vector2. Lane x's store source is the whole-register
+        // multiply result itself: if the pack store's Single field type smears
+        // back onto that local before the multiply's own typing runs, the
+        // multiply lowers scalar and the vector slot emits a synthetic default
+        // control never produced. The pack must spell the proven lane
+        // (`pack.x = v.x`) while the genuinely scalar lane stores whole.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = Vector2(app);
+        var module = new ModuleDefinition("LanePack.dll");
+        SeedCorLibTypes(app, module, vector, app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemSingleType, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemVoidType);
+
+        var vectorDef = vector.GetExtraData<TypeDefinition>("AsmResolverType")!;
+        var vectorSig = vectorDef.ToTypeSignature();
+        var singleSig = module.CorLibTypeFactory.Single;
+        foreach (var field in vector.Fields.OfType<InjectedFieldAnalysisContext>())
+        {
+            var fieldDefinition = new FieldDefinition(field.Name, FieldAttributes.Public,
+                new FieldSignature(singleSig));
+            vectorDef.Fields.Add(fieldDefinition);
+            field.PutExtraData("AsmResolverField", fieldDefinition);
+        }
+        var multiplyDef = new MethodDefinition("op_Multiply",
+            MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.HideBySig
+                | MethodAttributes.SpecialName,
+            MethodSignature.CreateStatic(vectorSig, [vectorSig, singleSig]));
+        vectorDef.Methods.Add(multiplyDef);
+        vector.InjectMethodContext("op_Multiply", vector,
+                R.MethodAttributes.Public | R.MethodAttributes.Static
+                    | R.MethodAttributes.SpecialName, vector, app.SystemTypes.SystemSingleType)
+            .PutExtraData("AsmResolverMethod", multiplyDef);
+
+        var holder = new InjectedTypeAnalysisContext(app.AssembliesByName["UnityEngine.CoreModule"],
+            "Tests", "Library", app.SystemTypes.SystemObjectType,
+            R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var holderDef = new TypeDefinition("Tests", "Library",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(holderDef);
+        holder.PutExtraData("AsmResolverType", holderDef);
+        var getVecDef = new MethodDefinition("GetVec",
+            MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.HideBySig,
+            MethodSignature.CreateStatic(vectorSig));
+        holderDef.Methods.Add(getVecDef);
+        var getVec = holder.InjectMethodContext("GetVec", vector,
+            R.MethodAttributes.Public | R.MethodAttributes.Static);
+        getVec.PutExtraData("AsmResolverMethod", getVecDef);
+
+        var callerType = new InjectedTypeAnalysisContext(app.AssembliesByName["UnityEngine.CoreModule"],
+            "Tests", "LaneRet", app.SystemTypes.SystemObjectType,
+            R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var caller = callerType.InjectMethodContext("Run", vector,
+            R.MethodAttributes.Public | R.MethodAttributes.Static);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Call, getVec, new Register(null, "V9")),
+            new Instruction(1, OpCode.Move, new Register(null, "V2"), new FloatLiteral(2f)),
+            new Instruction(2, OpCode.Multiply, new Register(null, "V0"),
+                new Register(null, "V9"), new Register(null, "V2")),
+            new Instruction(3, OpCode.Multiply, new Register(null, "V1"),
+                new Register(null, "V2"), new Register(null, "V2"))
+            {
+                NativeFloatWidthBits = 32
+            },
+            new Instruction(4, OpCode.Return, new Register(null, "V0")),
+        ]);
+        caller.Locals = [];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        caller.DominatorInfo = new DominatorInfo(caller.ControlFlowGraph);
+
+        var type = new TypeDefinition("Tests", "LaneRet", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);
+        var method = new MethodDefinition("Run",
+            MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.HideBySig,
+            MethodSignature.CreateStatic(vectorSig));
+        type.Methods.Add(method);
+
+        LocalVariables.CreateAll(caller);
+        LocalVariables.ResolveTypesAndFields(caller);
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            // The multiply keeps its vector lowering: `v9 * v2` through
+            // op_Multiply, not a scalar coerce.
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call
+                    && i.Operand is IMethodDescriptor named
+                    && named.Name?.ToString() == "op_Multiply"), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            // The pack materializes with its two proven lane stores.
+            var stores = il.Where(i => i.OpCode == CilOpCodes.Stfld).ToList();
+            Assert.That(stores.Select(i => (i.Operand as IFieldDescriptor)?.Name?.ToString())
+                    .Order(), Is.EqualTo(new[] { "x", "y" }),
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ret), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            // No slot reaches a default or a named no-conversion note.
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr && i.Operand is string text
+                    && (text.Contains("synthetic default value")
+                        || text.Contains("No legal conversion"))), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+        });
+    }
 }
