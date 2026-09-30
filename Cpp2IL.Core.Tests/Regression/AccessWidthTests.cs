@@ -352,4 +352,122 @@ public class AccessWidthTests
             Assert.That(Diagnoses(method, "m_value"), Is.False, () => Dump(method));
         });
     }
+
+    // Holder { float a @0x10; float b @0x14; float c @0x18 }, read eight bytes at a time.
+    private static (ApplicationAnalysisContext App, ModuleDefinition Module, LocalVariable Receiver) FloatHolder()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var holder = InjectClass(app, "Holder");
+        InjectField("a", app.SystemTypes.SystemSingleType, holder, 0x10);
+        InjectField("b", app.SystemTypes.SystemSingleType, holder, 0x14);
+        InjectField("c", app.SystemTypes.SystemSingleType, holder, 0x18);
+        var module = new ModuleDefinition("Width.dll");
+        Seed(module, app, holder);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemSingleType, app.SystemTypes.SystemInt64Type,
+            app.SystemTypes.SystemObjectType);
+        return (app, module, Local("holder", holder));
+    }
+
+    private static string? LoadedField(MethodAnalysisContext method, LocalVariable value)
+        => method.ControlFlowGraph!.Instructions
+            .Where(i => i is { OpCode: OpCode.Move } && ReferenceEquals(i.Operands[0], value))
+            .Select(i => (i.Operands[1] as FieldReference)?.Field.Name)
+            .SingleOrDefault();
+
+    [Test]
+    public void HighLaneOfAWideLoadIsTheNextField()
+    {
+        // `LDR X8, [holder, #0x10]; LSR X8, X8, #32; STR W8, [holder, #0x18]` copies b
+        // into c: the shifted high half of a load of a and b is b.
+        var (app, module, holder) = FloatHolder();
+        var wide = Local("wide", app.SystemTypes.SystemInt64Type);
+        var high = Local("high", app.SystemTypes.SystemInt64Type);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, wide, new MemoryOperand(holder, null, 0x10, 0, 8)),
+            new(1, OpCode.ShiftRight, high, wide, new Immediate(32)),
+            new(2, OpCode.Move, new MemoryOperand(holder, null, 0x18, 0, 4), high),
+            new(3, OpCode.Return)], [holder, wide, high]);
+
+        MetadataResolver.ResolveFieldOffsets(caller);
+        IlGenerator.GenerateIl(caller, method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(LoadedField(caller, high), Is.EqualTo("b"));
+            Assert.That(caller.ControlFlowGraph!.Instructions.Any(i => i.OpCode == OpCode.ShiftRight), Is.False);
+            Assert.That(Stores(method, "c"), Is.True, () => Dump(method));
+            Assert.That(Diagnoses(method, "Unrecoverable"), Is.False, () => Dump(method));
+        });
+    }
+
+    [Test]
+    public void NarrowStoreOfAWideLoadStoresItsFirstField()
+    {
+        // Mover { Point2 position @0x10; float speed @0x18 }: `LDR D0, [mover, #0x10];
+        // STR S0, [mover, #0x18]` is speed = position.x, not the whole Point2.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var point = InjectStruct(app, "Point2");
+        InjectField("x", app.SystemTypes.SystemSingleType, point, 0);
+        InjectField("y", app.SystemTypes.SystemSingleType, point, 4);
+        var mover = InjectClass(app, "Mover");
+        InjectField("position", point, mover, 0x10);
+        InjectField("speed", app.SystemTypes.SystemSingleType, mover, 0x18);
+        var module = new ModuleDefinition("Width.dll");
+        Seed(module, app, point, mover);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemSingleType, app.SystemTypes.SystemObjectType);
+
+        var receiver = Local("mover", mover);
+        var wide = Local("wide");
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, wide, new MemoryOperand(receiver, null, 0x10, 0, 8)),
+            new(1, OpCode.Move, new MemoryOperand(receiver, null, 0x18, 0, 4), wide),
+            new(2, OpCode.Return)], [receiver, wide]);
+
+        MetadataResolver.ResolveFieldOffsets(caller);
+        IlGenerator.GenerateIl(caller, method);
+
+        var stored = caller.ControlFlowGraph!.Instructions
+            .Single(i => i.OpCode == OpCode.Move && i.Operands[0] is FieldReference { Field.Name: "speed" }).Operands[1];
+        Assert.Multiple(() =>
+        {
+            Assert.That(stored is LocalVariable local ? LoadedField(caller, local) : null, Is.EqualTo("x"));
+            Assert.That(Stores(method, "speed"), Is.True, () => Dump(method));
+            Assert.That(Diagnoses(method, "synthetic default"), Is.False, () => Dump(method));
+        });
+    }
+
+    [Test]
+    public void ShiftOfAWholeLongFieldStaysArithmetic()
+    {
+        // Counter { long total @0x10 }: `total >> 32` is arithmetic on one field; no
+        // field starts at 0x14, so there is no lane to read.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var counter = InjectClass(app, "Counter");
+        InjectField("total", app.SystemTypes.SystemInt64Type, counter, 0x10);
+        var module = new ModuleDefinition("Width.dll");
+        Seed(module, app, counter);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt64Type, app.SystemTypes.SystemObjectType);
+
+        var receiver = Local("counter", counter);
+        var wide = Local("wide", app.SystemTypes.SystemInt64Type);
+        var high = Local("high", app.SystemTypes.SystemInt64Type);
+        var (caller, _) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, wide, new MemoryOperand(receiver, null, 0x10, 0, 8)),
+            new(1, OpCode.ShiftRight, high, wide, new Immediate(32)),
+            new(2, OpCode.Return, high)], [receiver, wide, high]);
+
+        MetadataResolver.ResolveFieldOffsets(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(LoadedField(caller, wide), Is.EqualTo("total"));
+            Assert.That(caller.ControlFlowGraph!.Instructions.Any(i => i.OpCode == OpCode.ShiftRight), Is.True);
+        });
+    }
 }
