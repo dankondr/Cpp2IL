@@ -650,8 +650,10 @@ public class ExceptionRegionRecoveryTests
     [TestCase(true, false, false, false)]
     [TestCase(false, true, false, false)]
     [TestCase(false, false, true, false)]
+    [TestCase(false, false, false, true, 0)]
+    [TestCase(false, false, false, true, 8)]
     public void ReturningCleanupClosureMustContinueToOriginalUnwind(bool differentArgument, bool extraStore,
-        bool returnsInsteadOfUnwinding, bool expected)
+        bool returnsInsteadOfUnwinding, bool expected, int scale = -1)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "ClosureOwner",
@@ -669,17 +671,19 @@ public class ExceptionRegionRecoveryTests
         caller.ConvertedIsil = [At(0x1000, OpCode.Move, receiver, new Immediate(42)),
             At(0x1004, OpCode.CallVoid, work), At(0x1008, OpCode.CallVoid, cleanup, new Immediate(42)),
             At(0x100C, OpCode.Return), At(0x2000, OpCode.Move, exception, x0),
-            At(0x2004, OpCode.Move, x0, new AddressOf(receiver)),
+            At(0x2004, OpCode.Move, x0, new AddressOf(scale >= 0 ? new StackOffset(0) : receiver)),
             At(0x2008, OpCode.CallVoid, new Immediate(0x3000), x0),
             returnsInsteadOfUnwinding ? At(0x200C, OpCode.Return)
                 : At(0x200C, OpCode.CallVoid, new StringLiteral("_Unwind_Resume"), exception)];
         var closure = new List<Instruction> {
             At(0x3000, OpCode.ShiftStack, new Immediate(-16)),
             At(0x3004, OpCode.Move, new StackOffset(0), exception),
-            At(0x3008, OpCode.Move, x0, differentArgument ? new Immediate(43) : new MemoryOperand(x0)),
+            At(0x3008, OpCode.Move, x0, differentArgument ? new Immediate(43)
+                : new MemoryOperand(x0, scale >= 0 ? new Register(null, "X21") : null, scale: scale >= 0 ? scale : 0)),
             At(0x300C, OpCode.CallVoid, cleanup, x0),
             At(0x3010, OpCode.Move, exception, new StackOffset(0)),
             At(0x3014, OpCode.ShiftStack, new Immediate(16)), At(0x3018, OpCode.Return) };
+        if (scale >= 0) closure.Insert(2, At(0x3006, OpCode.Move, new Register(null, "X21"), new Immediate(scale > 1 ? 1 : 8)));
         if (extraStore) closure.Insert(3, At(0x300A, OpCode.Move, new MemoryOperand(addend: 0x9000), new Immediate(1)));
         caller.UnwindInfo = new EhFunctionInfo { Start = 0x1000, Size = 0x1010 };
         caller.UnwindInfo.CallSites.Add(new EhCallSiteInfo(0x1004, 4, 0x2000, 0) { Actions = [new EhActionInfo(0, null)] });
@@ -691,7 +695,8 @@ public class ExceptionRegionRecoveryTests
 
     [TestCase(false)]
     [TestCase(true)]
-    public void SharedCatchGroupsCompareTheFullCalleeSignature(bool differentOverload)
+    [TestCase(false, true)]
+    public void SharedCatchGroupsCompareTheFullCalleeSignature(bool differentOverload, bool differentAssembly = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Overloads",
@@ -701,8 +706,10 @@ public class ExceptionRegionRecoveryTests
         var work = owner.InjectMethodContext("Work", app.SystemTypes.SystemVoidType, attributes, []);
         var report = owner.InjectMethodContext("Report", app.SystemTypes.SystemVoidType, attributes,
             [app.SystemTypes.SystemExceptionType, app.SystemTypes.SystemInt32Type]);
-        var other = differentOverload ? owner.InjectMethodContext("Report", app.SystemTypes.SystemVoidType, attributes,
-            [app.SystemTypes.SystemExceptionType, app.SystemTypes.SystemInt64Type]) : report;
+        var otherOwner = differentAssembly ? new InjectedTypeAnalysisContext(app.AssembliesByName["UnityEngine.CoreModule"],
+            "Tests", "Overloads", app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class) : owner;
+        var other = differentOverload || differentAssembly ? otherOwner.InjectMethodContext("Report", app.SystemTypes.SystemVoidType, attributes,
+            [app.SystemTypes.SystemExceptionType, differentOverload ? app.SystemTypes.SystemInt64Type : app.SystemTypes.SystemInt32Type]) : report;
         Instruction At(ulong address, OpCode op, params IOperand[] operands)
             => new(0, op, operands.ToList()) { NativeAddress = address };
         var ret = At(0x1008, OpCode.Return);
@@ -728,7 +735,7 @@ public class ExceptionRegionRecoveryTests
         }
         EhRegionPartition.Partition(caller);
         Assert.That(new NativeExceptionRegionProof(caller).FindCatches(a => a == 0xABC).Count,
-            Is.EqualTo(differentOverload ? 2 : 1));
+            Is.EqualTo(differentOverload || differentAssembly ? 2 : 1));
     }
 
     private static R.Assembly Load(ModuleDefinition module)

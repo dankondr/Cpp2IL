@@ -272,7 +272,7 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
 
     private static string? HandlerOperandKey(IOperand operand) => operand switch
     {
-        MethodAnalysisContext method => method.FullNameWithSignature,
+        MethodAnalysisContext method => method.DeclaringType?.DeclaringAssembly.Name + ":" + method.FullNameWithSignature,
         FieldReference field => $"{field.Offset}:{field}",
         _ => operand.ToString()
     };
@@ -790,7 +790,7 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
         if (memory.Index != null)
         {
             if (!TryNumber(Value(memory.Index, state), out var index)) return null;
-            offset = unchecked(offset + index * memory.Scale);
+            offset = unchecked(offset + index * (memory.Scale <= 1 ? 1 : memory.Scale));
         }
         return Plus(memory.Base == null ? Number(0) : Value(memory.Base, state), offset);
     }
