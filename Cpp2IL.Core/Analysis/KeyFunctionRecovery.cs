@@ -269,7 +269,7 @@ public static class KeyFunctionRecovery
             if (significant is [{ OpCode: OpCode.Jump }] && block.Successors.Count == 1)
                 return ThrowTailIsInvalidCast(block.Successors[0], depth + 1);
             return significant.LastOrDefault() is { OpCode: OpCode.Throw } thrown
-                && thrown.SourcesAndConstants.Any(ThrowsInvalidCast);
+                && thrown.Operands.Any(ThrowsInvalidCast);
         }
 
         bool ThrowsInvalidCast(IOperand operand)
