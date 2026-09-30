@@ -2344,6 +2344,10 @@ public static class LocalVariables
                     or OpCode.Divide or OpCode.VectorMin or OpCode.VectorMax)
                 || instruction.Operands is not [LocalVariable destination, var left, var right]
                 || !IsRegisterViewName(destination.Register.Name)
+                // A `Vn.Sk` destination is a single-lane write (`fmul s1`), not a
+                // whole-register vector op - a `_vec` local here would misread the
+                // other lanes' values wherever the destination feeds lane operands.
+                || IsLaneViewName(destination.Register.Name)
                 || destination.Register.Version < 0
                 || !IsScalarLaneType(destination.Type))
                 continue;
