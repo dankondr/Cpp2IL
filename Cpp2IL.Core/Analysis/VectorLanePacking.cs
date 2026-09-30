@@ -603,7 +603,7 @@ internal static class VectorLanePacking
     /// one floating-point argument register per lane. Returns the lane fields
     /// ordered by offset, or null.
     /// </summary>
-    private static FieldAnalysisContext[]? VectorLanes(TypeAnalysisContext type)
+    internal static FieldAnalysisContext[]? VectorLanes(TypeAnalysisContext type)
     {
         if (!type.IsValueType)
             return null;

@@ -2344,10 +2344,6 @@ public static class LocalVariables
                     or OpCode.Divide or OpCode.VectorMin or OpCode.VectorMax)
                 || instruction.Operands is not [LocalVariable destination, var left, var right]
                 || !IsRegisterViewName(destination.Register.Name)
-                // A `Vn.Sk` destination is a single-lane write (`fmul s1`), not a
-                // whole-register vector op - a `_vec` local here would misread the
-                // other lanes' values wherever the destination feeds lane operands.
-                || IsLaneViewName(destination.Register.Name)
                 || destination.Register.Version < 0
                 || !IsScalarLaneType(destination.Type))
                 continue;
@@ -2403,11 +2399,81 @@ public static class LocalVariables
 
             // Every other operand position holding the old local reads this def
             // site's value, so the whole lifetime retargets to the vector local.
+            // A `Vn.Sk` destination names one lane view of the register the
+            // vector op wrote whole: scalar slots take that lane's field, and
+            // only a slot that expects the whole vector takes the local itself.
+            var laneIndex = SingleLaneIndex(destination.Register.Name);
+            var laneLeaf = laneIndex >= 0
+                ? VectorLanePacking.VectorLanes(vectorType) is { } lanes && laneIndex < lanes.Length
+                    ? new FieldReference(lanes[laneIndex], split, 0)
+                    : (IOperand?)null
+                : null;
             foreach (var other in instructions)
             for (var operandIndex = 0; operandIndex < other.Operands.Count; operandIndex++)
-                if (ReplaceLocal(other.Operands[operandIndex], destination, split) is { } rewritten)
+            {
+                var operand = other.Operands[operandIndex];
+                if (laneLeaf != null && operand is LocalVariable local
+                    && ReferenceEquals(local, destination)
+                    && !SlotExpectsVector(other, operandIndex, method))
+                {
+                    other.SetOperand(operandIndex, laneLeaf);
+                    continue;
+                }
+                if (ReplaceLocal(operand, destination, split) is { } rewritten)
                     other.SetOperand(operandIndex, rewritten);
+            }
         }
+    }
+
+    /// <summary>
+    /// The `k` in a `Vn.Sk` lane-view name - the Single lane this view reads of
+    /// its register - or -1 for a whole-register name or a non-Single lane
+    /// width.
+    /// </summary>
+    private static int SingleLaneIndex(string? name)
+    {
+        if (name is null || !IsLaneViewName(name))
+            return -1;
+        var dot = name.IndexOf('.');
+        if (name[dot + 1] != 'S')
+            return -1;
+        var index = 0;
+        for (var i = dot + 2; i < name.Length && char.IsDigit(name[i]); i++)
+            index = index * 10 + (name[i] - '0');
+        return index;
+    }
+
+    /// <summary>
+    /// Whether an operand slot expects the whole vector value, where a
+    /// lane-viewed local retargets to the `_vec` local itself instead of one
+    /// lane leaf: a `Move` destination typed vector, a vector call argument, a
+    /// vector `ret`.
+    /// </summary>
+    private static bool SlotExpectsVector(Instruction use, int operandIndex,
+        MethodAnalysisContext method)
+    {
+        // Phi inputs name the def site's register, not a lane view of it.
+        if (use.OpCode == OpCode.Phi)
+            return true;
+        var expected = use.OpCode switch
+        {
+            OpCode.Move when operandIndex == 1 => use.Operands[0] switch
+            {
+                LocalVariable local => local.Type,
+                FieldReference field => field.Field.FieldType,
+                _ => null,
+            },
+            OpCode.Return => method.ReturnType,
+            OpCode.Call when operandIndex >= 2 =>
+                VectorLanePacking.ResolveCallee(method.AppContext, use.Operands[1])
+                    ?.Parameters.ElementAtOrDefault(operandIndex - 2)?.ParameterType,
+            OpCode.CallVoid or OpCode.IndirectCall when operandIndex >= 1 =>
+                VectorLanePacking.ResolveCallee(method.AppContext, use.Operands[0])
+                    ?.Parameters.ElementAtOrDefault(operandIndex - 1)?.ParameterType,
+            _ => null,
+        };
+        return expected?.FullName is "UnityEngine.Vector2" or "UnityEngine.Vector3"
+            or "UnityEngine.Vector4" or "UnityEngine.Quaternion";
     }
 
     /// <summary>
