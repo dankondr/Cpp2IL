@@ -683,6 +683,26 @@ public static class IlGenerator
                 }
 
                 var moveDestinationType = StoreContract(instruction.Operands[0], context);
+                // A pass-inserted copy (Index < 0) is an SSA phi-edge write: the
+                // edge carries the all-zero value of the one register it covers.
+                // When the destination slot's whole value fits that register the
+                // edge proves default(T); on a wider or unsized slot the binary
+                // only cleared the register, so the implicit default keeps a
+                // named note.
+                if (instruction.Index < 0 && instruction.Operands[0] is LocalVariable
+                    && moveDestinationType is { IsValueType: true }
+                    && IsZeroConstant(instruction.Operands[1]))
+                {
+                    var phiEdgeSlotSize = TypeSizes.MinimumUnboxedSize(moveDestinationType,
+                        context.AppContext.Binary.PointerSizeBytes);
+                    if (phiEdgeSlotSize > 0 && phiEdgeSlotSize <= context.AppContext.Binary.PointerSizeBytes)
+                        PushDefaultValue(moveDestinationType, method, instructions, context);
+                    else
+                        EmitNullOrDefault(moveDestinationType, method, instructions, context,
+                            $"Pass-inserted zero on a phi edge covers one register, not the whole {moveDestinationType.FullName} value: default is an implicit fill, not a stored value.");
+                    StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
+                    break;
+                }
                 if (LoadOperandIntoSlot(instruction.Operands[1], moveDestinationType, context, method, locals, writeLine))
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 break;
@@ -892,8 +912,16 @@ public static class IlGenerator
                 break;
 
             case OpCode.Box:
-                if (instruction.Operands is [_, TypeAnalysisContext boxedType, var boxedValue])
+                if (instruction.Operands is [_, TypeAnalysisContext erasedBoxedType, var boxedValue])
                 {
+                    // The token the binary boxed is the erased instantiation while the
+                    // operand provably emits a concrete one - e.g. an inlined
+                    // get_Current on a recovered Enumerator<T,...> pushes
+                    // KeyValuePair<T,...> where the ISIL token says
+                    // KeyValuePair<object,object>. The honest box token is the
+                    // produced instantiation when it shares the generic definition
+                    // and stays nameable.
+                    var boxedType = SharpenedBoxTokenType(erasedBoxedType, boxedValue, context);
                     if (!TypeTokenUsableFrom(boxedType, context))
                     {
                         // The boxed type cannot be named here (e.g. a shared-generic
@@ -2807,6 +2835,22 @@ public static class IlGenerator
         // names no receiver, so its instantiation is free to be sharpened from
         // any operand evidence.
         var maySolveTypeArguments = targetMethod.IsStatic;
+        // A slot already instantiated with erased arguments (the lifter bound
+        // `AwaitUnsafeOnCompleted<TaskAwaiter<object>,…>` before the awaiter
+        // local's proven type existed) may be re-instantiated at the proven
+        // concrete when it differs only at positions the current instantiation
+        // still leaves erased; a non-erased position already names a type and
+        // must match verbatim.
+        bool ReplacesErasedInstantiation(TypeAnalysisContext current, TypeAnalysisContext concrete) =>
+            current is GenericInstanceTypeAnalysisContext currentInstance
+            && concrete is GenericInstanceTypeAnalysisContext concreteInstance
+            && currentInstance.GenericArguments.Any(ContainsErasedSharedArgument)
+            && currentInstance.GenericArguments.Count == concreteInstance.GenericArguments.Count
+            && ThisConstructorCallPlan.SameTypeIdentity(currentInstance.GenericType,
+                concreteInstance.GenericType)
+            && currentInstance.GenericArguments.Zip(concreteInstance.GenericArguments,
+                (c, p) => ContainsErasedSharedArgument(c)
+                          || ThisConstructorCallPlan.SameTypeIdentity(c, p)).All(match => match);
         void Solve(TypeAnalysisContext? pattern, TypeAnalysisContext? concrete)
         {
             if (pattern == null || concrete == null)
@@ -2815,7 +2859,8 @@ public static class IlGenerator
             {
                 case GenericParameterTypeAnalysisContext { Type: Il2CppTypeEnum.IL2CPP_TYPE_VAR } typeParameter
                     when maySolveTypeArguments && typeArguments != null && typeParameter.Index < typeArguments.Length:
-                    if (IsErasedSharedArgument(typeArguments[typeParameter.Index])
+                    if ((IsErasedSharedArgument(typeArguments[typeParameter.Index])
+                         || ReplacesErasedInstantiation(typeArguments[typeParameter.Index], concrete))
                         && concrete is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext
                             or GenericParameterTypeAnalysisContext)
                         && !IsErasedSharedArgument(concrete)
@@ -2827,7 +2872,8 @@ public static class IlGenerator
                     break;
                 case GenericParameterTypeAnalysisContext { Type: Il2CppTypeEnum.IL2CPP_TYPE_MVAR } methodParameter
                     when methodArguments != null && methodParameter.Index < methodArguments.Length:
-                    if (IsErasedSharedArgument(methodArguments[methodParameter.Index])
+                    if ((IsErasedSharedArgument(methodArguments[methodParameter.Index])
+                         || ReplacesErasedInstantiation(methodArguments[methodParameter.Index], concrete))
                         && concrete is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext
                             or GenericParameterTypeAnalysisContext)
                         && !IsErasedSharedArgument(concrete)
@@ -4975,7 +5021,15 @@ public static class IlGenerator
                 && !candidate.IsStatic && candidate.Parameters.Count == 0) is not { } getter)
             return false;
 
-        var currentType = current.FieldType;
+        // `_current` is fetched through get_Current on the local's recovered
+        // instantiation (concreteGetter), so the spilled pair's type is that
+        // getter's return - KeyValuePair<string,T> on an Enumerator<string,T> -
+        // not the memberref's erased KeyValuePair<object,object>. Everything
+        // downstream (the temp local, the nested receiver, the tail chain)
+        // follows the same instantiation.
+        var concreteGetter = new ConcreteGenericMethodAnalysisContext(getter,
+            enumerator.GenericArguments, []);
+        var currentType = EffectiveCallReturnType(concreteGetter);
         var nestedReceiverType = field.Containers.Count == 1
             ? currentType
             : field.Containers.LastOrDefault()?.FieldType;
@@ -4991,7 +5045,6 @@ public static class IlGenerator
         if (!EmitManagedAddress(field.Local, method, context, locals, writeLine, enumerator))
             return false;
 
-        var concreteGetter = new ConcreteGenericMethodAnalysisContext(getter, enumerator.GenericArguments, []);
         var instructions = method.CilMethodBody!.Instructions;
         instructions.Add(CilOpCodes.Call, concreteGetter.ToMethodDescriptor());
         if (field.Containers.Count == 0)
@@ -5227,9 +5280,18 @@ public static class IlGenerator
     {
         if (!visited.Add(local) || context.ControlFlowGraph == null)
             return null;
+        // A stack slot lowers to a single emitted local no matter how many SSA
+        // versions the lifter split it into; a definition of any version writes
+        // the same slot, and a use of any version reads it. Contracts are
+        // therefore collected across every version that shares the register.
+        bool SameSlotLocal(IOperand? operand) =>
+            ReferenceEquals(operand, local)
+            || operand is LocalVariable other
+                && other.Register.Name == local.Register.Name
+                && Analysis.LocalVariables.TryStackOffset(other.Register.Name) != null;
         foreach (var instruction in context.ControlFlowGraph.Instructions)
         {
-            if (!ReferenceEquals(instruction.Destination, local))
+            if (!SameSlotLocal(instruction.Destination))
                 continue;
             foreach (var produced in ProducedInstanceTypes(instruction, context, visited))
             {
@@ -5242,7 +5304,21 @@ public static class IlGenerator
                     && !ThisConstructorCallPlan.SameTypeIdentity(producedInstance, erasedInstance)
                     && !producedInstance.GenericArguments.Any(argument =>
                         ContainsUnusableSharpenedArgument(argument, context)))
+                {
                     return producedInstance;
+                }
+                // An erased interface slot (`IEnumerable<KVP<o,o>>`) whose def is a
+                // concrete implementor (`IDictionary<s,JsonSchema>`): the interface
+                // instantiation the implementor satisfies - rebound through the
+                // produced instance's own arguments - is the slot's proven type.
+                if (produced is GenericInstanceTypeAnalysisContext interfaceProduced
+                    && erasedInstance.GenericType.IsInterface
+                    && ReboundInterfaceInstantiation(interfaceProduced, erasedInstance.GenericType, context)
+                        is { } reboundInterface
+                    && !ThisConstructorCallPlan.SameTypeIdentity(reboundInterface, erasedInstance))
+                {
+                    return reboundInterface;
+                }
             }
         }
 
@@ -5269,19 +5345,71 @@ public static class IlGenerator
 
         foreach (var instruction in context.ControlFlowGraph.Instructions)
         {
-            if (instruction is not { OpCode: OpCode.Move, Operands: [var destination, var source, ..] }
-                || !ReferenceEquals(source, local)
-                || DestinationType(destination) is not GenericInstanceTypeAnalysisContext candidate)
+            if (instruction is not { OpCode: OpCode.Move, Operands: [var destination, var source, ..] })
                 continue;
-            if (!AcceptUseContract(candidate))
+            if (SameSlotLocal(source)
+                && DestinationType(destination) is GenericInstanceTypeAnalysisContext candidate
+                && !AcceptUseContract(candidate))
                 return null;
+            // `&local` moved into a pointer slot demands the slot's element type
+            // just as `local` moved into a value slot demands the slot's type.
+            if (source is AddressOf { Target: LocalVariable addressedMove }
+                && SameSlotLocal(addressedMove)
+                && DestinationType(destination) is { } addressedDestination)
+            {
+                var addressedContract = addressedDestination switch
+                {
+                    ByRefTypeAnalysisContext { ElementType: { } element } => element,
+                    PointerTypeAnalysisContext { ElementType: { } element } => element,
+                    _ => addressedDestination
+                };
+                if (addressedContract is GenericInstanceTypeAnalysisContext genericContract
+                    && !AcceptUseContract(genericContract))
+                    return null;
+            }
+        }
+        // An `&local` inside a call is binary-proven too: as the receiver of a
+        // value-type instance call it demands the callee's declaring type
+        // (`awaiter.GetResult()`), and under a byref parameter it demands the
+        // parameter's element (a builder's `AwaitUnsafeOnCompleted` slot). Both
+        // come from the call's own metadata, not from a guessed conversion.
+        foreach (var call in context.ControlFlowGraph.Instructions)
+        {
+            if (!call.IsCall || call.Operands[0] is not MethodAnalysisContext calledMethod)
+                continue;
+            var thisIndex = call.OpCode == OpCode.CallVoid ? 1 : 2;
+            var parameterOffset = calledMethod.IsStatic ? 1 : 2;
+            if (call.OpCode == OpCode.Call)
+                parameterOffset += 1;
+            for (var operandIndex = thisIndex; operandIndex < call.Operands.Count; operandIndex++)
+            {
+                if (call.Operands[operandIndex] is not AddressOf { Target: LocalVariable addressed }
+                    || !SameSlotLocal(addressed))
+                    continue;
+                GenericInstanceTypeAnalysisContext? candidate = operandIndex == thisIndex
+                    && !calledMethod.IsStatic
+                    ? calledMethod.DeclaringType as GenericInstanceTypeAnalysisContext
+                    : operandIndex >= parameterOffset
+                        && calledMethod.Parameters.Count > operandIndex - parameterOffset
+                        && calledMethod.Parameters[operandIndex - parameterOffset].ParameterType
+                            is ByRefTypeAnalysisContext
+                            { ElementType: GenericInstanceTypeAnalysisContext elementType }
+                        ? elementType
+                        : null;
+                if (candidate != null && !AcceptUseContract(candidate))
+                {
+                    return null;
+                }
+            }
         }
         foreach (var cast in context.ControlFlowGraph.Instructions.SelectMany(instruction => instruction.Operands)
-                     .OfType<ReferenceCast>().Where(cast => ReferenceEquals(cast.Value, local)))
+                     .OfType<ReferenceCast>().Where(cast => SameSlotLocal(cast.Value)))
             if (cast.Type is GenericInstanceTypeAnalysisContext candidate && !AcceptUseContract(candidate))
                 return null;
         if (useContract != null)
+        {
             return useContract;
+        }
         return null;
     }
 
@@ -5295,6 +5423,28 @@ public static class IlGenerator
         || argument is GenericInstanceTypeAnalysisContext instance
             && instance.GenericArguments.Any(nested => ContainsUnusableSharpenedArgument(nested, context));
 
+    // il2cpp_value_box is lifted with the erased instantiation token, but the
+    // boxed operand may provably emit a concrete one (a recovered
+    // Enumerator<T,...>'s inlined get_Current pushes KeyValuePair<T,...> where
+    // the token says KeyValuePair<object,object>). When the produced type is a
+    // usable concrete instantiation of the same generic definition, that is the
+    // honest box token; anything else keeps the erased token.
+    private static TypeAnalysisContext SharpenedBoxTokenType(TypeAnalysisContext boxedType,
+        IOperand boxedValue, MethodAnalysisContext context)
+    {
+        if (boxedType is not GenericInstanceTypeAnalysisContext erasedInstance
+            || !erasedInstance.GenericArguments.Any(ContainsErasedSharedArgument))
+            return boxedType;
+        var valueOperand = boxedValue is AddressOf { Target: LocalVariable byRefValue } ? byRefValue : boxedValue;
+        if (EmittedOperandType(valueOperand, context) is not GenericInstanceTypeAnalysisContext producedInstance
+            || !ThisConstructorCallPlan.SameTypeIdentity(producedInstance.GenericType, erasedInstance.GenericType)
+            || producedInstance.GenericArguments.Any(ContainsErasedSharedArgument)
+            || producedInstance.GenericArguments.Any(argument => ContainsUnusableSharpenedArgument(argument, context))
+            || !TypeTokenUsableFrom(producedInstance, context))
+            return boxedType;
+        return producedInstance;
+    }
+
     private static IEnumerable<TypeAnalysisContext> ProducedInstanceTypes(
         Instruction instruction, MethodAnalysisContext context, HashSet<LocalVariable> visited)
     {
@@ -5305,7 +5455,8 @@ public static class IlGenerator
             // recover the concrete produced instantiation.
             var resolved = !callee.IsStatic && instruction.Operands.Count > 2
                 ? ThisConstructorCallPlan.RetargetToDestinationInstantiation(callee,
-                      DirectSharedGenericEvidenceType(instruction.Operands[2], context)) ?? callee
+                      DirectSharedGenericEvidenceType(instruction.Operands[2], context)
+                      ?? SharpenedReceiverEvidenceType(instruction.Operands[2], context, visited)) ?? callee
                 : callee;
             yield return EffectiveCallReturnType(resolved);
         }
@@ -5324,7 +5475,7 @@ public static class IlGenerator
                 case LocalVariable source:
                     // EmittedOperandType would recurse through the same sharpening
                     // with a fresh visited-set; keep the cycle guard instead.
-                    if ((DirectCallDefinedLocalType(source, context)
+                    if ((DirectCallDefinedLocalType(source, context, visited)
                             ?? (source.Type is GenericInstanceTypeAnalysisContext sourceInstance
                                 && sourceInstance.GenericArguments.Any(ContainsErasedSharedArgument)
                                 ? SharpenedLocalInstanceType(source, sourceInstance, context, visited)
@@ -5333,6 +5484,26 @@ public static class IlGenerator
                         is { } producedLocal)
                         yield return producedLocal;
                     break;
+                case FieldReference field:
+                    // A field read produces the member type on the instantiation
+                    // the host local is proven to hold: `enumerator.Current`
+                    // read through a sharpened `List<T>.Enumerator` host yields
+                    // the concrete `KeyValuePair<k,v>`, not the shared field
+                    // context's open `KeyValuePair<!0,!1>`. The field operand
+                    // may itself be bound to the erased instantiation - resolve
+                    // its declaring member, then instantiate on the sharpened host.
+                    var declaringField = field.Field is ConcreteGenericFieldAnalysisContext boundField
+                        ? boundField.BaseFieldContext
+                        : field.Field;
+                    yield return field.Local?.Type is GenericInstanceTypeAnalysisContext hostInstance
+                        && hostInstance.GenericArguments.Any(ContainsErasedSharedArgument)
+                        && SharpenedLocalInstanceType(field.Local, hostInstance, context, visited)
+                            is GenericInstanceTypeAnalysisContext sharpenedHost
+                        && MaxGenericParameterIndex(declaringField.FieldType)
+                            < sharpenedHost.GenericArguments.Count
+                        ? new ConcreteGenericFieldAnalysisContext(declaringField, sharpenedHost).FieldType
+                        : field.Field.FieldType;
+                    break;
                 default:
                     if (EmittedOperandType(operand, context) is { } producedOperand)
                         yield return producedOperand;
@@ -5340,6 +5511,19 @@ public static class IlGenerator
             }
         }
     }
+
+    private static int MaxGenericParameterIndex(TypeAnalysisContext type) => type switch
+    {
+        // A method generic parameter cannot be instantiated from a type host at all.
+        GenericParameterTypeAnalysisContext { Type: Il2CppTypeEnum.IL2CPP_TYPE_VAR }
+            genericParameter => genericParameter.Index,
+        GenericParameterTypeAnalysisContext => int.MaxValue,
+        WrappedTypeAnalysisContext wrapped => MaxGenericParameterIndex(wrapped.ElementType),
+        GenericInstanceTypeAnalysisContext instance => instance.GenericArguments.Count == 0
+            ? -1
+            : instance.GenericArguments.Max(MaxGenericParameterIndex),
+        _ => -1,
+    };
 
     internal static TypeAnalysisContext EmittedLocalType(LocalVariable local, MethodAnalysisContext context) =>
         EmittableLocalType(EmittedLocalTypeCore(local, context, []), context);
@@ -5404,7 +5588,7 @@ public static class IlGenerator
             return recoveredNumericType;
         if (local.Type != null && local.Type != context.AppContext.SystemTypes.SystemVoidType)
         {
-            if (CallDefinedLocalType(local, context) is { } callType)
+            if (CallDefinedLocalType(local, context, visited) is { } callType)
                 return callType;
             // IL2CPP represents `ref enumField` through a native pointer local whose
             // shared-generic metadata type is an internal *Enum marker. The defining
@@ -5445,7 +5629,7 @@ public static class IlGenerator
         // a numeric or boolean consumer is a weaker use-site view of the same
         // value and must not smear the slot (e.g. `result & 1` does not make a
         // `!0` call result Int32).
-        if (CallDefinedLocalType(local, context) is { } untypedCallType)
+        if (CallDefinedLocalType(local, context, visited) is { } untypedCallType)
             return untypedCallType;
         if (IsBooleanEmissionLocal(local, context))
             return context.AppContext.SystemTypes.SystemBooleanType;
@@ -5539,7 +5723,7 @@ public static class IlGenerator
     };
 
     private static TypeAnalysisContext? CallDefinedLocalType(LocalVariable local,
-        MethodAnalysisContext context)
+        MethodAnalysisContext context, HashSet<LocalVariable>? visited = null)
     {
         TypeAnalysisContext? produced = null;
         var found = false;
@@ -5550,9 +5734,15 @@ public static class IlGenerator
             if (definition is not { OpCode: OpCode.Call,
                     Operands: [MethodAnalysisContext { IsVoid: false } callee, ..] })
                 return null;
+            var receiverEvidence = !callee.IsStatic && definition.Operands.Count > 2
+                ? DirectSharedGenericEvidenceType(definition.Operands[2], context)
+                  ?? (visited != null
+                      ? SharpenedReceiverEvidenceType(definition.Operands[2], context, visited)
+                      : null)
+                : null;
             var resolved = !callee.IsStatic && definition.Operands.Count > 2
                 ? ThisConstructorCallPlan.RetargetToDestinationInstantiation(callee,
-                      DirectSharedGenericEvidenceType(definition.Operands[2], context)) ?? callee
+                      receiverEvidence) ?? callee
                 : callee;
             var solved = SolveSharedGenericArguments(resolved, definition, context, 2, false);
             var returnType = EffectiveCallReturnType(solved ?? resolved);
@@ -5598,7 +5788,7 @@ public static class IlGenerator
     }
 
     private static TypeAnalysisContext? DirectCallDefinedLocalType(LocalVariable local,
-        MethodAnalysisContext context)
+        MethodAnalysisContext context, HashSet<LocalVariable>? visited = null)
     {
         TypeAnalysisContext? produced = null;
         foreach (var definition in context.ControlFlowGraph!.Instructions
@@ -5609,7 +5799,10 @@ public static class IlGenerator
                 return null;
             var resolved = !callee.IsStatic && definition.Operands.Count > 2
                 ? ThisConstructorCallPlan.RetargetToDestinationInstantiation(callee,
-                      DirectSharedGenericEvidenceType(definition.Operands[2], context)) ?? callee
+                      DirectSharedGenericEvidenceType(definition.Operands[2], context)
+                      ?? (visited != null
+                          ? SharpenedReceiverEvidenceType(definition.Operands[2], context, visited)
+                          : null)) ?? callee
                 : callee;
             var returnType = EffectiveCallReturnType(resolved);
             if (!CanEmitTypeToken(returnType)
@@ -6170,12 +6363,64 @@ public static class IlGenerator
         var declared = DestinationType(destination);
         if (declared != null)
             return declared;
-        return destination switch
+        var fallback = destination switch
         {
             MemoryOperand { Index: null, Addend: 0, Scale: 0, Base: LocalVariable { Type: not ByRefTypeAnalysisContext } baseLocal }
                 => EmittableLocalType(EmittedLocalType(baseLocal, context), context),
             _ => null
         };
+        return fallback;
+    }
+
+    // The interface instantiation a produced instance satisfies: its
+    // definition's interface list still mentions the definition's parameters,
+    // so each entry is rebound through the instance's own arguments. Returns
+    // the instantiation of `interfaceDefinition` it enumerates, or null when
+    // the produced type implements no matching interface or the rebound
+    // arguments are still unnameable.
+    private static GenericInstanceTypeAnalysisContext? ReboundInterfaceInstantiation(
+        GenericInstanceTypeAnalysisContext produced, TypeAnalysisContext interfaceDefinition,
+        MethodAnalysisContext context)
+    {
+        foreach (var interfaceContext in produced.GenericType.InterfaceContexts)
+        {
+            TypeAnalysisContext instantiated;
+            try
+            {
+                instantiated = GenericInstantiation.Instantiate(interfaceContext, produced.GenericArguments, []);
+            }
+            catch
+            {
+                continue;
+            }
+            if (instantiated is GenericInstanceTypeAnalysisContext instantiatedInterface
+                && ThisConstructorCallPlan.SameTypeIdentity(instantiatedInterface.GenericType, interfaceDefinition)
+                && !instantiatedInterface.GenericArguments.Any(argument =>
+                    ContainsUnusableSharpenedArgument(argument, context)))
+                return instantiatedInterface;
+        }
+        return null;
+    }
+
+    // Receiver evidence a direct read can't see: `&local` into a value-type call
+    // has no operand case, and an erased-tagged receiver is rejected outright.
+    // The sharpened instantiation the receiver's own analysis proves is the
+    // same binary evidence carried one hop further.
+    private static TypeAnalysisContext? SharpenedReceiverEvidenceType(IOperand operand,
+        MethodAnalysisContext context, HashSet<LocalVariable> visited)
+    {
+        var (receiver, needsAddress) = operand switch
+        {
+            AddressOf { Target: LocalVariable addressed } => (addressed, true),
+            LocalVariable direct => (direct, false),
+            _ => (null, false),
+        };
+        var result = receiver?.Type is GenericInstanceTypeAnalysisContext receiverInstance
+            && receiverInstance.GenericArguments.Any(ContainsErasedSharedArgument)
+            && SharpenedLocalInstanceType(receiver, receiverInstance, context, visited) is { } sharpened
+            ? needsAddress ? new ByRefTypeAnalysisContext(sharpened) : sharpened
+            : null;
+        return result;
     }
 
     // Type evidence used to solve shared generics. Unlike the final emitted stack
@@ -6224,7 +6469,7 @@ public static class IlGenerator
                     ? expectedType
                     : EmittedImmediateType(immediate, expectedType, context),
             LocalVariable local => EmittedLocalType(local, context),
-            FieldReference field => field.Field.FieldType,
+            FieldReference field => InlinedEnumeratorCurrentType(field, context) ?? field.Field.FieldType,
             SelectedFieldReference selected => selected.FieldType,
             ArrayElementFieldReference elementField => elementField.Field.FieldType,
             ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } => array.ElementType,
@@ -6289,6 +6534,52 @@ public static class IlGenerator
 
     private static TypeAnalysisContext? ResolveSystemType(MethodAnalysisContext context, string fullName) =>
         context.AppContext.GetAssemblyByName("mscorlib")?.GetTypeByFullName(fullName);
+
+    // A `_current` field read does not push the memberref's field type: emission
+    // inlines the enumerator's get_Current on the local's recovered instantiation
+    // (TryEmitInlinedEnumeratorCurrent), so the produced type is that getter's
+    // return on the same instantiation - e.g. KeyValuePair<string,T> from an
+    // Enumerator<string,T> local, where the operand's memberref still names the
+    // erased KeyValuePair<object,object>. A nested `x._current.field` chain
+    // produces the nested getter's return (or the tail field's type on the
+    // same instantiation). Mirror the same guards so the reported type always
+    // matches what LoadOperand emits; failed lookups keep the memberref's own
+    // field type.
+    private static TypeAnalysisContext? InlinedEnumeratorCurrentType(FieldReference field,
+        MethodAnalysisContext context)
+    {
+        var current = field.Field.Name == "_current" && field.Containers.Count == 0
+            ? field.Field
+            : field.Containers.FirstOrDefault();
+        if (current?.Name != "_current"
+            || EmittedLocalType(field.Local, context) is not GenericInstanceTypeAnalysisContext enumerator
+            || enumerator.GenericType.Methods.FirstOrDefault(candidate => candidate.Name == "get_Current"
+                && !candidate.IsStatic && candidate.Parameters.Count == 0) is not { } getter)
+            return null;
+        var concreteGetter = new ConcreteGenericMethodAnalysisContext(getter,
+            enumerator.GenericArguments, []);
+        var currentType = EffectiveCallReturnType(concreteGetter);
+        if (field.Containers.Count == 0)
+            return currentType;
+        var nestedReceiverType = field.Containers.Count == 1
+            ? currentType
+            : field.Containers.LastOrDefault()?.FieldType;
+        var nestedGetter = nestedReceiverType != null
+            ? PublicFieldGetter(nestedReceiverType, field.Field)
+            : null;
+        // The nested path emits only under the same guards; otherwise the load
+        // falls back to a plain ldfld producing the memberref's field type.
+        if (!TypeTokenUsableFrom(currentType, context)
+            || field.Containers.Skip(1).Any(container => !FieldUsableFrom(container, context))
+            || !FieldUsableFrom(field.Field, context, receiverType: nestedReceiverType)
+                && nestedGetter == null)
+            return null;
+        if (nestedGetter != null)
+            return EffectiveCallReturnType(nestedGetter);
+        return nestedReceiverType is GenericInstanceTypeAnalysisContext nestedGit
+            ? new ConcreteGenericFieldAnalysisContext(field.Field, nestedGit).FieldType
+            : field.Field.FieldType;
+    }
 
     // The stack type a ReferenceCast to a generic parameter actually emits, mirroring
     // the ReferenceCast case of LoadOperand: a replaced cast leaves a `value !0`
