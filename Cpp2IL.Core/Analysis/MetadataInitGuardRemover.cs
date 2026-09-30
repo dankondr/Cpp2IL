@@ -29,7 +29,7 @@ public static class MetadataInitGuardRemover
     private const long MethodRgctxOffset32 = 0x1C;
 
     public static void Run(MethodAnalysisContext method)
-        => Run(method.ControlFlowGraph!, method.AppContext.Binary.is32Bit ? InitialisedFlagOffset32 : InitialisedFlagOffset64);
+        => Run(method.ControlFlowGraph!, method.AppContext.Binary.is32Bit ? InitialisedFlagOffset32 : InitialisedFlagOffset64, method);
 
     // Rewrite any metadata init calls we didn't remove into movs.
     public static void RewriteUnguardedInits(MethodAnalysisContext method)
@@ -222,7 +222,8 @@ public static class MetadataInitGuardRemover
 
     private static bool IsZero(IOperand operand) => operand is Immediate { Value: 0 };
 
-    public static void Run(ISILControlFlowGraph cfg, long initialisedFlagOffset)
+    public static void Run(ISILControlFlowGraph cfg, long initialisedFlagOffset,
+        MethodAnalysisContext? method = null)
     {
         var removedAny = false;
 
@@ -236,7 +237,7 @@ public static class MetadataInitGuardRemover
             {
                 if (!cfg.Blocks.Contains(guard))
                     continue;
-                removedInPass |= TryRemoveGuard(cfg, guard, initialisedFlagOffset);
+                removedInPass |= TryRemoveGuard(method, cfg, guard, initialisedFlagOffset);
             }
 
             removedAny |= removedInPass;
@@ -327,7 +328,8 @@ public static class MetadataInitGuardRemover
         return removedAny;
     }
 
-    private static bool TryRemoveGuard(ISILControlFlowGraph cfg, Block guard, long initialisedFlagOffset)
+    private static bool TryRemoveGuard(MethodAnalysisContext? method, ISILControlFlowGraph cfg,
+        Block guard, long initialisedFlagOffset)
     {
         if (guard.BlockType != BlockType.TwoWay || guard.Successors.Count != 2
             || guard.Instructions.Count == 0 || guard.Instructions[^1].OpCode != OpCode.ConditionalJump)
@@ -347,7 +349,245 @@ public static class MetadataInitGuardRemover
             || TryExcise(cfg, guard, second, first, initialisedFlagTest, metadataFlag)
             || TryExciseThroughSibling(cfg, guard, first, second, initialisedFlagTest, metadataFlag)
             || TryExciseThroughSibling(cfg, guard, second, first, initialisedFlagTest, metadataFlag)
+            || (method != null && TryExciseGuardCluster(method, guard, metadataFlag))
             || TryFoldMetadataFlag(cfg, guard, metadataFlag);
+    }
+
+    // Consecutive `if (!K->cctor_finished) il2cpp_runtime_class_init(K)` guards commonly share one
+    // arm (a single `bl class_init`) and one merge when they test the same class pointer - a
+    // `switch`/tableshape codegen emits `cbnz merge` per guard plus a shared trampoline and arm.
+    // Excising any one of them alone fails closure (the shared arm is also reached from the other
+    // guards' edges), so the cluster - all guards testing initialised(K) for the same K - is
+    // excised together: every guard jumps straight to the merge and the shared arm goes.
+    private static bool TryExciseGuardCluster(MethodAnalysisContext method, Block guard,
+        MemoryOperand? flag)
+    {
+        var cfg = method.ControlFlowGraph!;
+
+        if (flag is not { Index: null, Scale: 0, Base: LocalVariable flagBase } flagRead
+            || !Il2CppClassUsefulOffsets.TryGetField((uint)flagRead.Addend, method.AppContext.MetadataVersion,
+                    method.AppContext.Binary.is32Bit, out var field, out _)
+            || field != Il2CppClassUsefulOffsets.Il2CppClassField.CctorFinished)
+            return false;
+
+        var index = new DefUseIndex(cfg);
+        if (RuntimeClassTerms.RepresentedClass(flagBase, index) is not { } klass)
+            return false;
+
+        // Candidate merge = one of this guard's successors; the other is an init-region entry.
+        foreach (var merge in guard.Successors)
+        {
+            if (merge == cfg.EntryBlock || merge == cfg.ExitBlock)
+                continue;
+
+            // A sibling guard joins the cluster only when it tests initialised(K) for the same K
+            // and branches to the same merge.
+            var cluster = cfg.Blocks.Where(candidate =>
+                    candidate.BlockType == BlockType.TwoWay && candidate.Successors.Count == 2
+                    && candidate.Successors.Contains(merge)
+                    && GetComparedMemory(candidate) is { } otherFlag
+                    && RuntimeClassTerms.TryRead(otherFlag, method.AppContext.MetadataVersion,
+                        method.AppContext.Binary.is32Bit, index) is { Field: Il2CppClassUsefulOffsets.Il2CppClassField.CctorFinished } otherRead
+                    && SameClassPointer(flagBase, otherRead.ClassLocal, index))
+                .ToHashSet();
+            if (!cluster.Contains(guard))
+                continue;
+
+            if (!TryCollectClusterRegion(cfg, cluster, merge, out var region))
+                continue;
+
+            ExciseCluster(cfg, cluster, merge, region);
+            return true;
+        }
+
+        return false;
+    }
+
+    // The same class pointer - the same local, or copies / phis / merges that provably carry the
+    // same Il2CppClass<K>.
+    private static bool SameClassPointer(LocalVariable left, LocalVariable right, DefUseIndex index)
+    {
+        if (ReferenceEquals(left, right))
+            return true;
+        var leftClass = RuntimeClassTerms.RepresentedClass(left, index);
+        var rightClass = RuntimeClassTerms.RepresentedClass(right, index);
+        return leftClass != null && rightClass != null && RuntimeClassTerms.SameType(leftClass, rightClass);
+    }
+
+    // Region collection for a guard cluster: every non-merge successor of every cluster guard is an
+    // entry; the region must be closed (preds ⊆ cluster ∪ region, succs ⊆ {merge} ∪ region ∪
+    // throw tails) and contain at least one class-init call.
+    private static bool TryCollectClusterRegion(ISILControlFlowGraph cfg, HashSet<Block> cluster,
+        Block merge, out HashSet<Block> region)
+    {
+        region = [];
+
+        var sawClassInit = false;
+        var reconverges = merge.Predecessors.Count == 0;
+
+        var queue = new Queue<Block>();
+        foreach (var guard in cluster)
+            foreach (var successor in guard.Successors)
+                if (successor != merge)
+                    queue.Enqueue(successor);
+
+        while (queue.Count > 0)
+        {
+            var block = queue.Dequeue();
+
+            if (block == merge)
+            {
+                reconverges = true;
+                continue;
+            }
+            if (block == cfg.EntryBlock || block == cfg.ExitBlock || cluster.Contains(block)
+                || IsThrowTail(cfg, block))
+                continue;
+
+            if (!region.Add(block))
+                continue;
+
+            if (!ClassifyClusterBlock(block, ref sawClassInit))
+                return false;
+
+            foreach (var successor in block.Successors)
+                queue.Enqueue(successor);
+        }
+
+        if (region.Count == 0 || !reconverges || !sawClassInit)
+            return false;
+
+        var collected = region;
+        foreach (var block in collected)
+        {
+            if (block.Predecessors.Any(predecessor => !cluster.Contains(predecessor) && !collected.Contains(predecessor)))
+                return false;
+            if (block.Successors.Any(successor => successor != merge && !collected.Contains(successor)
+                                                  && !IsThrowTail(cfg, successor)))
+                return false;
+        }
+
+        // Nothing outside the cluster and its region may enter the merge except through them.
+        if (merge.Predecessors.Any(predecessor => !cluster.Contains(predecessor) && !collected.Contains(predecessor)))
+            return false;
+
+        // Region-defined locals must not escape: merge phis lose their region inputs, any other
+        // outside read would dangle.
+        var defined = new HashSet<LocalVariable>();
+        foreach (var block in collected)
+            foreach (var instruction in block.Instructions)
+                if (instruction.Destination is LocalVariable definedLocal)
+                    defined.Add(definedLocal);
+        foreach (var outside in cfg.Blocks)
+        {
+            if (collected.Contains(outside))
+                continue;
+            foreach (var instruction in outside.Instructions)
+            {
+                if (outside == merge && instruction.OpCode == OpCode.Phi)
+                    continue;
+                if (instruction.SourcesAndConstants.Any(source =>
+                        source is LocalVariable read && defined.Contains(read)
+                        || source is MemoryOperand { Base: LocalVariable memoryBase } && defined.Contains(memoryBase)))
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool ClassifyClusterBlock(Block block, ref bool sawClassInit)
+    {
+        foreach (var instruction in block.Instructions)
+        {
+            switch (instruction.OpCode)
+            {
+                case OpCode.Jump or OpCode.ConditionalJump or OpCode.Phi:
+                    break;
+                case OpCode.Call or OpCode.CallVoid:
+                    if (instruction.Operands is not [StringLiteral { Value: ClassInitExport or ClassInitActual or ClassInitCodegen }, ..])
+                        return false;
+                    sawClassInit = true;
+                    break;
+                default:
+                    if (!IsSideEffectFree(instruction))
+                        return false;
+                    break;
+            }
+        }
+        return true;
+    }
+
+    // A throw tail is a block that only throws (the shared `bl throw_*` epilogue) or jumps to one.
+    // Conditional exits to it from inside an init region are fine: the region is provably reached
+    // only when the class is uninitialised, so its internal fail paths stay fail paths.
+    private static bool IsThrowTail(ISILControlFlowGraph cfg, Block block, int depth = 0)
+    {
+        if (depth > 8 || block == cfg.EntryBlock)
+            return false;
+
+        var significant = block.Instructions.Where(i => i.OpCode != OpCode.Nop).ToList();
+        if (significant is [{ OpCode: OpCode.Jump }] && block.Successors.Count == 1)
+            return IsThrowTail(cfg, block.Successors[0], depth + 1);
+
+        return significant.Any(i => i.OpCode == OpCode.Throw)
+            && significant.All(i => i.OpCode is OpCode.Throw or OpCode.Return or OpCode.Move
+                or OpCode.Jump);
+    }
+
+    // The taken edge of a conditional inside a region is admissible when it lands in a throw tail:
+    // the arm's own fail path, never real control flow.
+    private static bool JumpsToThrowTail(ISILControlFlowGraph cfg, Instruction jump) =>
+        jump.Operands[0] is Instruction target
+        && cfg.Blocks.FirstOrDefault(block => block.Instructions.Contains(target)) is { } targetBlock
+        && IsThrowTail(cfg, targetBlock);
+
+    private static void ExciseCluster(ISILControlFlowGraph cfg, HashSet<Block> cluster, Block merge,
+        HashSet<Block> region)
+    {
+        // Repair the merge's phis: drop the inputs arriving on region back-edges. Cluster-guard
+        // edges stay (the guard now jumps straight here), so their phi inputs are kept.
+        for (var i = merge.Predecessors.Count - 1; i >= 0; i--)
+        {
+            if (!region.Contains(merge.Predecessors[i]))
+                continue;
+
+            foreach (var phi in merge.Instructions)
+                if (phi.OpCode == OpCode.Phi && 1 + i < phi.Operands.Count)
+                    phi.RemoveOperandAt(1 + i);
+
+            merge.Predecessors.RemoveAt(i);
+        }
+
+        // Fold every cluster guard to a straight jump into the merge.
+        foreach (var guard in cluster)
+        {
+            foreach (var successor in guard.Successors.Where(successor => successor != merge))
+            {
+                successor.Predecessors.Remove(guard);
+            }
+            guard.Successors.RemoveAll(successor => successor != merge);
+            if (!guard.Successors.Contains(merge))
+                guard.Successors.Add(merge);
+
+            var terminator = guard.Instructions[^1];
+            terminator.OpCode = OpCode.Jump;
+            terminator.SetOperands(merge);
+            guard.CalculateBlockType();
+        }
+
+        // Delete the region (init calls, reload moves, trampolines).
+        foreach (var block in region)
+        {
+            foreach (var successor in block.Successors)
+                successor.Predecessors.Remove(block);
+            foreach (var predecessor in block.Predecessors)
+                predecessor.Successors.Remove(block);
+
+            block.Successors.Clear();
+            block.Predecessors.Clear();
+            cfg.Blocks.Remove(block);
+        }
     }
 
     // Some value-producing guards repeat a real field assignment in both arms, so excising the init
@@ -566,7 +806,13 @@ public static class MetadataInitGuardRemover
                 return false;
 
             foreach (var successor in block.Successors)
+            {
+                // A throw tail is an exit from the region (the init arm's own fail path), not part
+                // of it.
+                if (IsThrowTail(cfg, successor))
+                    continue;
                 queue.Enqueue(successor);
+            }
         }
 
         var sawInit = contextRequirement == null
@@ -580,34 +826,32 @@ public static class MetadataInitGuardRemover
         {
             if (block.Predecessors.Any(predecessor => predecessor != guard && !collected.Contains(predecessor)))
                 return false;
-            if (block.Successors.Any(successor => successor != merge && !collected.Contains(successor)))
+            if (block.Successors.Any(successor => successor != merge && !collected.Contains(successor)
+                                                   && !IsThrowTail(cfg, successor)))
                 return false;
         }
 
         // Region-defined locals must not escape the region: after excision only the merge survives
         // the boundary, and its phis lose the region's inputs - any other outside read would dangle.
-        if (initGuards != null)
-        {
-            var defined = new HashSet<LocalVariable>();
-            foreach (var block in collected)
-                foreach (var instruction in block.Instructions)
-                    if (instruction.Destination is LocalVariable definedLocal)
-                        defined.Add(definedLocal);
+        var defined = new HashSet<LocalVariable>();
+        foreach (var block in collected)
+            foreach (var instruction in block.Instructions)
+                if (instruction.Destination is LocalVariable definedLocal)
+                    defined.Add(definedLocal);
 
-            foreach (var outside in cfg.Blocks)
+        foreach (var outside in cfg.Blocks)
+        {
+            if (collected.Contains(outside))
+                continue;
+            foreach (var instruction in outside.Instructions)
             {
-                if (collected.Contains(outside))
+                // Phi inputs arriving on the region's back-edges are dropped by Excise.
+                if (instruction.OpCode == OpCode.Phi)
                     continue;
-                foreach (var instruction in outside.Instructions)
-                {
-                    // Phi inputs arriving on the region's back-edges are dropped by Excise.
-                    if (instruction.OpCode == OpCode.Phi)
-                        continue;
-                    if (instruction.SourcesAndConstants.Any(source =>
-                            source is LocalVariable read && defined.Contains(read)
-                            || source is MemoryOperand { Base: LocalVariable memoryBase } && defined.Contains(memoryBase)))
-                        return false;
-                }
+                if (instruction.SourcesAndConstants.Any(source =>
+                        source is LocalVariable read && defined.Contains(read)
+                        || source is MemoryOperand { Base: LocalVariable memoryBase } && defined.Contains(memoryBase)))
+                    return false;
             }
         }
 
@@ -629,11 +873,15 @@ public static class MetadataInitGuardRemover
                     break;
 
                 // A nested init guard (rgctx-slot recheck or class-init flag test) is itself provable
-                // boilerplate - both its arms are collected and classified like any region block.
+                // boilerplate - both its arms are collected and classified like any region block. A
+                // non-guard conditional is admissible only as a fail edge into a throw tail: the
+                // double-check `if (flag == 0) throw` shape. Any other nested branch may hide real
+                // control flow.
                 case OpCode.ConditionalJump:
-                    if (initGuards == null || !initGuards.Contains(block))
-                        return false;
-                    break;
+                    if (initGuards?.Contains(block) == true
+                        || JumpsToThrowTail(cfg, instruction))
+                        break;
+                    return false;
 
                 // A phi inside a nested region merges the inner guard's arms; any escaping use is
                 // rejected by the post-collection escape check.

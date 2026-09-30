@@ -467,4 +467,71 @@ public class MetadataInitGuardRemoverTests
 
         Assert.That(graph.Instructions.Any(instruction => instruction.IsCall), Is.True);
     }
+
+    // VoodooLive::set_UseCacheOnly's shape: several guards test cctor_finished of the same class
+    // pointer, the pointer reaching every check through a phi, each guard branching over a shared
+    // init trampoline into one merge. No single guard is excisable (the trampoline's other
+    // back-edge fails closure), so the cluster goes together.
+    [Test]
+    public void SiblingInitGuardsOnPhiedClassPointerAreExcisedAsCluster()
+    {
+        var stream = App.AssembliesByName["mscorlib"].GetTypeByFullName("System.IO.MemoryStream")!;
+        var instance = new LocalVariable("instance", new Register(null, "x20")) { Type = stream };
+        var selector = new LocalVariable("selector", new Register(null, "x21"));
+        var selectorB = new LocalVariable("selectorB", new Register(null, "x22"));
+        var klassA = new LocalVariable("klassA", new Register(null, "x0"));
+        var klassB = new LocalVariable("klassB", new Register(null, "x1"));
+        var klassP = new LocalVariable("klassP", new Register(null, "x2"));
+        var flagA = new LocalVariable("flagA", new Register(null, "x3"));
+        var flagB = new LocalVariable("flagB", new Register(null, "x4"));
+        var condA = new LocalVariable("condA", new Register(null, "w3"));
+        var condB = new LocalVariable("condB", new Register(null, "w4"));
+        var cond0 = new LocalVariable("cond0", new Register(null, "w0"));
+        var cond2 = new LocalVariable("cond2", new Register(null, "w1"));
+        var initResult = new LocalVariable("initResult", new Register(null, "x9"));
+        var handle = new LocalVariable("handle", new Register(null, "x10"));
+
+        var pathB = new Instruction(4, OpCode.Move, klassB, new MemoryOperand(instance, null, 0, 0));
+        var join = new Instruction(5, OpCode.Phi, klassP, klassA, klassB);
+        var guardB = new Instruction(12, OpCode.Move, flagB, new MemoryOperand(klassP, null, 0xE0, 0));
+        var tramp = new Instruction(16, OpCode.Call,
+            new StringLiteral("il2cpp_runtime_class_init_actual"), initResult, handle);
+        var merge = new Instruction(18, OpCode.Return);
+        var graph = new ISILControlFlowGraph(
+        [
+            new(0, OpCode.CheckNotEqual, cond0, selector, new Immediate(0)),
+            new(1, OpCode.ConditionalJump, pathB, cond0),
+            new(2, OpCode.Move, klassA, new MemoryOperand(instance, null, 0, 0)),
+            new(3, OpCode.Jump, join),
+            pathB,
+            join,
+            new(6, OpCode.CheckNotEqual, cond2, selectorB, new Immediate(0)),
+            new(7, OpCode.ConditionalJump, guardB, cond2),
+            new(8, OpCode.Move, flagA, new MemoryOperand(klassP, null, 0xE0, 0)),
+            new(9, OpCode.CheckNotEqual, condA, flagA, new Immediate(0)),
+            new(10, OpCode.ConditionalJump, merge, condA),
+            new(11, OpCode.Jump, tramp),
+            guardB,
+            new(13, OpCode.CheckNotEqual, condB, flagB, new Immediate(0)),
+            new(14, OpCode.ConditionalJump, merge, condB),
+            new(15, OpCode.Jump, tramp),
+            tramp,
+            new(17, OpCode.Jump, merge),
+            merge,
+        ]);
+        var method = new InjectedMethodAnalysisContext(App.SystemTypes.SystemObjectType, "Fixture",
+            App.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = graph,
+        };
+
+        MetadataInitGuardRemover.Run(graph, 0x135, method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(graph.Instructions.Any(instruction => instruction.IsCall), Is.False);
+            Assert.That(graph.Instructions.Any(instruction => instruction.Operands.Any(operand =>
+                    operand is MemoryOperand { Addend: 0xE0 })), Is.False);
+        });
+    }
 }

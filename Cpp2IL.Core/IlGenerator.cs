@@ -394,6 +394,24 @@ public static class IlGenerator
     private static string Diagnostic(string message) 
         => message.Length <= 250 ? message : message[..250] + "…";
 
+    // A load off a class pointer that matches no recovered idiom still gets its field named in the
+    // diagnostic, so the string names `initialized` or `vtable slot n` rather than a raw offset.
+    private static string ClassStructureReadName(MemoryOperand memory, MethodAnalysisContext? callingContext)
+    {
+        if (callingContext == null
+            || memory is not { Index: null, Scale: 0, Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext } }
+            || memory.Addend is < 0 or > uint.MaxValue)
+            return "";
+
+        var metadataVersion = callingContext.AppContext.MetadataVersion;
+        var is32Bit = callingContext.AppContext.Binary.is32Bit;
+        if (Il2CppClassUsefulOffsets.TryGetField((uint)memory.Addend, metadataVersion, is32Bit, out var field, out var name))
+            return $" ({name})";
+        return Il2CppClassUsefulOffsets.GetVTableSlot(memory.Addend, metadataVersion, is32Bit) is { } slot
+            ? $" (vtable slot {slot})"
+            : "";
+    }
+
     // Replaces a call the verifier could never resolve with the standard diagnostic stub:
     // note the unnameable callee, then throw. The ISIL operands are never loaded, so the
     // stack stays balanced and the destination (if any) keeps its default.
@@ -4433,12 +4451,13 @@ public static class IlGenerator
                     });
                     break;
                 }
-                instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand));
+                var readName = ClassStructureReadName(memory, callingContext);
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand + readName));
                 instructions.Add(CilOpCodes.Call, writeLine);
                 var exceptionCtor = module.CorLibTypeFactory.CorLibScope
                     .CreateTypeReference("System", "Exception")
                     .CreateMemberReference(".ctor", MethodSignature.CreateInstance(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.String]));
-                instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand));
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand + readName));
                 instructions.Add(CilOpCodes.Newobj, exceptionCtor);
                 instructions.Add(CilOpCodes.Throw);
                 return false;
