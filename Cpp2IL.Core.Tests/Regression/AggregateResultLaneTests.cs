@@ -70,10 +70,16 @@ public class AggregateResultLaneTests
     // The production order: CFG -> dominators -> SSA -> CreateAll -> fixpoint.
     private static InjectedMethodAnalysisContext Drive(InjectedTypeAnalysisContext callerType,
         Instruction[] instructions, params TypeAnalysisContext[] parameterTypes)
+        => DriveReturning(callerType, Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemVoidType,
+            instructions, parameterTypes);
+
+    private static InjectedMethodAnalysisContext DriveReturning(InjectedTypeAnalysisContext callerType,
+        TypeAnalysisContext returnType, Instruction[] instructions,
+        params TypeAnalysisContext[] parameterTypes)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         app.InstructionSet = new Cpp2IL.Core.InstructionSets.NewArmV8InstructionSet();
-        var caller = callerType.InjectMethodContext("Run", app.SystemTypes.SystemVoidType,
+        var caller = callerType.InjectMethodContext("Run", returnType,
             R.MethodAttributes.Public, parameterTypes);
         caller.ControlFlowGraph = new ISILControlFlowGraph(instructions.ToList());
         caller.ParameterOperands = app.InstructionSet.CallingConventionResolver!
@@ -88,13 +94,25 @@ public class AggregateResultLaneTests
 
     private static MethodDefinition Emit(InjectedMethodAnalysisContext caller, ModuleDefinition module,
         params TypeAnalysisContext[] types)
+        => EmitReturning(caller, module, null, types);
+
+    private static MethodDefinition EmitReturning(InjectedMethodAnalysisContext caller,
+        ModuleDefinition module, TypeAnalysisContext? returnType, params TypeAnalysisContext[] types)
     {
+        // Locals typed as a corlib primitive still go through ToTypeSignature,
+        // which wants an AsmResolverType - seed the primitives a typed local or
+        // field can reference the same way injected types are seeded.
+        foreach (var type in caller.Locals.Select(l => l.Type).Where(t => t != null)
+                     .Concat(types).Distinct())
+            SeedTypeTree(module, type!);
         SeedTypes(module, types);
         var callerType = new TypeDefinition("Tests", "EmittedCaller",
             TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
         module.TopLevelTypes.Add(callerType);
         var method = new MethodDefinition("Run", MethodAttributes.Public,
-            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+            MethodSignature.CreateInstance(returnType == null
+                ? module.CorLibTypeFactory.Void
+                : SignatureFor(module, returnType)));
         callerType.Methods.Add(method);
         IlGenerator.GenerateIl(caller, method);
         return method;
@@ -113,6 +131,29 @@ public class AggregateResultLaneTests
             "System.Void" => module.CorLibTypeFactory.Void,
             _ => type.ToTypeSignature(),
         };
+
+    private static void SeedTypeTree(ModuleDefinition module, TypeAnalysisContext type)
+    {
+        var pending = new Queue<TypeAnalysisContext>();
+        pending.Enqueue(type);
+        while (pending.Count > 0)
+        {
+            var next = pending.Dequeue();
+            if (next.GetExtraData<TypeDefinition>("AsmResolverType") != null)
+                continue;
+            var definition = new TypeDefinition(next.Namespace, next.Name,
+                TypeAttributes.Public | (next.IsValueType
+                    ? TypeAttributes.Sealed | TypeAttributes.SequentialLayout
+                    : TypeAttributes.Class),
+                next.IsValueType
+                    ? module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType")
+                    : module.CorLibTypeFactory.Object.Type);
+            module.TopLevelTypes.Add(definition);
+            next.PutExtraData("AsmResolverType", definition);
+            foreach (var field in next.Fields)
+                pending.Enqueue(field.FieldType);
+        }
+    }
 
     private static void SeedTypes(ModuleDefinition module, IEnumerable<TypeAnalysisContext> types)
     {
@@ -299,6 +340,44 @@ public class AggregateResultLaneTests
         {
             Assert.That(lane.Field.Name, Is.EqualTo("y"));
             Assert.That(lane.Local, Is.SameAs(caller.ParameterLocals.First(p => !p.IsThis)));
+        });
+    }
+
+    [Test]
+    public void Vector2ReturnRebuildsStructFromLanes()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector2 = InjectStruct("Vector2", FloatFields("x", "y"));
+        var callerType = CallerTypeWithField("pos", vector2, 0x80);
+
+        // scvtf s0,w19; scvtf s1,w0; ret in a method returning Vector2: the
+        // lifter reads V1 as the second lane of the result (the mirror of the
+        // call's implicit lane definitions).
+        var ret = new Instruction(0x18, OpCode.Return, Reg("V0"), Reg("V1"));
+        var caller = DriveReturning(callerType, vector2, [
+            new Instruction(0x10, OpCode.Move, Reg("V0"), new Immediate(1)),
+            new Instruction(0x14, OpCode.Move, Reg("V1"), new Immediate(2)),
+            ret]);
+
+        var result = (LocalVariable)ret.Operands[0];
+        var stores = caller.ControlFlowGraph!.Instructions
+            .Where(i => i.OpCode == OpCode.Move && i.Operands[0] is FieldReference)
+            .Select(i => (FieldReference)i.Operands[0]).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.Type, Is.SameAs(vector2));
+            Assert.That(stores.Select(f => f.Field.Name), Is.EqualTo(new[] { "x", "y" }));
+            Assert.That(stores.All(f => ReferenceEquals(f.Local, result)), Is.True);
+        });
+
+        var module = new ModuleDefinition("Lanes.dll");
+        var method = EmitReturning(caller, module, vector2, callerType, vector2);
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ret), Is.True);
+            Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldstr), Is.EqualTo(0),
+                "the rebuilt return carries no diagnostic note");
         });
     }
 }

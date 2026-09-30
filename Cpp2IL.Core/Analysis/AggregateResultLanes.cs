@@ -131,8 +131,14 @@ internal static class AggregateResultLanes
             }
         }
 
+        // The method's own aggregate return comes back the same way: the lifter
+        // puts each lane on the Return's operands, and the value is rebuilt from
+        // the fields its bytes hold - before the projection loop below so the
+        // operands still name their registers.
+        var changed = RebuildAggregateReturns(method, resolver, pointerSize);
+
         if (provenLanes.Count == 0 && lateLanes.Count == 0 && entryLanes.Count == 0)
-            return created;
+            return created || changed;
 
         // Dominance for late-def and entry-lane per-use resolution - built here when
         // analysis did not already compute it (synthetic callers).
@@ -176,7 +182,6 @@ internal static class AggregateResultLanes
             return null;
         }
 
-        var changed = false;
         foreach (var block in graph.Blocks)
         {
             for (var instructionIndex = 0; instructionIndex < block.Instructions.Count; instructionIndex++)
@@ -228,6 +233,114 @@ internal static class AggregateResultLanes
 
         return changed || created;
     }
+
+    // A multi-register result leaves the method in its lanes: the lifter puts
+    // each lane register on the Return's operands (lane 0 first, then the extra
+    // lanes in order). Rebuild the value as a local of the return type with each
+    // lane stored into the field its bytes hold - the same exact-width rule as
+    // call-side projection - so `SCVTF S0,W19; SCVTF S1,W0; RET` of a Vector2
+    // method returns `new Vector2(x, y)` instead of one Int32 lane plus a
+    // conversion failure. A Return whose operands no longer name the lane
+    // registers, or whose fields cannot all be proven, keeps its operands for
+    // the default-fill note.
+    private static bool RebuildAggregateReturns(MethodAnalysisContext method,
+        BaseCallingConventionResolver resolver, int pointerSize)
+    {
+        if (method.IsVoid || resolver.ReturnsViaHiddenBuffer(method))
+            return false;
+
+        var firstLane = resolver.ReturnRegister(method);
+        var lanes = resolver.ExtraLanes(method.ReturnType, firstLane);
+        if (lanes.Count == 0)
+            return false;
+
+        var changed = false;
+        foreach (var block in method.ControlFlowGraph!.Blocks)
+        {
+            for (var index = 0; index < block.Instructions.Count; index++)
+            {
+                var instruction = block.Instructions[index];
+                if (instruction.OpCode != OpCode.Return
+                    || instruction.Operands.Count != lanes.Count + 1
+                    || LaneOperand(instruction.Operands[0], firstLane.Name) is not { } lane0)
+                    continue;
+
+                // Each operand must still name the register of the lane at its
+                // position - lane 0 covering [0, lanes[0].ByteOffset).
+                var sources = new List<(IOperand Operand, int Offset, int Width)>
+                    { (lane0, 0, lanes[0].ByteOffset) };
+                var proven = true;
+                for (var laneIndex = 0; laneIndex < lanes.Count; laneIndex++)
+                {
+                    if (LaneOperand(instruction.Operands[laneIndex + 1], lanes[laneIndex].Register.Name)
+                            is not { } source)
+                    {
+                        proven = false;
+                        break;
+                    }
+                    sources.Add((source, lanes[laneIndex].ByteOffset, lanes[laneIndex].AccessSize));
+                }
+                if (!proven)
+                    continue;
+
+                var fields = new List<(FieldAnalysisContext Field, int Offset,
+                    IReadOnlyList<FieldAnalysisContext> Containers, int Width)>();
+                foreach (var (_, offset, width) in sources)
+                {
+                    if (MetadataResolver.FindInstanceFieldPathAtOffset(method.ReturnType, offset, width)
+                            is not { } path
+                        || TypeSizes.MinimumUnboxedSize(path.Field.FieldType, pointerSize) != width)
+                    {
+                        proven = false;
+                        break;
+                    }
+                    fields.Add((path.Field, offset, path.Containers, width));
+                }
+                if (!proven)
+                    continue;
+
+                var result = new LocalVariable($"aggregateResult_{instruction.Index}",
+                    new Register(null, $"ARET_{instruction.Index}"), method.ReturnType);
+                method.Locals.Add(result);
+
+                for (var i = 0; i < sources.Count; i++)
+                {
+                    var (operand, offset, width) = sources[i];
+                    var (field, _, containers, _) = fields[i];
+                    block.Instructions.Insert(index + i, new Instruction(instruction.Index, OpCode.Move,
+                        new FieldReference(field, result, offset, containers, width),
+                        LaneValue(operand, width, pointerSize))
+                    {
+                        NativeMemoryAccessSize = width
+                    });
+                }
+
+                instruction.SetOperands(result);
+                index += sources.Count;
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    private static IOperand? LaneOperand(IOperand operand, string? registerName) => operand switch
+    {
+        Register register when register.Name == registerName => register,
+        LocalVariable { Register.Name: var name } local when name == registerName => local,
+        _ => null
+    };
+
+    // The lane operand emits exactly its width: a local typed wider than the lane
+    // (the whole-call-result local sits in lane 0 of a passthrough return) narrows
+    // to the field covering the lane's bytes, the same rule as for reads.
+    private static IOperand LaneValue(IOperand operand, int width, int pointerSize)
+        => operand is LocalVariable { Type: { } type } local
+           && TypeSizes.MinimumUnboxedSize(type, pointerSize) > width
+           && MetadataResolver.FindInstanceFieldPathAtOffset(type, 0, width) is { } path
+           && TypeSizes.MinimumUnboxedSize(path.Field.FieldType, pointerSize) == width
+            ? new FieldReference(path.Field, local, 0, path.Containers, width)
+            : operand;
 
     private static FieldReference Clone(FieldReference projection)
         => new(projection.Field, projection.Local, projection.Offset, projection.Containers,

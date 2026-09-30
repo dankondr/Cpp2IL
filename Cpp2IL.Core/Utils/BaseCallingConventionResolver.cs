@@ -141,6 +141,21 @@ public abstract class BaseCallingConventionResolver
                 call.ImplicitDefinitions.Add(lane.Register);
     }
 
+    // The mirror of AttachResultLanes: a method whose own return type spans
+    // several registers reads each lane as a separate operand of the Return, so
+    // SSA and local binding treat them like any other use. AggregateResultLanes
+    // rebuilds the aggregate from them; a Return whose lanes cannot be proven
+    // keeps its extra operands for the default-fill note.
+    public void AttachReturnLanes(Instruction instruction, MethodAnalysisContext context)
+    {
+        if (instruction.OpCode != OpCode.Return || context.IsVoid || ReturnsViaHiddenBuffer(context))
+            return;
+
+        var firstLane = ReturnRegister(context);
+        foreach (var lane in ExtraLanes(context.ReturnType, firstLane))
+            instruction.AddOperands([lane.Register]);
+    }
+
     protected static int ArgBase(Instruction call) => call.OpCode is OpCode.CallVoid ? 1 : 2;
 
     private static string? RegisterName(IOperand operand) => operand switch
