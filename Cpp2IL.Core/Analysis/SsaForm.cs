@@ -364,7 +364,7 @@ public class SsaForm
 
     private static IEnumerable<Register> EnumerateRegisters(Instruction instruction)
     {
-        if (instruction.ImplicitDefinition is { } clobbered)
+        foreach (var clobbered in instruction.ImplicitDefinitions)
             yield return clobbered;
 
         foreach (var operand in instruction.Operands)
@@ -491,8 +491,8 @@ public class SsaForm
 
                 // Nothing to write the new version back into, but taking it off the stack is the point: reads
                 // after this one can't reach back past the call
-                if (instruction.ImplicitDefinition is { } clobbered)
-                    instruction.ImplicitDefinition = NewName(clobbered, definedHere);
+                for (var i = 0; i < instruction.ImplicitDefinitions.Count; i++)
+                    instruction.ImplicitDefinitions[i] = NewName(instruction.ImplicitDefinitions[i], definedHere);
 
                 for (var i = 0; i < instruction.Operands.Count; i++)
                 {

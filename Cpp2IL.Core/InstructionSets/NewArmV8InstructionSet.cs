@@ -204,10 +204,11 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         {
             var index = instructions[^1].Index + 1;
 
-            if (context.IsVoid)
-                instructions.Add(new Instruction(index, OpCode.Return));
-            else
-                instructions.Add(new Instruction(index, OpCode.Return, CallingConventions.ReturnRegister(context)));
+            var ret = context.IsVoid
+                ? new Instruction(index, OpCode.Return)
+                : new Instruction(index, OpCode.Return, CallingConventions.ReturnRegister(context));
+            CallingConventions.AttachReturnLanes(ret, context);
+            instructions.Add(ret);
         }
 
         // fix branches
@@ -298,6 +299,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                             ? new MemoryOperand(CallingConventions.HiddenReturnBufferRegister(ctx))
                             : CallingConventions.ReturnRegister(ctx));
 
+                // A multi-register result occupies its further lanes immediately: SSA
+                // sees them defined here, so the reads of V1..V3/X1 that store them
+                // away get the call's version instead of the method-entry value.
+                if (!ctx.IsVoid && !CallingConventions.ReturnsViaHiddenBuffer(ctx))
+                    foreach (var lane in CallingConventions.ExtraLanes(ctx.ReturnType,
+                                 CallingConventions.ReturnRegister(ctx)))
+                        call.ImplicitDefinitions.Add(lane.Register);
+
                 call.AddOperands(CallingConventions.ResolveForManaged(ctx));
             }
             else if (!TryEmitScalarMathImport(target))
@@ -310,10 +319,13 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
         void AddReturn()
         {
-            if (context.IsVoid)
-                Add(address, OpCode.Return);
-            else
-                Add(address, OpCode.Return, CallingConventions.ReturnRegister(context));
+            // A multi-register result leaves the callee in its lanes: the Return
+            // reads V1../X1 as operands (the mirror of the call's implicit lane
+            // definitions) so AggregateResultLanes can rebuild the aggregate.
+            var ret = context.IsVoid
+                ? Add(address, OpCode.Return)
+                : Add(address, OpCode.Return, CallingConventions.ReturnRegister(context));
+            CallingConventions.AttachReturnLanes(ret, context);
         }
 
         // for pre/post indexed accesses, apply the base register update on the correct side of the access

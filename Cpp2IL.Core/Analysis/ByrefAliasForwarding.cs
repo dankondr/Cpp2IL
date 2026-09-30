@@ -52,7 +52,7 @@ internal static class ByrefAliasForwarding
         var clobberedRegisters = new HashSet<string?>();
         foreach (var block in graph.Blocks)
             foreach (var instruction in block.Instructions)
-                if (instruction.ImplicitDefinition is { } clobbered)
+                foreach (var clobbered in instruction.ImplicitDefinitions)
                     clobberedRegisters.Add(clobbered.Name);
 
         var parameterLocals = new HashSet<LocalVariable>(method.ParameterLocals);
