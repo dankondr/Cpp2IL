@@ -9767,16 +9767,15 @@ public static class IlGenerator
             destination = WholeStorage(destination, BlockCopyPointee(content, context));
             content = WholeStorage(content, BlockCopyPointee(destination, context));
         }
+        // A fill that covers the whole struct local clears the local, not its first field.
+        else if (count is Immediate { Value: > 0 } fillCount
+                 && destination is AddressOf { Target: FieldReference { Local.Type: { IsValueType: true } filled } }
+                 && ManagedSize(filled, context) == fillCount.Value)
+            destination = WholeStorage(destination, filled);
         if (count is not Immediate { Value: > 0 } byteCount
             || BlockCopyPointee(destination, context) is not { IsValueType: true } pointee
             || pointee is GenericParameterTypeAnalysisContext
-            // The managed size (instance size less the object header), not the marshaled native
-            // size, which is -1 for a struct holding references.
-            || (pointee is not GenericInstanceTypeAnalysisContext
-                && TypeSizes.UnboxedSize(pointee, context.AppContext.Binary.PointerSizeBytes) is > 0 and var managedSize
-                ? managedSize
-                : TypeSizes.LaidOutSize(pointee, context.AppContext.Binary.PointerSizeBytes) is > 0 and var laidOut
-                    ? laidOut : (long?)null) is not { } pointeeSize
+            || ManagedSize(pointee, context) is not { } pointeeSize
             || byteCount.Value != pointeeSize
             || !TypeTokenUsableFrom(pointee, context))
             return false;
@@ -9799,6 +9798,16 @@ public static class IlGenerator
             default:
                 return false;
         }
+    }
+
+    // The managed size (instance size less the object header), not the marshaled native size,
+    // which is -1 for a struct holding references. A generic instance has no metadata size.
+    private static long? ManagedSize(TypeAnalysisContext type, MethodAnalysisContext context)
+    {
+        var pointerSize = context.AppContext.Binary.PointerSizeBytes;
+        if (type is not GenericInstanceTypeAnalysisContext && TypeSizes.UnboxedSize(type, pointerSize) is > 0 and var exact)
+            return exact;
+        return TypeSizes.LaidOutSize(type, pointerSize) is > 0 and var laidOut ? laidOut : null;
     }
 
     private static IOperand WholeStorage(IOperand operand, TypeAnalysisContext? other)

@@ -504,4 +504,33 @@ public class AccessWidthTests
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stobj), Is.True, () => Dump(method));
         });
     }
+
+    [Test]
+    public void FillOfAWholeStructThroughItsFirstFieldAddressIsInitobj()
+    {
+        // `memset(&local.a, 0, 8)` over Pair2 { int a; int b } clears the whole local.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var pair = InjectStruct(app, "Pair2");
+        var a = InjectField("a", app.SystemTypes.SystemInt32Type, pair, 0);
+        InjectField("b", app.SystemTypes.SystemInt32Type, pair, 4);
+        var module = new ModuleDefinition("Width.dll");
+        Seed(module, app, pair);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemObjectType);
+
+        var local = Local("local", pair);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.MemorySet, new AddressOf(new FieldReference(a, local, 0)), new Immediate(0), new Immediate(8)),
+            new(1, OpCode.Return)], [local]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Initblk), Is.False, () => Dump(method));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Initobj), Is.True, () => Dump(method));
+        });
+    }
 }
