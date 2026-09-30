@@ -30,9 +30,14 @@ public static class ContextToMethodDescriptor
 
     public static IMethodDescriptor ToMethodDescriptor(this MethodAnalysisContext context)
     {
-        return context is ConcreteGenericMethodAnalysisContext concreteMethod
-            ? concreteMethod.ToMethodDescriptor()
-            : context.GetMethodDefinition();
+        return context switch
+        {
+            ConcreteGenericMethodAnalysisContext concreteMethod => concreteMethod.ToMethodDescriptor(),
+            // T[,]::Get/Set/Address are provided by the runtime; no definition exists to import.
+            InjectedMethodAnalysisContext { DeclaringType: ArrayTypeAnalysisContext arrayType } =>
+                new MemberReference(arrayType.ToTypeSignature().ToTypeDefOrRef(), context.Name, context.ToMethodSignature()),
+            _ => context.GetMethodDefinition(),
+        };
     }
 
     public static IMethodDescriptor ToMethodDescriptor(this ConcreteGenericMethodAnalysisContext context)
