@@ -196,6 +196,80 @@ public class ErasedObjectSharedGenericTests
     }
 
     [Test]
+    public void ErasedReceiverRetargetMarshalsFsgContract()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("ErasedRetarget.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemVoidType);
+        var fsgType = new InjectedTypeAnalysisContext(app.AssembliesByName["UnityEngine.CoreModule"],
+            "Unity.IL2CPP.Metadata", "__Il2CppFullySharedGenericType",
+            app.SystemTypes.SystemObjectType,
+            System.Reflection.TypeAttributes.Public | System.Reflection.TypeAttributes.Class);
+        SeedCorLibTypes(app, module, fsgType);
+        // Box<T>::TakeBox(T) - the metadata callee declares `!T`, but the
+        // receiver spells `Box<FSG>` so the emitted slot is the fully-shared
+        // placeholder: the same retarget the call emitter performs.
+        var boxType = new InjectedTypeAnalysisContext(app.AssembliesByName["UnityEngine.CoreModule"],
+            "Erased", "Box`1",
+            app.SystemTypes.SystemObjectType,
+            System.Reflection.TypeAttributes.Public | System.Reflection.TypeAttributes.Class);
+        var boxT = new GenericParameterTypeAnalysisContext("T", 0,
+            Il2CppTypeEnum.IL2CPP_TYPE_VAR, 0, boxType);
+        boxType.GenericParameters.Add(boxT);
+        var takeBox = boxType.InjectMethodContext("TakeBox",
+            app.SystemTypes.SystemVoidType,
+            System.Reflection.MethodAttributes.Public,
+            boxT);
+        var boxDefinition = new TypeDefinition("Erased", "Box`1",
+            TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        boxDefinition.GenericParameters.Add(new GenericParameter("T"));
+        module.TopLevelTypes.Add(boxDefinition);
+        var takeBoxDefinition = new MethodDefinition("TakeBox",
+            MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void,
+                [new GenericParameterSignature(AsmResolver.DotNet.Signatures.GenericParameterType.Type, 0)]));
+        boxDefinition.Methods.Add(takeBoxDefinition);
+        takeBox.PutExtraData("AsmResolverMethod", takeBoxDefinition);
+        boxType.PutExtraData("AsmResolverType", boxDefinition);
+        var recv = new LocalVariable("recv", new Register(null, "recv"))
+            { Type = new GenericInstanceTypeAnalysisContext(boxType, [fsgType]) };
+        // spill is the erased rep: its `!T` use would adopt, but the
+        // FSG-marshaled argument slot on the retargeted callee vetoes - the
+        // value stays erased, the `!T` use keeps its note and no `castclass`
+        // to the placeholder is fabricated.
+        var spill = new LocalVariable("spill", new Register(null, "spill")) { Type = fsgType };
+        var (caller, method, typeArgument, callerType) =
+            GenericHost(app, module, [recv, spill]);
+        var take = InjectTake(callerType, module, method, typeArgument);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.CallVoid, take, spill),
+            new(1, OpCode.CallVoid, takeBox, recv, spill),
+            new(2, OpCode.Return)]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var body = method.CilMethodBody!;
+        var instructions = body.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(instructions.Any(i => i.OpCode == CilOpCodes.Call
+                    && i.Operand?.ToString().Contains("TakeBox") == true), Is.True,
+                () => string.Join("\n", instructions.Select(i => i.ToString())));
+            Assert.That(instructions.Any(i => i.OpCode == CilOpCodes.Castclass
+                    && i.Operand?.ToString().Contains("__Il2CppFullySharedGenericType") == true),
+                Is.False,
+                () => string.Join("\n", instructions.Select(i => i.ToString())));
+            Assert.That(instructions.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("operand to T")), Is.True,
+                () => string.Join("\n", instructions.Select(i => i.ToString())));
+        });
+    }
+
+    [Test]
     public void UnprovenProducerKeepsConversionDiagnostic()
     {
         Cpp2IlApi.ResetInternalState();
