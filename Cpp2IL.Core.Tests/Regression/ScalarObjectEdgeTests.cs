@@ -311,4 +311,42 @@ public class ScalarObjectEdgeTests
                     + string.Join("\n", il.Select(i => i.ToString())));
         });
     }
+
+    [Test]
+    public void ReadBeforeAnyDefinitionKeepsObjectSlotNotUnassignedLoad()
+    {
+        // The lifter's register names are not SSA: this register's only
+        // definition is the instruction that also reads it. Retyping the slot
+        // would emit `ldloc` before any `stloc` - an unassigned-local read the
+        // C# layer cannot spell. The slot keeps System.Object, so the
+        // unemittable operation leaves its noted default store instead.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var slot = Local("v", app.SystemTypes.SystemObjectType);
+        var module = new ModuleDefinition("SelfReadSlot.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemObjectType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Subtract, slot, slot, slot),
+            new(1, OpCode.Return)], [slot]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        var firstStore = il.ToList().FindIndex(i => i.OpCode == CilOpCodes.Stloc);
+        Assert.Multiple(() =>
+        {
+            Assert.That(method.CilMethodBody.LocalVariables.Any(local =>
+                    local.VariableType?.ToString()?.Contains("Object") == true), Is.True,
+                () => "the unreadable slot keeps System.Object:\n"
+                    + string.Join("\n", method.CilMethodBody.LocalVariables.Select(l => l.ToString())));
+            Assert.That(firstStore, Is.GreaterThanOrEqualTo(0),
+                () => "the honest stop still assigns the slot:\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(firstStore < 0 || il.Take(firstStore).All(i => i.OpCode != CilOpCodes.Ldloc), Is.True,
+                () => "no ldloc may precede the slot's first store:\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
+        });
+    }
 }

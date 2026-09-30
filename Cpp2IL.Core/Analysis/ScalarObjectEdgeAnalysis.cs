@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Linq;
+using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 
@@ -162,7 +163,102 @@ public static class ScalarObjectEdgeAnalysis
                 return null;
             found = true;
         }
-        return found ? proven : null;
+        // A retyped slot must also be readable: with the object contract gone the
+        // unemittable operation that used to leave a default store disappears,
+        // so a local whose reads are not all dominated by a definition would
+        // emit a read of an unassigned local. Keeping it object keeps those
+        // sites on the prior path with their note.
+        return found && EveryReadHasDominatingDefinition(local, context) ? proven : null;
+    }
+
+    // True when every read of `local` - through any operand nesting - is
+    // guaranteed a value: some definition of it (a destination store, or an
+    // &local argument to a call whose callee can write the cell) sits in a
+    // block that dominates the read's block, or earlier in the same block.
+    // The lifter's register names are not SSA: the same stack-cell register
+    // is defined on one path and read on another where no store precedes it.
+    private static bool EveryReadHasDominatingDefinition(LocalVariable local,
+        MethodAnalysisContext context)
+    {
+        if (context.ControlFlowGraph is not { } graph)
+            return false;
+        // Analyze() computes this once after stack analysis; fixtures that
+        // hand the context a graph never ran it, so build it on demand.
+        var dominators = context.DominatorInfo
+            ?? context.GetExtraData<DominatorInfo>("ScalarSlotDominators")
+            ?? new DominatorInfo(graph);
+        if (context.DominatorInfo == null)
+            context.PutExtraData("ScalarSlotDominators", dominators);
+        var accesses = LocalAccessMap(context);
+        foreach (var (readBlock, readIndex, isDef) in accesses.TryGetValue(local, out var positions)
+                     ? positions : [])
+        {
+            if (isDef)
+                continue;
+            var covered = positions.Any(access =>
+                access.isDef
+                && (ReferenceEquals(access.block, readBlock) && access.index < readIndex
+                    || !ReferenceEquals(access.block, readBlock)
+                        && dominators.Dominates(access.block, readBlock)));
+            if (!covered)
+                return false;
+        }
+        return true;
+    }
+
+    // Every def and read position for every local in the method, collected in
+    // one pass: a def is a bare-local destination or an &local call operand
+    // (the callee can write the cell); a read is a local reachable through
+    // any operand nesting except those. Positions are (block, instruction
+    // index within the block).
+    private static Dictionary<LocalVariable, List<(Graphs.Block block, int index, bool isDef)>>
+        LocalAccessMap(MethodAnalysisContext context)
+    {
+        var cached = context.GetExtraData<Dictionary<LocalVariable, List<(Graphs.Block, int, bool)>>>(
+            "ScalarSlotAccesses");
+        if (cached != null)
+            return cached;
+        var map = new Dictionary<LocalVariable, List<(Graphs.Block, int, bool)>>();
+        void Record(LocalVariable local, Graphs.Block block, int index, bool isDef)
+        {
+            if (!map.TryGetValue(local, out var positions))
+                map[local] = positions = [];
+            positions.Add((block, index, isDef));
+        }
+        foreach (var block in context.ControlFlowGraph!.Blocks)
+            for (var index = 0; index < block.Instructions.Count; index++)
+            {
+                var instruction = block.Instructions[index];
+                if (instruction.Destination is LocalVariable destination)
+                    Record(destination, block, index, isDef: true);
+                var isCall = instruction.OpCode is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall;
+                // A bare-local destination position is written, not read -
+                // matched by index because a self-referencing operation passes
+                // the same local object as a source too. Compound destinations
+                // (memory, field receivers) keep their inner reads.
+                var destinationIndex = instruction.Destination is LocalVariable
+                    ? instruction.Operands.ToList()
+                        .FindIndex(o => ReferenceEquals(o, instruction.Destination))
+                    : -1;
+                for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
+                {
+                    var operand = instruction.Operands[operandIndex];
+                    if (operand is AddressOf && isCall)
+                    {
+                        // &local handed to a call can be written through the
+                        // callee: a def, not a read.
+                        foreach (var addressed in LocalVariables.OperandLocals(operand))
+                            Record(addressed, block, index, isDef: true);
+                        continue;
+                    }
+                    if (operandIndex == destinationIndex)
+                        continue;
+                    foreach (var readLocal in LocalVariables.OperandLocals(operand))
+                        Record(readLocal, block, index, isDef: false);
+                }
+            }
+        context.PutExtraData("ScalarSlotAccesses", map);
+        return map;
     }
 
     // The stack type one producing instruction provably leaves in the
