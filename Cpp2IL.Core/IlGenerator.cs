@@ -1837,7 +1837,14 @@ public static class IlGenerator
                 }
                 else
                 {
-                    LoadOperand(instruction.Operands[1], method, locals, writeLine, null, context);
+                    LoadOperand(instruction.Operands[1], method, locals, writeLine,
+                        // `fneg` on a 128-bit constant reads a float lane: without a
+                        // Single contract the literal emits ldnull, which `neg`
+                        // cannot consume - the lane-0 scalar view is the honest
+                        // projection the scalarized ops get elsewhere.
+                        instruction.OpCode == OpCode.Negate && instruction.Operands[1] is Vector128Literal
+                            ? context.AppContext.SystemTypes.SystemSingleType
+                            : null, context);
                     // `not`/`neg` on `&x` really means the pointed value; the coerce
                     // dereferences an integral element or drops a lost one for zero.
                     if (unaryOperandType is ByRefTypeAnalysisContext)
@@ -7645,6 +7652,15 @@ public static class IlGenerator
             receiver = EmittedContainerFieldType(member, receiver) ?? member.FieldType;
         }
         instructions.Add(CilOpCodes.Ldfld, FieldDescriptorFor(field.Field, receiver));
+        // The leaf lands raw on the stack - apply the same coerce the resolved
+        // path would, or drop it for the diagnosed slot default when the leaf
+        // type cannot legally cross the contract.
+        if (!EmitStackCoerce(field.Field.FieldType, contract, method, context, convertByRef))
+        {
+            instructions.Add(CilOpCodes.Pop);
+            PushDefaultOf(contract, method, instructions, context,
+                SlotDefaultReason(field.Field.FieldType, contract));
+        }
         return true;
     }
 
