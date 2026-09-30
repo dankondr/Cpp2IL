@@ -684,14 +684,22 @@ public static class IlGenerator
 
                 var moveDestinationType = StoreContract(instruction.Operands[0], context);
                 // A pass-inserted copy (Index < 0) is an SSA phi-edge write: the
-                // destination carries a whole variable's value, so a literal 0
-                // means the variable's all-zero value - default(T) for a
-                // value-type slot - not a narrower integer mis-bound to it.
+                // edge carries the all-zero value of the one register it covers.
+                // When the destination slot's whole value fits that register the
+                // edge proves default(T); on a wider or unsized slot the binary
+                // only cleared the register, so the implicit default keeps a
+                // named note.
                 if (instruction.Index < 0 && instruction.Operands[0] is LocalVariable
                     && moveDestinationType is { IsValueType: true }
                     && IsZeroConstant(instruction.Operands[1]))
                 {
-                    PushDefaultValue(moveDestinationType, method, instructions, context);
+                    var phiEdgeSlotSize = TypeSizes.MinimumUnboxedSize(moveDestinationType,
+                        context.AppContext.Binary.PointerSizeBytes);
+                    if (phiEdgeSlotSize > 0 && phiEdgeSlotSize <= context.AppContext.Binary.PointerSizeBytes)
+                        PushDefaultValue(moveDestinationType, method, instructions, context);
+                    else
+                        EmitNullOrDefault(moveDestinationType, method, instructions, context,
+                            $"Pass-inserted zero on a phi edge covers one register, not the whole {moveDestinationType.FullName} value: default is an implicit fill, not a stored value.");
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                     break;
                 }

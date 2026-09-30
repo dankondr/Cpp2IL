@@ -14,9 +14,10 @@ namespace Cpp2IL.Core.Tests.Regression;
 // instantiation the binary's own call metadata proves: an `&local` receiver on
 // an instance call demands the callee's declaring type, and an `&local` under
 // a byref parameter demands the parameter's element type. A pass-inserted
-// (Index < 0) move writes a whole SSA variable, so a literal zero into a
-// value-type local is its all-zero default, emitted with no diagnostic; the
-// same literal in a real lifted store keeps its named note.
+// (Index < 0) move carries the one register it covers: a literal zero into a
+// register-sized value-type local is its all-zero default, emitted with no
+// diagnostic; the same literal into a wider value type, or in a real lifted
+// store, keeps a named note.
 public class AwaiterProvenanceTests
 {
     private static GenericInstanceTypeAnalysisContext Awaiter(ApplicationAnalysisContext app,
@@ -167,8 +168,42 @@ public class AwaiterProvenanceTests
         });
     }
 
+    // A pass-inserted phi-edge Move carries one register's all-zero value: for a
+    // slot whose unboxed size fits that register (DateTime, 8 bytes) the edge
+    // proves default(T) - initobj with no diagnostic.
     [Test]
-    public void SyntheticMoveZeroIntoWideValueTypeEmitsDefaultWithoutNote()
+    public void PassInsertedMoveZeroIntoRegisterSizedValueTypeEmitsDefaultWithoutNote()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var dateTimeType = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.DateTime")!;
+        var slot = new LocalVariable("slot", new Register(null, "slot")) { Type = dateTimeType };
+        var (caller, method) = ForeignCaller(app, new ModuleDefinition("AwaiterProvenance.dll"), [
+            new(-1, OpCode.Move, slot, new Immediate(0)),
+            new(1, OpCode.Return)], [slot]);
+        SeedCorLibTypes(app, method.DeclaringModule!, app.SystemTypes.SystemVoidType,
+            app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemValueTypeType, dateTimeType);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Initobj),
+                Is.True, () => string.Join("\n", il));
+            Assert.That(il.All(instruction =>
+                    instruction.Operand?.ToString()?.Contains("No legal conversion") != true
+                    && instruction.Operand?.ToString()?.Contains("NoteDecompilerIssue") != true),
+                Is.True, () => string.Join("\n", il));
+        });
+    }
+
+    // The same pass-inserted zero into a wider value type (Decimal, 16 bytes)
+    // proves only the register it covers: default(T) is still the best value,
+    // but it is an implicit fill and stays diagnosed.
+    [Test]
+    public void PassInsertedMoveZeroIntoWideValueTypeKeepsDecompilerNote()
     {
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2022Game();
@@ -188,9 +223,8 @@ public class AwaiterProvenanceTests
         {
             Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Initobj),
                 Is.True, () => string.Join("\n", il));
-            Assert.That(il.All(instruction =>
-                    instruction.Operand?.ToString()?.Contains("No legal conversion") != true
-                    && instruction.Operand?.ToString()?.Contains("NoteDecompilerIssue") != true),
+            Assert.That(il.Any(instruction =>
+                    instruction.Operand?.ToString()?.Contains("NoteDecompilerIssue") == true),
                 Is.True, () => string.Join("\n", il));
         });
     }
