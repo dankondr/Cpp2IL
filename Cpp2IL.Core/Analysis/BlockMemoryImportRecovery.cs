@@ -12,22 +12,27 @@ using LibCpp2IL;
 namespace Cpp2IL.Core.Analysis;
 
 /// <summary>
-/// Recovers ARM64 ELF block-memory imports - `memcpy`, `memset`, `memmove` - whose call
-/// sites stay unresolved by the normal resolvers. A `bl` into a linker GOT veneer
-/// (adrp; ldr; [add]; br) loads a pointer slot whose dynamic relocation names the
-/// import; that relocated symbol plus the raw ABI argument layout are the only
-/// evidence used. No fixed addresses, no game-specific tokens.
+/// Recovers ARM64 ELF imports whose call sites stay unresolved by the normal
+/// resolvers. A `bl` into a linker GOT veneer (adrp; ldr; [add]; br) loads a
+/// pointer slot whose dynamic relocation names the import; that relocated symbol
+/// plus the raw ABI argument layout are the only evidence used. No fixed
+/// addresses, no game-specific tokens.
 ///
-/// The pass runs at the end of method analysis, after SSA removal and copy forwarding,
-/// so the operands it inspects are the ones emission will see - a call rewritten here
-/// cannot drift into an unprovable shape later.
+/// The pass runs at the end of method analysis, after SSA removal and copy
+/// forwarding, so the operands it inspects are the ones emission will see - a
+/// call rewritten here cannot drift into an unprovable shape later.
 ///
-/// The rewrite commits only when the destination operand provably denotes a region
-/// that cannot hold managed references: cpblk/initblk emit no GC write barriers, so a
-/// destination that could carry reference slots must stay an unresolved call and keep
-/// its diagnostic rather than silently skip the barriers a managed store would need.
-/// The returned dst pointer is preserved as a native int only when the lifted result
-/// local is still read and can legally hold a native int.
+/// Every resolved import gets its name, so an unproven use stays diagnosed as
+/// `Unknown call target operand: "memcpy"` rather than an anonymous address.
+/// `memcpy`/`memset`/`memmove` become block ops when the destination operand
+/// provably denotes a region that cannot hold managed references: cpblk/initblk
+/// emit no GC write barriers, so a destination that could carry reference slots
+/// must stay a named call rather than silently skip the barriers a managed store
+/// would need. `modf`/`modff`/`sincos`/`sincosf` become their managed math
+/// equivalents plus a store through the out pointer, only when the out pointer
+/// provably targets a managed store destination. The returned dst pointer is
+/// preserved as a native int only when the lifted result local is still read and
+/// can legally hold a native int.
 /// </summary>
 public static class BlockMemoryImportRecovery
 {
@@ -35,7 +40,9 @@ public static class BlockMemoryImportRecovery
         Environment.GetEnvironmentVariable("CPP2IL_BLOCKMEM_DIAG");
     private static readonly object DiagnosticsLock = new();
 
-    public static void Run(MethodAnalysisContext method)
+    public static void Run(MethodAnalysisContext method) => Run(method, null);
+
+    internal static void Run(MethodAnalysisContext method, Func<ulong, string?>? importNameResolver)
     {
         if (method.AppContext.InstructionSet is not NewArmV8InstructionSet)
             return;
@@ -44,22 +51,42 @@ public static class BlockMemoryImportRecovery
         var unresolvedOther = 0;
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
-            if (instruction.OpCode != OpCode.Call || instruction.Operands[0] is not Immediate target)
+            if (!instruction.IsCall)
                 continue;
 
-            var name = ResolveImportName(binary, target.UnsignedValue);
-            if (name is not ("memcpy" or "memset" or "memmove"))
+            ulong? immediateTarget = instruction.Operands[0] is Immediate target
+                ? target.UnsignedValue
+                : null;
+            var name = instruction.Operands[0] switch
             {
-                if (DiagnosticsPath != null && name != null)
-                    Record(method, instruction, target.UnsignedValue, name, "other-import", "");
+                Immediate => importNameResolver != null
+                    ? importNameResolver(immediateTarget!.Value)
+                    : ResolveImportName(binary, immediateTarget!.Value),
+                StringLiteral { Value: { Length: > 0 } value } => value,
+                _ => null,
+            };
+            if (name == null)
+                continue;
+
+            var detail = "";
+            var rewritten = name is "memcpy" or "memset" or "memmove"
+                ? TryRewriteCall(method, instruction, name, out detail)
+                : name is "modf" or "modff" or "sincos" or "sincosf"
+                    && TryRewriteScalarOutImportCall(method, instruction, name, out detail);
+
+            if (!rewritten && immediateTarget is { } unresolved)
+            {
+                // An unresolved import keeps a diagnostic, but it deserves its
+                // symbol name instead of a bare address.
+                instruction.SetOperand(0, new StringLiteral(name));
+                if (DiagnosticsPath != null)
+                    Record(method, instruction, unresolved, name,
+                        name is "memcpy" or "memset" or "memmove" ? "rejected" : "named", detail);
                 else
                     unresolvedOther++;
-                continue;
             }
-
-            var rewritten = TryRewriteCall(method, instruction, name, out var detail);
-            if (DiagnosticsPath != null)
-                Record(method, instruction, target.UnsignedValue, name,
+            else if (DiagnosticsPath != null)
+                Record(method, instruction, immediateTarget ?? 0, name,
                     rewritten ? "rewritten" : "rejected", detail);
         }
         if (DiagnosticsPath != null && unresolvedOther > 0)
@@ -100,7 +127,7 @@ public static class BlockMemoryImportRecovery
     // Resolves a call target that is a GOT veneer to the relocated symbol name on the
     // pointer slot its ldr reads - e.g. "memcpy" for `bl memcpy@plt`. Returns null for
     // any other shape: direct calls, unresolved stubs, relocations to other symbols.
-    private static string? ResolveImportName(Il2CppBinary binary, ulong target)
+    internal static string? ResolveImportName(Il2CppBinary binary, ulong target)
     {
         if (!NewArm64KeyFunctionAddresses.TryDecodeGotVeneerSlot(target, ReadWord, out var slot))
             return null;
@@ -140,9 +167,10 @@ public static class BlockMemoryImportRecovery
             return false;
         }
 
-        if (call.OpCode != OpCode.Call
-            || call.Operands.Count < 5
-            || call.Operands[0] is not Immediate)
+        // Operand 0 is the call target - an Immediate before naming or a
+        // StringLiteral once the import is named; the name passed in already
+        // says which import it is, so either form is fine.
+        if (call.OpCode != OpCode.Call || call.Operands.Count < 5)
         {
             detail = $"shape:op={call.OpCode} count={call.Operands.Count}";
             return false;
@@ -561,6 +589,257 @@ public static class BlockMemoryImportRecovery
         }
         var emitted = IlGenerator.EmittedOperandType(result, context);
         return emitted != null && IlGenerator.IntegralStackWidth(emitted) != 0;
+    }
+
+    /// <summary>
+    /// Rewrites a named libm import whose ABI puts an out pointer in an integer
+    /// argument slot: `modf`/`modff` (x in s0/d0, iptr in x0) and
+    /// `sincos`/`sincosf` (x in s0/d0, sin ptr in x0, cos ptr in x1). The result
+    /// becomes the managed call's return value plus a `Move` through each out
+    /// pointer - `Move &local, v` collapses to a local store, `Move [byref], v`
+    /// to a managed-pointer store, `[stack base+off]` to a frame-slot store, and
+    /// `Move fieldRef, v` to stfld. When the pointer's provenance cannot be
+    /// resolved to one of those shapes the call stays named instead of emitting
+    /// an unverifiable raw store. Because the pass runs last, operands[1]/[2]/[3]/[10]
+    /// are still the ABI slots: return local, X0, X1 and V0.
+    /// </summary>
+    internal static bool TryRewriteScalarOutImportCall(MethodAnalysisContext method, Instruction call,
+        string? importName)
+        => TryRewriteScalarOutImportCall(method, call, importName, out _);
+
+    internal static bool TryRewriteScalarOutImportCall(MethodAnalysisContext method, Instruction call,
+        string? importName, out string detail)
+    {
+        detail = "";
+        var names = importName switch
+        {
+            "modf" or "modff" => new[] { "Truncate" },
+            "sincos" or "sincosf" => new[] { "Sin", "Cos" },
+            _ => null,
+        };
+        if (names == null)
+        {
+            detail = "not-import";
+            return false;
+        }
+
+        // V0 is the floating argument slot, so at least operand 10 must exist.
+        if (call.OpCode != OpCode.Call || call.Operands.Count < 11)
+        {
+            detail = $"shape:op={call.OpCode} count={call.Operands.Count}";
+            return false;
+        }
+
+        var single = importName is "modff" or "sincosf";
+        var valueType = single
+            ? method.AppContext.SystemTypes.SystemSingleType
+            : method.AppContext.SystemTypes.SystemDoubleType;
+        var x = call.Operands[10];
+        var outSlots = names.Length == 1
+            ? new[] { call.Operands[2] }                       // modf: iptr is x0
+            : new[] { call.Operands[2], call.Operands[3] };    // sincos: x0/x1
+
+        var results = new (MethodAnalysisContext Method, LocalVariable Result)[names.Length];
+        var stores = new Instruction[names.Length];
+        for (var i = 0; i < names.Length; i++)
+        {
+            if (ResolveImportMathMethod(method, names[i], valueType) is not { } mathMethod)
+            {
+                detail = $"math={names[i]}";
+                return false;
+            }
+            var value = new LocalVariable($"out_{names[i]}_{call.Index}",
+                new Register(null, $"X{8 + i}"), valueType);
+            results[i] = (mathMethod, value);
+
+            if (!TryMakeOutStore(method, outSlots[i], valueType, value, out var store, out var storeDetail))
+            {
+                detail = $"out{i}={storeDetail}";
+                return false;
+            }
+            stores[i] = store;
+        }
+
+        var block = method.ControlFlowGraph!.FindBlockByInstruction(call);
+        if (block == null)
+            return false;
+
+        var inserted = new List<Instruction>();
+        for (var i = 0; i < names.Length; i++)
+        {
+            var mathCall = new Instruction(-1, OpCode.Call, results[i].Method, results[i].Result, x);
+            if (single)
+                mathCall.NativeFloatWidthBits = 32;
+            inserted.Add(mathCall);
+            inserted.Add(stores[i]);
+            method.Locals.Add(results[i].Result);
+        }
+        block.Instructions.InsertRange(block.Instructions.IndexOf(call), inserted);
+
+        if (names.Length == 1)
+        {
+            // modf returns x - trunc(x): the fractional part is what remains.
+            call.OpCode = OpCode.Subtract;
+            call.SetOperands(call.Operands[1], x, results[0].Result);
+            call.NativeFloatWidthBits = single ? 32 : 64;
+        }
+        else
+        {
+            // sincos returns void; its lifted X0 result slot has no value. The
+            // out stores above carry the real outputs, so the call drops away.
+            call.OpCode = OpCode.Nop;
+        }
+
+        detail = $"x={Describe(x, method)}";
+        return true;
+    }
+
+    // The managed method for a named libm import in this app's corlib: System.Math
+    // for doubles, System.MathF then UnityEngine.Mathf for floats. The corlib is
+    // found by assembly name the way IlGenerator's ResolveSystemType does it, with
+    // the double type's own declaring assembly as fallback for unusual layouts.
+    // Exact-width signatures only - a float import without a float member stays a
+    // named call rather than silently widening to double.
+    private static MethodAnalysisContext? ResolveImportMathMethod(MethodAnalysisContext context,
+        string name, TypeAnalysisContext numberType)
+    {
+        var systemTypes = context.AppContext.SystemTypes;
+        var single = numberType == systemTypes.SystemSingleType;
+        var assemblies = new[]
+            {
+                context.AppContext.AssembliesByName.GetValueOrDefault("mscorlib"),
+                systemTypes.SystemDoubleType.DeclaringAssembly,
+                context.AppContext.AssembliesByName.GetValueOrDefault("netstandard"),
+            }.OfType<AssemblyAnalysisContext>()
+            .Distinct();
+        var types = assemblies
+            .Select(a => a.GetTypeByFullName(single ? "System.MathF" : "System.Math"))
+            .Where(t => t != null)
+            .ToList();
+        if (single)
+            types.Add(context.AppContext.AssembliesByName.GetValueOrDefault("UnityEngine.CoreModule")
+                ?.GetTypeByFullName("UnityEngine.Mathf"));
+
+        foreach (var type in types.OfType<TypeAnalysisContext>())
+            if (type.Methods.FirstOrDefault(method => method.IsStatic && method.Name == name
+                    && method.Parameters.Count == 1
+                    && method.Parameters[0].ParameterType.FullName == numberType.FullName
+                    && method.ReturnType.FullName == numberType.FullName) is { } found)
+                return found;
+        return null;
+    }
+
+    // Turns an out-pointer operand into a `Move target, value` store instruction
+    // whose emission is a managed store. Anything else keeps the call named.
+    private static bool TryMakeOutStore(MethodAnalysisContext method, IOperand pointer,
+        TypeAnalysisContext valueType, LocalVariable value, out Instruction store, out string detail)
+    {
+        store = null!;
+        detail = "";
+        switch (ResolveOutStoreTarget(pointer, method, []))
+        {
+            case LocalVariable local:
+                if (!CanReceiveScalarStore(local, valueType, method))
+                {
+                    detail = Describe(local, method);
+                    return false;
+                }
+                store = new Instruction(-1, OpCode.Move, local, value);
+                return true;
+            case FieldReference field when !InteriorFieldProvenance(field)
+                && field.Field.FieldType.FullName == valueType.FullName:
+                store = new Instruction(-1, OpCode.Move, field, value);
+                return true;
+            case ArrayAccess { Array.Type: SzArrayTypeAnalysisContext { ElementType: { } element } } access
+                when element.FullName == valueType.FullName:
+                store = new Instruction(-1, OpCode.Move, access, value);
+                return true;
+            case MemoryOperand memory:
+                store = new Instruction(-1, OpCode.Move, memory, value);
+                return true;
+            case { } other:
+                detail = Describe(other, method);
+                return false;
+            default:
+                detail = Describe(pointer, method);
+                return false;
+        }
+    }
+
+    // Resolves what a pointer operand ultimately addresses: a local through an
+    // address-of, a field or array element, a byref-typed local (store through
+    // [ptr]), or a stack-region base plus a constant offset (a frame slot).
+    // Locals whose definitions disagree or trace to an opaque value stay
+    // unresolved - the call then keeps its name diagnostic.
+    private static IOperand? ResolveOutStoreTarget(IOperand pointer, MethodAnalysisContext context,
+        HashSet<LocalVariable> visiting)
+    {
+        switch (pointer)
+        {
+            case AddressOf { Target: LocalVariable local }:
+                return local;
+            case AddressOf { Target: FieldReference field }:
+                return field;
+            case AddressOf { Target: ArrayAccess access }:
+                return access;
+            case AddressOf { Target: MemoryOperand memory }:
+                return memory;
+            case LocalVariable { Type: ByRefTypeAnalysisContext } byRef:
+                return new MemoryOperand(byRef);
+            case LocalVariable local:
+            {
+                if (!visiting.Add(local))
+                    return null;
+                try
+                {
+                    var defs = context.ControlFlowGraph!.Instructions
+                        .Where(i => ReferenceEquals(i.Destination, local)).ToList();
+                    IOperand? resolved = null;
+                    foreach (var def in defs)
+                    {
+                        IOperand? target = def.OpCode switch
+                        {
+                            OpCode.Move or OpCode.SignExtend32 =>
+                                ResolveOutStoreTarget(def.Operands[1], context, visiting),
+                            OpCode.Add or OpCode.Subtract when def.Operands[1] is AddressOf
+                                    { Target: LocalVariable frame } && def.Operands[2] is Immediate offset =>
+                                new MemoryOperand(frame, null,
+                                    def.OpCode == OpCode.Subtract
+                                        ? -(long)offset.UnsignedValue
+                                        : (long)offset.UnsignedValue),
+                            _ => null,
+                        };
+                        if (target == null)
+                            return null;
+                        if (resolved == null)
+                            resolved = target;
+                        else if (!target.Equals(resolved))
+                            return null;
+                    }
+                    return resolved;
+                }
+                finally
+                {
+                    visiting.Remove(local);
+                }
+            }
+            default:
+                return null;
+        }
+    }
+
+    // Whether a local can receive a direct scalar store of this width without a
+    // reinterpret: a matching declared type, or an unclaimed slot that takes the
+    // value's type (same contract as CanMaterializeReturn).
+    private static bool CanReceiveScalarStore(LocalVariable local, TypeAnalysisContext valueType,
+        MethodAnalysisContext context)
+    {
+        if (local.Type == null)
+        {
+            local.Type = valueType;
+            return true;
+        }
+        return IlGenerator.EmittedOperandType(local, context)?.FullName == valueType.FullName;
     }
 
     // Reference-free means the type's storage provably contains no managed object

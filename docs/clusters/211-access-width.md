@@ -27,6 +27,12 @@ Rules, in `MetadataResolver.ResolveFieldOffsets`:
 - Fields the method may not name (another assembly's private members) are not
   split into; the store keeps its diagnostic.
 
+- A wide load read in part is a narrower load (`NarrowWideLoads`). The high bytes
+  after a shift and the low bytes of a narrower store are the field at that offset,
+  read right after the wide load. `LDR D1` of two floats then `LSR #32` of it is
+  the second float, not an integer shift of a `Vector2`. The part is split only
+  when it is exactly one field: `long >> 32` stays arithmetic.
+
 Float and vector stores keep `AccessSize` 0 on the memory operand, a convention
 other passes read. Their real width is `Instruction.NativeStoreWidthBytes`.
 
