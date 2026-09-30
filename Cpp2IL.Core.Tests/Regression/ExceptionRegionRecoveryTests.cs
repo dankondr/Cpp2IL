@@ -116,9 +116,11 @@ public class ExceptionRegionRecoveryTests
         Assert.That(caller.AnalysisWarnings, Is.Empty);
         Assert.That(body.ComputeMaxStack(), Is.EqualTo(0));
     }
-    [TestCase(8, true)]
-    [TestCase(16, false)]
-    public void CallInvalidationRespectsTheWidthOfAnAdjacentSavedFramePointer(int width, bool proven)
+    [TestCase(8, true, false, false)]
+    [TestCase(16, false, false, false)]
+    [TestCase(8, true, true, true)]
+    [TestCase(8, false, false, true)]
+    public void CallInvalidationRespectsTheWidthOfAnAdjacentSavedFramePointer(int width, bool proven, bool boxesValue, bool earlierArgument)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Frame",
@@ -137,7 +139,8 @@ public class ExceptionRegionRecoveryTests
         var store = At(0x1000, OpCode.Move, saved, storage);
         store.NativeStoreWidthBytes = width;
         caller.ConvertedIsil = [store,
-            At(0x1004, OpCode.CallVoid, work, storage),
+            At(0x1004, OpCode.CallVoid, boxesValue ? new StringLiteral("il2cpp_value_box") : work,
+                earlierArgument ? new AddressOf(new StackOffset(4)) : storage),
             At(0x1008, OpCode.CallVoid, cleanup, storage), At(0x100C, OpCode.Return),
             At(0x2000, OpCode.Move, exception, new Register(null, "X0")),
             At(0x2004, OpCode.Move, receiver, saved),

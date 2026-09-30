@@ -342,7 +342,13 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
                 // struct result). Initial zeroes are not facts about the returned object.
                 var callee = callees.GetValueOrDefault(instruction.NativeAddress);
                 var arguments = instruction.Operands.Skip(instruction.OpCode == OpCode.CallVoid ? 1 : 2);
-                var writes = arguments.Select(o => (Address: Value(o, after), Size: ArgumentStorageSize(callee, o))).ToList();
+                // Boxing copies the input bytes; it never writes through the value
+                // pointer. Treating it as an unknown writer erased adjacent saved
+                // cleanup receivers even on the exceptional edge.
+                var boxesValue = Helper(instruction.Operands[0]) is nameof(BaseKeyFunctionAddresses.il2cpp_value_box)
+                    or nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_box);
+                var writes = arguments.Where(_ => !boxesValue)
+                    .Select(o => (Address: Value(o, after), Size: ArgumentStorageSize(callee, o))).ToList();
                 if (instruction.Destination is MemoryOperand result)
                     writes.Add((Address(result, after), StorageSize(callee?.ReturnType)));
                 foreach (var (address, size) in writes)
