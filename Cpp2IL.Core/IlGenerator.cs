@@ -4887,13 +4887,24 @@ public static class IlGenerator
         var left = instruction.Operands[1];
         var right = instruction.Operands[2];
 
-        IOperand typeOperand;
+        IOperand? typeOperand;
         LocalVariable objLocal;
+        LocalVariable? otherObjLocal = null;
 
         if (left is TypeAnalysisContext && IsKlassPointerLoad(right, out var rightLocal))
             (typeOperand, objLocal) = (left, rightLocal);
         else if (right is TypeAnalysisContext && IsKlassPointerLoad(left, out var leftLocal))
             (typeOperand, objLocal) = (right, leftLocal);
+        else if (context.ControlFlowGraph is { } cfg
+                 && Analysis.InterfaceDispatchRecovery.BuildMaps(cfg) is var maps
+                 && Analysis.KlassLoadTypeTestRecovery.IsObjectHeaderKlassLoad(left, maps.Definitions, out objLocal)
+                 && Analysis.KlassLoadTypeTestRecovery.IsObjectHeaderKlassLoad(right, maps.Definitions, out var otherLocal))
+        {
+            // klass_a == klass_b - the objects share a runtime class iff their
+            // types are equal, so emit a.GetType() == b.GetType().
+            typeOperand = null;
+            otherObjLocal = otherLocal;
+        }
         else
             return false;
 
@@ -4918,8 +4929,15 @@ public static class IlGenerator
         // reaches it only through box.
         CoerceOrDefault(EmittedLocalType(objLocal, context), context?.AppContext.SystemTypes.SystemObjectType, method, context);
         instructions.Add(CilOpCodes.Callvirt, getType);
-        LoadOperand(typeOperand, method, locals, writeLine,
-            ResolveSystemType(context, "System.Type"), context); // emits typeof(T)
+        if (typeOperand is { } comparedOperand)
+            LoadOperand(comparedOperand, method, locals, writeLine,
+                ResolveSystemType(context, "System.Type"), context); // emits typeof(T)
+        else
+        {
+            LoadLocal(otherObjLocal!, method, locals, context);
+            CoerceOrDefault(EmittedLocalType(otherObjLocal!, context), context?.AppContext.SystemTypes.SystemObjectType, method, context);
+            instructions.Add(CilOpCodes.Callvirt, getType);
+        }
         instructions.Add(CilOpCodes.Ceq);
 
         if (instruction.OpCode == OpCode.CheckNotEqual)

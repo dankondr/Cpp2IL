@@ -680,6 +680,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         ArrayRecovery.RecoverAccesses(this);
         KeyFunctionRecovery.Run(this);
 
+        // Fold klass-pointer loads into the exact-type tests that consume them while
+        // each local still has a single SSA definition. The dead Move then drops out.
+        KlassLoadTypeTestRecovery.Run(this);
+
         SsaForm.Remove(this);
 
         // Phi removal leaves a copy per merged version, most of which can share one local

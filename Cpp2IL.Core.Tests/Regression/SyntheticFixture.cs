@@ -32,12 +32,13 @@ internal static class SyntheticFixture
 
     public static (MethodAnalysisContext caller, MethodDefinition method) ForeignCaller(
         ApplicationAnalysisContext app, ModuleDefinition module, List<Instruction> instructions,
-        List<LocalVariable> locals)
+        List<LocalVariable> locals, TypeAnalysisContext? returnType = null)
     {
+        var returnType_ = returnType ?? app.SystemTypes.SystemVoidType;
         var callerType = new InjectedTypeAnalysisContext(app.AssembliesByName["UnityEngine.CoreModule"],
             "Tests", "ForeignCaller", app.SystemTypes.SystemObjectType,
             R.TypeAttributes.Public | R.TypeAttributes.Class);
-        var caller = callerType.InjectMethodContext("Run", app.SystemTypes.SystemVoidType,
+        var caller = callerType.InjectMethodContext("Run", returnType_,
             R.MethodAttributes.Public | R.MethodAttributes.Static);
         caller.ControlFlowGraph = new ISILControlFlowGraph(instructions);
         caller.Locals = locals;
@@ -46,8 +47,11 @@ internal static class SyntheticFixture
         var type = new TypeDefinition("Tests", "ForeignCaller", TypeAttributes.Public | TypeAttributes.Class,
             module.CorLibTypeFactory.Object.Type);
         module.TopLevelTypes.Add(type);
+        var ilReturnType = returnType_ == app.SystemTypes.SystemVoidType
+            ? module.CorLibTypeFactory.Void
+            : returnType_.GetExtraData<TypeDefinition>("AsmResolverType")!.ToTypeSignature();
         var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
-            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+            MethodSignature.CreateStatic(ilReturnType));
         type.Methods.Add(method);
         return (caller, method);
     }
