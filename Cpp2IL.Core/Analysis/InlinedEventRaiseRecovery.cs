@@ -40,23 +40,32 @@ internal static class InlinedEventRaiseRecovery
             {
                 if (call.OpCode is not (OpCode.Call or OpCode.CallVoid)
                     || call.Operands.Count == 0
-                    || call.Operands[0] is not MethodAnalysisContext invoke
-                    || invoke.Name != "Invoke"
+                    || call.Operands[0] is not MethodAnalysisContext invoke)
+                    continue;
+                if (invoke.Name != "Invoke"
                     || invoke.DeclaringType?.IsDelegate != true)
                     continue;
 
                 var receiverIndex = call.OpCode == OpCode.CallVoid ? 1 : 2;
-                if (call.Operands.Count <= receiverIndex
-                    || ResolveFieldLoad(call.Operands[receiverIndex], definitions) is not { } receiver
-                    || receiver.Local is null
-                    || !HasEventTwin(receiver.Field)
-                    || WithinPrivateScope(method.DeclaringType, receiver.Field.DeclaringType))
+                if (call.Operands.Count <= receiverIndex)
+                    continue;
+                var fieldRef = ResolveFieldLoad(call.Operands[receiverIndex], definitions);
+                if (fieldRef is null || fieldRef.Local is null)
+                    continue;
+                var receiver = fieldRef;
+                if (!HasEventTwin(receiver.Field))
+                    continue;
+                if (WithinPrivateScope(method.DeclaringType, receiver.Field.DeclaringType))
                     continue;
 
                 var sources = TrampolineSources(block);
-                if (sources.Count != 1
-                    || !TryGetNullGuard(sources[0], receiver.Field, definitions, uses, block, out var guard)
-                    || !TryFindUniqueRaiser(method, receiver.Field, invoke, out var raiser))
+                Guard guard = default;
+                MethodAnalysisContext raiser = null!;
+                var guarded = sources.Count == 1
+                    && TryGetNullGuard(sources[0], receiver.Field, definitions, uses, block,
+                        out guard);
+                var raiserFound = guarded && TryFindUniqueRaiser(method, receiver.Field, invoke, out raiser);
+                if (!guarded || !raiserFound)
                     continue;
 
                 // Proven inlined raise: the guard's null check is folded into
@@ -81,6 +90,40 @@ internal static class InlinedEventRaiseRecovery
 
         if (recovered > 0)
         {
+            // A respelled call no longer reads the field, and its guard's check
+            // is gone: the moves those uses kept alive leave dead stores that
+            // still count as foreign field references. One local can be shared
+            // across several raise sites, so the count is settled only after
+            // every rewrite.
+            // A Move may go only when its destination local is never read again
+            // anywhere in the method — checked by a flat operand scan, not by
+            // reachability: a still-read local (or one written anywhere else)
+            // keeps its store, so no read can lose the value it spells.
+            // Removing a dead store can in turn make the load or copy it
+            // consumed dead, so removal runs to a fixpoint.
+            var allInstructions = cfg.Blocks.SelectMany(b => b.Instructions).ToList();
+            var removed = true;
+            while (removed)
+            {
+                removed = false;
+                foreach (var candidate in allInstructions.ToList())
+                {
+                    if (candidate.OpCode != OpCode.Move
+                        || candidate.Operands.Count < 2
+                        || candidate.Operands[0] is not LocalVariable destination
+                        || destination.IsThis || destination.IsReturn
+                        || !allInstructions.All(i => ReferenceEquals(i, candidate)
+                            || !Reads(i, destination)))
+                        continue;
+                    var owner = cfg.Blocks.FirstOrDefault(b => b.Instructions.Contains(candidate));
+                    if (owner is null)
+                        continue;
+                    owner.Instructions.Remove(candidate);
+                    allInstructions.Remove(candidate);
+                    removed = true;
+                }
+            }
+
             cfg.RemoveUnreachableBlocks();
             DeadCodeEliminator.Run(method);
         }
@@ -176,11 +219,13 @@ internal static class InlinedEventRaiseRecovery
         if (isil is not { Count: > 0 })
             return false;
 
-        // Only Move copies are chased; mapping every destination would let a
+        // Post-pipeline bodies carry named locals; a fresh conversion carries
+        // raw registers. Only Move copies are chased - by operand identity, so
+        // both shapes resolve - and mapping every destination would let a
         // call's return slot overwrite the copy that produced the delegate.
-        var definitions = new Dictionary<LocalVariable, Instruction>();
+        var definitions = new Dictionary<IOperand, Instruction>();
         foreach (var instruction in isil)
-            if (instruction.OpCode == OpCode.Move && instruction.Destination is LocalVariable destination)
+            if (instruction.OpCode == OpCode.Move && instruction.Destination is { } destination)
                 definitions[destination] = instruction;
 
         var invokeImplOffset = (candidate.AppContext.Binary.is32Bit ? 4 : 8) * 3;
@@ -194,15 +239,62 @@ internal static class InlinedEventRaiseRecovery
                 {
                     var receiverIndex = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
                     if (instruction.Operands.Count > receiverIndex
-                        && ResolveFieldLoad(instruction.Operands[receiverIndex], definitions)?.Field == field)
+                        && LoadsFieldRaw(instruction.Operands[receiverIndex], field, definitions))
                         return true;
                     break;
                 }
                 case OpCode.IndirectCall or OpCode.IndirectJump:
-                    if (DelegateLocal(instruction, definitions, invokeImplOffset) is { } delegateLocal
-                        && ResolveFieldLoad(delegateLocal, definitions)?.Field == field)
+                    if (DelegateLocalRaw(instruction, definitions, invokeImplOffset) is { } delegateLocal
+                        && LoadsFieldRaw(delegateLocal, field, definitions))
                         return true;
                     break;
+            }
+        return false;
+    }
+
+    // The delegate a call dispatches on, in either ISIL shape: the call target
+    // chases through copies to a load of the delegate's invoke_impl slot.
+    private static IOperand? DelegateLocalRaw(Instruction call,
+        Dictionary<IOperand, Instruction> definitions, int invokeImplOffset)
+    {
+        if (call.Operands.Count == 0)
+            return null;
+        var target = call.Operands[0];
+        if (target is Register or LocalVariable
+            && definitions.TryGetValue(target, out var definition)
+            && definition.OpCode == OpCode.Move
+            && definition.Operands.Count >= 2)
+            target = definition.Operands[1];
+        return target switch
+        {
+            MemoryOperand { Addend: var offset, Index: null, Scale: 0, Base: { } value }
+                when offset == invokeImplOffset => value,
+            FieldReference { Field.Name: "invoke_impl", Local: { } value } => value,
+            _ => null
+        };
+    }
+
+    // Whether the operand's value came from reading `field`: a FieldReference
+    // to it (resolved form) or a bare [base + field.Offset] load (raw form),
+    // reached through Move copies.
+    private static bool LoadsFieldRaw(IOperand operand, FieldAnalysisContext field,
+        Dictionary<IOperand, Instruction> definitions)
+    {
+        for (var depth = 0; depth < MaxCopyDepth; depth++)
+            switch (operand)
+            {
+                case FieldReference reference when reference.Field == field:
+                case MemoryOperand { Index: null, Scale: 0, Addend: var offset }
+                    when offset == field.Offset && field.Offset >= 0:
+                    return true;
+                case Register or LocalVariable
+                    when definitions.TryGetValue(operand, out var definition)
+                        && definition.OpCode == OpCode.Move
+                        && definition.Operands.Count >= 2:
+                    operand = definition.Operands[1];
+                    continue;
+                default:
+                    return false;
             }
         return false;
     }
@@ -219,25 +311,32 @@ internal static class InlinedEventRaiseRecovery
         }
     }
 
-    // The delegate a call dispatches on: the call target chases through copies
-    // to a load of the delegate's invoke_impl slot.
-    private static LocalVariable? DelegateLocal(Instruction call,
-        Dictionary<LocalVariable, Instruction> definitions, int invokeImplOffset)
+    // Whether `instruction` consumes `local`: as a source, or inside a wrapped
+    // destination (`Move [v.x], y` writes through v). A LocalVariable
+    // destination is a write, not a read.
+    private static bool Reads(Instruction instruction, LocalVariable local)
     {
-        if (call.Operands.Count == 0)
-            return null;
-        var target = call.Operands[0];
-        if (target is LocalVariable targetLocal)
-            target = InterfaceDispatchRecovery.ChaseCopies(definitions, targetLocal) is
-                { OpCode: OpCode.Move, Operands: [_, var loaded] } ? loaded : target;
-        return target switch
-        {
-            MemoryOperand { Addend: var offset, Index: null, Scale: 0, Base: LocalVariable value }
-                when offset == invokeImplOffset => value,
-            FieldReference { Field.Name: "invoke_impl", Local: { } value } => value,
-            _ => null
-        };
+        if (instruction.Sources.Any(source => SourceReads(source, local)))
+            return true;
+        return instruction.Destination is not (null or LocalVariable)
+            && LocalVariables.OperandLocals(instruction.Destination).Any(o => SameLocal(o, local));
     }
+
+    // Whether a source operand reads `local`: directly, or as the instance of
+    // a field, memory or other wrapped access inside the operand tree.
+    // FieldReference.Local and MemoryOperand bases can carry a different object
+    // for the same variable, so equality is by name and register, not
+    // reference.
+    private static bool SourceReads(IOperand source, LocalVariable local) => source switch
+    {
+        LocalVariable l => SameLocal(l, local),
+        _ => LocalVariables.OperandLocals(source).Any(o => SameLocal(o, local))
+    };
+
+    private static bool SameLocal(LocalVariable a, LocalVariable b)
+        => ReferenceEquals(a, b)
+           || (a.Name == b.Name && a.Register.Name == b.Register.Name
+               && a.Register.Number == b.Register.Number);
 
     private static FieldReference? ResolveFieldLoad(IOperand operand, Dictionary<LocalVariable, Instruction> definitions)
     {
