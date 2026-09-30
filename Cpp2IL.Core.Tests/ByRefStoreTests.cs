@@ -128,3 +128,53 @@ public class ByRefStoreTests
         Assert.That(arguments[0], Is.Null);
     }
 }
+
+
+// A value typed by a generic parameter is not an object reference: isinst/castclass
+// on it need `box !!T` first, as the C# compiler emits it.
+public class GenericParameterReferenceCastTests
+{
+    [Test]
+    public void ReferenceCastOfAGenericParameterValueBoxesFirst()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var stringType = app.SystemTypes.SystemStringType;
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Cast",
+            stringType, System.Reflection.MethodAttributes.Public | System.Reflection.MethodAttributes.Static, []);
+        var parameter = new GenericParameterTypeAnalysisContext("T", 0,
+            LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_MVAR, 0, caller);
+        caller.GenericParameters.Add(parameter);
+        var value = new LocalVariable("value", new Register(null, "value"), parameter);
+        var result = new LocalVariable("result", new Register(null, "result"), stringType);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, value, new Immediate(0)),
+            new(1, OpCode.Move, result, new ReferenceCast(value, stringType, nullOnFailure: true)),
+            new(2, OpCode.Return, result)]);
+        caller.Locals = [value, result];
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var module = new ModuleDefinition("CastFixture.dll", new AssemblyReference("System.Private.CoreLib", typeof(object).Assembly.GetName().Version!));
+        foreach (var context in new[] { app.SystemTypes.SystemObjectType, stringType })
+        {
+            var placeholder = new TypeDefinition("Fixture", context.Name, TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+            module.TopLevelTypes.Add(placeholder);
+            context.PutExtraData("AsmResolverType", placeholder);
+        }
+        var type = new TypeDefinition("Tests", "Caster", TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);
+        var definition = new MethodDefinition("Cast", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.String, 1, System.Array.Empty<TypeSignature>()));
+        definition.GenericParameters.Add(new GenericParameter("T"));
+        type.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions.ToList();
+        var listing = string.Join(" | ", il.Select(i => i.ToString())) + " || locals: "
+            + string.Join(", ", definition.CilMethodBody.LocalVariables.Select(l => l.VariableType.FullName));
+        var cast = il.FindIndex(i => i.OpCode == CilOpCodes.Isinst);
+        Assert.That(cast > 0 && il[cast - 1].OpCode == CilOpCodes.Box, Is.True, listing);
+    }
+}
