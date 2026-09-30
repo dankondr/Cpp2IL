@@ -69,6 +69,39 @@ public class SimplifierTests
         Assert.That(add.Operands[1], Is.InstanceOf<FieldReference>());
     }
 
+    [Test]
+    public void KeepsTheCopyThatCarriesAPointerIntoTheNextIteration()
+    {
+        // for (; i < n; i++) { x = *p; p += 4; }: lowered out of SSA, the step is `q = p + 4;
+        // p = q` at the bottom of the loop, and `[p]` at its top reads that copy on the next
+        // iteration. Dropping it would read the first element every time.
+        var p = new LocalVariable("p", new Register(null, "p"));
+        var q = new LocalVariable("q", new Register(null, "q"));
+        var x = new LocalVariable("x", new Register(null, "x"));
+        var i = new LocalVariable("i", new Register(null, "i"));
+        var n = new LocalVariable("n", new Register(null, "n"));
+        var c = new LocalVariable("c", new Register(null, "c"));
+        var top = new Instruction(2, OpCode.Move, x, new MemoryOperand(p, null, 0, 0, 4));
+        var step = new Instruction(4, OpCode.Move, p, q);
+        var graph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, i, Imm(0)),
+            new Instruction(1, OpCode.CallVoid, Str("Consume"), p),
+            top,
+            new Instruction(3, OpCode.Add, q, p, Imm(4)),
+            step,
+            new Instruction(5, OpCode.Add, i, i, Imm(1)),
+            new Instruction(6, OpCode.CheckLess, c, i, n),
+            new Instruction(7, OpCode.ConditionalJump, top, c),
+            new Instruction(8, OpCode.Return, x)
+        ]);
+
+        Simplifier.Simplify(CreateMethod(graph, p, q, x, i, n, c));
+
+        Assert.That(graph.Blocks.SelectMany(b => b.Instructions)
+            .Count(instruction => ReferenceEquals(instruction.Destination, p)), Is.EqualTo(1),
+            () => string.Join("\n", graph.Blocks.SelectMany(b => b.Instructions)));
+    }
+
     private static MethodAnalysisContext CreateMethod(ISILControlFlowGraph graph, params LocalVariable[] locals)
     {
         var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));

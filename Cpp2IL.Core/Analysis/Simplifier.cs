@@ -482,7 +482,9 @@ public static class Simplifier
             visited.EnsureCapacity(_graph.Blocks.Count);
 #endif
 
-            visited.Add(startBlock);
+            // The start block is not marked visited: a loop back into it reaches the reads before
+            // `startIndex` too. A copy at the end of a loop body is read at the top of the next
+            // iteration (`p = p + 4` feeding the load of `[p]`), and dropping it freezes the loop.
             remaining.Push((startBlock, startIndex));
 
             usedByMemory = false;
