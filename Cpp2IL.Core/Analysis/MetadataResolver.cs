@@ -189,6 +189,17 @@ public static class MetadataResolver
             .Where(g => g.Count() == 1)
             .ToDictionary(g => g.Key, g => g.Single());
 
+        // Locals that are the base register of a raw memory load emit `&T`
+        // (or native int) because that use demands it. Replacing the def-source
+        // of such a local with a managed value can demote its emitted type to a
+        // reference and leave the surviving [v] loads with `ref` where they need
+        // `&`, so substitutions into those defs are not made here.
+        var loadBases = new HashSet<LocalVariable>();
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        foreach (var operand in instruction.Operands)
+            if (operand is MemoryOperand { Base: LocalVariable baseLocal })
+                loadBases.Add(baseLocal);
+
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             for (var i = 0; i < instruction.Operands.Count; i++)
@@ -199,12 +210,19 @@ public static class MetadataResolver
                     continue;
 
                 if (memory.Base is not LocalVariable local
-                    || EffectiveObjectType(local, definitions) is not { } localType)
+                    || EffectiveObjectType(local, definitions, method.DeclaringType) is not { } localType)
                     continue;
 
                 // check if static field access
                 var staticOwner = (localType as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
-                var owner = staticOwner ?? localType;
+                // [ref-to-struct + off] is a member read of the referenced value
+                // (min.y), not pointer arithmetic - resolve it against the element
+                // type's layout. Only a byref lowers to a legal ldfld receiver; an
+                // unmanaged pointer does not, so pointer bases stay unresolved.
+                var byRefElement = staticOwner == null
+                    && localType is ByRefTypeAnalysisContext { ElementType.IsValueType: true } byRef
+                    ? byRef.ElementType : null;
+                var owner = staticOwner ?? byRefElement ?? localType;
                 var genericOwner = owner as GenericInstanceTypeAnalysisContext;
 
                 if (memory.Index is LocalVariable selector
@@ -218,7 +236,12 @@ public static class MetadataResolver
                         try { offset = checked(memory.Addend + selectorValue * scale); }
                         catch (System.OverflowException) { choices.Clear(); break; }
 
-                        if (ResolveField(owner, staticOwner, offset, memory.AccessSize) is not { } selectedField)
+                        if (ResolveField(owner, staticOwner, offset, memory.AccessSize,
+                                byRefElement != null) is not { } selectedField
+                            || MemberPathUnspellable(selectedField, method,
+                                instruction.OpCode == OpCode.Move && i == 0, addressed: false)
+                            || (staticOwner == null
+                                && !LocalSuppliesFieldBase(local, owner, method.DeclaringType, method)))
                         {
                             choices.Clear();
                             break;
@@ -226,7 +249,7 @@ public static class MetadataResolver
 
                         var resolvedField = selectedField.Field;
                         if (genericOwner != null && resolvedField is not ConcreteGenericFieldAnalysisContext)
-                            resolvedField = new ConcreteGenericFieldAnalysisContext(resolvedField, genericOwner);
+                            resolvedField = BindResolvedFieldLeaf(owner, selectedField.Containers, resolvedField);
                         choices.Add((selectorValue,
                             new FieldReference(resolvedField, local, (int)offset, selectedField.Containers,
                                 memory.AccessSize)));
@@ -245,15 +268,25 @@ public static class MetadataResolver
                 if (memory.Index != null || memory.Scale != 0)
                     continue;
 
-                var resolved = ResolveField(owner, staticOwner, memory.Addend, memory.AccessSize);
+                var resolved = ResolveField(owner, staticOwner, memory.Addend, memory.AccessSize,
+                    byRefElement != null);
                 var field = resolved?.Field;
 
-                if (field == null) // TODO: Support nested fields (Field1.Field2.Field3)
+                if (field == null // TODO: Support nested fields (Field1.Field2.Field3)
+                    || MemberPathUnspellable(resolved!.Value, method,
+                        instruction.OpCode == OpCode.Move && i == 0, addressed: false))
+                    continue;
+
+                // The produced reference pushes `local` as its ldfld/stfld base.
+                // When the local's declared type supplies neither `&host` nor a
+                // host-assignable reference the emission is invalid IL - keep the
+                // diagnostic instead. Static owners emit ldsfld and need no base.
+                if (staticOwner == null && !LocalSuppliesFieldBase(local, owner, method.DeclaringType, method))
                     continue;
 
                 // make sure we have a full GIT for field access. open type is bad.
                 if (genericOwner != null && field is not ConcreteGenericFieldAnalysisContext)
-                    field = new ConcreteGenericFieldAnalysisContext(field, genericOwner);
+                    field = BindResolvedFieldLeaf(owner, resolved.Value.Containers, field);
 
                 instruction.SetOperand(i, new FieldReference(field, local, (int)memory.Addend,
                     resolved!.Value.Containers, memory.AccessSize));
@@ -274,11 +307,370 @@ public static class MetadataResolver
             }
         }
 
+        changed |= ResolveAddressedStorageReads(method, definitions, loadBases);
         return changed;
     }
 
+    /// <summary>
+    /// Rewrites [v + addend] unmanaged dereferences whose base register provably holds the
+    /// address of a managed storage location (v = &amp;t, plus constant displacements on it).
+    /// [&amp;t] is a plain `t` read; [&amp;t + k] reaches the sibling frame slot at that
+    /// offset; [&amp;f + k] reaches whatever field of f's host object sits at f's absolute
+    /// offset plus k (which includes f's own interior for value-typed f). Any site whose
+    /// storage cannot be proven keeps its MemoryOperand and its diagnostic.
+    /// </summary>
+    private static bool ResolveAddressedStorageReads(MethodAnalysisContext method,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        HashSet<LocalVariable> loadBases)
+    {
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+
+        // Frame slots by fp-relative offset; [&stack_N + k] reads the slot at -N + k,
+        // which is a real local read only when exactly one local names that address.
+        // A slot carried by several SSA versions is ambiguous - the load's live version
+        // cannot be chosen from the address alone - so only single-version cells qualify.
+        var slots = new Dictionary<int, LocalVariable>();
+        foreach (var candidate in method.Locals)
+        {
+            if (LocalVariables.TryStackOffset(candidate.Register.Name) is not { } offset)
+                continue;
+            if (!slots.TryAdd(offset, candidate))
+                slots[offset] = null!; // several locals share the offset - ambiguous
+        }
+
+        var changed = false;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        for (var i = 0; i < instruction.Operands.Count; i++)
+        {
+            if (instruction.Operands[i] is not MemoryOperand
+                    { Base: LocalVariable baseLocal, Index: null, Scale: 0 } memory
+                || ResolveAddressedStorage(baseLocal, definitions, []) is not { } resolved)
+                continue;
+
+            long effective;
+            try
+            {
+                effective = checked(memory.Addend + resolved.Displacement);
+            }
+            catch (System.OverflowException)
+            {
+                continue;
+            }
+
+            switch (resolved.Storage)
+            {
+                case LocalVariable slot:
+                    if (effective == 0)
+                    {
+                        // *(&t) reads t's storage; a pointer-sized deref of a wider
+                        // struct local would silently truncate, so value types stay out.
+                        if (memory.AccessSize == pointerSize && slot.Type is not { IsValueType: true }
+                            && LoadsAsPointer(instruction, slot.Type)
+                            && !DemotesLoadBase(instruction, loadBases, slot.Type, method))
+                        {
+                            instruction.SetOperand(i, slot);
+                            changed = true;
+                        }
+                    }
+                    else if (memory.AccessSize == pointerSize
+                             && LocalVariables.TryStackOffset(slot.Register.Name) is { } slotOffset
+                             && slotOffset + effective is >= int.MinValue and <= int.MaxValue
+                             && slots.TryGetValue((int)(slotOffset + effective), out var siblingSlot)
+                             && siblingSlot != null
+                             && siblingSlot.Type is not { IsValueType: true }
+                             && LoadsAsPointer(instruction, siblingSlot.Type)
+                             && !DemotesLoadBase(instruction, loadBases, siblingSlot.Type, method))
+                    {
+                        instruction.SetOperand(i, siblingSlot);
+                        changed = true;
+                    }
+                    break;
+
+                case FieldReference addressed when !addressed.Field.IsStatic:
+                    if (effective == 0)
+                    {
+                        // *(&f) is f itself when f's storage is a single pointer slot.
+                        if (memory.AccessSize == pointerSize
+                            && addressed.Field.FieldType is { IsValueType: false }
+                                and not PointerTypeAnalysisContext
+                            && (addressed.Containers.Count > 0
+                                    ? addressed.Containers[0].DeclaringType
+                                    : addressed.Field.DeclaringType) is { } declaredOwner
+                            && LocalSuppliesFieldBase(addressed.Local, declaredOwner, method.DeclaringType, method)
+                            && LoadsAsPointer(instruction, addressed.Field.FieldType)
+                            && !DemotesLoadBase(instruction, loadBases, addressed.Field.FieldType, method))
+                        {
+                            instruction.SetOperand(i, addressed);
+                            changed = true;
+                        }
+                        break;
+                    }
+
+                    var host = EffectiveObjectType(addressed.Local, definitions, method.DeclaringType)
+                               ?? addressed.Field.DeclaringType;
+                    if (host == null
+                        // The produced reference's Local is pushed as the ldfld/stfld
+                        // base: `&host` for a value-type host, a host-assignable
+                        // reference otherwise. object/untyped supplies neither.
+                        || !LocalSuppliesFieldBase(addressed.Local, host, method.DeclaringType, method)
+                        || ResolveField(host, null, addressed.Offset + effective,
+                            memory.AccessSize) is not { } sibling
+                        || !LoadsAsPointer(instruction, sibling.Field.FieldType)
+                        || DemotesLoadBase(instruction, loadBases, sibling.Field.FieldType, method))
+                        break;
+                    instruction.SetOperand(i, new FieldReference(sibling.Field, addressed.Local,
+                        (int)(addressed.Offset + effective), sibling.Containers, memory.AccessSize));
+                    changed = true;
+                    break;
+            }
+        }
+        return changed;
+    }
+
+    // Chases a base register's single-definition Move/Add/Subtract chain to the
+    // addressed storage it carries (&t or &f), accumulating byte displacement.
+    private static (IOperand Storage, long Displacement)? ResolveAddressedStorage(
+        IOperand operand, IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        HashSet<LocalVariable> visiting)
+    {
+        switch (operand)
+        {
+            case AddressOf { Target: LocalVariable or FieldReference } address:
+                return (address.Target, 0);
+
+            case LocalVariable local:
+                if (!visiting.Add(local)
+                    || !definitions.TryGetValue(local, out var definition))
+                    return null;
+
+                (IOperand Storage, long Displacement)? resolved = definition switch
+                {
+                    { OpCode: OpCode.Move, Operands.Count: >= 2 }
+                        => ResolveAddressedStorage(definition.Operands[1], definitions, visiting),
+                    { OpCode: OpCode.Add or OpCode.Subtract, Operands: [_, { } source, Immediate displacement] }
+                        => ResolveAddressedStorage(source, definitions, visiting) is { } inner
+                            ? (inner.Storage, inner.Displacement
+                                + (definition.OpCode == OpCode.Subtract ? -displacement.Value : displacement.Value))
+                            : null,
+                    { OpCode: OpCode.Add, Operands: [_, Immediate displacement, { } source] }
+                        => ResolveAddressedStorage(source, definitions, visiting) is { } inner
+                            ? (inner.Storage, inner.Displacement + displacement.Value)
+                            : null,
+                    _ => null,
+                };
+
+                visiting.Remove(local);
+                return resolved;
+
+            default:
+                return null;
+        }
+    }
+
+    // The instruction's produced value lands in a local that other instructions
+    // may consume as an address (`[dest]` loads, `&dest`, ldfld receivers, cpblk,
+    // `in`/`ref` arguments, calli targets) rather than as a value. Substituting a
+    // managed operand for the unmanaged def-source changes the local's emitted
+    // type to the produced type, so every such consumer must still be satisfied:
+    // [dest + off] must resolve through the produced type's instance layout (they
+    // then resolve in this same pass - a bare [dest] deref of a reference type
+    // reads the object header, not a managed field, and ResolveField's offset-0
+    // miss keeps the diagnostic), a field receiver needs the produced type
+    // assignable to the declaring type, an arithmetic or pointer-demanding use
+    // needs a non-reference produced type, and `&`-positions need an exact type.
+    private static bool DemotesLoadBase(Instruction instruction, HashSet<LocalVariable> loadBases,
+        TypeAnalysisContext? producedType, MethodAnalysisContext method, bool checkMemoryBases = true)
+    {
+        if (instruction.Destination is not LocalVariable destination
+            || destination.Type is ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+            return false;
+        return BreaksConsumers(destination, producedType, method, [], checkMemoryBases);
+    }
+
+    private static bool BreaksConsumers(LocalVariable dest, TypeAnalysisContext? producedType,
+        MethodAnalysisContext method, HashSet<LocalVariable> visited, bool checkMemoryBases)
+    {
+        if (!visited.Add(dest))
+            return false;
+        foreach (var user in method.ControlFlowGraph!.Instructions)
+        for (var j = 0; j < user.Operands.Count; j++)
+        {
+            switch (user.Operands[j])
+            {
+                case MemoryOperand { Base: { } baseLocal } memory
+                    when checkMemoryBases && ReferenceEquals(baseLocal, dest):
+                    // The use's own host type wins over what this def alone
+                    // produces: a declared/propagated type is what emission sees.
+                    var host = dest.Type ?? producedType;
+                    if (host == null || memory.Index != null || memory.Scale != 0
+                        || ResolveField(host, null, memory.Addend, memory.AccessSize) == null)
+                        return true;
+                    break;
+                case AddressOf { Target: { } target } when ReferencesLocal(target, dest):
+                    // `&dest` forwards whatever address the produced operand's
+                    // storage carries; its consumer's exact type cannot be
+                    // established here, so the diagnostic stays.
+                    return true;
+                case FieldReference { Local: { } receiver } field
+                    when ReferenceEquals(receiver, dest):
+                    // The receiver supplies the first container's owner on a
+                    // chained access (`v.a.b` needs `a`'s declaring type), not
+                    // the leaf field's.
+                    if (producedType == null
+                        || !ReceiverSatisfied(producedType, LocalVariables.ReceiverHost(field)))
+                        return true;
+                    break;
+                case SelectedFieldReference { Selector: LocalVariable selector }
+                    when ReferenceEquals(selector, dest):
+                    return true; // the selector slot is numeric, a reference cannot fill it
+                case ArrayAccess { Array: { } array } when ReferenceEquals(array, dest):
+                    if (producedType is not SzArrayTypeAnalysisContext)
+                        return true;
+                    break;
+                case LocalVariable local when ReferenceEquals(local, dest):
+                    if (BreaksValueUse(user, j, producedType, method, visited, checkMemoryBases))
+                        return true;
+                    break;
+            }
+        }
+        return false;
+    }
+
+    private static bool ReferencesLocal(IOperand operand, LocalVariable local) => operand switch
+    {
+        LocalVariable localOperand => ReferenceEquals(localOperand, local),
+        FieldReference { Local: { } fieldLocal } => ReferenceEquals(fieldLocal, local),
+        ArrayAccess { Array: { } array, Index: { } index } =>
+            ReferenceEquals(array, local) || index is LocalVariable indexLocal
+                && ReferenceEquals(indexLocal, local),
+        _ => false,
+    };
+
+    // A ldfld/stfld or instance-call receiver emits `&host` for a value-type
+    // host (ldloca on a host-typed local) or a host-assignable reference
+    // otherwise. `&` consumption needs the exact element type; a reference
+    // receiver accepts any subtype.
+    private static bool ReceiverSatisfied(TypeAnalysisContext producedType, TypeAnalysisContext? host)
+        => LocalVariables.ReceiverSatisfied(producedType, host);
+
+    private static bool BreaksValueUse(Instruction user, int operandIndex,
+        TypeAnalysisContext? producedType, MethodAnalysisContext method, HashSet<LocalVariable> visited,
+        bool checkMemoryBases)
+    {
+        switch (user.OpCode)
+        {
+            // `Move copy, dest` propagates the produced type to the copy - its
+            // consumers must satisfy it too.
+            case OpCode.Move:
+                return operandIndex != 0 && user.Destination is LocalVariable copy
+                       && BreaksConsumers(copy, producedType, method, visited, checkMemoryBases);
+            // Arithmetic and pointer-shaping ops need a numeric/`&` operand; a
+            // managed reference cannot fill them.
+            case OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+                or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And
+                or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
+                or OpCode.SignExtend32 or OpCode.VectorMin or OpCode.VectorMax or OpCode.NewArr:
+                return producedType is not { IsValueType: true }
+                       and not ByRefTypeAnalysisContext and not PointerTypeAnalysisContext
+                       and not GenericParameterTypeAnalysisContext;
+            // Raw-memory ops take `&`-positions; calli/jump targets a code pointer.
+            case OpCode.MemoryCopy or OpCode.MemorySet or OpCode.MemoryMove
+                or OpCode.IndirectCall or OpCode.IndirectJump:
+                return true;
+            case OpCode.Box:
+                return producedType is not { IsValueType: true };
+            case OpCode.Call or OpCode.CallVoid:
+                if (user.Operands[0] is not MethodAnalysisContext callee)
+                    return false;
+                var baseIndex = user.OpCode == OpCode.Call ? 2 : 1;
+                if (!callee.IsStatic)
+                {
+                    if (operandIndex == baseIndex)
+                        return producedType == null
+                               || !ReceiverSatisfied(producedType, callee.DeclaringType);
+                    baseIndex++;
+                }
+                var parameterIndex = operandIndex - baseIndex;
+                return parameterIndex >= 0 && parameterIndex < callee.Parameters.Count
+                       && callee.Parameters[parameterIndex].ParameterType
+                            is ByRefTypeAnalysisContext { ElementType: { } element }
+                       && (producedType == null || element.FullName != producedType.FullName);
+            default:
+                return false;
+        }
+    }
+
+    // Operand positions consumed as a raw address rather than a value slot:
+    // cpblk/initblk destinations and sources, and calli/jump targets. A local or
+    // field substituted there is only honest when its declared type already is a
+    // pointer - pushing an object reference and conv.u-ing it is invalid IL and
+    // would misread a reference as an address anyway.
+    private static bool LoadsAsPointer(Instruction instruction, TypeAnalysisContext? producedType)
+        => instruction.OpCode is not (OpCode.MemoryCopy or OpCode.MemorySet or OpCode.MemoryMove
+                or OpCode.IndirectCall or OpCode.IndirectJump)
+           || producedType is ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+               or { FullName: "System.IntPtr" or "System.UIntPtr" };
+
+    // A FieldReference's Local is pushed as the ldfld/stfld receiver: `&host` for
+    // a value-type host (ldloca on a T-declared local, or a &T local), or a
+    // reference assignable to the host. An object/untyped local supplies neither,
+    // so such sites keep their MemoryOperand and their diagnostic.
+    private static bool LocalSuppliesFieldBase(LocalVariable local, TypeAnalysisContext host,
+        TypeAnalysisContext? thisType, MethodAnalysisContext method)
+    {
+        // Mirrors EmittedLocalTypeCore's `this` arm: ldarg.0 pushes the declaring
+        // type (`&T` for value types), the self-instantiation on generic types.
+        TypeAnalysisContext? type;
+        if (local.IsThis && thisType != null)
+        {
+            var thisEmit = local.Type as GenericInstanceTypeAnalysisContext ?? thisType;
+            type = thisEmit.IsValueType ? new ByRefTypeAnalysisContext(thisEmit) : thisEmit;
+        }
+        else
+            type = local.Type;
+        var contract = type is ByRefTypeAnalysisContext { ElementType: { } pointee }
+            ? pointee
+            : type;
+        var declaredSupplies = contract != null && contract.IsAssignableTo(host);
+        var emitted = LocalVariables.EmittedSlotLocalType(local, method);
+        if (!declaredSupplies)
+            // local.Type can be transiently unannotated mid-fixpoint, and an
+            // erased annotation - System.Object, a shared-generic parameter,
+            // an instantiation with erased arguments like List<object> - is the
+            // lifter's placeholder rather than a contract: only a concrete
+            // non-erased declared type proves a mismatch. A wider annotation the
+            // host is itself assignable to (UnityEngine.Object on a
+            // T:UnityEngine.Object-erased copy, a shared interface) is equally
+            // non-contradicting - a contract-typed slot can still hold the host
+            // value - so it too defers to the produced type.
+            return (contract == null || IlGenerator.ContainsErasedSharedArgument(contract)
+                    || host.IsAssignableTo(contract))
+                   && EmittedValueSuppliesReceiver(emitted, host);
+        // The receiver pushes the local's emitted slot type - a `Move`-copy's
+        // source, a numeric view or an `&`-emission can differ from local.Type.
+        return EmittedValueSuppliesReceiver(emitted, host);
+    }
+
+    // Whether the value the emitted slot carries can honestly reach an ldfld
+    // receiver for `host`. A value-type host needs `&host` (a `&T` slot or a T
+    // local ldloca'd); anything else makes the emitter substitute a default
+    // address - a masked read. A reference host takes the object itself, which
+    // any reference-typed slot supplies through a castclass bridge; a
+    // byref/pointer/value slot cannot reach an object receiver, so the emitter
+    // pushes a contract-typed default - again masked.
+    private static bool EmittedValueSuppliesReceiver(TypeAnalysisContext? emitted, TypeAnalysisContext host)
+    {
+        if (emitted == null)
+            return false;
+        if (host.IsValueType)
+            return ReceiverSatisfied(emitted, host);
+        return emitted is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+               && !emitted.IsValueType;
+    }
+
     private static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)? ResolveField(
-        TypeAnalysisContext owner, TypeAnalysisContext? staticOwner, long offset, int accessSize)
+        TypeAnalysisContext owner, TypeAnalysisContext? staticOwner, long offset, int accessSize,
+        bool sizeMatchedLeaf = false)
     {
         if (staticOwner != null)
         {
@@ -289,7 +681,7 @@ public static class MetadataResolver
             return null;
         }
 
-        return FindInstanceFieldPathAtOffset(owner, offset, accessSize);
+        return ResolveFieldPath(owner, offset, accessSize, sizeMatchedLeaf);
     }
 
     // The honest public equivalent of a cross-assembly private field read: IL2CPP inlines managed
@@ -484,13 +876,160 @@ public static class MetadataResolver
                 || Extensions.AccessibilityExtensions.SharesEmittedInternals(declaringAssembly, callerAssembly));
     }
 
+    // A resolved path that must name a compiler-generated backing field can
+    // only be spelled through its property accessor: a load needs a getter
+    // visible from the caller, a store a visible setter. A backing field as a
+    // container hop emits ldflda, which the decompiler-facing rewrite can
+    // still turn into the getter call - but only when it is the last hop
+    // before a load leaf, so the call's by-value result feeds the member read
+    // (ldfld accepts a struct value where the pointer was). Any other
+    // container position, a store, or an addressed leaf keeps the managed
+    // pointer no call can produce, so those paths stay diagnosed rather than
+    // naming a member the recovered source cannot write. One exception:
+    // inside the accessor's own body the access is a plain field access
+    // (get_P reads <P>k__BackingField, set_P writes it) - refusing it would
+    // strip the recovered accessor back to a throwing stub.
+    internal static bool MemberPathUnspellable(
+        (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers) resolved,
+        MethodAnalysisContext caller, bool store, bool addressed)
+    {
+        var containers = resolved.Containers;
+        for (var i = 0; i < containers.Count; i++)
+        {
+            if (!IsCompilerGeneratedBackingField(containers[i]))
+                continue;
+            if (i != containers.Count - 1 || addressed
+                || (store && !IsOwnBackingAccessor(containers[i], caller, store: true))
+                || !(BackingAccessorVisible(containers[i], caller, store: false)
+                     || IsOwnBackingAccessor(containers[i], caller, store)))
+                return true;
+        }
+        var leaf = resolved.Field;
+        return IsCompilerGeneratedBackingField(leaf)
+            && (addressed
+                || !(BackingAccessorVisible(leaf, caller, store)
+                     || IsOwnBackingAccessor(leaf, caller, store)));
+    }
+
+    private static bool IsCompilerGeneratedBackingField(FieldAnalysisContext field) =>
+        field.Name.StartsWith("<", System.StringComparison.Ordinal)
+        && field.Name.EndsWith(">k__BackingField", System.StringComparison.Ordinal);
+
+    private static MethodAnalysisContext? FindBackingAccessor(FieldAnalysisContext field, bool store)
+    {
+        var property = field.Name[1..field.Name.IndexOf('>')];
+        var accessorName = (store ? "set_" : "get_") + property;
+        for (var type = field.DeclaringType; type != null; type = type.BaseType)
+        {
+            var lookup = type is GenericInstanceTypeAnalysisContext instance ? instance.GenericType : type;
+            var accessor = lookup.Methods.FirstOrDefault(m => m.Name == accessorName
+                && m.IsStatic == field.IsStatic
+                && m.Parameters.Count == (store ? 1 : 0));
+            if (accessor != null)
+                return accessor;
+        }
+        return null;
+    }
+
+    internal static bool BackingAccessorVisible(FieldAnalysisContext field,
+        MethodAnalysisContext caller, bool store)
+        => FindBackingAccessor(field, store) is { } accessor
+            && AccessorAccessibleFrom(accessor, caller);
+
+    // True when the calling method is the field's own accessor - get_P for a
+    // read, set_P for a write. The accessor body spells the access as the
+    // field access it already is, not as a call to itself.
+    private static bool IsOwnBackingAccessor(FieldAnalysisContext field,
+        MethodAnalysisContext caller, bool store)
+        => ReferenceEquals(FindBackingAccessor(field, store), caller);
+
+    // Mirrors the emission pass's accessor reachability (a declared-access check
+    // against the calling type) closely enough to decide whether the recovered
+    // body can spell the call: same-type access is always legal, declared
+    // visibility is judged from the caller's assembly and hierarchy. It stays a
+    // shade conservative of the real widening rules - a miss keeps a diagnostic
+    // rather than emitting an unnameable access.
+    private static bool AccessorAccessibleFrom(MethodAnalysisContext accessor, MethodAnalysisContext caller)
+    {
+        if (ReferenceEquals(accessor, caller))
+            return false; // the accessor's own body must keep its field access
+        var callerType = caller.DeclaringType;
+        var declaring = accessor.DeclaringType;
+        if (callerType == null || declaring == null)
+            return false;
+        var declaringDef = declaring is GenericInstanceTypeAnalysisContext declaringInstance
+            ? declaringInstance.GenericType : declaring;
+        // A type nested inside the accessor's declaring type can spell its
+        // private members (C# grants enclosing access down the DeclaringType
+        // chain only - siblings and parents cannot see a nested type's
+        // privates).
+        for (var t = callerType; t != null; t = t.DeclaringType)
+        {
+            var callerDef = t is GenericInstanceTypeAnalysisContext callerInstance
+                ? callerInstance.GenericType : t;
+            if (ReferenceEquals(callerDef, declaringDef))
+                return true;
+        }
+        var sameAssembly = callerType.DeclaringAssembly != null && declaring.DeclaringAssembly != null
+            && (ReferenceEquals(callerType.DeclaringAssembly, declaring.DeclaringAssembly)
+                || callerType.DeclaringAssembly.Name == declaring.DeclaringAssembly.Name);
+        // A nested type spells members with its enclosing type's accessibility:
+        // protected access resolves when any type on the declaring chain
+        // derives from the accessor's declaring type.
+        var derived = false;
+        for (var t = callerType; t != null && !derived; t = t.DeclaringType)
+            derived = t.IsAssignableTo(declaring);
+        return (accessor.Attributes & MethodAttributes.MemberAccessMask) switch
+        {
+            MethodAttributes.Public => true,
+            MethodAttributes.Assembly => sameAssembly,
+            MethodAttributes.Family => derived,
+            MethodAttributes.FamORAssem => sameAssembly || derived,
+            MethodAttributes.FamANDAssem => sameAssembly && derived,
+            _ => false,
+        };
+    }
+
+    // The instantiation a resolved-path leaf binds to: a flat path's leaf
+    // belongs to the owner the access was resolved against, but a nested
+    // path's leaf belongs to the innermost container's field type -
+    // `outer.inner.leaf` is a member of Inner, not of Outer. Binding a nested
+    // leaf to the outer generic instance mislabels its declaring type, which
+    // lets ctor-initonly and accessibility gates judge the member against the
+    // wrong owner (and emits the member on a type that never declared it).
+    internal static FieldAnalysisContext BindResolvedFieldLeaf(TypeAnalysisContext owner,
+        IReadOnlyList<FieldAnalysisContext> containers, FieldAnalysisContext leaf)
+    {
+        var leafOwner = containers.Count > 0 ? containers[^1].FieldType : owner;
+        return IlGenerator.GenericFieldOwnerInstance(leafOwner, leaf) is { } instance
+            ? new ConcreteGenericFieldAnalysisContext(leaf, instance)
+            : leaf;
+    }
+
     internal static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)?
         FindInstanceFieldPathAtOffset(TypeAnalysisContext owner, long offset, int accessSize)
+        => ResolveFieldPath(owner, offset, accessSize, false);
+
+    // A flat hit is an exact-offset match; a nested hit additionally requires the load's
+    // width to match the leaf member's storage so a wider read is not silently narrowed
+    // to its first member. sizeMatchedLeaf applies the same width rule to a top-level
+    // leaf - needed when the base itself is a reference into a value type, where the
+    // "object" is exactly the struct body and every byte belongs to some member.
+    private static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)?
+        ResolveFieldPath(TypeAnalysisContext owner, long offset, int accessSize, bool sizeMatchedLeaf)
     {
-        if (FindNestedInstanceFieldAtOffset(owner, offset, accessSize) is { } nested)
-            return (nested.Field, [nested.Container]);
-        return FindInstanceFieldAtOffset(owner, offset) is { } field ? (field, []) : null;
+        if (FindNestedInstanceFieldPathAtOffset(owner, offset, accessSize) is { } nested)
+            return nested;
+        if (FindInstanceFieldAtOffset(owner, offset) is not { } field)
+            return null;
+        if (sizeMatchedLeaf && accessSize > 0
+            && LeafStorageSize(field.FieldType, owner.AppContext.Binary.PointerSizeBytes) != accessSize)
+            return null;
+        return (field, []);
     }
+
+    private static long LeafStorageSize(TypeAnalysisContext type, int pointerSize)
+        => PrimitiveStorageSize(type, pointerSize) ?? TypeSizes.MinimumUnboxedSize(type, pointerSize);
 
     private static (FieldAnalysisContext Container, FieldAnalysisContext Field)? FindNestedStaticFieldAtOffset(
         TypeAnalysisContext owner, long offset, int accessSize)
@@ -579,23 +1118,29 @@ public static class MetadataResolver
             .GroupBy(i => (LocalVariable)i.Destination!)
             .Where(g => g.Count() == 1).ToDictionary(g => g.Key, g => g.Single());
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>>? uses = null;
         var changed = false;
         foreach (var instruction in instructions)
         for (var i = 0; i < instruction.Operands.Count; i++)
         {
             if (instruction.Operands[i] is not MemoryOperand { Base: LocalVariable alias } memory
                 || !definitions.TryGetValue(alias, out var definition)
-                || definition is not { OpCode: OpCode.Add, Operands: [_, LocalVariable root, Immediate displacement] }
+                || definition is not { OpCode: OpCode.Add or OpCode.Subtract, Operands: [_, LocalVariable root, Immediate displacement] }
                 || ReferenceEquals(root, alias)
-                || EffectiveObjectType(root, definitions) is not { IsValueType: false } rootType)
+                || EffectiveObjectType(root, definitions, method.DeclaringType) is not { } rootType
+                || rootType.IsValueType && !root.IsThis)
                 continue;
+            // ldarg.0 of a struct method's own `this` is &T, so this + disp is interior
+            // addressing just like object + disp is for references.
+            var signed = definition.OpCode == OpCode.Subtract ? -displacement.Value : displacement.Value;
             long offset;
-            try { offset = checked(memory.Addend + displacement.Value); }
+            try { offset = checked(memory.Addend + signed); }
             catch (System.OverflowException) { continue; }
             var folded = memory;
             folded.Base = root;
             folded.Addend = offset;
-            if (!ResolvesToKnownAccess(rootType, folded, pointerSize))
+            if (!ResolvesToKnownAccess(rootType, folded, pointerSize, method, instruction, i,
+                    () => uses ??= ArrayRecovery.CollectUses(method.ControlFlowGraph!)))
                 continue;
             instruction.SetOperand(i, folded);
             changed = true;
@@ -604,14 +1149,24 @@ public static class MetadataResolver
     }
 
     private static TypeAnalysisContext? EffectiveObjectType(LocalVariable local,
-        IReadOnlyDictionary<LocalVariable, Instruction> definitions) =>
-        EffectiveObjectType(local, definitions, []);
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        TypeAnalysisContext? thisType = null) =>
+        EffectiveObjectType(local, definitions, [], thisType);
 
     private static TypeAnalysisContext? EffectiveObjectType(LocalVariable local,
-        IReadOnlyDictionary<LocalVariable, Instruction> definitions, HashSet<LocalVariable> visiting)
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions, HashSet<LocalVariable> visiting,
+        TypeAnalysisContext? thisType)
     {
+        // `this` denotes the declaring type's instance (byref interior on
+        // structs), which is strictly more informative than an erased placeholder
+        // annotation like System.Object. A real carried type - including the
+        // generic instantiation X<T0> the field layout needs - always wins.
+        var fallback = local.IsThis && thisType != null
+            && (local.Type == null || local.Type.FullName == "System.Object")
+            ? thisType
+            : local.Type;
         if (!visiting.Add(local) || !definitions.TryGetValue(local, out var definition))
-            return local.Type;
+            return fallback;
 
         var recovered = definition switch
         {
@@ -623,76 +1178,227 @@ public static class MetadataResolver
                 _ => null,
             },
             { OpCode: OpCode.Move, Operands: [_, LocalVariable source] }
-                => EffectiveObjectType(source, definitions, visiting),
+                => EffectiveObjectType(source, definitions, visiting, thisType),
+            // A local holding a field's / element's / cast's loaded value carries that
+            // value's managed type, even when the local itself was never annotated.
+            { OpCode: OpCode.Move, Operands: [_, FieldReference field] }
+                => field.Field.FieldType,
+            { OpCode: OpCode.Move, Operands: [_, SelectedFieldReference selected] }
+                => selected.FieldType,
+            { OpCode: OpCode.Move, Operands: [_, ReferenceCast cast] }
+                => cast.Type,
+            { OpCode: OpCode.Move, Operands: [_, ArrayAccess access] }
+                => EffectiveObjectType(access.Array, definitions, visiting, thisType) is SzArrayTypeAnalysisContext array
+                    ? array.ElementType : null,
+            // A local holding &valueTypeStorage addresses the storage interior:
+            // [v + off] reaches the container's field at off. Reference-typed storage
+            // is handled by ResolveAddressedStorageReads instead, where [v] is the
+            // slot's own value.
+            { OpCode: OpCode.Move, Operands: [_, AddressOf { Target: LocalVariable { Type: { IsValueType: true } addressedType } }] }
+                => addressedType,
+            { OpCode: OpCode.Move, Operands: [_, AddressOf { Target: FieldReference { Field.FieldType: { IsValueType: true } addressedFieldType } }] }
+                => addressedFieldType,
+            { OpCode: OpCode.Move, Operands: [_, AddressOf { Target: ArrayAccess element }] }
+                => EffectiveObjectType(element.Array, definitions, visiting, thisType) is SzArrayTypeAnalysisContext { ElementType: { IsValueType: true } elementType }
+                    ? elementType : null,
             _ => null,
         };
 
         visiting.Remove(local);
-        return recovered ?? local.Type;
+        return recovered ?? fallback;
     }
 
-    private static bool ResolvesToKnownAccess(TypeAnalysisContext owner, MemoryOperand memory, int pointerSize)
+    private static bool ResolvesToKnownAccess(TypeAnalysisContext owner, MemoryOperand memory, int pointerSize,
+        MethodAnalysisContext method, Instruction instruction, int operandIndex,
+        Func<Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>>> uses)
     {
         if (owner is SzArrayTypeAnalysisContext arrayType)
-            return ArrayRecovery.ResolvesAccess(memory, arrayType, pointerSize);
+            return ArrayRecovery.ResolvesAccess(memory, arrayType, pointerSize,
+                method, instruction, operandIndex, uses);
 
         if (owner is StaticFieldStorageTypeAnalysisContext staticStorage)
             return memory.Index == null && memory.Scale == 0
                 && FindStaticFieldAtOffset(staticStorage.OwnerType, memory.Addend) != null;
 
+        if (owner is ByRefTypeAnalysisContext { ElementType.IsValueType: true } byRef)
+            return memory.Index == null && memory.Scale == 0
+                && ResolveFieldPath(byRef.ElementType, memory.Addend, memory.AccessSize, true) != null;
+
         return memory.Index == null && memory.Scale == 0
             && FindInstanceFieldPathAtOffset(owner, memory.Addend, memory.AccessSize) != null;
     }
 
-    internal static (FieldAnalysisContext Container, FieldAnalysisContext Field)? FindNestedInstanceFieldAtOffset(
-        TypeAnalysisContext owner, long offset, int accessSize)
+    // A load landing inside a value-typed member is a nested member access
+    // (outer.inner[.inner...]): descend through struct-typed container fields while the
+    // offset stays inside one's extent, carrying the whole container chain. A leaf is
+    // proven when a member sits exactly at the relative offset and - when the load's
+    // width is known - its storage size equals that width; without the width rule a wide
+    // read would be silently narrowed to the first member it overlaps.
+    internal static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)?
+        FindNestedInstanceFieldPathAtOffset(TypeAnalysisContext owner, long offset, int accessSize)
     {
-        if (accessSize <= 0)
-            return null;
-
-        if (owner is GenericInstanceTypeAnalysisContext genericOwner)
-        {
-            var containing = GenericInstanceFieldLayout.FindFieldContainingOffset(genericOwner, offset);
-            if (containing is not { Field.FieldType.IsValueType: true } range
-                || range.Size == accessSize)
-                return null;
-            var relativeOffset = offset - range.Offset;
-            var nested = range.Field.FieldType is GenericInstanceTypeAnalysisContext nestedGeneric
-                ? GenericInstanceFieldLayout.FindFieldContainingOffset(nestedGeneric, relativeOffset) is
-                    { Offset: var nestedFieldOffset, Size: var nestedFieldSize, Field: var concrete }
-                    && nestedFieldOffset == relativeOffset && nestedFieldSize == accessSize ? concrete : null
-                : range.Field.FieldType.Fields.FirstOrDefault(field => !field.IsStatic
-                    && (field.BackingData?.FieldOffset ?? field.Offset) == relativeOffset
-                    && PrimitiveStorageSize(field.FieldType, owner.AppContext.Binary.PointerSizeBytes) == accessSize);
-            return nested == null ? null : (range.Field, nested);
-        }
-
-        if (owner.GenericParameters.Count > 0)
-            return null;
-
+        var pointerSize = owner.AppContext.Binary.PointerSizeBytes;
         for (var candidate = owner; candidate != null; candidate = candidate.BaseType)
         {
-            // generic candidates' field offsets are layout placeholders, not real offsets
-            if (candidate is GenericInstanceTypeAnalysisContext || candidate.GenericParameters.Count > 0)
+            // a generic instance's declared offsets are layout placeholders; only a
+            // recomputed one-level path is available there
+            if (candidate is GenericInstanceTypeAnalysisContext genericCandidate)
+            {
+                if (FindGenericNestedFieldAtOffset(genericCandidate, offset, accessSize, pointerSize)
+                        is { } generic)
+                    return (generic.Field, [generic.Container]);
+                continue;
+            }
+            if (candidate.GenericParameters.Count > 0)
                 continue;
 
-            foreach (var container in candidate.Fields.Where(f => !f.IsStatic && f.FieldType.IsValueType)
-                         .OrderByDescending(f => f.Offset))
+            foreach (var container in candidate.Fields.Where(f => !f.IsStatic
+                         && (f.Attributes & FieldAttributes.Literal) == 0 && f.FieldType.IsValueType)
+                         .OrderByDescending(f => f.BackingData?.FieldOffset ?? f.Offset))
             {
-                var relativeOffset = offset - container.Offset;
-                if (relativeOffset < 0 || PrimitiveStorageSize(container.FieldType, owner.AppContext.Binary.PointerSizeBytes) == accessSize)
+                var relativeOffset = offset - (container.BackingData?.FieldOffset ?? container.Offset);
+                if (relativeOffset < 0)
                     continue;
+                var containerSize = TypeSizes.MinimumUnboxedSize(container.FieldType, pointerSize);
+                if (containerSize > 0 && relativeOffset >= containerSize)
+                    continue;
+                if (PrimitiveStorageSize(container.FieldType, pointerSize) == accessSize)
+                    continue; // the load is the whole container - the flat lookup names it
 
-                var nested = container.FieldType.Fields.FirstOrDefault(f => !f.IsStatic
-                    && f.Offset == relativeOffset
-                    && PrimitiveStorageSize(f.FieldType, owner.AppContext.Binary.PointerSizeBytes) == accessSize);
-                if (nested != null)
-                    return (container, nested);
+                if (FindFieldPathWithin(container.FieldType, relativeOffset, accessSize, pointerSize)
+                        is { } inner)
+                    return (inner.Field, new[] { container }.Concat(inner.Containers).ToList());
             }
         }
 
         return null;
     }
+
+    private static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)?
+        FindFieldPathWithin(TypeAnalysisContext owner, long offset, int accessSize, int pointerSize,
+            int depth = 0)
+    {
+        // Structs cannot inherit fields, so one level's own members are the whole layout;
+        // a depth cap keeps degenerate self-referencing layouts from recursing forever.
+        if (depth > 8)
+            return null;
+
+        var leaf = owner.Fields.FirstOrDefault(f => !f.IsStatic
+            && (f.Attributes & FieldAttributes.Literal) == 0
+            && (f.BackingData?.FieldOffset ?? f.Offset) == offset
+            && (accessSize <= 0 || LeafStorageSize(f.FieldType, pointerSize) == accessSize));
+        if (leaf != null)
+            return (leaf, []);
+
+        foreach (var container in owner.Fields.Where(f => !f.IsStatic
+                     && (f.Attributes & FieldAttributes.Literal) == 0 && f.FieldType.IsValueType
+                     && PrimitiveStorageSize(f.FieldType, pointerSize) != accessSize)
+                     .OrderByDescending(f => f.BackingData?.FieldOffset ?? f.Offset))
+        {
+            var relativeOffset = offset - (container.BackingData?.FieldOffset ?? container.Offset);
+            if (relativeOffset < 0)
+                continue;
+            var containerSize = TypeSizes.MinimumUnboxedSize(container.FieldType, pointerSize);
+            if (containerSize > 0 && relativeOffset >= containerSize)
+                continue;
+            if (FindFieldPathWithin(container.FieldType, relativeOffset, accessSize, pointerSize,
+                    depth + 1) is { } inner)
+                return (inner.Field, new[] { container }.Concat(inner.Containers).ToList());
+        }
+
+        return null;
+    }
+
+    private static (FieldAnalysisContext Container, FieldAnalysisContext Field)?
+        FindGenericNestedFieldAtOffset(GenericInstanceTypeAnalysisContext genericOwner, long offset,
+            int accessSize, int pointerSize)
+    {
+        var containing = GenericInstanceFieldLayout.FindFieldContainingOffset(genericOwner, offset);
+        if (containing is not { Field.FieldType.IsValueType: true } range
+            || range.Size == accessSize)
+            return null;
+        var relativeOffset = offset - range.Offset;
+        var nested = range.Field.FieldType is GenericInstanceTypeAnalysisContext nestedGeneric
+            ? GenericInstanceFieldLayout.FindFieldContainingOffset(nestedGeneric, relativeOffset) is
+                { Offset: var nestedFieldOffset, Size: var nestedFieldSize, Field: var concrete }
+                && nestedFieldOffset == relativeOffset && nestedFieldSize == accessSize ? concrete : null
+            : range.Field.FieldType.Fields.FirstOrDefault(field => !field.IsStatic
+                && (field.BackingData?.FieldOffset ?? field.Offset) == relativeOffset
+                && PrimitiveStorageSize(field.FieldType, pointerSize) == accessSize);
+        return nested == null ? null : (range.Field, nested);
+    }
+
+    // A native store can land strictly inside a value-typed instance field - the
+    // object the base operand names is only the outermost level: a state machine
+    // keeps struct awaiters, enumerators and wrapper structs as fields, so
+    // [this + K] may write `this.awaiter.cancellationToken`, not any field
+    // sitting at K directly. Descend through value-typed containers collecting
+    // every member boundary the access covers exactly, shallowest first; each
+    // candidate leaf is provably a member the binary writes, and the caller
+    // picks the one the stored value can actually carry (a whole struct write
+    // for a struct-typed source, or the member inside it for a primitive one).
+    // Anything else - past every field, inside reference-typed storage,
+    // part-way through a member, or a store whose width is unknown - yields no
+    // candidate and keeps its diagnostic.
+    internal static List<(FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)>?
+        FindInteriorInstanceFieldPaths(TypeAnalysisContext owner, long offset, int accessSize)
+    {
+        if (accessSize <= 0)
+            return null;
+
+        var pointerSize = owner.AppContext.Binary.PointerSizeBytes;
+        var paths = new List<(FieldAnalysisContext, IReadOnlyList<FieldAnalysisContext>)>();
+        var containers = new List<FieldAnalysisContext>();
+        var current = owner;
+        var relative = offset;
+        for (var depth = 0; depth < 8; depth++)
+        {
+            if (FindFieldCovering(current, relative, pointerSize) is not { } hit)
+                break;
+            var (field, fieldOffset, fieldSize) = hit;
+            if (fieldOffset == relative && fieldSize == accessSize)
+                paths.Add((field, containers.ToArray()));
+            if (!field.FieldType.IsValueType)
+                break;
+            containers.Add(field);
+            current = field.FieldType;
+            relative -= fieldOffset;
+        }
+
+        return paths.Count == 0 ? null : paths;
+    }
+
+    // The single instance field whose byte range covers the offset, on the type
+    // or any of its bases. Generic definitions and generic instances both keep
+    // placeholder metadata offsets, so their layout comes from
+    // GenericInstanceFieldLayout instead.
+    private static (FieldAnalysisContext Field, long Offset, long Size)? FindFieldCovering(
+        TypeAnalysisContext owner, long offset, int pointerSize)
+    {
+        for (var candidate = owner; candidate != null; candidate = candidate.BaseType)
+        {
+            if (candidate is GenericInstanceTypeAnalysisContext genericCandidate)
+            {
+                if (GenericInstanceFieldLayout.FindFieldContainingOffset(genericCandidate, offset)
+                    is { } genericHit)
+                    return genericHit;
+                continue;
+            }
+            if (candidate.GenericParameters.Count > 0)
+                continue;
+            foreach (var field in candidate.Fields.Where(f => !f.IsStatic
+                         && (f.Attributes & FieldAttributes.Literal) == 0))
+            {
+                var fieldOffset = field.BackingData?.FieldOffset ?? field.Offset;
+                var size = GenericInstanceFieldLayout.FieldStorageSize(field.FieldType, pointerSize);
+                if (size > 0 && offset >= fieldOffset && offset < fieldOffset + size)
+                    return (field, fieldOffset, size);
+            }
+        }
+
+        return null;
+    }
+
 
     private static int? PrimitiveStorageSize(TypeAnalysisContext type, int pointerSize)
     {
@@ -794,23 +1500,8 @@ public static class MetadataResolver
                 // type, which either throw it themselves or build it and hand it back for the caller to raise.
                 if (ThrowHelperRecovery.GetThrownException(method.AppContext, target) is { } thrown)
                 {
-                    if (NonReturningHelperRecovery.IsProven(method.AppContext, target)
-                        && InjectedCheckRemover.HasEquivalentImplicitFailure(method, block, thrown.FullName, recoveredImplicitHelpers))
-                    {
-                        callInstruction.OpCode = OpCode.Throw;
-                        callInstruction.SetOperands(thrown);
-                        recoveredImplicitHelpers.Add(block);
-                    }
-                    else if (callInstruction.Destination is LocalVariable produced && method.ControlFlowGraph!.Instructions.Any(i => i.Sources.Any(s => ReferenceEquals(s, produced))))
-                    {
-                        callInstruction.OpCode = OpCode.Newobj;
-                        callInstruction.SetOperands(produced, thrown);
-                    }
-                    else
-                    {
-                        callInstruction.OpCode = OpCode.Throw;
-                        callInstruction.SetOperands(thrown);
-                    }
+                    LowerThrowHelperCall(method, block, callInstruction, thrown,
+                        NonReturningHelperRecovery.IsProven(method.AppContext, target), recoveredImplicitHelpers);
 
                     continue;
                 }
@@ -838,6 +1529,44 @@ public static class MetadataResolver
         }
 
         method.ControlFlowGraph.MergeCallBlocks();
+    }
+
+    // A helper built around an exception type either raises it (proven non-returning, or
+    // its result is never read) or hands the constructed exception back for the caller to
+    // raise. A proven non-returning helper always lowers to Throw: keeping the call's
+    // fall-through edge alive via Newobj lets downstream joins read locals that no path
+    // to them assigns (CS0165 in decompiled output), while every real reader of the
+    // produced value is unreachable anyway because the call cannot return.
+    internal static void LowerThrowHelperCall(MethodAnalysisContext method, Block block,
+        Instruction callInstruction, TypeAnalysisContext thrown, bool isProvenNonReturning,
+        HashSet<Block> recoveredImplicitHelpers)
+    {
+        var produced = callInstruction.Destination as LocalVariable;
+        var hasReader = produced != null
+            && method.ControlFlowGraph!.Instructions.Any(i => i.Sources.Any(s => ReferenceEquals(s, produced)));
+
+        // Implicit-failure equivalence must be evaluated before the opcode mutates:
+        // it expects the block's last instruction to still be the call.
+        var implicitFailure = isProvenNonReturning
+            && InjectedCheckRemover.HasEquivalentImplicitFailure(method, block, thrown.FullName, recoveredImplicitHelpers);
+
+        if (isProvenNonReturning || !hasReader)
+        {
+            callInstruction.OpCode = OpCode.Throw;
+            callInstruction.SetOperands(thrown);
+            if (implicitFailure)
+                recoveredImplicitHelpers.Add(block);
+            else if (hasReader)
+                // A bare Throw block reads to the injected-check remover as an il2cpp
+                // check epilogue; a raise whose result was still consumed is not one,
+                // so tag the instruction to keep its guarding branches intact.
+                callInstruction.ThrowFromNonReturningCall = true;
+        }
+        else
+        {
+            callInstruction.OpCode = OpCode.Newobj;
+            callInstruction.SetOperands(produced!, thrown);
+        }
     }
 
     /// <summary>
@@ -1094,7 +1823,8 @@ public static class MetadataResolver
             {
                 if (!ReferenceEquals(resolved, representedMethod)
                     && ReferenceEquals(BaseMethodOf(resolved), BaseMethodOf(representedMethod))
-                    && ErasedGenericArgumentCount(representedMethod) < ErasedGenericArgumentCount(resolved))
+                    && ErasedGenericArgumentCount(representedMethod) < ErasedGenericArgumentCount(resolved)
+                    && ReceiverTypeConsistent(instruction, representedMethod))
                 {
                     instruction.SetOperand(0, representedMethod);
                     representedMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, representedMethod);
@@ -1117,7 +1847,8 @@ public static class MetadataResolver
             if (!ReferenceEquals(representedMethod, method)
                 && hiddenParamIndex < instruction.Operands.Count
                 && AsMethodInfo(instruction.Operands[hiddenParamIndex]) is { RepresentedMethod: { } hiddenMethod }
-                && ReferenceEquals(BaseMethodOf(hiddenMethod), BaseMethodOf(representedMethod)))
+                && ReferenceEquals(BaseMethodOf(hiddenMethod), BaseMethodOf(representedMethod))
+                && ReceiverTypeConsistent(instruction, representedMethod))
             {
                 instruction.SetOperand(0, representedMethod);
                 representedMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, representedMethod);
@@ -1134,7 +1865,8 @@ public static class MetadataResolver
                     continue;
 
                 if (hiddenParamIndex >= instruction.Operands.Count
-                    || AsMethodInfo(instruction.Operands[hiddenParamIndex]) == null)
+                    || AsMethodInfo(instruction.Operands[hiddenParamIndex]) == null
+                    || !ReceiverTypeConsistent(instruction, representedMethod))
                     continue;
 
                 instruction.SetOperand(0, representedMethod);
@@ -1148,7 +1880,8 @@ public static class MetadataResolver
 
             //Try to actually match on the method name so we don't just replace a call with something else.
             var representedBase = BaseMethodOf(representedMethod);
-            if (!candidates.Any(candidate => ReferenceEquals(BaseMethodOf(candidate), representedBase)))
+            if (!candidates.Any(candidate => ReferenceEquals(BaseMethodOf(candidate), representedBase))
+                || !ReceiverTypeConsistent(instruction, representedMethod))
                 continue;
 
             instruction.SetOperand(0, representedMethod);
@@ -1310,6 +2043,113 @@ public static class MetadataResolver
             LocalVariable { Type: RuntimeMethodInfoAnalysisContext methodInfoLocal } => methodInfoLocal,
             _ => null
         };
+
+    // The MethodInfo* a call's operand list carries can be a stale register leftover
+    // rather than this call's hidden argument - an earlier sibling call's rgctx load
+    // still occupies the register. A callee bound from it is only believable when the
+    // receiver operand's known type can be the declaring type: a `&SomeStruct` this
+    // can never be a class instance, and an `&A` this can never host a method of B.
+    private static bool ReceiverTypeConsistent(Instruction call, MethodAnalysisContext representedMethod)
+    {
+        if (representedMethod.IsStatic || representedMethod.DeclaringType is not { } declaring)
+            return true;
+
+        // A hidden return buffer shifts the receiver register on conventions where it
+        // consumes an argument slot, and where it does not the buffer is still operand
+        // clutter - skip rather than inspect the wrong operand.
+        var resolver = representedMethod.AppContext.InstructionSet.CallingConventionResolver;
+        if (resolver?.ReturnsViaHiddenBuffer(representedMethod) == true)
+            return true;
+
+        var firstArg = call.OpCode == OpCode.CallVoid ? 1 : 2;
+        if (firstArg >= call.Operands.Count
+            || OperandEmittedType(call.Operands[firstArg]) is not { } receiverType)
+            return true;
+
+        if (receiverType is RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext
+            or RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext
+            or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext)
+            // Runtime handle operands say nothing about the receiver object.
+            return true;
+
+        if (receiverType is not ByRefTypeAnalysisContext { ElementType: { } receiverElement })
+            // Only a managed-pointer operand carries reliable receiver evidence: a
+            // byref type states what the register points at, while a plain local's
+            // static type can be stale (register reuse re-labels a pointer value).
+            return true;
+
+        if (receiverElement is GenericParameterTypeAnalysisContext
+            || receiverElement.FullName?.Contains("__Il2CppFullySharedGeneric") == true)
+            // Shared-generic or erased receivers cannot be checked against a declaring type.
+            return true;
+
+        // A managed pointer can be a struct `this`, or a class receiver under
+        // `constrained.` (a `&T` holding a T object), or reach the type through
+        // the pointed-to struct's offset-0 field (the pointer is the same address).
+        if (SameTypeFamily(receiverElement, declaring)
+            || ZeroOffsetField(receiverElement, declaring) != null)
+            return true;
+
+        // &v.f0 names the same address as &v: treat it as a pointer to V.
+        if (call.Operands[firstArg] is AddressOf
+            { Target: FieldReference { Offset: 0, Containers: { Count: 0 } } addressedField })
+        {
+            var addressedStruct = addressedField.Local.Type is ByRefTypeAnalysisContext addressedByRef
+                ? addressedByRef.ElementType
+                : addressedField.Local.Type;
+            if (addressedStruct is { IsValueType: true })
+                return SameTypeFamily(addressedStruct, declaring);
+        }
+        return false;
+    }
+
+    private static TypeAnalysisContext? OperandEmittedType(IOperand operand) => operand switch
+    {
+        LocalVariable local => local.Type,
+        FieldReference field => field.Field.FieldType,
+        AddressOf { Target: LocalVariable addressed } => addressed.Type is { } localType
+            ? new ByRefTypeAnalysisContext(localType)
+            : null,
+        AddressOf { Target: FieldReference field } => new ByRefTypeAnalysisContext(field.Field.FieldType),
+        _ => null,
+    };
+
+    // Generic-sharing erases receiver types (a MapField<K,V> body sees MapField<object,object>),
+    // so family membership is decided on the generic definitions; a System.Object operand
+    // carries no evidence either way. Context objects for one type are not interned, so the
+    // erased names are what is compared.
+    private static bool SameTypeFamily(TypeAnalysisContext actual, TypeAnalysisContext expected)
+    {
+        var erasedActual = actual is GenericInstanceTypeAnalysisContext actualInstance
+            ? actualInstance.GenericType ?? actual : actual;
+        var erasedExpected = expected is GenericInstanceTypeAnalysisContext expectedInstance
+            ? expectedInstance.GenericType ?? expected : expected;
+        if (ReferenceEquals(erasedActual, erasedExpected)
+            || erasedActual.FullName == erasedExpected.FullName
+            || erasedActual.FullName is "System.Object")
+            return true;
+        for (var type = erasedActual; type != null; type = type.BaseType)
+        {
+            var erased = type is GenericInstanceTypeAnalysisContext instance
+                ? instance.GenericType ?? type : type;
+            if (erased.FullName == erasedExpected.FullName)
+                return true;
+            // Interface dispatch reaches the receiver through implements, not extends.
+            foreach (var iface in type.InterfaceContexts)
+                if ((iface is GenericInstanceTypeAnalysisContext ifaceInstance
+                        ? ifaceInstance.GenericType ?? iface : iface).FullName == erasedExpected.FullName)
+                    return true;
+        }
+        for (var type = erasedExpected.BaseType; type != null; type = type.BaseType)
+            if ((type is GenericInstanceTypeAnalysisContext instance ? instance.GenericType ?? type : type)
+                    .FullName == erasedActual.FullName)
+                return true;
+        return false;
+    }
+
+    private static FieldAnalysisContext? ZeroOffsetField(TypeAnalysisContext owner, TypeAnalysisContext fieldType) =>
+        owner.Fields.Where(field => !field.IsStatic && field.Offset == 0 && SameTypeFamily(field.FieldType, fieldType))
+            .ToList() is [var field] ? field : null;
 
     private static void HandleKeyFunction(ApplicationAnalysisContext appContext, Instruction instruction, ulong target, BaseKeyFunctionAddresses kFA)
     {

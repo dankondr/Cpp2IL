@@ -10,9 +10,14 @@ namespace Cpp2IL.Core.Analysis;
 /// </summary>
 public static class SsaSimplifier
 {
-    public static void Run(MethodAnalysisContext method) => Run(method.ControlFlowGraph!, method.ParameterLocals);
+    public static void Run(MethodAnalysisContext method) =>
+        Run(method.ControlFlowGraph!, method.ParameterLocals, method);
 
-    public static void Run(ISILControlFlowGraph cfg, List<LocalVariable> parameterLocals)
+    public static void Run(ISILControlFlowGraph cfg, List<LocalVariable> parameterLocals) =>
+        Run(cfg, parameterLocals, null);
+
+    private static void Run(ISILControlFlowGraph cfg, List<LocalVariable> parameterLocals,
+        MethodAnalysisContext? method)
     {
         // dest -> value for every forwardable copy/constant. SSA's single-assignment property means a
         // local is defined at most once, so there is never a conflicting entry for the same key.
@@ -22,9 +27,23 @@ public static class SsaSimplifier
             foreach (var instruction in block.Instructions)
                 if (instruction.OpCode == OpCode.Move
                     && instruction.Operands[0] is LocalVariable dest
-                    && !parameterLocals.Contains(dest)
-                    && IsForwardable(instruction.Operands[1]))
-                    forwarded[dest] = instruction.Operands[1];
+                    && !parameterLocals.Contains(dest))
+                {
+                    // A copy between locals that cannot hold each other's value - a slot merging
+                    // unrelated references across paths - has no legal managed store, so the
+                    // source is never forwarded into the destination's typed positions (an
+                    // address-of field receiver would emit an invalid ldflda). The move itself
+                    // stays: the emitter fills the slot with a noted synthetic default (a
+                    // decompiler-issue call naming both types), so the stored value is measured
+                    // rather than silently dropped. Copies between managed pointers (T& or T*
+                    // on both sides) are exempt - the value is the address itself.
+                    if (instruction.Operands[1] is LocalVariable copySource
+                        && LocalVariables.NoLegalManagedCopy(dest, copySource, allowByRefReinterpret: true))
+                        continue;
+
+                    if (IsForwardable(instruction.Operands[1]))
+                        forwarded[dest] = instruction.Operands[1];
+                }
 
         if (forwarded.Count == 0)
             return;
@@ -37,7 +56,7 @@ public static class SsaSimplifier
         // One global substitution of every use.
         foreach (var block in cfg.Blocks)
             foreach (var instruction in block.Instructions)
-                ReplaceUses(instruction, resolved);
+                ReplaceUses(instruction, resolved, method);
 
         // A forwarded local is dead now - unless a use could not take its value (a constant cannot be
         // a memory base/index, so such a use keeps the original local). Drop the defining Move only
@@ -68,7 +87,8 @@ public static class SsaSimplifier
         return value;
     }
 
-    private static void ReplaceUses(Instruction instruction, Dictionary<LocalVariable, IOperand> resolved)
+    private static void ReplaceUses(Instruction instruction, Dictionary<LocalVariable, IOperand> resolved,
+        MethodAnalysisContext? method)
     {
         // The single definition position (a Move/Call destination local) must not be rewritten - only
         // reads are forwarded. In SSA the local being eliminated never appears as a use of itself, so
@@ -79,7 +99,10 @@ public static class SsaSimplifier
         {
             switch (instruction.Operands[i])
             {
-                case LocalVariable local when !ReferenceEquals(local, destination) && resolved.TryGetValue(local, out var value):
+                case LocalVariable local when !ReferenceEquals(local, destination) && resolved.TryGetValue(local, out var value)
+                    && (value is not LocalVariable localReplacement
+                        || !LocalVariables.CallOperandProvenMismatched(instruction, i,
+                            localReplacement, method)):
                     instruction.SetOperand(i, value);
                     break;
 
@@ -93,23 +116,108 @@ public static class SsaSimplifier
                     instruction.SetOperand(i, memory); // MemoryOperand is a struct, write the copy back
                     break;
 
-                // Same as a memory base: the object a field is read from must stay a local.
-                case FieldReference { Local: { } fieldLocal } field when resolved.TryGetValue(fieldLocal, out var fieldValue) && fieldValue is LocalVariable fieldReplacement:
+                // Same as a memory base: the object a field is read from must stay a local, and
+                // its type must be able to serve as the receiver - a mismatched local would
+                // produce an invalid ldfld.
+                case FieldReference { Local: { } fieldLocal } field when resolved.TryGetValue(fieldLocal, out var fieldValue) && fieldValue is LocalVariable fieldReplacement && !LocalVariables.NoLegalManagedCopy(fieldLocal, fieldReplacement)
+                    && (method == null || !LocalVariables.ReceiverProvenMismatched(
+                        LocalVariables.EmittedSlotLocalType(fieldReplacement, method),
+                        LocalVariables.ReceiverHost(field))):
                     field.Local = fieldReplacement;
                     break;
                 case SelectedFieldReference selected:
                     if (resolved.TryGetValue(selected.Selector, out var selectorValue) && selectorValue is LocalVariable selectorReplacement)
                         selected.Selector = selectorReplacement;
                     foreach (var choice in selected.Choices)
-                        if (resolved.TryGetValue(choice.Field.Local, out var receiverValue) && receiverValue is LocalVariable receiverReplacement)
+                        if (resolved.TryGetValue(choice.Field.Local, out var receiverValue) && receiverValue is LocalVariable receiverReplacement && !LocalVariables.NoLegalManagedCopy(choice.Field.Local, receiverReplacement)
+                            && (method == null || !LocalVariables.ReceiverProvenMismatched(
+                                LocalVariables.EmittedSlotLocalType(receiverReplacement, method),
+                                LocalVariables.ReceiverHost(choice.Field))))
                             choice.Field.Local = receiverReplacement;
+                    break;
+
+                // Same as a memory base: the operand of a reference cast is a managed-reference
+                // slot typed LocalVariable, so only a local replacement is substituted there; a
+                // constant stays put, which keeps the source Move alive.
+                case ReferenceCast cast
+                    when resolved.TryGetValue(cast.Value, out var castValue) && castValue is LocalVariable castReplacement:
+                    instruction.SetOperand(i, new ReferenceCast(castReplacement, cast.Type, cast.NullOnFailure));
+                    break;
+
+                // An address-take's target can itself be a compound expression (&receiver.field,
+                // &array[i].field, &mem[base+index]): the locals inside it are reads like any
+                // other, so a forwarded copy substitutes there too. Without this the target still
+                // names the old local after its definition is dropped, leaving a use of an
+                // unassigned local in the emitted IL.
+                case AddressOf address:
+                    SubstituteAddressTarget(address, resolved, method);
                     break;
             }
         }
     }
 
+    // Substitution inside an address-take's target. Compound positions - the object or memory
+    // cell a field/element is addressed through - take local replacements exactly like their
+    // top-level counterparts. A bare local target (&v) is the cell's own identity rather than a
+    // value inside it, so forwarding must not rewrite it.
+    private static void SubstituteAddressTarget(AddressOf address, Dictionary<LocalVariable, IOperand> resolved,
+        MethodAnalysisContext? method)
+    {
+        switch (address.Target)
+        {
+            case MemoryOperand memory:
+                if (memory.Base is LocalVariable baseLocal && resolved.TryGetValue(baseLocal, out var baseValue) && baseValue is LocalVariable baseReplacement)
+                    memory.Base = baseReplacement;
+                if (memory.Index is LocalVariable indexLocal && resolved.TryGetValue(indexLocal, out var indexValue) && indexValue is LocalVariable indexReplacement)
+                    memory.Index = indexReplacement;
+                address.Target = memory; // MemoryOperand is a struct, write the copy back
+                break;
+            case FieldReference { Local: { } fieldLocal } field
+                when resolved.TryGetValue(fieldLocal, out var fieldValue) && fieldValue is LocalVariable fieldReplacement && !LocalVariables.NoLegalManagedCopy(fieldLocal, fieldReplacement)
+                     && (method == null || !LocalVariables.ReceiverProvenMismatched(
+                         LocalVariables.EmittedSlotLocalType(fieldReplacement, method),
+                         LocalVariables.ReceiverHost(field))):
+                field.Local = fieldReplacement;
+                break;
+            case SelectedFieldReference selected:
+                if (resolved.TryGetValue(selected.Selector, out var selectorValue) && selectorValue is LocalVariable selectorReplacement)
+                    selected.Selector = selectorReplacement;
+                foreach (var choice in selected.Choices)
+                    if (resolved.TryGetValue(choice.Field.Local, out var receiverValue) && receiverValue is LocalVariable receiverReplacement && !LocalVariables.NoLegalManagedCopy(choice.Field.Local, receiverReplacement)
+                        && (method == null || !LocalVariables.ReceiverProvenMismatched(
+                            LocalVariables.EmittedSlotLocalType(receiverReplacement, method),
+                            LocalVariables.ReceiverHost(choice.Field))))
+                        choice.Field.Local = receiverReplacement;
+                break;
+            case ArrayAccess access:
+                if (resolved.TryGetValue(access.Array, out var arrayValue) && arrayValue is LocalVariable arrayReplacement)
+                    access.Array = arrayReplacement;
+                if (access.Index is LocalVariable elementIndex && resolved.TryGetValue(elementIndex, out var elementValue) && elementValue is LocalVariable elementReplacement)
+                    access.Index = elementReplacement;
+                break;
+            case ArrayElementFieldReference elementField:
+                if (resolved.TryGetValue(elementField.Array, out var elementArrayValue) && elementArrayValue is LocalVariable elementArrayReplacement)
+                    elementField.Array = elementArrayReplacement;
+                if (elementField.Index is LocalVariable elementFieldIndex && resolved.TryGetValue(elementFieldIndex, out var elementIndexValue) && elementIndexValue is LocalVariable elementIndexReplacement)
+                    elementField.Index = elementIndexReplacement;
+                break;
+            case ArrayLength length
+                when resolved.TryGetValue(length.Array, out var lengthValue) && lengthValue is LocalVariable lengthReplacement:
+                length.Array = lengthReplacement;
+                break;
+            case ReferenceCast cast
+                when resolved.TryGetValue(cast.Value, out var castValue) && castValue is LocalVariable castReplacement:
+                address.Target = new ReferenceCast(castReplacement, cast.Type, cast.NullOnFailure);
+                break;
+            case AddressOf nested:
+                SubstituteAddressTarget(nested, resolved, method);
+                break;
+        }
+    }
+
     // Every local read by some instruction. The single write position (a plain local destination) is
-    // excluded; memory and field operands always contribute their address/object locals as reads.
+    // excluded; memory and field operands always contribute their address/object locals as reads, as
+    // do locals nested inside an address-take's compound target (&receiver.field reads receiver).
     private static HashSet<LocalVariable> CollectReadLocals(ISILControlFlowGraph cfg)
     {
         var reads = new HashSet<LocalVariable>();
@@ -121,29 +229,12 @@ public static class SsaSimplifier
 
                 foreach (var operand in instruction.Operands)
                 {
-                    switch (operand)
-                    {
-                        case LocalVariable local when !ReferenceEquals(local, destination):
-                            reads.Add(local);
-                            break;
-                        case AddressOf { Target: LocalVariable addressed }:
-                            reads.Add(addressed);
-                            break;
-                        case MemoryOperand memory:
-                            if (memory.Base is LocalVariable baseLocal)
-                                reads.Add(baseLocal);
-                            if (memory.Index is LocalVariable indexLocal)
-                                reads.Add(indexLocal);
-                            break;
-                        case FieldReference field when field.Local is { } fieldLocal:
-                            reads.Add(fieldLocal);
-                            break;
-                        case SelectedFieldReference selected:
-                            reads.Add(selected.Selector);
-                            foreach (var choice in selected.Choices)
-                                reads.Add(choice.Field.Local);
-                            break;
-                    }
+                    if (operand is LocalVariable destinationLocal && ReferenceEquals(destinationLocal, destination))
+                        continue;
+
+                    foreach (var used in LocalVariables.OperandLocals(operand))
+                        if (used != null)
+                            reads.Add(used);
                 }
             }
 

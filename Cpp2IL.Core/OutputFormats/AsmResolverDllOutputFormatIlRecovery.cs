@@ -73,6 +73,9 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             // The injected friend-assembly attributes introduce their own
             // framework-type references; re-run the (emit-if-missing) pass.
             FrameworkSurfaceTypes.EmitMissing(assemblies);
+            // After every widening the references above applied, re-assert the
+            // accessibility-consistency invariants on the final emitted flags.
+            MemberAccessibility.FixupEmittedVisibility(context);
             return assemblies;
         }
         finally
@@ -213,10 +216,18 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
     // against - Unity package internals cross assembly boundaries constantly
     // (internal types in fields, methods, casts). The verifier resolves the real
     // hierarchy and rejects those references as invisible. Restoring the grant
-    // for every sibling assembly recreates the access shape the binary actually
-    // had - the il2cpp runtime never enforced .NET visibility anyway.
+    // for every sibling recreates that access, but a blanket grant also exposes
+    // the internal polyfill types many packages compile privately (for example
+    // the NotNullWhenAttribute copies NuGet libraries carry) to consumers that
+    // never touched them - a consumer naming the same type through the runtime
+    // library then sees two definitions and the compile reports duplicate-type
+    // errors. Emit a grant only where the friend's own emitted metadata touches
+    // the grantor's internals: the reference is the evidence the original
+    // assembly carried one.
     private static void RestoreInternalsVisibleTo(List<AssemblyDefinition> assemblies)
     {
+        var exercisedInternals = CollectExercisedInternals(assemblies);
+
         // Strong-named friends must be listed with their full public key or
         // the runtime and ILVerify treat the InternalsVisibleTo grant as not
         // matching - il2cpp kept Unity's keypair-signed public keys.
@@ -227,7 +238,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             // creates duplicate-type compiler errors.
             .Where(a => a.Name is not null
                 && !AccessibilityExtensions.IsExternalRuntimeAssembly(a.Name))
-            .Select(FriendName)
+            .Select(a => (SimpleName: a.Name!.ToString(), Name: FriendName(a), Keyed: a.PublicKey is { Length: > 0 }))
             .Distinct()
             .ToList();
         foreach (var assembly in assemblies)
@@ -235,14 +246,25 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             var module = assembly.Modules.FirstOrDefault();
             if (module == null || assembly.Name is null)
                 continue;
+            if (!exercisedInternals.TryGetValue(assembly, out var exercised) || exercised.Count == 0)
+                continue;
+            // A strong-named grantor may only name strong-named friends - an
+            // unsigned name in InternalsVisibleTo is rejected outright when
+            // the signed output is recompiled (CS1726), and the original build
+            // could not have carried the grant either.
+            var grantorKeyed = assembly.PublicKey is { Length: > 0 };
             var factory = module.CorLibTypeFactory;
             var ivtCtor = factory.CorLibScope
                 .CreateTypeReference("System.Runtime.CompilerServices", "InternalsVisibleToAttribute")
                 .CreateMemberReference(".ctor",
                     MethodSignature.CreateInstance(factory.Void, [factory.String]));
             var self = assembly.Name.ToString() + ",";
-            foreach (var friend in friends)
+            foreach (var (simpleName, friend, friendKeyed) in friends)
             {
+                if (!exercised.Contains(simpleName))
+                    continue;
+                if (grantorKeyed && !friendKeyed)
+                    continue;
                 if (friend.StartsWith(self, StringComparison.Ordinal))
                     continue;
                 var signature = new CustomAttributeSignature(
@@ -251,6 +273,391 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             }
         }
     }
+
+    // For each emitted assembly, the set of consumer assembly names whose
+    // emitted metadata references a type or member the consumer could only see
+    // through an InternalsVisibleTo grant: member/signature references naming
+    // internal (or family-and-assembly / protected-internal) members and types,
+    // type forwards of internal types, and virtual overrides whose kept access
+    // relies on seeing the base member's internal half (implicit overrides
+    // leave no reference of their own). References the emission-time access
+    // gates widened to public need no grant; every remaining internal-facing
+    // edge is evidence the original assembly carried one.
+    private static Dictionary<AssemblyDefinition, HashSet<string>> CollectExercisedInternals(
+        List<AssemblyDefinition> assemblies)
+    {
+        var needed = new Dictionary<AssemblyDefinition, HashSet<string>>();
+        var typeCache = new Dictionary<ITypeDefOrRef, TypeDefinition?>();
+        var memberCache = new Dictionary<IMemberDescriptor, IMemberDefinition?>();
+        var exportedTypeMaps = new Dictionary<AssemblyDefinition, Dictionary<string, TypeDefinition>>();
+
+        foreach (var consumer in assemblies)
+        {
+            if (consumer.Name?.ToString() is not { } consumerName)
+                continue;
+
+            void Require(AssemblyDefinition? owner)
+            {
+                if (owner is null || ReferenceEquals(owner, consumer))
+                    return;
+                if (!needed.TryGetValue(owner, out var set))
+                    needed[owner] = set = new HashSet<string>(StringComparer.Ordinal);
+                set.Add(consumerName);
+            }
+
+            foreach (var module in consumer.Modules)
+            {
+                var runtimeContext = module.RuntimeContext;
+
+                TypeDefinition? ResolveType(ITypeDefOrRef? type)
+                {
+                    switch (type)
+                    {
+                        case null:
+                            return null;
+                        case TypeDefinition definition:
+                            return definition;
+                    }
+                    if (!typeCache.TryGetValue(type, out var resolved))
+                    {
+                        resolved = type.Resolve(runtimeContext, out var result) == ResolutionStatus.Success
+                            ? result
+                            : null;
+                        typeCache[type] = resolved;
+                    }
+                    return resolved;
+                }
+
+                IMemberDefinition? ResolveMember(IMemberDescriptor member)
+                {
+                    if (member is MethodSpecification { Method: { } specificationMethod })
+                        member = specificationMethod;
+                    if (member is IMemberDefinition definition)
+                        return definition;
+                    if (member is not MemberReference reference)
+                        return null;
+                    if (!memberCache.TryGetValue(reference, out var resolved))
+                    {
+                        resolved = reference.TryResolve(runtimeContext, out var result) ? result : null;
+                        memberCache[reference] = resolved;
+                    }
+                    return resolved;
+                }
+
+                void NoteType(ITypeDescriptor? type)
+                {
+                    foreach (var leaf in EmittedTypeLeaves(type))
+                        if (ResolveType(leaf) is { } definition && TypeNeedsFriendAccess(definition))
+                            Require(definition.DeclaringModule?.Assembly);
+                }
+
+                void NoteSignature(TypeSignature? signature)
+                {
+                    foreach (var leaf in EmittedSignatureLeaves(signature))
+                        NoteType(leaf);
+                }
+
+                void NoteMember(IMemberDescriptor? member)
+                {
+                    switch (member)
+                    {
+                        case null:
+                            return;
+                        case MethodSpecification specification:
+                            if (specification.Signature is { } genericSignature)
+                                foreach (var argument in genericSignature.TypeArguments)
+                                    NoteSignature(argument);
+                            NoteMember(specification.Method);
+                            return;
+                    }
+                    NoteType(member.DeclaringType);
+                    if (member is MemberReference { Signature: MethodSignature methodSignature })
+                    {
+                        NoteSignature(methodSignature.ReturnType);
+                        foreach (var parameterType in methodSignature.ParameterTypes)
+                            NoteSignature(parameterType);
+                    }
+                    else if (member is MemberReference { Signature: FieldSignature fieldSignature })
+                    {
+                        NoteSignature(fieldSignature.FieldType);
+                    }
+                    var resolved = ResolveMember(member);
+                    if (resolved?.DeclaringType?.DeclaringModule?.Assembly is { } owner
+                        && (TypeNeedsFriendAccess(resolved.DeclaringType) || MemberNeedsFriendAccess(resolved)))
+                        Require(owner);
+                }
+
+                void NoteAttributes(IEnumerable<CustomAttribute> attributes)
+                {
+                    foreach (var attribute in attributes)
+                    {
+                        NoteMember(attribute.Constructor);
+                        if (attribute.Signature is not { } signature)
+                            continue;
+                        foreach (var argument in signature.FixedArguments)
+                            NoteArgument(argument);
+                        foreach (var named in signature.NamedArguments)
+                        {
+                            NoteSignature(named.ArgumentType);
+                            NoteArgument(named.Argument);
+                        }
+                    }
+                }
+
+                void NoteArgument(CustomAttributeArgument argument)
+                {
+                    NoteSignature(argument.ArgumentType);
+                    NoteArgumentValue(argument.Element);
+                    if (argument.Elements is { } elements)
+                        foreach (var element in elements)
+                            NoteArgumentValue(element);
+                }
+
+                void NoteArgumentValue(object? value)
+                {
+                    switch (value)
+                    {
+                        case TypeSignature signature:
+                            NoteSignature(signature);
+                            break;
+                        case ITypeDefOrRef type:
+                            NoteType(type);
+                            break;
+                        case BoxedArgument boxed:
+                            NoteSignature(boxed.Type);
+                            NoteArgumentValue(boxed.Value);
+                            break;
+                        case CustomAttributeArgument nested:
+                            NoteArgument(nested);
+                            break;
+                        case IEnumerable<object?> sequence:
+                            foreach (var element in sequence)
+                                NoteArgumentValue(element);
+                            break;
+                    }
+                }
+
+                foreach (var type in module.GetAllTypes())
+                {
+                    NoteType(type.BaseType);
+                    foreach (var @interface in type.Interfaces)
+                        NoteType(@interface.Interface);
+                    foreach (var genericParameter in type.GenericParameters)
+                    {
+                        foreach (var constraint in genericParameter.Constraints)
+                            NoteType(constraint.Constraint);
+                        NoteAttributes(genericParameter.CustomAttributes);
+                    }
+                    foreach (var implementation in type.MethodImplementations)
+                    {
+                        NoteMember(implementation.Declaration);
+                        NoteMember(implementation.Body);
+                    }
+                    NoteAttributes(type.CustomAttributes);
+
+                    foreach (var field in type.Fields)
+                    {
+                        if (field.Signature is { } fieldSignature)
+                            NoteSignature(fieldSignature.FieldType);
+                        NoteAttributes(field.CustomAttributes);
+                    }
+
+                    foreach (var property in type.Properties)
+                    {
+                        if (property.Signature is { } propertySignature)
+                        {
+                            NoteSignature(propertySignature.ReturnType);
+                            foreach (var parameterType in propertySignature.ParameterTypes)
+                                NoteSignature(parameterType);
+                        }
+                        NoteAttributes(property.CustomAttributes);
+                    }
+
+                    foreach (var @event in type.Events)
+                    {
+                        NoteType(@event.EventType);
+                        NoteAttributes(@event.CustomAttributes);
+                    }
+
+                    foreach (var method in type.Methods)
+                    {
+                        if (method.Signature is { } methodSignature)
+                        {
+                            NoteSignature(methodSignature.ReturnType);
+                            foreach (var parameterType in methodSignature.ParameterTypes)
+                                NoteSignature(parameterType);
+                        }
+                        foreach (var genericParameter in method.GenericParameters)
+                        {
+                            foreach (var constraint in genericParameter.Constraints)
+                                NoteType(constraint.Constraint);
+                            NoteAttributes(genericParameter.CustomAttributes);
+                        }
+                        NoteAttributes(method.CustomAttributes);
+                        foreach (var parameter in method.ParameterDefinitions)
+                            NoteAttributes(parameter.CustomAttributes);
+
+                        // A virtual member reusing a base slot is an implicit
+                        // override: it references no base member, but keeping an
+                        // internal-reliant access still needs the grant it proves.
+                        if (method.IsVirtual && !method.IsStatic && !method.IsNewSlot)
+                            for (var scope = type.BaseType; scope is not null;)
+                            {
+                                var baseDefinition = ResolveType(scope);
+                                if (baseDefinition is null)
+                                    break;
+                                scope = baseDefinition.BaseType;
+                                if (baseDefinition.DeclaringModule?.Assembly is not { } owner)
+                                    continue;
+                                foreach (var candidate in baseDefinition.Methods)
+                                {
+                                    if (!candidate.IsVirtual || candidate.IsStatic
+                                        || candidate.Name?.Value != method.Name?.Value)
+                                        continue;
+                                    var baseAccess = (int)(candidate.Attributes & MethodAttributes.MemberAccessMask);
+                                    var overrideAccess = (int)(method.Attributes & MethodAttributes.MemberAccessMask);
+                                    // A protected-internal override relies on the
+                                    // internal half of a protected-internal base;
+                                    // an assembly/family-and-assembly base is only
+                                    // visible (and overridable) through the grant.
+                                    if (baseAccess is 2 or 3 || baseAccess == 5 && overrideAccess == 5)
+                                        Require(owner);
+                                }
+                            }
+
+                        if (method.CilMethodBody is not { } body)
+                            continue;
+                        foreach (var variable in body.LocalVariables)
+                            NoteSignature(variable.VariableType);
+                        foreach (var handler in body.ExceptionHandlers)
+                            NoteType(handler.ExceptionType);
+                        foreach (var instruction in body.Instructions)
+                            switch (instruction.Operand)
+                            {
+                                case ITypeDefOrRef operandType:
+                                    NoteType(operandType);
+                                    break;
+                                case IMemberDescriptor member:
+                                    NoteMember(member);
+                                    break;
+                                case StandAloneSignature { Signature: MethodSignature standAlone }:
+                                    NoteSignature(standAlone.ReturnType);
+                                    foreach (var parameterType in standAlone.ParameterTypes)
+                                        NoteSignature(parameterType);
+                                    break;
+                            }
+                    }
+                }
+
+                NoteAttributes(module.CustomAttributes);
+                NoteAttributes(consumer.CustomAttributes);
+
+                // An exported type forwarding an internal type is only
+                // nameable by the consumer through the grant.
+                foreach (var exported in module.ExportedTypes)
+                {
+                    if (exported.Implementation is not AssemblyReference { Name: { } targetName })
+                        continue;
+                    var owner = assemblies.FirstOrDefault(a => a.Name?.ToString() == targetName.ToString());
+                    if (owner is null || ReferenceEquals(owner, consumer))
+                        continue;
+                    if (!exportedTypeMaps.TryGetValue(owner, out var fullNameMap))
+                    {
+                        fullNameMap = owner.Modules
+                            .SelectMany(m => m.GetAllTypes())
+                            .GroupBy(t => t.FullName)
+                            .ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
+                        exportedTypeMaps[owner] = fullNameMap;
+                    }
+                    if (exported.FullName is { } fullName
+                        && fullNameMap.TryGetValue(fullName, out var forwarded)
+                        && TypeNeedsFriendAccess(forwarded))
+                        Require(owner);
+                }
+            }
+        }
+        return needed;
+    }
+
+    // The metadata types a descriptor can actually name: a specification's
+    // signature leaves and the type itself. Resolution of a nested type's own
+    // declaring chain happens inside TypeNeedsFriendAccess.
+    private static IEnumerable<ITypeDefOrRef> EmittedTypeLeaves(ITypeDescriptor? type) => type switch
+    {
+        null => [],
+        TypeSpecification specification => EmittedSignatureLeaves(specification.Signature),
+        TypeSignature signature => EmittedSignatureLeaves(signature),
+        ITypeDefOrRef defOrRef => [defOrRef],
+        _ => [],
+    };
+
+    private static IEnumerable<ITypeDefOrRef> EmittedSignatureLeaves(TypeSignature? signature)
+    {
+        switch (signature)
+        {
+            case null or GenericParameterSignature:
+                yield break;
+            case CustomModifierTypeSignature modifier:
+                if (modifier.ModifierType is { } modifierType)
+                    yield return modifierType;
+                foreach (var leaf in EmittedSignatureLeaves(modifier.BaseType))
+                    yield return leaf;
+                yield break;
+            case GenericInstanceTypeSignature genericInstance:
+                if (genericInstance.GenericType is { } genericType)
+                    yield return genericType;
+                foreach (var argument in genericInstance.TypeArguments)
+                    foreach (var leaf in EmittedSignatureLeaves(argument))
+                        yield return leaf;
+                yield break;
+            case TypeSpecificationSignature specification:
+                foreach (var leaf in EmittedTypeLeaves(specification.DeclaringType))
+                    yield return leaf;
+                foreach (var leaf in EmittedSignatureLeaves(specification.BaseType))
+                    yield return leaf;
+                yield break;
+            case TypeDefOrRefSignature typeDefOrRef:
+                if (typeDefOrRef.Type is { } type)
+                    yield return type;
+                yield break;
+            case FunctionPointerTypeSignature functionPointer:
+                if (functionPointer.Signature is { } methodSignature)
+                {
+                    foreach (var leaf in EmittedSignatureLeaves(methodSignature.ReturnType))
+                        yield return leaf;
+                    foreach (var parameterType in methodSignature.ParameterTypes)
+                        foreach (var leaf in EmittedSignatureLeaves(parameterType))
+                            yield return leaf;
+                }
+                yield break;
+        }
+    }
+
+    // Whether a reference to the type could only bind through an
+    // InternalsVisibleTo grant: internal at the type or at any enclosing scope.
+    // A private link in the chain makes the type unnameable either way.
+    private static bool TypeNeedsFriendAccess(TypeDefinition type)
+    {
+        for (var current = type; current is not null; current = current.DeclaringType)
+        {
+            if (!current.IsNested)
+                return current.IsNotPublic;
+            if (current.IsNestedAssembly || current.IsNestedFamilyAndAssembly || current.IsNestedFamilyOrAssembly)
+                return true;
+            if (current.IsNestedPrivate)
+                return false;
+        }
+        return false;
+    }
+
+    // Internal access levels (family-and-assembly, assembly, protected
+    // internal's internal half) share the same low bits on methods and fields.
+    private static bool MemberNeedsFriendAccess(IMemberDefinition member) => member switch
+    {
+        MethodDefinition method => (int)(method.Attributes & MethodAttributes.MemberAccessMask) is 2 or 3 or 5,
+        FieldDefinition field => (int)(field.Attributes & FieldAttributes.FieldAccessMask) is 2 or 3 or 5,
+        _ => false,
+    };
 
     private static string FriendName(AssemblyDefinition friend)
     {

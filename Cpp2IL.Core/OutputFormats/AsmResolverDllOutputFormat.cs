@@ -8,6 +8,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Builder;
+using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.Builder;
 using AsmResolver.PE.DotNet.Cil;
@@ -35,16 +36,88 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
     {
         if (methodDefinition.DeclaringModule is not { } module)
         {
-            methodDefinition.ReplaceMethodBodyWithMinimalImplementation();
+            if (!TryFillAutoPropertyAccessorBody(methodDefinition, methodContext))
+                methodDefinition.ReplaceMethodBodyWithMinimalImplementation();
             EnsureStubVerifiable(methodDefinition, methodContext);
             return;
         }
 
         lock (_stubLocks.GetOrAdd(module, _ => new object()))
         {
-            methodDefinition.ReplaceMethodBodyWithMinimalImplementation();
+            if (!TryFillAutoPropertyAccessorBody(methodDefinition, methodContext))
+                methodDefinition.ReplaceMethodBodyWithMinimalImplementation();
             EnsureStubVerifiable(methodDefinition, methodContext);
         }
+    }
+
+    // MethodStubber recognizes an auto-property accessor by the emitted
+    // FieldDefinition's access flags, but parallel body fills widen that flag
+    // through MemberAccessibility.EnsureAccessible the moment another module
+    // references the field - the same stub fill then landed on an accessor or
+    // a default body depending on scheduling. Decide on the declared flags
+    // instead, which never mutate: a declared-private <Name>k__BackingField is
+    // the compiler's auto-property evidence and always earns the real
+    // accessor body.
+    private static bool TryFillAutoPropertyAccessorBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
+    {
+        var methodName = methodDefinition.Name?.Value;
+        var isGetter = methodDefinition.IsGetMethod
+            && methodName?.StartsWith("get_") == true
+            && methodDefinition.Signature?.ParameterTypes.Count == 0;
+        var isSetter = !isGetter
+            && methodDefinition.IsSetMethod
+            && methodName?.StartsWith("set_") == true
+            && methodDefinition.Signature?.ParameterTypes.Count == 1
+            && methodDefinition.Signature.ReturnType.ElementType == ElementType.Void;
+        var declaringContext = methodContext.DeclaringType;
+        var declaringType = methodDefinition.DeclaringType;
+        if ((!isGetter && !isSetter) || declaringContext == null || declaringType == null)
+            return false;
+
+        var backingField = declaringContext.Fields.FirstOrDefault(field =>
+            field.Name == $"<{methodName![4..]}>k__BackingField");
+        if (backingField == null
+            || (backingField.Attributes & System.Reflection.FieldAttributes.FieldAccessMask)
+                != System.Reflection.FieldAttributes.Private)
+        {
+            return false; // computed accessor or a non-private member, not an auto-property
+        }
+
+        var backingFieldDefinition = backingField.GetExtraData<FieldDefinition>("AsmResolverField");
+        if (backingFieldDefinition == null
+            || backingField.IsStatic != methodContext.IsStatic
+            || methodDefinition.DeclaringModule?.RuntimeContext is not { } runtimeContext
+            || !runtimeContext.SignatureComparer.Equals(
+                backingFieldDefinition.Signature?.FieldType,
+                isGetter ? methodDefinition.Signature?.ReturnType
+                    : methodDefinition.Signature?.ParameterTypes[0]))
+        {
+            // A declared-private <Name>k__BackingField is present but its shape
+            // cannot carry this accessor - emit the minimal stub, but say so by
+            // name rather than silently defaulting an evidence-shaped member.
+            Logger.WarnNewline($"Accessor '{methodContext.FullName}' has a backing field that is not usable auto-property evidence; emitting a minimal stub.", "DllOutput");
+            return false;
+        }
+
+        var body = new CilMethodBody();
+        methodDefinition.CilMethodBody = body;
+        var instructions = body.Instructions;
+        var fieldOperand = AsmResolverAssemblyPopulator.AutoPropertyFieldOperand(backingFieldDefinition, declaringType);
+        if (methodContext.IsStatic)
+        {
+            if (!isGetter)
+                instructions.Add(CilOpCodes.Ldarg_0);
+            instructions.Add(isGetter ? CilOpCodes.Ldsfld : CilOpCodes.Stsfld, fieldOperand);
+        }
+        else
+        {
+            instructions.Add(CilOpCodes.Ldarg_0);
+            if (!isGetter)
+                instructions.Add(CilOpCodes.Ldarg_1);
+            instructions.Add(isGetter ? CilOpCodes.Ldfld : CilOpCodes.Stfld, fieldOperand);
+        }
+        instructions.Add(CilOpCodes.Ret);
+        return true;
     }
 
     private static void EnsureStubVerifiable(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
@@ -332,7 +405,10 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
             {
                 var managedMethod = methodCtx.GetExtraData<MethodDefinition>("AsmResolverMethod") ?? throw new($"AsmResolver method not found in method analysis context for {typeContext.FullName}.{methodCtx.Name}");
 
-                FillMethodBody(managedMethod, methodCtx);
+                // Member references the body emits only need the access this
+                // type's scope can actually see, not a blanket public widening.
+                using (MemberAccessibility.EmittingFrom(typeContext))
+                    FillMethodBody(managedMethod, methodCtx);
             }
 #if !DEBUG
             catch (System.Exception e)

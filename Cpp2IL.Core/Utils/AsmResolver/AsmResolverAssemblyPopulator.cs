@@ -69,6 +69,50 @@ public static class AsmResolverAssemblyPopulator
         }
     }
 
+    // ECMA-335 writes a nested type's attribute-blob SerString as
+    // "Ns.Parent+Child": only the outermost element carries a namespace.
+    // AsmResolver's TypeNameBuilder walks DeclaringType but still prints each
+    // element's own Namespace, so a nested typedef/typeref that kept it emits
+    // "Parent+Ns.Child", which no compiler resolves. Rewrap nested elements in
+    // null-namespace TypeReference clones - only the name the blob serializes
+    // changes; resolution scope is preserved via the parent chain.
+    internal static TypeSignature CanonicalBlobTypeName(TypeSignature signature) => signature switch
+    {
+        TypeDefOrRefSignature { Type.DeclaringType: not null } defOrRef =>
+            new TypeDefOrRefSignature(CanonicalBlobTypeRef(defOrRef.Type), defOrRef.IsValueType),
+        GenericInstanceTypeSignature generic => new GenericInstanceTypeSignature(
+            CanonicalBlobTypeRef(generic.GenericType), generic.IsValueType,
+            generic.TypeArguments.Select(CanonicalBlobTypeName).ToList()),
+        SzArrayTypeSignature szArray => CanonicalBlobTypeName(szArray.BaseType).MakeSzArrayType(),
+        ByReferenceTypeSignature byRef => CanonicalBlobTypeName(byRef.BaseType).MakeByReferenceType(),
+        PointerTypeSignature pointer => CanonicalBlobTypeName(pointer.BaseType).MakePointerType(),
+        PinnedTypeSignature pinned => CanonicalBlobTypeName(pinned.BaseType).MakePinnedType(),
+        CustomModifierTypeSignature modifier => CanonicalBlobTypeName(modifier.BaseType)
+            .MakeModifierType(modifier.ModifierType, modifier.IsRequired),
+        ArrayTypeSignature array => new ArrayTypeSignature(
+            CanonicalBlobTypeName(array.BaseType), array.Dimensions.ToArray()),
+        _ => signature,
+    };
+
+    private static TypeReference CanonicalBlobTypeRef(ITypeDefOrRef type)
+    {
+        if (type.DeclaringType is { } declaring)
+            // Nested level: the canonical SerString drops the element's own
+            // namespace; its scope is the canonicalized parent.
+            return new TypeReference(CanonicalBlobTypeRef(declaring), null, type.Name);
+
+        // Outermost element keeps its real scope (module, or declaring
+        // assembly reference) and namespace. ITypeDefOrRef.Scope already
+        // answers module-or-parent for TypeDefinition and the declared scope
+        // for TypeReference.
+        return new TypeReference(type.Scope, type.Namespace, type.Name);
+    }
+
+    private static TypeSignature? BlobTypeValue(BaseCustomAttributeTypeParameter parameter)
+        => parameter.TypeContext?.ToTypeSignature() is { } signature
+            ? CanonicalBlobTypeName(signature)
+            : null;
+
     private static TypeSignature GetTypeSigFromAttributeArg(BaseCustomAttributeParameter parameter) =>
         parameter switch
         {
@@ -98,7 +142,7 @@ public static class AsmResolverAssemblyPopulator
                 {
                     CustomAttributePrimitiveParameter primitiveParameter => primitiveParameter.PrimitiveValue,
                     CustomAttributeEnumParameter enumParameter => enumParameter.UnderlyingPrimitiveParameter.PrimitiveValue,
-                    BaseCustomAttributeTypeParameter type => (object?)type.TypeContext?.ToTypeSignature(),
+                    BaseCustomAttributeTypeParameter type => (object?)BlobTypeValue(type),
                     CustomAttributeNullParameter => null,
                     CustomAttributeArrayParameter array => BuildArrayArgument(array).Elements.ToArray(),
                     _ => throw new("Not supported array element type: " + e.GetType().FullName)
@@ -145,7 +189,7 @@ public static class AsmResolverAssemblyPopulator
     /// <remarks>
     /// BoxIfNeeded will cause the resulting attribute to be boxed if the parameter is an enum or a type parameter. This is required if, for example, the enum or type is being passed as the argument in a constructor for which the parameter is typed as object.
     /// </remarks>
-    private static CustomAttributeArgument FromAnalyzedAttributeArgument(BaseCustomAttributeParameter parameter, bool boxIfNeeded)
+    internal static CustomAttributeArgument FromAnalyzedAttributeArgument(BaseCustomAttributeParameter parameter, bool boxIfNeeded)
     {
 #if !DEBUG
         try
@@ -161,8 +205,11 @@ public static class AsmResolverAssemblyPopulator
                 CustomAttributeEnumParameter enumParameter when boxIfNeeded => new(systemTypes.SystemObjectType.ToTypeSignature(), new BoxedArgument(GetTypeSigFromAttributeArg(enumParameter), enumParameter.UnderlyingPrimitiveParameter.PrimitiveValue)),
                 CustomAttributeEnumParameter enumParameter => new(GetTypeSigFromAttributeArg(enumParameter), enumParameter.UnderlyingPrimitiveParameter.PrimitiveValue),
                 
-                //BaseCustomAttributeTypeParameter typeParameter when boxIfNeeded => new(systemTypes.SystemObjectType.ToTypeSignature(), new BoxedArgument(GetTypeSigFromAttributeArg(parentAssembly, typeParameter), typeParameter.TypeContext?.ToTypeSignature(parentAssembly.ManifestModule!))),
-                BaseCustomAttributeTypeParameter typeParameter => new(systemTypes.SystemTypeType.ToTypeSignature(), typeParameter.TypeContext?.ToTypeSignature()),
+                //A typeof(x) argument in an object-typed slot is boxed like an enum is:
+                //the blob needs the SERIALIZATION_TYPE_TYPE tag before the SerString or
+                //the attribute decodes as garbage ("Could not decode attribute arguments").
+                BaseCustomAttributeTypeParameter typeParameter when boxIfNeeded => new(systemTypes.SystemObjectType.ToTypeSignature(), new BoxedArgument(systemTypes.SystemTypeType.ToTypeSignature(), BlobTypeValue(typeParameter))),
+                BaseCustomAttributeTypeParameter typeParameter => new(systemTypes.SystemTypeType.ToTypeSignature(), BlobTypeValue(typeParameter)),
                 
                 CustomAttributeArrayParameter arrayParameter => BuildArrayArgument(arrayParameter),
                 _ => throw new ArgumentException("Unknown custom attribute parameter type: " + parameter.GetType().FullName)
@@ -285,11 +332,25 @@ public static class AsmResolverAssemblyPopulator
         //share visibility and dispatch flags in real metadata.
         var attributes = (sibling?.Attributes ?? MethodAttributes.Public)
             | MethodAttributes.HideBySig | MethodAttributes.SpecialName;
-        var accessor = new MethodDefinition((isGetter ? "get_" : "set_") + property.Name, attributes, accessorSignature);
+        // Accessor names embed the property's name: for an explicit interface
+        // implementation like `I.Prop` the pair is `I.get_Prop`/`I.set_Prop`, so
+        // keep the dotted prefix or the pair stops matching the interface
+        // convention.
+        var propertyName = property.Name.ToString();
+        var lastDot = propertyName.LastIndexOf('.');
+        var accessorName = lastDot < 0
+            ? (isGetter ? "get_" : "set_") + propertyName
+            : propertyName.Substring(0, lastDot + 1) + (isGetter ? "get_" : "set_") + propertyName.Substring(lastDot + 1);
+        var accessor = new MethodDefinition(accessorName, attributes, accessorSignature);
         declaringType.Methods.Add(accessor);
 
         if (accessor.IsAbstract)
             return accessor;
+
+        // On a generic declaring type the field operand must be the type's own
+        // generic instance (a TypeSpec `C<T>`), not the bare typedef — that is
+        // the shape the compiler emits and the only one the verifier accepts.
+        IFieldDescriptor fieldOperand = AutoPropertyFieldOperand(backingField, declaringType);
 
         var body = new CilMethodBody();
         var instructions = body.Instructions;
@@ -298,18 +359,34 @@ public static class AsmResolverAssemblyPopulator
             instructions.Add(CilOpCodes.Ldarg_0);
             if (!isGetter)
                 instructions.Add(CilOpCodes.Ldarg_1);
-            instructions.Add(isGetter ? CilOpCodes.Ldfld : CilOpCodes.Stfld, backingField);
+            instructions.Add(isGetter ? CilOpCodes.Ldfld : CilOpCodes.Stfld, fieldOperand);
         }
         else
         {
             if (!isGetter)
                 instructions.Add(CilOpCodes.Ldarg_0);
-            instructions.Add(isGetter ? CilOpCodes.Ldsfld : CilOpCodes.Stsfld, backingField);
+            instructions.Add(isGetter ? CilOpCodes.Ldsfld : CilOpCodes.Stsfld, fieldOperand);
         }
         instructions.Add(CilOpCodes.Ret);
         accessor.CilMethodBody = body;
 
         return accessor;
+    }
+
+    // The field operand an auto-property accessor body carries: the bare field
+    // definition on a closed declaring type, a member reference over the type's
+    // own generic instance on a generic one.
+    internal static IFieldDescriptor AutoPropertyFieldOperand(FieldDefinition backingField, TypeDefinition declaringType)
+    {
+        if (declaringType.GenericParameters.Count == 0)
+            return backingField;
+        var selfInstance = new GenericInstanceTypeSignature(
+            declaringType, declaringType.IsValueType,
+            declaringType.GenericParameters
+                .Select((_, i) => (TypeSignature)new GenericParameterSignature(GenericParameterType.Type, i))
+                .ToArray());
+        return new MemberReference(
+            new TypeSpecification(selfInstance), backingField.Name, backingField.Signature);
     }
 
     private static void CopyCustomAttributes(HasCustomAttributes source, IList<CustomAttribute> destination)
@@ -557,6 +634,28 @@ public static class AsmResolverAssemblyPopulator
             propertyCtx.PutExtraData("AsmResolverProperty", managedProperty);
 
             ilTypeDefinition.Properties.Add(managedProperty);
+
+            // il2cpp strips accessor MethodDefs the binary never calls, so a
+            // compiler-generated auto-property can arrive with only its setter
+            // surviving. A setter-only property decompiles to `{ set; }`, which
+            // is not valid C# (CS8051). `<X>k__BackingField` proves the original
+            // was `{ get; set; }`, so the getter can be restored from it. A
+            // normal setter's only parameter is `value`; a setter with more is
+            // an indexer, which can never be an auto-property.
+            // A dotted property name is an explicit interface implementation;
+            // C# forbids those as auto-properties, so the interface's own
+            // stripped getter cannot be evidenced by a backing field and the
+            // surviving accessor pair already decompiles legally — leave it.
+            if (managedGetter == null && managedSetter is { Parameters.Count: 1 }
+                && !managedProperty.Name!.ToString().Contains('.'))
+            {
+                var backingField = ilTypeDefinition.Fields.FirstOrDefault(f =>
+                    f.Name?.ToString() == $"<{managedProperty.Name}>k__BackingField");
+                if (backingField != null)
+                    managedProperty.SetSemanticMethods(
+                        SynthesizeAccessor(managedProperty, managedSetter, backingField, true),
+                        managedSetter);
+            }
         }
     }
 
@@ -623,7 +722,11 @@ public static class AsmResolverAssemblyPopulator
                 if (overrideContext.Name == methodContext.Name && !isPrivate)
                     continue;
 
-                var interfaceMethod = (IMethodDefOrRef)overrideContext.ToMethodDescriptor();
+                // The emitted MethodImpl sits on typeContext, so the operand
+                // only needs the access visible from there.
+                IMethodDefOrRef interfaceMethod;
+                using (MemberAccessibility.EmittingFrom(typeContext))
+                    interfaceMethod = (IMethodDefOrRef)overrideContext.ToMethodDescriptor();
                 var method = methodContext.GetExtraData<MethodDefinition>("AsmResolverMethod") ?? throw new($"AsmResolver method not found in method analysis context for {methodContext}");
                 type.MethodImplementations.Add(new MethodImplementation(interfaceMethod, method));
                 var resolutionStatus = interfaceMethod.Resolve(runtimeContext, out var interfaceMethodResolved);

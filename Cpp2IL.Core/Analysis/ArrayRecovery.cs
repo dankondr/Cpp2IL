@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -24,6 +25,10 @@ public static class ArrayRecovery
 
     public static void Run(MethodAnalysisContext method)
     {
+        // Whole-element stores are themselves resolved by RecoverAccesses, so the
+        // bulk-copy pass must run first or its redundant-chunk cleanup never sees
+        // the MemoryOperand shape it matches.
+        RecoverStructArrayBulkCopies(method);
         RecoverAccesses(method);
         RecoverElementPointerWalkers(method);
         RecoverReferenceArrayOffsetWalkers(method);
@@ -32,7 +37,6 @@ public static class ArrayRecovery
         RecoverFieldAddressAliases(method);
         RecoverValueTypeFieldAddresses(method);
         RecoverStructElementAddresses(method);
-        RecoverStructArrayBulkCopies(method);
         GroupInitialisers(method.ControlFlowGraph!);
     }
 
@@ -44,6 +48,7 @@ public static class ArrayRecovery
     {
         var cfg = method.ControlFlowGraph!;
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        Dictionary<LocalVariable, Instruction?>? definitions = null;
         foreach (var instruction in cfg.Instructions.ToList())
         {
             if (instruction is not { OpCode: OpCode.Move,
@@ -67,14 +72,60 @@ public static class ArrayRecovery
             var elementEnd = elementStart + stride;
             instruction.SetOperands(new ArrayAccess(array, new Immediate(relative / stride)), value);
 
-            foreach (var chunk in cfg.Instructions)
-                if (!ReferenceEquals(chunk, instruction) && chunk is
-                    { OpCode: OpCode.Move, Operands: [MemoryOperand { Base: LocalVariable chunkArray,
-                        Index: null, Scale: 0, Addend: var chunkOffset }, _] }
-                    && ReferenceEquals(chunkArray, array)
-                    && chunkOffset >= elementStart && chunkOffset < elementEnd)
-                    MakeNop(chunk);
+            // Drop the copy's remaining piece stores: instructions beside the anchor in
+            // the same block that write another slice of the same element from the same
+            // slice of the stored value. A same-span store whose source is not provably
+            // [value + offset] is a real write (e.g. arr[i].field = x beside arr[i] = v)
+            // and ends the contiguous piece run.
+            var block = cfg.Blocks.FirstOrDefault(b => b.Instructions.Contains(instruction));
+            if (block == null)
+                continue;
+            definitions ??= SingleDefinitions(cfg);
+            var anchor = block.Instructions.IndexOf(instruction);
+            for (var step = -1; step <= 1; step += 2)
+            for (var i = anchor + step; i >= 0 && i < block.Instructions.Count; i += step)
+            {
+                var chunk = block.Instructions[i];
+                if (chunk is not { OpCode: OpCode.Move,
+                        Operands: [MemoryOperand { Base: LocalVariable chunkArray,
+                            Index: null, Scale: 0, Addend: var chunkOffset }, var chunkSource] }
+                    || !ReferenceEquals(chunkArray, array)
+                    || chunkOffset < elementStart || chunkOffset >= elementEnd)
+                    continue;
+                if (!IsSameValueSlice(chunkSource, value, chunkOffset - elementStart, definitions))
+                    break;
+                MakeNop(chunk);
+            }
         }
+
+    }
+
+    // Whether `source` provably reads the `sliceOffset`-byte slice of `value` —
+    // [value + sliceOffset] directly or through single-definition Move chains, or
+    // through the same &stack alias ResolveStackAlias resolves a stack local from.
+    private static bool IsSameValueSlice(IOperand source, LocalVariable value, long sliceOffset,
+        Dictionary<LocalVariable, Instruction?> definitions)
+    {
+        var seen = new HashSet<LocalVariable>();
+        while (source is LocalVariable local && seen.Add(local)
+                && definitions.TryGetValue(local, out var definition)
+                && definition is { OpCode: OpCode.Move, Operands: [_, { } next] })
+            source = next;
+
+        if (source is not MemoryOperand { Base: LocalVariable sliceBase, Index: null, Scale: 0,
+                Addend: var addend })
+            return false;
+
+        if (ReferenceEquals(sliceBase, value))
+            return addend == sliceOffset;
+
+        return definitions.TryGetValue(sliceBase, out var pointerDefinition)
+            && pointerDefinition is { OpCode: OpCode.Move,
+                Operands: [_, AddressOf { Target: LocalVariable origin }] }
+            && ((ReferenceEquals(origin, value) && addend == sliceOffset)
+                || (StackOffset(origin.Register.Name) is { } originOffset
+                    && StackOffset(value.Register.Name) is { } valueOffset
+                    && originOffset + addend == valueOffset + sliceOffset));
     }
 
     private static LocalVariable? ResolveStackAlias(MemoryOperand memory, MethodAnalysisContext method,
@@ -409,19 +460,30 @@ public static class ArrayRecovery
     }
 
     // Whether RecoverAccesses would resolve this operand into an ArrayLength or
-    // ArrayAccess for the given array type.
-    internal static bool ResolvesAccess(MemoryOperand memory, SzArrayTypeAnalysisContext arrayType, int pointerSize)
+    // ArrayAccess for the given array type. Alias normalization folds displaced
+    // bases onto the array through this same predicate, so the full instruction
+    // context - sibling agreement and the lifted-lea discipline - applies: a
+    // fold must never strand an operand RecoverAccesses will then refuse.
+    internal static bool ResolvesAccess(MemoryOperand memory, SzArrayTypeAnalysisContext arrayType, int pointerSize,
+        MethodAnalysisContext method, Instruction instruction, int operandIndex,
+        Func<Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>>> uses)
     {
         if (memory.Index == null && memory.Scale == 0 && memory.Addend == LengthOffset(pointerSize))
             return true;
 
-        return ElementIndex(memory, arrayType, pointerSize) != null;
+        if (ElementIndex(memory, arrayType, pointerSize) != null)
+            return true;
+
+        return ResolveStructElementAccess(instruction, operandIndex, memory, arrayType, pointerSize,
+            uses) != null;
     }
 
     internal static void RecoverAccesses(MethodAnalysisContext method)
     {
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
         var definitions = SingleDefinitions(method.ControlFlowGraph!);
+        Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>>? uses = null;
+        var guardContext = new GuardedIndexContext(method);
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
@@ -442,6 +504,11 @@ public static class ArrayRecovery
                 {
                     if (DerivedElementAccess(memory, pointerSize, definitions) is { } derived)
                         instruction.SetOperand(i, derived);
+                    else if (GuardedIndexAccess(method, instruction, i, memory, pointerSize, definitions,
+                                 () => uses ??= CollectUses(method.ControlFlowGraph!), guardContext) is { } guardedDerived)
+                        instruction.SetOperand(i, guardedDerived);
+                    else if (LengthWordLoad(instruction, i, memory, pointerSize, definitions) is { } lengthArray)
+                        instruction.SetOperand(i, new ArrayLength(lengthArray));
                     continue;
                 }
 
@@ -452,7 +519,19 @@ public static class ArrayRecovery
                 }
 
                 if (ElementIndex(memory, arrayType, pointerSize) is { } index)
+                {
                     instruction.SetOperand(i, new ArrayAccess(array, index));
+                    continue;
+                }
+
+                if (ResolveStructElementAccess(instruction, i, memory, arrayType, pointerSize,
+                        () => uses ??= CollectUses(method.ControlFlowGraph!)) is { } access)
+                    instruction.SetOperand(i, access.Field is { } elementField
+                        ? new ArrayElementFieldReference(array, access.Index, elementField)
+                        : new ArrayAccess(array, access.Index));
+                else if (GuardedIndexAccess(method, instruction, i, memory, pointerSize, definitions,
+                             () => uses ??= CollectUses(method.ControlFlowGraph!), guardContext) is { } guarded)
+                    instruction.SetOperand(i, guarded);
             }
         }
     }
@@ -491,6 +570,545 @@ public static class ArrayRecovery
             && definition is { OpCode: OpCode.Move, Operands: [_, var source] }
                 ? ResolveArray(source, definitions, depth + 1)
                 : null;
+    }
+
+    // A read of the array header's length word through an address chain: the
+    // binary materializes `array + 0x18` into its own local and dereferences
+    // `[p]` or `[p + k]`, so the base resolves to the array only when the
+    // touched word lands exactly on max_length. Only load positions qualify -
+    // writing the word has no ldlen spelling and keeps its store diagnostic.
+    private static LocalVariable? LengthWordLoad(
+        Instruction instruction, int operandIndex, MemoryOperand memory, int pointerSize,
+        Dictionary<LocalVariable, Instruction?> definitions)
+    {
+        if (memory.Index != null || memory.Scale != 0 || IsStorePosition(instruction, operandIndex)
+            || EvaluateHeaderBase(memory.Base, definitions, 0) is not
+                { Root: LocalVariable { Type: SzArrayTypeAnalysisContext } array, Multiplier: 1 } headerBase
+            || headerBase.Offset + memory.Addend != LengthOffset(pointerSize))
+            return null;
+        return array;
+    }
+
+    private static bool IsStorePosition(Instruction instruction, int operandIndex) =>
+        operandIndex == 0 && instruction.OpCode
+            is OpCode.Move or OpCode.MemoryCopy or OpCode.MemorySet or OpCode.MemoryMove;
+
+    // The base address as `root + constant` through definition chains that are
+    // provably address arithmetic: `Move` copies and `Add`/`Subtract` immediates.
+    // A `Move` from a MemoryOperand is a real load - the value is the word that
+    // was read (e.g. the class pointer), not the address it came from - so it
+    // makes the local an opaque root rather than `array + 0`. A local typed as
+    // the array proves itself; anything else is an opaque root the caller's
+    // array-type test rejects.
+    private static Affine? EvaluateHeaderBase(IOperand? operand,
+        Dictionary<LocalVariable, Instruction?> definitions, int depth)
+    {
+        if (depth > 8)
+            return null;
+
+        switch (operand)
+        {
+            case null:
+                return null;
+            case Immediate { Value: var value }:
+                return new Affine(null, 0, value);
+            case LocalVariable { Type: SzArrayTypeAnalysisContext } array:
+                return new Affine(array, 1, 0);
+            case LocalVariable local:
+                if (!definitions.TryGetValue(local, out var definition) || definition == null)
+                    return new Affine(local, 1, 0);
+                return definition switch
+                {
+                    { OpCode: OpCode.Move, Operands: [_, var source] } when source is not MemoryOperand
+                        => EvaluateHeaderBase(source, definitions, depth + 1),
+                    { OpCode: OpCode.Add or OpCode.Subtract, Operands: [_, var left, var right] }
+                        => Sum(EvaluateHeaderBase(left, definitions, depth + 1),
+                               ScaleBy(EvaluateHeaderBase(right, definitions, depth + 1),
+                                   definition.OpCode is OpCode.Subtract ? -1 : 1)),
+                    _ => new Affine(local, 1, 0),
+                };
+            default:
+                return null;
+        }
+    }
+
+    // Element accesses where the element-region offset is folded into the base
+    // local: the binary materializes `array + elementsOffset` once, then
+    // dereferences `[p + i * stride + off]` (or `[p + i + off]` when the index is
+    // already in bytes). Solve the base and index as affine expressions, fold
+    // the constants into an element index plus a field offset, and only rewrite
+    // when a bounds check for the same array proves the index - the conditional
+    // jump fed by a `CheckLess` against the array's length must dominate the
+    // access on its in-bounds edge. Anything else stays diagnosed.
+    private static IOperand? GuardedIndexAccess(
+        MethodAnalysisContext method,
+        Instruction instruction,
+        int operandIndex,
+        MemoryOperand memory,
+        int pointerSize,
+        Dictionary<LocalVariable, Instruction?> definitions,
+        Func<Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>>> uses,
+        GuardedIndexContext context)
+    {
+        // Only positions that consume an element value or store one may be
+        // rewritten: a MemoryOperand inside integer or address arithmetic is
+        // an element address, not an element, and stays diagnosed.
+        if (memory.Index == null || method.DominatorInfo == null
+            || instruction.OpCode is not (OpCode.Move
+                or OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall
+                or OpCode.CheckEqual or OpCode.CheckNotEqual
+                or OpCode.CheckLess or OpCode.CheckGreater
+                or OpCode.CheckLessOrEqual or OpCode.CheckGreaterOrEqual
+                or OpCode.Return or OpCode.Throw))
+        {
+            return null;
+        }
+
+        var baseAffine = Evaluate(memory.Base, definitions, 0, true);
+        if (baseAffine is { Root: LocalVariable { Type: SzArrayTypeAnalysisContext rootedType } root, Multiplier: 1 })
+        {
+            return GuardedIndexAccess(method, instruction, operandIndex, memory, pointerSize,
+                definitions, uses, context, root, rootedType, baseAffine.Value);
+        }
+        if (memory.Base is LocalVariable { Type: SzArrayTypeAnalysisContext baseType } typedBase)
+        {
+            // The typed base is itself the array (e.g. a field load the affine
+            // evaluator cannot follow); its own value is the root.
+            return GuardedIndexAccess(method, instruction, operandIndex, memory, pointerSize,
+                definitions, uses, context, typedBase, baseType, new Affine(typedBase, 1, 0));
+        }
+        return null;
+    }
+
+    private static IOperand? GuardedIndexAccess(
+        MethodAnalysisContext method,
+        Instruction instruction,
+        int operandIndex,
+        MemoryOperand memory,
+        int pointerSize,
+        Dictionary<LocalVariable, Instruction?> definitions,
+        Func<Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>>> uses,
+        GuardedIndexContext context,
+        LocalVariable array,
+        SzArrayTypeAnalysisContext arrayType,
+        Affine baseAffine)
+    {
+        var elementSize = ElementSize(arrayType.ElementType, pointerSize);
+        if (elementSize == 0 && arrayType.ElementType.IsValueType)
+            elementSize = MetadataElementSize(arrayType.ElementType, pointerSize);
+        if (elementSize <= 0)
+        {
+            return null;
+        }
+
+        // An equality compare on a whole value type cannot be emitted, and an
+        // ordering compare on a reference element compares element addresses;
+        // leave both diagnosed.
+        if ((ElementSize(arrayType.ElementType, pointerSize) == 0
+                && instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual)
+            || (instruction.OpCode is OpCode.CheckLess or OpCode.CheckGreater
+                or OpCode.CheckLessOrEqual or OpCode.CheckGreaterOrEqual
+                && !arrayType.ElementType.IsValueType))
+        {
+            return null;
+        }
+
+        var indexAffine = ScaleBy(Evaluate(memory.Index, definitions, 0, true), Math.Max(memory.Scale, 1));
+        if (indexAffine is not { Root: { } indexRoot } idx)
+        {
+            return null;
+        }
+        if (idx.Multiplier <= 0 || idx.Multiplier % elementSize != 0)
+        {
+            return null;
+        }
+
+        var multiplier = idx.Multiplier / elementSize;
+        var tail = idx.Offset + baseAffine.Offset + memory.Addend - ElementsOffset(pointerSize);
+        var fieldOffset = tail % elementSize;
+        if (fieldOffset < 0)
+            fieldOffset += elementSize;
+        var bias = (tail - fieldOffset) / elementSize;
+
+        // The check compares the element index `multiplier * root + bias`
+        // against the length word, so that is the affine the guard must match.
+        if (!ProveIndexGuard(method, instruction, array, new Affine(indexRoot, multiplier, bias),
+                definitions, uses, context))
+        {
+            return null;
+        }
+
+        IOperand indexOperand = indexRoot;
+        var inserted = new List<Instruction>();
+        if (multiplier != 1)
+        {
+            var scaled = NewIndexTemp(method, ref context.TempIndex);
+            inserted.Add(new Instruction(-1, OpCode.Multiply, scaled, indexOperand, new Immediate(multiplier)));
+            indexOperand = scaled;
+        }
+        if (bias != 0)
+        {
+            var adjusted = NewIndexTemp(method, ref context.TempIndex);
+            inserted.Add(new Instruction(-1, bias > 0 ? OpCode.Add : OpCode.Subtract, adjusted, indexOperand,
+                new Immediate(Math.Abs(bias))));
+            indexOperand = adjusted;
+        }
+
+        (IOperand Index, FieldAnalysisContext? Field)? resolved;
+        if (arrayType.ElementType.IsValueType && ElementSize(arrayType.ElementType, pointerSize) == 0)
+        {
+            // Whole-element or member accesses of a struct can only be emitted
+            // when the value flows to or from a slot typed as that struct (or a
+            // member load) - a scalar-typed slot means the operand is really an
+            // element address in disguise.
+            var sibling = instruction.Operands[operandIndex == 0 ? 1 : 0];
+            if (sibling is LocalVariable { Type: { } siblingType }
+                && siblingType != arrayType.ElementType
+                && fieldOffset == 0)
+            {
+                return null;
+            }
+            var normalized = new MemoryOperand(array, indexOperand,
+                ElementsOffset(pointerSize) + fieldOffset, (int)elementSize, memory.AccessSize);
+            resolved = ResolveStructElementAccess(instruction, operandIndex, normalized, arrayType,
+                pointerSize, uses);
+        }
+        else
+        {
+            resolved = fieldOffset == 0 ? (indexOperand, null) : ((IOperand, FieldAnalysisContext?)?)null;
+        }
+
+        if (resolved is not { } access)
+        {
+            return null;
+        }
+
+        // A rewritten Move either loads the element into a slot (whose declared
+        // type and transitive uses must accept it) or stores a value into the
+        // element (whose type must fit the slot): anything else would emit an
+        // element access where the coerced types cannot convert.
+        var targetType = access.Field?.FieldType ?? arrayType.ElementType;
+        if (!EmittedOperandFits(method, instruction, operandIndex, targetType, pointerSize, uses()))
+        {
+            return null;
+        }
+
+        if (context.Home(instruction) is not { } accessBlock)
+            return null;
+
+        if (inserted.Count != 0)
+            accessBlock.Instructions.InsertRange(accessBlock.Instructions.IndexOf(instruction), inserted);
+
+        return access.Field is { } elementField
+            ? new ArrayElementFieldReference(array, access.Index, elementField)
+            : new ArrayAccess(array, access.Index);
+    }
+
+    // Whether an operand carrying `emittedType` may occupy the slot it would
+    // land in: `Move` destination and store source must convert to the slot
+    // contract, a call argument must fit its parameter, a return its return
+    // type, a throw a reference element. Simplifier copy propagation carries
+    // the same operand into a moved local's uses, so each consumer is checked
+    // the same way.
+    private static bool EmittedOperandFits(
+        MethodAnalysisContext method,
+        Instruction instruction,
+        int operandIndex,
+        TypeAnalysisContext emittedType,
+        int pointerSize,
+        Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>> uses,
+        HashSet<LocalVariable>? visited = null)
+        => instruction.OpCode switch
+        {
+            OpCode.Move => operandIndex == 1
+                ? MoveDestinationAccepts(instruction.Operands[0], emittedType, method, pointerSize,
+                    uses, visited)
+                : StoredSourceAccepts(instruction.Operands[1], emittedType, method, pointerSize),
+            OpCode.Call or OpCode.CallVoid => CallOperandSlotFits(instruction, operandIndex, emittedType),
+            OpCode.CheckEqual or OpCode.CheckNotEqual => true,
+            OpCode.CheckLess or OpCode.CheckGreater
+                or OpCode.CheckLessOrEqual or OpCode.CheckGreaterOrEqual
+                => ElementSize(emittedType, pointerSize) != 0,
+            OpCode.Return => EmittedOperandFitsReturn(method, emittedType),
+            OpCode.Throw => !emittedType.IsValueType,
+            _ => false,
+        };
+
+    private static bool EmittedOperandFitsReturn(MethodAnalysisContext method, TypeAnalysisContext emittedType)
+    {
+        TypeAnalysisContext? returnType;
+        try
+        {
+            returnType = method.ReturnType;
+        }
+        catch
+        {
+            returnType = null;
+        }
+        return returnType == null || emittedType.IsAssignableTo(returnType);
+    }
+
+    // The `this` or parameter slot an element operand lands in inside a call:
+    // it must be assignable to the callee's receiver or parameter contract.
+    private static bool CallOperandSlotFits(
+        Instruction instruction,
+        int operandIndex,
+        TypeAnalysisContext emittedType)
+    {
+        if (instruction.Operands[0] is not MethodAnalysisContext callee)
+            return true;
+        var parameterIndex = operandIndex - (instruction.OpCode == OpCode.Call ? 2 : 1);
+        if (!callee.IsStatic)
+        {
+            if (parameterIndex == 0)
+                return !emittedType.IsValueType
+                    && (callee.DeclaringType == null || emittedType.IsAssignableTo(callee.DeclaringType));
+            parameterIndex--;
+        }
+        if (parameterIndex < 0 || parameterIndex >= callee.Parameters.Count
+            || callee.Parameters[parameterIndex].ParameterType is not { } parameterType)
+            return true;
+        if (parameterType is ByRefTypeAnalysisContext { ElementType: { } pointee })
+            parameterType = pointee;
+        return emittedType.IsAssignableTo(parameterType);
+    }
+
+    // Whether an element value may land in `destination`: a local's declared
+    // type must accept it and its transitive consumers must consume such a
+    // value, while a field or nested element slot simply has to be assignable.
+    private static bool MoveDestinationAccepts(
+        IOperand destination,
+        TypeAnalysisContext elementType,
+        MethodAnalysisContext method,
+        int pointerSize,
+        Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>> uses,
+        HashSet<LocalVariable>? visited)
+        => destination switch
+        {
+            // A store through `&local` writes the local's slot, so the copy's
+            // consumers must keep seeing the emitted value.
+            AddressOf { Target: LocalVariable addressed }
+                => (addressed.Type is not { } addressedDeclared || elementType.IsAssignableTo(addressedDeclared))
+                    && PropagationSafe(method, addressed, elementType, pointerSize, uses, visited),
+            LocalVariable local => (local.Type is not { } declared || elementType.IsAssignableTo(declared))
+                && PropagationSafe(method, local, elementType, pointerSize, uses, visited),
+            FieldReference field => elementType.IsAssignableTo(field.Field.FieldType),
+            SelectedFieldReference selectedField => elementType.IsAssignableTo(selectedField.FieldType),
+            ArrayElementFieldReference elementField => elementType.IsAssignableTo(elementField.Field.FieldType),
+            ArrayAccess { Array.Type: SzArrayTypeAnalysisContext destinationArray }
+                => elementType.IsAssignableTo(destinationArray.ElementType),
+            // A store into unmanaged memory keeps its own diagnostic; the
+            // operand inside it is still the element's value.
+            MemoryOperand => true,
+            _ => false,
+        };
+
+    // Whether `source` stores a value that fits the element slot: locals and
+    // field-like operands carry a declared type, scalar constants fit a
+    // scalar element, and a string literal fits a reference element.
+    private static bool StoredSourceAccepts(
+        IOperand source,
+        TypeAnalysisContext elementType,
+        MethodAnalysisContext method,
+        int pointerSize)
+        => source switch
+        {
+            LocalVariable local => (LocalVariables.EmittedSlotLocalType(local, method) ?? local.Type)
+                is { } sourceType && sourceType.IsAssignableTo(elementType),
+            FieldReference field => field.Field.FieldType.IsAssignableTo(elementType),
+            SelectedFieldReference selectedField => selectedField.FieldType.IsAssignableTo(elementType),
+            ArrayElementFieldReference elementField => elementField.Field.FieldType.IsAssignableTo(elementType),
+            ArrayAccess { Array.Type: SzArrayTypeAnalysisContext sourceArray }
+                => sourceArray.ElementType.IsAssignableTo(elementType),
+            Immediate or FloatLiteral or DoubleLiteral => ElementSize(elementType, pointerSize) != 0,
+            StringLiteral => !elementType.IsValueType,
+            _ => false,
+        };
+
+    // Whether every transitive consumer of a rewritten Move destination can
+    // hold the emitted operand's type: Move copies are followed through, each
+    // consumer's slot is checked like the rewrite's own, and integer or
+    // address arithmetic on the operand would see the access where a raw
+    // local was expected.
+    private static bool PropagationSafe(
+        MethodAnalysisContext method,
+        LocalVariable destination,
+        TypeAnalysisContext emittedType,
+        int pointerSize,
+        Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>> uses,
+        HashSet<LocalVariable>? visited = null)
+    {
+        visited ??= [];
+        if (!visited.Add(destination) || !uses.TryGetValue(destination, out var sites))
+            return true;
+
+        var numeric = ElementSize(emittedType, pointerSize) != 0;
+        foreach (var (site, operandIndex) in sites)
+        {
+            var safe = site.Operands[operandIndex] switch
+            {
+                // `&local` is the address of the slot, not of the element:
+                // writes through it must keep landing on the local.
+                AddressOf => false,
+                // As an unmanaged memory base the operand still carries its
+                // value (the load keeps its own diagnostic); as an index it
+                // must be a scalar.
+                MemoryOperand useMemory => ReferenceEquals(useMemory.Index, destination) ? numeric : true,
+                _ => site.OpCode switch
+                {
+                    OpCode.Move => operandIndex == 1
+                        && MoveDestinationAccepts(site.Operands[0], emittedType, method, pointerSize,
+                            uses, visited),
+                    OpCode.Call or OpCode.CallVoid => CallOperandSlotFits(site, operandIndex, emittedType),
+                    OpCode.CheckEqual or OpCode.CheckNotEqual => true,
+                    OpCode.CheckLess or OpCode.CheckGreater
+                        or OpCode.CheckLessOrEqual or OpCode.CheckGreaterOrEqual => numeric,
+                    OpCode.ConditionalJump => numeric || !emittedType.IsValueType,
+                    OpCode.Return => EmittedOperandFitsReturn(method, emittedType),
+                    OpCode.Throw => !emittedType.IsValueType,
+                    _ => false,
+                },
+            };
+            if (!safe)
+                return false;
+        }
+        return true;
+    }
+
+    // A bounds check proves an element index when an unsigned compare of that
+    // index against this array's length feeds a conditional jump (through
+    // Move/Not chains, one `Not` per inverted sense) whose in-bounds edge
+    // dominates the access. On ARM64 the unsigned compare is the carry flag:
+    // a `CheckLess` whose destination is the "C" register - `B.HS`/`B.LO`
+    // branches read it, and FlagConditionRecovery's signed folds never rewrite
+    // it, while signed compares fold into Check* opcodes on other registers.
+    private static bool ProveIndexGuard(
+        MethodAnalysisContext method,
+        Instruction accessInstruction,
+        LocalVariable array,
+        Affine elementIndex,
+        Dictionary<LocalVariable, Instruction?> definitions,
+        Func<Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>>> uses,
+        GuardedIndexContext context)
+    {
+        if (method.DominatorInfo is not { } dominators
+            || context.Home(accessInstruction) is not { } accessBlock)
+        {
+            return false;
+        }
+
+        foreach (var candidate in method.ControlFlowGraph!.Instructions)
+        {
+            // Only the unsigned compare proves the index: `CheckLess` onto the
+            // carry flag against this array's length word.
+            if (candidate.OpCode != OpCode.CheckLess
+                || candidate.Operands is not [LocalVariable { Register.Name: "C" } flag, _, _]
+                || Evaluate(candidate.Operands[1], definitions, 0, true) is not { } compared
+                || !ReferenceEquals(compared.Root, elementIndex.Root)
+                || compared.Multiplier != elementIndex.Multiplier
+                || compared.Offset != elementIndex.Offset)
+                continue;
+
+            if (EvaluateSeed(candidate.Operands[2], context.AllDefinitions, method, []) is not
+                    { Type: SeedType.Length, Array: { } checkedArray }
+                || !ReferenceEquals(checkedArray, array))
+                continue;
+
+            if (GuardedEdges(flag, uses(), context.HomeMap) is { } inBounds
+                && inBounds.Any(inBoundsBlock => dominators.Dominates(inBoundsBlock, accessBlock)))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Walks the flag's readers through Move/Not copies; every ConditionalJump it
+    // reaches yields an in-bounds successor - the jump target when the (possibly
+    // inverted) comparison is true in bounds, the fall-through edge otherwise.
+    private static IEnumerable<Block> GuardedEdges(
+        LocalVariable flag,
+        Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>> uses,
+        Dictionary<Instruction, Block> home)
+    {
+        var inBoundsEdges = new List<Block>();
+        var frontier = new Queue<(LocalVariable Local, int NotCount)>();
+        var visited = new HashSet<LocalVariable>();
+        frontier.Enqueue((flag, 0));
+
+        while (frontier.Count != 0)
+        {
+            var (local, nots) = frontier.Dequeue();
+            if (!visited.Add(local) || !uses.TryGetValue(local, out var sites))
+                continue;
+
+            var running = nots;
+            foreach (var (site, operandIndex) in sites)
+            {
+                switch (site)
+                {
+                    case { OpCode: OpCode.Not, Operands: [LocalVariable destination, var source] }
+                        when operandIndex == 1 && ReferenceEquals(source, local):
+                        if (ReferenceEquals(destination, local))
+                            running++;
+                        else
+                            frontier.Enqueue((destination, running + 1));
+                        break;
+                    case { OpCode: OpCode.Move, Operands: [LocalVariable destination, var source] }
+                        when operandIndex == 1 && ReferenceEquals(source, local):
+                        frontier.Enqueue((destination, running));
+                        break;
+                    case { OpCode: OpCode.ConditionalJump } when operandIndex == 1
+                        && home.TryGetValue(site, out var jumpBlock):
+                        var inBounds = running % 2 == 0;
+                        var target = site.Operands[0] switch
+                        {
+                            Block block => block,
+                            Instruction targetInstruction => home.GetValueOrDefault(targetInstruction),
+                            _ => null,
+                        };
+                        if (target == null)
+                            break;
+                        if (inBounds)
+                        {
+                            if (jumpBlock.Successors.Any(s => s != target))
+                                inBoundsEdges.Add(target);
+                        }
+                        else if (jumpBlock.Successors.FirstOrDefault(s => s != target && s != jumpBlock)
+                                 is { } fallThrough)
+                            inBoundsEdges.Add(fallThrough);
+                        break;
+                }
+            }
+        }
+
+        return inBoundsEdges;
+    }
+
+    private sealed class GuardedIndexContext(MethodAnalysisContext method)
+    {
+        private Dictionary<LocalVariable, List<Instruction>>? _allDefinitions;
+        private Dictionary<Instruction, Block>? _homeMap;
+
+        public int TempIndex;
+
+        public Dictionary<LocalVariable, List<Instruction>> AllDefinitions => _allDefinitions ??= BuildAllDefinitions();
+
+        public Dictionary<Instruction, Block> HomeMap => _homeMap ??= method.ControlFlowGraph!.Blocks
+            .SelectMany(block => block.Instructions.Select(instruction => (instruction, block)))
+            .ToDictionary(pair => pair.instruction, pair => pair.block);
+
+        public Block? Home(Instruction instruction) => HomeMap.GetValueOrDefault(instruction);
+
+        private Dictionary<LocalVariable, List<Instruction>> BuildAllDefinitions()
+        {
+            var result = new Dictionary<LocalVariable, List<Instruction>>();
+            foreach (var instruction in method.ControlFlowGraph!.Instructions)
+                if (instruction.Destination is LocalVariable destination)
+                    (result.TryGetValue(destination, out var list) ? list : result[destination] = []).Add(instruction);
+            return result;
+        }
     }
 
     private static IOperand? ScaledIndex(IOperand operand, long elementSize,
@@ -643,6 +1261,104 @@ public static class ArrayRecovery
         return memory.Scale == elementSize && offset == 0 ? memory.Index : null;
     }
 
+    // A dereference into an array of value-typed elements lands on an element
+    // when the offset is past the header and element-aligned, on a member of
+    // the element when a flat field covers the access width exactly. The
+    // returned operand is the element index; field is null for a whole-element
+    // access. Nested members, interior gaps and widths no member covers stay
+    // unproven.
+    private static (IOperand Index, FieldAnalysisContext? Field)? StructElementAccess(
+        MemoryOperand memory, SzArrayTypeAnalysisContext arrayType, long accessWidth, int pointerSize)
+    {
+        var elementType = arrayType.ElementType;
+        if (!elementType.IsValueType || ElementSize(elementType, pointerSize) != 0)
+            return null;
+
+        var elementSize = MetadataElementSize(elementType, pointerSize);
+        if (elementSize <= 0)
+            return null;
+
+        var offset = memory.Addend - ElementsOffset(pointerSize);
+        if (offset < 0)
+            return null;
+
+        IOperand index;
+        long fieldOffset;
+        if (memory.Index == null)
+        {
+            if (memory.Scale != 0)
+                return null;
+            index = new Immediate(offset / elementSize);
+            fieldOffset = offset % elementSize;
+        }
+        else
+        {
+            if (memory.Scale != elementSize || offset >= elementSize)
+                return null;
+            index = memory.Index;
+            fieldOffset = offset;
+        }
+
+        if (fieldOffset == 0 && accessWidth == elementSize)
+            return (index, null);
+
+        if (accessWidth <= 0
+            || MetadataResolver.FindInstanceFieldPathAtOffset(elementType, fieldOffset, (int)accessWidth)
+                is not { Field: { } field, Containers: { Count: 0 } }
+            || PrimitiveElementFieldSize(field.FieldType, pointerSize) != accessWidth)
+            return null;
+
+        return (index, field);
+    }
+
+    // Wraps StructElementAccess with the instruction context a rewrite needs:
+    // the width of a load or store comes from its Move sibling when the operand
+    // itself records none, the sibling's declared type must agree with what is
+    // being read or written, and a Move source whose destination is only ever
+    // used as a pointer is a lifted lea - the element-address pass rewrites
+    // those into &array[i]. The uses table is computed lazily; most operands
+    // never need it.
+    private static (IOperand Index, FieldAnalysisContext? Field)? ResolveStructElementAccess(
+        Instruction instruction, int operandIndex, MemoryOperand memory,
+        SzArrayTypeAnalysisContext arrayType, int pointerSize,
+        Func<Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>>> uses)
+    {
+        var sibling = operandIndex <= 1 && instruction is { OpCode: OpCode.Move, Operands: [_, { }] }
+            ? instruction.Operands[1 - operandIndex]
+            : null;
+
+        if (operandIndex == 1 && sibling is LocalVariable destination
+            && uses().TryGetValue(destination, out var destinationUses)
+            && destinationUses.Count != 0
+            && destinationUses.All(use => use.Instruction.IsCall
+                || IsMemoryBase(use.Instruction.Operands[use.OperandIndex], destination)))
+            return null;
+
+        var accessWidth = memory.AccessSize != 0
+            ? memory.AccessSize
+            : sibling switch
+            {
+                // A SIMD store records no access size on the operand; a whole
+                // vector literal is always a full 16-byte element write.
+                Vector128Literal => 16,
+                LocalVariable { Type: { } siblingType }
+                    => (int)TypeSizes.MinimumUnboxedSize(siblingType, pointerSize),
+                _ => 0,
+            };
+
+        if (StructElementAccess(memory, arrayType, accessWidth, pointerSize) is not { } access)
+            return null;
+
+        var targetType = access.Field?.FieldType ?? arrayType.ElementType;
+        if (sibling is LocalVariable { Type: { } contract }
+            && (contract.IsValueType
+                ? contract.FullName != targetType.FullName
+                : targetType.IsValueType))
+            return null;
+
+        return access;
+    }
+
     private static long ElementSize(TypeAnalysisContext elementType, int pointerSize)
     {
         if (!elementType.IsValueType)
@@ -773,7 +1489,8 @@ public static class ArrayRecovery
     // value = Multiplier * Root + Offset (a null Root means it's just a constant)
     private readonly record struct Affine(LocalVariable? Root, long Multiplier, long Offset);
 
-    private static Affine? Evaluate(IOperand operand, Dictionary<LocalVariable, Instruction?> definitions, int depth)
+    private static Affine? Evaluate(IOperand operand, Dictionary<LocalVariable, Instruction?> definitions,
+        int depth, bool subtractIsAffine = false)
     {
         if (depth > 8)
             return null;
@@ -790,11 +1507,12 @@ public static class ArrayRecovery
 
                 return definition switch
                 {
-                    { OpCode: OpCode.Move, Operands: [_, MemoryOperand lea] } => EvaluateLea(lea, definitions, depth + 1),
-                    { OpCode: OpCode.Move, Operands: [_, var source] } => Evaluate(source, definitions, depth + 1),
-                    { OpCode: OpCode.Add, Operands: [_, var left, var right] } => Sum(Evaluate(left, definitions, depth + 1), Evaluate(right, definitions, depth + 1)),
-                    { OpCode: OpCode.ShiftLeft, Operands: [_, var left, Immediate { Value: >= 0 and < 32 } shift] } => ScaleBy(Evaluate(left, definitions, depth + 1), 1L << (int)shift.Value),
-                    { OpCode: OpCode.Multiply, Operands: [_, var left, Immediate factor] } => ScaleBy(Evaluate(left, definitions, depth + 1), factor.Value),
+                    { OpCode: OpCode.Move, Operands: [_, MemoryOperand lea] } => EvaluateLea(lea, definitions, depth + 1, subtractIsAffine),
+                    { OpCode: OpCode.Move, Operands: [_, var source] } => Evaluate(source, definitions, depth + 1, subtractIsAffine),
+                    { OpCode: OpCode.Add, Operands: [_, var left, var right] } => Sum(Evaluate(left, definitions, depth + 1, subtractIsAffine), Evaluate(right, definitions, depth + 1, subtractIsAffine)),
+                    { OpCode: OpCode.Subtract, Operands: [_, var minuend, var subtrahend] } when subtractIsAffine => Sum(Evaluate(minuend, definitions, depth + 1, true), ScaleBy(Evaluate(subtrahend, definitions, depth + 1, true), -1)),
+                    { OpCode: OpCode.ShiftLeft, Operands: [_, var left, Immediate { Value: >= 0 and < 32 } shift] } => ScaleBy(Evaluate(left, definitions, depth + 1, subtractIsAffine), 1L << (int)shift.Value),
+                    { OpCode: OpCode.Multiply, Operands: [_, var left, Immediate factor] } => ScaleBy(Evaluate(left, definitions, depth + 1, subtractIsAffine), factor.Value),
                     _ => new Affine(local, 1, 0)
                 };
             }
@@ -804,15 +1522,16 @@ public static class ArrayRecovery
         }
     }
 
-    private static Affine? EvaluateLea(MemoryOperand lea, Dictionary<LocalVariable, Instruction?> definitions, int depth)
+    private static Affine? EvaluateLea(MemoryOperand lea, Dictionary<LocalVariable, Instruction?> definitions,
+        int depth, bool subtractIsAffine = false)
     {
         var result = (Affine?)new Affine(null, 0, lea.Addend);
 
         if (lea.Base != null)
-            result = Sum(result, Evaluate(lea.Base, definitions, depth));
+            result = Sum(result, Evaluate(lea.Base, definitions, depth, subtractIsAffine));
 
         if (lea.Index != null)
-            result = Sum(result, ScaleBy(Evaluate(lea.Index, definitions, depth), Math.Max(lea.Scale, 1)));
+            result = Sum(result, ScaleBy(Evaluate(lea.Index, definitions, depth, subtractIsAffine), Math.Max(lea.Scale, 1)));
 
         return result;
     }
@@ -843,7 +1562,7 @@ public static class ArrayRecovery
         return definitions;
     }
 
-    private static Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>> CollectUses(ISILControlFlowGraph cfg)
+    internal static Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>> CollectUses(ISILControlFlowGraph cfg)
     {
         var uses = new Dictionary<LocalVariable, List<(Instruction, int)>>();
 

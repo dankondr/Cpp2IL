@@ -89,11 +89,192 @@ public class SsaForm
 
                 foreach (var operand in instruction.Operands)
                 {
-                    if (operand is AddressOf { Target: Register addressed } && IsReadAfter(block, i, addressed))
+                    // Taking the slot's address only clobbers it if the published pointer can reach
+                    // a write. One that stays inside the frame - the exception-handling record that
+                    // just lets the landing pad reload the cell, for example - leaves the value alone.
+                    if (operand is AddressOf { Target: Register addressed }
+                        && IsReadAfter(block, i, addressed)
+                        && PointerMayWrite(graph, instruction))
                         _clobbering.Add(instruction);
                 }
             }
         }
+    }
+
+    // Whether the pointer published by an address-take can reach a write of the cell it
+    // addresses. A carrier is a register or frame cell that may hold the pointer; a
+    // forward reaching analysis propagates carriers over the control-flow graph - a
+    // value-preserving write fed by a carrier makes the destination another carrier,
+    // any other write kills it, so a register reassigned before the pointer is used is
+    // no longer tracked.
+    //
+    // A carrier only proves a write when it escapes or is dereferenced for a store: a
+    // call operand, a return/throw, the destination of a memory write, or another
+    // address-take (&carrier is a pointer to the pointer, too indirect to keep
+    // tracking). Copies, arithmetic and spills into other cells produce more carriers;
+    // a load through a carrier only reads the cell. A carrier stored through an
+    // explicitly sub-pointer width is truncated - it can never be reloaded as a
+    // pointer, so a byte/half/word store only writes data.
+    //
+    // Cells are keyed uniformly: a frame cell's "stack_N"/"stack_-N" register (named by
+    // StackAnalyzer's NameForSlot) and a raw stack[N] StackOffset operand in an
+    // unreachable pad both hash to the same key. Blocks unreachable from entry -
+    // exception landing pads, dispatched by the runtime out of band - are scanned
+    // against every carrier seen anywhere, since a pad can be entered at any point
+    // where the pointer is live.
+    private static bool PointerMayWrite(ISILControlFlowGraph graph, Instruction take)
+    {
+        if (take.Destination is not Register produced)
+            return true; // no register carries the pointer: assume it can be written through
+
+        static int CellKey(int offset) =>
+            (offset < 0 ? $"stack_-{-offset:X}" : $"stack_{offset:X}").GetHashCode();
+
+        static int? CarrierKey(IOperand? operand) => operand switch
+        {
+            Register register => register.Number,
+            StackOffset stackOffset => CellKey(stackOffset.Offset),
+            _ => null,
+        };
+
+        var slotKey = take.Operands
+            .OfType<AddressOf>()
+            .Select(addressOf => CarrierKey(addressOf.Target))
+            .FirstOrDefault(key => key.HasValue);
+
+        // Destinations of other takes of the same cell hold an identical pointer - they
+        // are carriers too (kept forever: being pointers is a fact, not a flow state).
+        var born = new HashSet<int>();
+        foreach (var instruction in graph.Blocks.SelectMany(block => block.Instructions))
+        {
+            if (!ReferenceEquals(instruction, take)
+                && instruction.Operands.Any(o => o is AddressOf addressOf && CarrierKey(addressOf.Target) == slotKey)
+                && CarrierKey(instruction.Destination) is { } destKey)
+                born.Add(destKey);
+        }
+
+        // Scan one block's instructions against a live carrier set, returning true on
+        // the first escape. `everSeen` accumulates the union of carriers live at any
+        // scanned point, for seeding unreachable blocks afterwards.
+        bool ScanBlock(Block block, HashSet<int> carriers, HashSet<int>? everSeen)
+        {
+            bool IsCarrier(IOperand? operand) =>
+                CarrierKey(operand) is { } key && (carriers.Contains(key) || born.Contains(key));
+
+            bool AddressesThroughCarrier(IOperand? operand) =>
+                operand is MemoryOperand memory && (IsCarrier(memory.Base) || IsCarrier(memory.Index));
+
+            foreach (var instruction in block.Instructions)
+            {
+                if (ReferenceEquals(instruction, take))
+                    carriers.Add(produced.Number);
+                else
+                {
+                    var readsCarrier = instruction.Sources.Any(IsCarrier);
+
+                    // &carrier escapes into pointer-to-pointer territory this cannot follow;
+                    // a store addressed through a carrier writes the cell outright.
+                    if (instruction.Operands.Any(o =>
+                            o is AddressOf { Target: { } target } && IsCarrier(target))
+                        || AddressesThroughCarrier(instruction.Destination))
+                        return true;
+
+                    switch (instruction.OpCode)
+                    {
+                        // Value-preserving shapes make the destination another carrier.
+                        case OpCode.Move or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+                            or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And or OpCode.Or
+                            or OpCode.Xor or OpCode.Not or OpCode.Negate or OpCode.SignExtend32
+                            or OpCode.VectorMin or OpCode.VectorMax or OpCode.Phi:
+                            // A carrier stored into raw memory escapes tracking - unless the
+                            // store is provably narrower than a pointer: a truncated address
+                            // can never be reloaded as a carrier, so a byte/half/word store
+                            // only writes data.
+                            if (readsCarrier
+                                && instruction.Destination is not Register and not StackOffset
+                                && instruction.Destination is not MemoryOperand { AccessSize: > 0 and < 8 })
+                                return true;
+                            break;
+                        // Reads that cannot produce a pointer: comparisons, branches, padding.
+                        case OpCode.CheckEqual or OpCode.CheckGreater or OpCode.CheckLess or OpCode.CheckNotEqual
+                            or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual
+                            or OpCode.ConditionalJump or OpCode.Jump
+                            or OpCode.Nop or OpCode.Invalid or OpCode.NotImplemented or OpCode.Interrupt:
+                            break;
+                        // Calls, returns, throws, allocations and block-memory ops hand the
+                        // pointer to code the analysis cannot follow. Every operand position
+                        // counts - some opcodes keep their escape positions out of `Sources`
+                        // (Throw's value, a Call's destination register, Newobj's arguments).
+                        default:
+                            if (instruction.Operands.Any(o => IsCarrier(o) || AddressesThroughCarrier(o)))
+                                return true;
+                            break;
+                    }
+
+                    // A register or frame cell written from a carrier becomes one; any other
+                    // write to it kills the carrier (a load through a carrier reads the
+                    // cell's contents, so its bare-source check fails and it dies here too).
+                    if (CarrierKey(instruction.Destination) is { } writtenKey)
+                    {
+                        if (readsCarrier)
+                            carriers.Add(writtenKey);
+                        else
+                            carriers.Remove(writtenKey);
+                    }
+                }
+
+                everSeen?.UnionWith(carriers);
+            }
+
+            return false;
+        }
+
+        var reachable = new HashSet<Block>();
+        var queue = new Queue<Block>();
+        queue.Enqueue(graph.EntryBlock);
+        while (queue.Count > 0)
+        {
+            var current = queue.Dequeue();
+            if (!reachable.Add(current))
+                continue;
+            foreach (var successor in current.Successors)
+                queue.Enqueue(successor);
+        }
+
+        var outSets = graph.Blocks.ToDictionary(block => block, _ => new HashSet<int>());
+        var everSeen = new HashSet<int>(born);
+        var pending = new Queue<Block>(reachable);
+        while (pending.Count > 0)
+        {
+            var block = pending.Dequeue();
+
+            var carriers = new HashSet<int>();
+            foreach (var predecessor in block.Predecessors)
+                if (reachable.Contains(predecessor))
+                    carriers.UnionWith(outSets[predecessor]);
+
+            if (ScanBlock(block, carriers, everSeen))
+                return true;
+
+            if (!carriers.SetEquals(outSets[block]))
+            {
+                outSets[block] = carriers;
+                foreach (var successor in block.Successors)
+                    if (reachable.Contains(successor))
+                        pending.Enqueue(successor);
+            }
+        }
+
+        // Exception pads are unreachable in the graph but can run at any point where
+        // the pointer is live; scan each under every carrier seen anywhere.
+        foreach (var block in graph.Blocks)
+        {
+            if (!reachable.Contains(block)
+                && ScanBlock(block, new HashSet<int>(everSeen), null))
+                return true;
+        }
+
+        return false;
     }
 
     private static bool IsReadAfter(Block block, int index, Register register)
@@ -438,11 +619,18 @@ public class SsaForm
                     // Native registers can merge unrelated managed references at a
                     // control-flow join (especially normal and exception paths). Such
                     // a bit-pattern phi has no legal managed copy; emitting castclass
-                    // makes the normal path throw. Leave that edge at default instead.
-                    if (destination is LocalVariable { Type: { IsValueType: false } destinationType }
-                        && source is LocalVariable { Type: { IsValueType: false } sourceType }
-                        && !sourceType.IsAssignableTo(destinationType)
-                        && !destinationType.IsAssignableTo(sourceType))
+                    // makes the normal path throw. Unlike the forwarding passes, this
+                    // edge is emitted as a real store, so copies between managed
+                    // pointers of different element types stay illegal here (a &U
+                    // slot cannot receive a &T value). The edge emits nothing:
+                    // any value stood in for it - even a bare diagnostic read -
+                    // is an invented definition the binary does not prove. The
+                    // destination's reads on this path stay unassigned (CS0165);
+                    // when no surviving edge stores the destination at all, its
+                    // own reads carry the named Undefined local diagnostic.
+                    if (destination is LocalVariable destinationLocal
+                        && source is LocalVariable sourceLocal
+                        && LocalVariables.NoLegalManagedCopy(destinationLocal, sourceLocal))
                         continue;
 
                     moves.Add(new Instruction(-1, OpCode.Move, destination, source));
@@ -478,4 +666,5 @@ public class SsaForm
 
         block.Instructions.InsertRange(insertAt, moves);
     }
+
 }
