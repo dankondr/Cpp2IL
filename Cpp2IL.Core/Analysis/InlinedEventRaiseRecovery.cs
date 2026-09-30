@@ -316,7 +316,7 @@ internal static class InlinedEventRaiseRecovery
     // destination is a write, not a read.
     private static bool Reads(Instruction instruction, LocalVariable local)
     {
-        if (instruction.Sources.Any(source => SourceReads(source, local)))
+        if (SafeSources(instruction).Any(source => SourceReads(source, local)))
             return true;
         return instruction.Destination is not (null or LocalVariable)
             && LocalVariables.OperandLocals(instruction.Destination).Any(o => SameLocal(o, local));
@@ -440,8 +440,25 @@ internal static class InlinedEventRaiseRecovery
     {
         var uses = new Dictionary<LocalVariable, int>();
         foreach (var instruction in cfg.Blocks.SelectMany(b => b.Instructions))
-            foreach (var local in instruction.Sources.OfType<LocalVariable>())
+            foreach (var local in SafeSources(instruction).OfType<LocalVariable>())
                 uses[local] = uses.GetValueOrDefault(local) + 1;
         return uses;
+    }
+
+    // `Instruction.Sources` assumes every operand slot its opcode implies is
+    // populated; a partially-formed instruction (a trimmed operand list,
+    // e.g. inside a synthetic or mid-mutation body) throws instead. Falling
+    // back to the raw operands only ever over-approximates reads, and an
+    // over-counted read makes the pass refuse — never rewrite.
+    private static IEnumerable<IOperand> SafeSources(Instruction instruction)
+    {
+        try
+        {
+            return instruction.Sources;
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return instruction.Operands;
+        }
     }
 }
