@@ -37,9 +37,10 @@ only when all three elements are present: a canary check (`CheckEqual` /
 `CheckNotEqual` where one side provably is the canary — the TLS cell
 `[SYSREG + 0x28]`, a local or cell whose every def carries it — and both
 sides are shapes it can take: a local, a `[base + 0x28]` read through any
-base, a cell proven to hold it, or a frame cell read through a materialized
-`Move ptr, &stackslot` whose store the lift never emitted — large frames
-re-materialize the frame base per use), the `ConditionalJump` it feeds, and
+base, a cell proven to hold it, or a frame cell — read through a materialized
+`Move ptr, &stackslot` whose store the lift never emitted, or spelled as a
+field access `stackslot.field` — large frames re-materialize or re-type the
+slot), the `ConditionalJump` it feeds, and
 a `__stack_chk_fail` call reachable from one of its successors through empty
 connector blocks — nothing else ever calls it, so the reachable failure is
 the structural co-proof when neither side is a direct TLS read. The fold
@@ -49,9 +50,14 @@ orphaned blocks. Two residuals fold on their own proofs: a compare already
 collapsed to a constant (`CheckNotEqual x, x` / `CheckEqual x, x` — the
 failure call is gone, the coalesced compare survived) folds to its live
 edge, and the dead edge's failure call is collected and nopped the same way
-when the shared tail stays reachable for real code. Anything else —
-non-TLS bases, real-code successors, unproven frame slots, missing or
-differing sides — is left diagnosed.
+when the shared tail stays reachable for real code. Because the lifter
+reuses register slots across a method — a `TEMPCOND` local can carry a dozen
+unrelated compares — every def the condition proof counts must sit in a
+block that dominates the guard (computed once per method as classic
+iterative dominators); defs on paths that never reach the branch can
+neither prove nor defeat it. Anything else — non-TLS bases, real-code
+successors, unproven frame slots, missing or differing sides — is left
+diagnosed.
 
 After the folds, `SweepDeadCanary` nops the machinery they left behind so it
 emits no TLS-read or undefined-SYSREG diagnostics: pure defs
@@ -68,6 +74,7 @@ cells carrying real data are never touched.
 `CanaryGuardWithLocalStoredCanaryFolds`, `SharedFailBlockFoldsEveryGuard`,
 `StoredCanaryFrameSlotFolds`, `SpilledTlsPointerCompareFoldsAndSweepsMachinery`,
 `AddressOfFrameCellCompareFolds`, `AddressOfFrameCellWithoutFailCallStays`,
+`StackSlotFieldCompareFolds`, `ReusedConditionSlotDoesNotDefeatTheFold`,
 `UnprovenPointerCellStoreSurvivesTheSweep`, `UnprovenFrameSlotIsNotExcised`,
 `AnImmediateFailTargetIsMatchedThroughTheResolver`,
 `SelfCompareCanaryFoldsToFallThroughWithoutFailCall`,

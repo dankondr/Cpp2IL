@@ -497,6 +497,91 @@ public class StackProtectorRecoveryTests
         Assert.That(failCall.OpCode, Is.EqualTo(OpCode.Nop));
     }
 
+    // The lifter reuses register slots: the condition local may carry defs for
+    // unrelated compares on paths that never reach the guard. Only defs that
+    // dominate the branch feed it, so the guard still folds.
+    [Test]
+    public void ReusedConditionSlotDoesNotDefeatTheFold()
+    {
+        var caller = Caller();
+        var sysLocal = new LocalVariable("v_sys", new Register(null, "SYSREG"), _int64);
+        var tls = Reg("X23", _int64, 1);
+        var cond = Reg("TEMPCOND", _app.SystemTypes.SystemBooleanType, 20);
+        var other = Reg("X0", _app.SystemTypes.SystemInt32Type, 462);
+
+        var failCall = new Instruction(6, OpCode.Call, new StringLiteral("__stack_chk_fail"),
+            Reg("X0", version: 2));
+        var failReturn = new Instruction(7, OpCode.Return);
+        var mergeReturn = new Instruction(5, OpCode.Return, Reg("X0", version: 3));
+        // An unrelated def of the same condition slot on a disjoint path: the
+        // outer branch picks the guard or this sibling, so the sibling's def
+        // can never feed the guard's jump.
+        var guardCheck = new Instruction(2, OpCode.CheckNotEqual, cond,
+            new MemoryOperand(tls, null, 0x28), new MemoryOperand(tls, null, 0x28));
+        var pickGuard = new Instruction(8, OpCode.ConditionalJump, guardCheck,
+            Reg("TEMPCOND", _app.SystemTypes.SystemBooleanType, 30));
+        var siblingCheck = new Instruction(10, OpCode.CheckNotEqual, cond, other, other);
+        var siblingEnd = new Instruction(11, OpCode.Return);
+        var branch = new Instruction(3, OpCode.ConditionalJump, failCall, cond);
+
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, tls, sysLocal),
+            pickGuard,            // fall-through: sibling path; taken: the guard
+            siblingCheck,         // sibling: non-dominating def of the shared slot
+            siblingEnd,
+            guardCheck,           // guard path
+            branch,
+            mergeReturn,
+            failCall,
+            failReturn,
+        ]);
+        caller.Locals = [sysLocal, tls, cond, other];
+
+        StackProtectorRecovery.Run(caller);
+
+        Assert.That(branch.OpCode, Is.EqualTo(OpCode.Jump));
+        Assert.That(failCall.OpCode, Is.EqualTo(OpCode.Nop));
+    }
+
+    // The same frame cell spelled as a typed field access (`stackslot.field`)
+    // instead of `[ptr + off]` folds the same way.
+    [Test]
+    public void StackSlotFieldCompareFolds()
+    {
+        var caller = Caller();
+        var sysLocal = new LocalVariable("v_sys", new Register(null, "SYSREG"), _int64);
+        var tls = Reg("X23", _int64, 1);
+        var frameSlot = new LocalVariable("v116", new Register(null, "stack_-70"),
+            _app.SystemTypes.SystemDoubleType);
+        var owner = new InjectedTypeAnalysisContext(_app.AssembliesByName["mscorlib"], "T",
+            "Owner", _app.SystemTypes.SystemObjectType, R.TypeAttributes.Public);
+        var valueField = new InjectedFieldAnalysisContext("value",
+            _app.SystemTypes.SystemDoubleType, R.FieldAttributes.Public, owner, 8);
+        var cond = Reg("TEMPCOND", _app.SystemTypes.SystemBooleanType, 20);
+
+        var failCall = new Instruction(5, OpCode.Call, new StringLiteral("__stack_chk_fail"),
+            Reg("X0", version: 2));
+        var failReturn = new Instruction(6, OpCode.Return);
+        var mergeReturn = new Instruction(4, OpCode.Return, Reg("X0", version: 3));
+        var branch = new Instruction(3, OpCode.ConditionalJump, failCall, cond);
+
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, tls, sysLocal),
+            new Instruction(2, OpCode.CheckNotEqual, cond,
+                new MemoryOperand(tls, null, 0x28), new FieldReference(valueField, frameSlot, 8)),
+            branch,
+            mergeReturn,
+            failCall,
+            failReturn,
+        ]);
+        caller.Locals = [sysLocal, tls, frameSlot, cond];
+
+        StackProtectorRecovery.Run(caller);
+
+        Assert.That(branch.OpCode, Is.EqualTo(OpCode.Jump));
+        Assert.That(failCall.OpCode, Is.EqualTo(OpCode.Nop));
+    }
+
     // The same frame-cell compare with no failure call anywhere: without the
     // co-proof the frame slot is not proven the canary and the guard stays.
     [Test]

@@ -51,9 +51,10 @@ public static class StackProtectorRecovery
         var cfg = method.ControlFlowGraph!;
         var orphaned = new Queue<Block>();
         var failCalls = new List<Instruction>();
+        var dom = Dominators(cfg);
 
         foreach (var block in cfg.Blocks.ToList())
-            TryExciseGuard(cfg, block, ResolveName, orphaned, failCalls);
+            TryExciseGuard(cfg, block, ResolveName, orphaned, failCalls, dom);
 
         RemoveOrphanedBlocks(cfg, orphaned);
 
@@ -147,7 +148,8 @@ public static class StackProtectorRecovery
             {
                 case MemoryOperand { Index: null, Addend: TlsStackGuardOffset,
                         Base: LocalVariable canaryBase }
-                    when deadLocals.Contains(canaryBase) || IsSysregProvenanced(canaryBase, cfg):
+                    when deadLocals.Contains(canaryBase)
+                        || IsSysregProvenanced(canaryBase, cfg.Instructions, cfg):
                 case MemoryOperand cell when deadCells.Contains(cell):
                 case Register { Name: "SYSREG" }:
                     return true;
@@ -156,7 +158,8 @@ public static class StackProtectorRecovery
                         || (mem.Index is LocalVariable i && deadLocals.Contains(i)):
                     return true;
                 case LocalVariable local
-                    when deadLocals.Contains(local) || IsSysregProvenanced(local, cfg):
+                    when deadLocals.Contains(local)
+                        || IsSysregProvenanced(local, cfg.Instructions, cfg):
                     return true;
             }
         }
@@ -190,15 +193,22 @@ public static class StackProtectorRecovery
     // successors leads to __stack_chk_fail is the protector's epilogue guard:
     // fold it to the other successor. Any other shape is left alone.
     private static void TryExciseGuard(ISILControlFlowGraph cfg, Block guard,
-        Func<ulong, string?> resolve, Queue<Block> orphaned, List<Instruction> failCalls)
+        Func<ulong, string?> resolve, Queue<Block> orphaned, List<Instruction> failCalls,
+        IReadOnlyDictionary<Block, HashSet<Block>> dom)
     {
         if (guard.Successors.Count != 2 || guard.Instructions.Count == 0)
             return;
         var branch = guard.Instructions[^1];
         if (branch.OpCode != OpCode.ConditionalJump
             || branch.Operands.Count < 2
-            || branch.Operands[1] is not LocalVariable condition
-            || !IsCanaryCondition(condition, cfg))
+            || branch.Operands[1] is not LocalVariable condition)
+            return;
+
+        // The lifter reuses register slots across a method: a local can carry
+        // defs in blocks this branch's paths never pass. Only defs in blocks
+        // dominating the guard can feed its condition.
+        var visible = DominatingDefs(guard, dom);
+        if (!IsCanaryCondition(condition, visible, cfg))
             return;
 
         foreach (var successor in guard.Successors.ToList())
@@ -227,7 +237,7 @@ public static class StackProtectorRecovery
         // edge's failure call is collected and nopped the same way: when the
         // block it shares with real code (the exception-scaffold tail) stays
         // reachable, the other instructions keep their own diagnostics.
-        if (!IsConstantCanaryCondition(condition, cfg, out var constant))
+        if (!IsConstantCanaryCondition(condition, visible, cfg, out var constant))
             return;
         var live = guard.Successors[constant ? 1 : 0];
         var dead = guard.Successors[constant ? 0 : 1];
@@ -289,7 +299,8 @@ public static class StackProtectorRecovery
     // check - a CheckEqual/CheckNotEqual comparing the TLS stack-guard cell
     // [SYSREG + 0x28] against the stored canary (a local, or the same cell read
     // through a spilled TLS base). Anything else means the branch is real code.
-    private static bool IsCanaryCondition(LocalVariable condition, ISILControlFlowGraph cfg)
+    private static bool IsCanaryCondition(LocalVariable condition,
+        IReadOnlyCollection<Instruction> visible, ISILControlFlowGraph cfg)
     {
         var visited = new HashSet<LocalVariable>();
         var stack = new Stack<LocalVariable>();
@@ -301,7 +312,7 @@ public static class StackProtectorRecovery
             if (!visited.Add(local))
                 continue;
             var sawDef = false;
-            foreach (var def in cfg.Instructions
+            foreach (var def in visible
                          .Where(i => ReferenceEquals(i.Destination, local)))
             {
                 sawDef = true;
@@ -313,7 +324,7 @@ public static class StackProtectorRecovery
                         stack.Push(source);
                         break;
                     case OpCode.CheckEqual or OpCode.CheckNotEqual:
-                        if (!IsCanaryCheck(def, cfg))
+                        if (!IsCanaryCheck(def, visible, cfg))
                             return false;
                         sawCheck = true;
                         break;
@@ -333,7 +344,8 @@ public static class StackProtectorRecovery
     // with each `Not` hop flipping it. Returns false when any terminal check
     // compares differing operands or the paths disagree on the value - the
     // guard may then still be excised only via a reachable failure call.
-    private static bool IsConstantCanaryCondition(LocalVariable condition, ISILControlFlowGraph cfg,
+    private static bool IsConstantCanaryCondition(LocalVariable condition,
+        IReadOnlyCollection<Instruction> visible, ISILControlFlowGraph cfg,
         out bool constant)
     {
         var visited = new HashSet<(LocalVariable, int)>();
@@ -346,7 +358,7 @@ public static class StackProtectorRecovery
             if (!visited.Add((local, parity)))
                 continue;
             var sawDef = false;
-            foreach (var def in cfg.Instructions
+            foreach (var def in visible
                          .Where(i => ReferenceEquals(i.Destination, local)))
             {
                 sawDef = true;
@@ -369,7 +381,7 @@ public static class StackProtectorRecovery
                         stack.Push((negated, parity ^ 1));
                         break;
                     case OpCode.CheckEqual or OpCode.CheckNotEqual:
-                        if (!IsCanaryCheck(def, cfg)
+                        if (!IsCanaryCheck(def, visible, cfg)
                             || def.Operands.Count < 3
                             || !def.Operands[1].Equals(def.Operands[2]))
                         {
@@ -405,15 +417,16 @@ public static class StackProtectorRecovery
         return true;
     }
 
-    private static bool IsCanaryCheck(Instruction check, ISILControlFlowGraph cfg)
+    private static bool IsCanaryCheck(Instruction check,
+        IReadOnlyCollection<Instruction> visible, ISILControlFlowGraph cfg)
     {
         if (check.Operands.Count < 3)
             return false;
         var left = check.Operands[1];
         var right = check.Operands[2];
-        return (IsCanaryProven(left, cfg) || IsCanaryProven(right, cfg))
-            && IsCanaryOperand(left, cfg)
-            && IsCanaryOperand(right, cfg);
+        return (IsCanaryProven(left, visible, cfg) || IsCanaryProven(right, visible, cfg))
+            && IsCanaryOperand(left, visible, cfg)
+            && IsCanaryOperand(right, visible, cfg);
     }
 
     // A side provably part of the protector: the fresh TLS read, a local whose
@@ -421,11 +434,13 @@ public static class StackProtectorRecovery
     // side proves the canary and the other is a shape it could take, the
     // compare feeding a reachable __stack_chk_fail is the protector - nothing
     // else ever calls it.
-    private static bool IsCanaryProven(IOperand operand, ISILControlFlowGraph cfg) =>
+    private static bool IsCanaryProven(IOperand operand,
+        IReadOnlyCollection<Instruction> visible, ISILControlFlowGraph cfg) =>
         operand switch
         {
-            LocalVariable local => IsCanaryValue(local, cfg),
-            MemoryOperand mem => IsTlsCanaryRead(mem, cfg) || IsStoredCanaryCell(mem, cfg),
+            LocalVariable local => IsCanaryValue(local, visible, cfg),
+            MemoryOperand mem => IsTlsCanaryRead(mem, visible, cfg)
+                || IsStoredCanaryCell(mem, cfg),
             _ => false,
         };
 
@@ -435,12 +450,17 @@ public static class StackProtectorRecovery
     // the stored canary - the frame slot the prologue wrote with
     // `Move [frame+off], [SYSREG+0x28]` - or a frame cell read through a
     // materialized address-of pointer whose store the lift did not emit.
-    private static bool IsCanaryOperand(IOperand operand, ISILControlFlowGraph cfg) =>
+    private static bool IsCanaryOperand(IOperand operand,
+        IReadOnlyCollection<Instruction> visible, ISILControlFlowGraph cfg) =>
         operand switch
         {
             LocalVariable => true,
             MemoryOperand { Index: null, Addend: TlsStackGuardOffset } => true,
-            MemoryOperand mem => IsStoredCanaryCell(mem, cfg) || IsFrameCanaryCell(mem, cfg),
+            MemoryOperand mem => IsStoredCanaryCell(mem, cfg)
+                || IsFrameCanaryCell(mem, visible, cfg),
+            // A field read on a stack-slot local (`stackslot.field`) is a frame
+            // cell spelled as a typed access rather than a byte offset.
+            FieldReference fieldReference => IsStackSlot(fieldReference.Local),
             _ => false,
         };
 
@@ -450,7 +470,8 @@ public static class StackProtectorRecovery
     // frame base per use and the lifter may not have emitted the prologue
     // store. The compiler only ever compares the TLS canary against its own
     // stored copy, so next to a proven canary side the frame cell is that copy.
-    private static bool IsFrameCanaryCell(MemoryOperand cell, ISILControlFlowGraph cfg)
+    private static bool IsFrameCanaryCell(MemoryOperand cell,
+        IReadOnlyCollection<Instruction> visible, ISILControlFlowGraph cfg)
     {
         if (cell.Index != null)
             return false;
@@ -459,7 +480,7 @@ public static class StackProtectorRecovery
         if (cell.Base is not LocalVariable pointer)
             return false;
         var saw = false;
-        foreach (var def in cfg.Instructions.Where(i => ReferenceEquals(i.Destination, pointer)))
+        foreach (var def in visible.Where(i => ReferenceEquals(i.Destination, pointer)))
         {
             if (def.OpCode != OpCode.Move || def.Operands.Count < 2
                 || def.Operands[1] is not AddressOf source
@@ -475,7 +496,8 @@ public static class StackProtectorRecovery
 
     // A memory cell is the stored canary when every write to it carries the
     // TLS canary value - the prologue's `Move [cell], [SYSREG+0x28]`, possibly
-    // through a spilled local whose own defs all read the same cell.
+    // through a spilled local whose own defs all read the same cell. The claim
+    // is about the physical cell, so every store in the method must satisfy it.
     private static bool IsStoredCanaryCell(MemoryOperand cell, ISILControlFlowGraph cfg)
     {
         if (cell.Index != null)
@@ -486,7 +508,7 @@ public static class StackProtectorRecovery
                      && i.Operands[0] is MemoryOperand dest
                      && dest.Equals(cell)))
         {
-            if (!IsCanaryValue(def.Operands[1], cfg))
+            if (!IsCanaryValue(def.Operands[1], cfg.Instructions, cfg))
                 return false;
             saw = true;
         }
@@ -510,7 +532,7 @@ public static class StackProtectorRecovery
             var proven = def.Operands[1] switch
             {
                 Register { Name: "SYSREG" } => true,
-                LocalVariable source => IsSysregProvenanced(source, cfg),
+                LocalVariable source => IsSysregProvenanced(source, cfg.Instructions, cfg),
                 _ => false,
             };
             if (!proven)
@@ -520,17 +542,18 @@ public static class StackProtectorRecovery
         return saw;
     }
 
-    private static bool IsCanaryValue(IOperand operand, ISILControlFlowGraph cfg)
+    private static bool IsCanaryValue(IOperand operand,
+        IReadOnlyCollection<Instruction> visible, ISILControlFlowGraph cfg)
     {
-        if (IsTlsCanaryRead(operand, cfg))
+        if (IsTlsCanaryRead(operand, visible, cfg))
             return true;
         if (operand is not LocalVariable local)
             return false;
         var saw = false;
-        foreach (var def in cfg.Instructions.Where(i => ReferenceEquals(i.Destination, local)))
+        foreach (var def in visible.Where(i => ReferenceEquals(i.Destination, local)))
         {
             if (def.OpCode != OpCode.Move || def.Operands.Count < 2
-                || !IsTlsCanaryRead(def.Operands[1], cfg))
+                || !IsTlsCanaryRead(def.Operands[1], visible, cfg))
                 return false;
             saw = true;
         }
@@ -539,15 +562,17 @@ public static class StackProtectorRecovery
 
     // [base + 0x28] where base's producers root at SYSREG - the thread-pointer
     // register (`mrs xN, tpidr_el0`) whose +0x28 slot holds the stack guard.
-    private static bool IsTlsCanaryRead(IOperand operand, ISILControlFlowGraph cfg) =>
+    private static bool IsTlsCanaryRead(IOperand operand,
+        IReadOnlyCollection<Instruction> visible, ISILControlFlowGraph cfg) =>
         operand is MemoryOperand
             { Index: null, Addend: TlsStackGuardOffset, Base: LocalVariable baseLocal }
-        && IsSysregProvenanced(baseLocal, cfg);
+        && IsSysregProvenanced(baseLocal, visible, cfg);
 
     // True when some producer chain roots the local at the TLS base register.
     // A coalesced local may carry other provenance on paths that cannot reach
     // the check; any chain suffices as evidence the TLS cell is the one read.
-    private static bool IsSysregProvenanced(LocalVariable local, ISILControlFlowGraph cfg)
+    private static bool IsSysregProvenanced(LocalVariable local,
+        IReadOnlyCollection<Instruction> visible, ISILControlFlowGraph cfg)
     {
         var visited = new HashSet<LocalVariable>();
         var stack = new Stack<LocalVariable>();
@@ -559,7 +584,7 @@ public static class StackProtectorRecovery
                 continue;
             if (current.Register.Name == "SYSREG")
                 return true;
-            foreach (var def in cfg.Instructions
+            foreach (var def in visible
                          .Where(i => ReferenceEquals(i.Destination, current)))
             {
                 if (def.OpCode != OpCode.Move)
@@ -574,6 +599,52 @@ public static class StackProtectorRecovery
             }
         }
         return false;
+    }
+
+    // The defs that can feed a guard's branch are those in blocks dominating
+    // it. The lifter reuses register slots across a method (a TEMPCOND local
+    // can carry a dozen unrelated compares), so counting every def of the
+    // condition local would mix in branches that never reach this guard.
+    private static HashSet<Instruction> DominatingDefs(Block guard,
+        IReadOnlyDictionary<Block, HashSet<Block>> dom)
+    {
+        var defs = new HashSet<Instruction>();
+        foreach (var block in dom[guard])
+            foreach (var instruction in block.Instructions)
+                defs.Add(instruction);
+        return defs;
+    }
+
+    // Classic iterative dominators: dom(b) = {b} u (intersect dom(p) for p in
+    // preds(b)), entry = {entry}. Blocks with no predecessors converge to
+    // {self} - they cannot dominate a reachable guard anyway.
+    private static Dictionary<Block, HashSet<Block>> Dominators(ISILControlFlowGraph cfg)
+    {
+        var all = new HashSet<Block>(cfg.Blocks);
+        var dom = new Dictionary<Block, HashSet<Block>>(cfg.Blocks.Count);
+        foreach (var block in cfg.Blocks)
+            dom[block] = new HashSet<Block>(all);
+        dom[cfg.EntryBlock] = [cfg.EntryBlock];
+        var changed = true;
+        while (changed)
+        {
+            changed = false;
+            foreach (var block in cfg.Blocks)
+            {
+                if (block == cfg.EntryBlock)
+                    continue;
+                var next = new HashSet<Block>(all);
+                foreach (var predecessor in block.Predecessors)
+                    next.IntersectWith(dom[predecessor]);
+                next.Add(block);
+                if (!next.SetEquals(dom[block]))
+                {
+                    dom[block] = next;
+                    changed = true;
+                }
+            }
+        }
+        return dom;
     }
 
     // Removes `from` -> `to`, dropping `from`'s phi operands on `to` (phi operand
