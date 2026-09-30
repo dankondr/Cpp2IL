@@ -1972,8 +1972,16 @@ public class IlGeneratorTests
             Assert.That(il[2].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
             Assert.That(il[3].OpCode, Is.EqualTo(CilOpCodes.Stloc));
             Assert.That(il[4].OpCode, Is.EqualTo(CilOpCodes.Ldloc));
-            Assert.That(il[5].OpCode, Is.EqualTo(CilOpCodes.Box));
-            Assert.That(il[6].OpCode, Is.EqualTo(CilOpCodes.Call));
+            // The scalar -> object argument edge has no definition proving a
+            // reference or a box, so no `box` may be fabricated for it; the
+            // site keeps the named decompiler-issue note and stops instead.
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Box), Is.False,
+                () => string.Join("\n", il));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("no binary proof")), Is.True,
+                () => string.Join("\n", il));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Throw), Is.True,
+                () => string.Join("\n", il));
         });
     }
 
@@ -2047,10 +2055,20 @@ public class IlGeneratorTests
 
         IlGenerator.GenerateIl(context, method);
 
-        Assert.That(method.CilMethodBody!.Instructions.Any(instruction =>
-            instruction.OpCode == CilOpCodes.Box
-            && instruction.Operand?.ToString()?.Contains("Boolean") == true), Is.True,
-            () => string.Join("\n", method.CilMethodBody.Instructions));
+        var instructions = method.CilMethodBody!.Instructions;
+        // No definition proves the Boolean argument is a reference or a box
+        // allocation: the unproven edge keeps the named note and stops rather
+        // than fabricating a `box` the binary never made.
+        Assert.Multiple(() =>
+        {
+            Assert.That(instructions.Any(i => i.OpCode == CilOpCodes.Box), Is.False,
+                () => string.Join("\n", instructions));
+            Assert.That(instructions.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("no binary proof")), Is.True,
+                () => string.Join("\n", instructions));
+            Assert.That(instructions.Any(i => i.OpCode == CilOpCodes.Throw), Is.True,
+                () => string.Join("\n", instructions));
+        });
     }
 
     [Test]

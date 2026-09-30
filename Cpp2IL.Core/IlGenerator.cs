@@ -629,7 +629,8 @@ public static class IlGenerator
                         instructions.Add(CilOpCodes.Pop);
                         break;
                     }
-                    CoerceOrDefault(EmittedOperandType(instruction.Operands[1], context, stored), stored, method, context);
+                    CoerceOrDefault(EmittedOperandType(instruction.Operands[1], context, stored), stored, method, context,
+                        operand: instruction.Operands[1]);
                     if (StelemOpCode(stored) is { } stelemOp)
                         instructions.Add(stelemOp);
                     else if (TypeTokenUsableFrom(stored, context))
@@ -4879,8 +4880,10 @@ public static class IlGenerator
 
         LoadLocal(objLocal, method, locals, context);
         // GetType is a reference-type member: a generic or value-typed operand
-        // reaches it only through box.
-        CoerceOrDefault(EmittedLocalType(objLocal, context), context?.AppContext.SystemTypes.SystemObjectType, method, context);
+        // reaches it only through box. The call itself proves the binary boxed - a
+        // value receiver cannot invoke GetType any other way.
+        CoerceOrDefault(EmittedLocalType(objLocal, context), context?.AppContext.SystemTypes.SystemObjectType, method, context,
+            operand: objLocal, operationProvesBox: true);
         instructions.Add(CilOpCodes.Callvirt, getType);
         LoadOperand(typeOperand, method, locals, writeLine,
             ResolveSystemType(context, "System.Type"), context); // emits typeof(T)
@@ -6980,12 +6983,45 @@ public static class IlGenerator
             or "System.UInt16" or "System.UInt32" or "System.UInt64" or "System.UIntPtr"
         || type is { IsEnumType: true, DefaultEnumUnderlyingType: { } underlying } && IsUnsignedType(underlying);
 
+    // Resolves the diagnostic target an honest-failure emission writes to: the
+    // injected Cpp2ILHelpers.NoteDecompilerIssue when it exists in the emitting
+    // assembly, Console.WriteLine otherwise.
+    private static IMethodDescriptor NoteIssueMethod(MethodAnalysisContext? context, MethodDefinition method)
+    {
+        var module = method.DeclaringModule!;
+        var factory = module.CorLibTypeFactory;
+        var noteIssueContext = context?.DeclaringType?.DeclaringAssembly
+            .GetTypeByFullName($"{HelpersNamespace}.{HelpersTypeName}")
+            ?.Methods.FirstOrDefault(m => m.Name == NoteIssueMethodName);
+        return noteIssueContext?.ToMethodDescriptor()
+            ?? factory.CorLibScope.CreateTypeReference("System", "Console")
+                .CreateMemberReference("WriteLine",
+                    MethodSignature.CreateStatic(factory.Void, [factory.String]));
+    }
+
+    // A scalar reaching a System.Object slot earns `box` only when the operand's
+    // definitions prove the binary allocated one (castle-recovery#189); every
+    // other edge is a conversion the binary never performed - a named
+    // decompiler-issue note and an honest stop instead of a fabricated box.
+    // Returns true when the caller's ordinary `box` emission may proceed.
+    private static bool ObjectBoxEdgeIsProven(MethodDefinition method, MethodAnalysisContext? context,
+        IOperand? operand, TypeAnalysisContext from, bool operationProvesBox = false)
+    {
+        if (operationProvesBox
+            || (context != null && Analysis.ScalarObjectEdgeAnalysis.OperandProvesBox(operand, context)))
+            return true;
+        EmitUnrecoverableOperation(method, NoteIssueMethod(context, method),
+            $"Unproven scalar->object edge: a {from.FullName} value reaching System.Object has no binary proof of a reference or a box");
+        return false;
+    }
+
     // Emits the conversion needed to make a value of `from` acceptable where `to` is
     // required: primitive width change, box, unbox or reference cast. Returns false
     // when no legal conversion exists and the value still does not satisfy `to`;
     // callers then drop the unrepresentable value and fill the slot honestly.
     private static bool EmitStackCoerce(TypeAnalysisContext? from, TypeAnalysisContext? to, MethodDefinition method,
-        MethodAnalysisContext? context, bool convertByRef = false)
+        MethodAnalysisContext? context, bool convertByRef = false, IOperand? operand = null,
+        bool operationProvesBox = false)
     {
         // Handle contexts have no managed stack type of their own; everything below
         // reasons about the native int they emit as.
@@ -7088,7 +7124,7 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldobj, element.ToTypeSignature().ToTypeDefOrRef());
             else
                 instructions.Add(CilOpCodes.Ldind_Ref);
-            return EmitStackCoerce(element, to, method, context, convertByRef);
+            return EmitStackCoerce(element, to, method, context, convertByRef, operand);
         }
 
         if (fromWidth != 0 && toWidth != 0)
@@ -7155,6 +7191,9 @@ public static class IlGenerator
         if (primitive != null && !to.IsValueType
             && to is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext))
         {
+            if (Analysis.ScalarObjectEdgeAnalysis.IsScalarObjectEdge(from, to)
+                && !ObjectBoxEdgeIsProven(method, context, operand, from, operationProvesBox))
+                return true;
             instructions.Add(CilOpCodes.Box, primitive.ToTypeDefOrRef());
             if (to.FullName == "System.Object" || !CanEmitTypeToken(to))
                 return true;
@@ -7177,6 +7216,9 @@ public static class IlGenerator
                 return true;
             if (!TypeTokenUsableFrom(from, context))
                 return false;
+            if (Analysis.ScalarObjectEdgeAnalysis.IsScalarObjectEdge(from, to)
+                && !ObjectBoxEdgeIsProven(method, context, operand, from, operationProvesBox))
+                return true;
             instructions.Add(CilOpCodes.Box, from.ToTypeSignature().ToTypeDefOrRef());
             // box yields a `from` reference; an interface/other-ref destination still
             // needs the narrowing cast the verifier requires.
@@ -7262,9 +7304,10 @@ public static class IlGenerator
     // operation can bridge the types - drops it and fills the slot with the same
     // honest default PushDefaultOf uses for operands that were lost upstream.
     private static void CoerceOrDefault(TypeAnalysisContext? from, TypeAnalysisContext? to, MethodDefinition method,
-        MethodAnalysisContext? context, bool convertByRef = false)
+        MethodAnalysisContext? context, bool convertByRef = false, IOperand? operand = null,
+        bool operationProvesBox = false)
     {
-        if (to == null || EmitStackCoerce(from, to, method, context, convertByRef))
+        if (to == null || EmitStackCoerce(from, to, method, context, convertByRef, operand, operationProvesBox))
             return;
         var instructions = method.CilMethodBody!.Instructions;
         instructions.Add(CilOpCodes.Pop);
@@ -7501,7 +7544,7 @@ public static class IlGenerator
             // then fails (e.g. a ref-struct element has no legal crossing).
             // Whatever its kind, an uncoercible value must not leak into the
             // slot - it is dropped and the default substitution is diagnosed.
-            if (!EmitStackCoerce(emitted, contract, method, context, convertByRef))
+            if (!EmitStackCoerce(emitted, contract, method, context, convertByRef, resolved))
             {
                 var instructions = method.CilMethodBody!.Instructions;
                 instructions.Add(CilOpCodes.Pop);
@@ -7599,6 +7642,21 @@ public static class IlGenerator
             // has no honest managed form; before the base .ctor runs it is also an
             // uninitialized read.
             return false;
+        }
+        // A scalar-claimed operand into an object slot is honest only when its
+        // definitions prove the register really carried a managed reference
+        // (castle-recovery#189): emit that producing value - a reference-typed
+        // field or array load, a cast, a reference-typed local - instead of the
+        // mislabeled scalar. When nothing proves it, the remaining coercion is
+        // the unproven edge EmitStackCoerce diagnoses rather than boxes.
+        if (Analysis.ScalarObjectEdgeAnalysis.IsScalarObjectEdge(emitted, contract)
+            && Analysis.ScalarObjectEdgeAnalysis.TryResolveReferenceValue(resolved, context)
+                is { } referenceValue
+            && EmittedOperandType(referenceValue, context, contract) is { IsValueType: false } referenceType
+            && StackContractSatisfied(referenceType, contract, context, convertByRef))
+        {
+            resolved = referenceValue;
+            emitted = referenceType;
         }
         return contract == null || StackContractSatisfied(emitted, contract, context, convertByRef);
     }
@@ -8600,12 +8658,13 @@ public static class IlGenerator
     // coercion exists the value is replaced by default(contract) - same as a
     // dropped operand - so the consuming store still sees a compatible type.
     private static void EmitStackCoerceOrDefault(TypeAnalysisContext? from, TypeAnalysisContext? contract,
-        MethodDefinition method, MethodAnalysisContext? context, bool convertByRef = false)
+        MethodDefinition method, MethodAnalysisContext? context, bool convertByRef = false,
+        IOperand? operand = null, bool operationProvesBox = false)
     {
         var instructions = method.CilMethodBody!.Instructions;
         if (contract == null || StackContractSatisfied(from, contract, context, convertByRef))
         {
-            EmitStackCoerce(from, contract, method, context, convertByRef);
+            EmitStackCoerce(from, contract, method, context, convertByRef, operand, operationProvesBox);
             return;
         }
         instructions.Add(CilOpCodes.Pop);

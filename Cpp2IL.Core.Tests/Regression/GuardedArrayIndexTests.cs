@@ -118,7 +118,12 @@ public class GuardedArrayIndexTests
         {
             Assert.That(il.Any(i => i.OpCode.ToString()!.Contains("ldelem")), Is.True,
                 () => Emit(il));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.False,
+            // The unreachable oob slot keeps its unproven-edge note; no box
+            // may be fabricated for it.
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Box), Is.False,
+                () => Emit(il));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("no binary proof")), Is.True,
                 () => Emit(il));
         });
     }
@@ -141,7 +146,10 @@ public class GuardedArrayIndexTests
         {
             Assert.That(il.Any(i => i.OpCode.ToString()!.Contains("stelem")), Is.True,
                 () => Emit(il));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.False,
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Box), Is.False,
+                () => Emit(il));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("no binary proof")), Is.True,
                 () => Emit(il));
         });
     }
@@ -171,7 +179,10 @@ public class GuardedArrayIndexTests
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldfld
                     && i.Operand?.ToString().Contains("y") == true), Is.True,
                 () => Emit(il));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.False,
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Box), Is.False,
+                () => Emit(il));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("no binary proof")), Is.True,
                 () => Emit(il));
         });
     }
