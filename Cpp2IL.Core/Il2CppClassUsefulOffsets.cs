@@ -14,6 +14,85 @@ public static class Il2CppClassUsefulOffsets
             ? is32Bit ? 0x999 /*TODO*/ : 0x138
             : is32Bit ? 0x999 /*TODO*/ : 0x128;
 
+    // Named fields of the Il2CppClass runtime structure, addressed by offset for the metadata
+    // version in use. Recognisers must look fields up here, not scatter literals.
+    public enum Il2CppClassField
+    {
+        ElementType,
+        InterfaceOffsets,
+        StaticFields,
+        RgctxData,
+        TypeHierarchy,
+        CctorFinished,
+        InterfaceOffsetsCount,
+        TypeHierarchyDepth,
+        Flags1,
+        Flags2,
+    }
+
+    private readonly record struct FieldRow(Il2CppClassField Field, string Name, uint Offset, Type Type, bool Is32Bit, float MinMetadataVersion, float MaxMetadataVersion = float.MaxValue);
+
+    // 64-bit rows. Metadata >= 29 (Unity 2023+/6) inserted fields that pushed cctor_finished to
+    // 0xE4 and interface_offsets_count to 0x12E; older versions keep 0xE0/0x12A.
+    private static readonly FieldRow[] FieldRows =
+    [
+        new(Il2CppClassField.ElementType, "elementType", 0x40, typeof(IntPtr), false, 0),
+        new(Il2CppClassField.InterfaceOffsets, "interfaceOffsets", 0xB0, typeof(IntPtr), false, 0),
+        new(Il2CppClassField.StaticFields, "static_fields", 0xB8, typeof(IntPtr), false, 0),
+        new(Il2CppClassField.RgctxData, "rgctx_data", 0xC0, typeof(IntPtr), false, 0),
+        new(Il2CppClassField.TypeHierarchy, "typeHierarchy", 0xC8, typeof(IntPtr), false, 0),
+        new(Il2CppClassField.CctorFinished, "cctor_finished", 0xE0, typeof(uint), false, 0, 29f),
+        new(Il2CppClassField.CctorFinished, "cctor_finished", 0xE4, typeof(uint), false, 29f),
+        new(Il2CppClassField.InterfaceOffsetsCount, "interface_offsets_count", 0x12A, typeof(ushort), false, 0, 29f),
+        new(Il2CppClassField.InterfaceOffsetsCount, "interface_offsets_count", 0x12E, typeof(ushort), false, 29f),
+        new(Il2CppClassField.TypeHierarchyDepth, "typeHierarchyDepth", 0x130, typeof(byte), false, 0),
+        new(Il2CppClassField.Flags1, "flags1", 0x132, typeof(byte), false, 0),
+        new(Il2CppClassField.Flags2, "flags2", 0x133, typeof(byte), false, 0),
+
+        // 32-bit rows
+        new(Il2CppClassField.CctorFinished, "cctor_finished", 0x74, typeof(uint), true, 0),
+        new(Il2CppClassField.Flags1, "flags1", 0xBB, typeof(byte), true, 0),
+        new(Il2CppClassField.InterfaceOffsets, "interfaceOffsets", X86_INTERFACE_OFFSETS_OFFSET, typeof(IntPtr), true, 0),
+        new(Il2CppClassField.StaticFields, "static_fields", 0x5C, typeof(IntPtr), true, 0),
+    ];
+
+    /// <summary>
+    /// The field read at <paramref name="offset"/> in an Il2CppClass for the given metadata
+    /// version, or null when the offset names no modeled field (e.g. inside the vtable).
+    /// </summary>
+    public static bool TryGetField(uint offset, float metadataVersion, bool is32Bit,
+        out Il2CppClassField field, out string name)
+    {
+        field = default;
+        name = null!;
+        foreach (var row in FieldRows)
+        {
+            if (row.Is32Bit != is32Bit || row.Offset != offset
+                || metadataVersion < row.MinMetadataVersion || metadataVersion >= row.MaxMetadataVersion)
+                continue;
+            field = row.Field;
+            name = row.Name;
+            return true;
+        }
+        return false;
+    }
+
+    public static string? GetOffsetName(uint offset, float metadataVersion, bool is32Bit) =>
+        TryGetField(offset, metadataVersion, is32Bit, out _, out var name) ? name : null;
+
+    /// <summary>
+    /// The vtable slot an addend refers to: vtable entries are 16-byte VirtualInvokeData pairs at
+    /// <see cref="GetVtableOffset"/> + 16 * slot. Null when the addend is before the vtable or not
+    /// slot-aligned.
+    /// </summary>
+    public static int? GetVTableSlot(long addend, float metadataVersion, bool is32Bit)
+    {
+        var vtableOffset = GetVtableOffset(metadataVersion, is32Bit);
+        if (addend < vtableOffset || (addend - vtableOffset) % 16 != 0)
+            return null;
+        return (int)((addend - vtableOffset) / 16);
+    }
+
     public static readonly List<UsefulOffset> UsefulOffsets =
     [
         new("cctor_finished", 0x74, typeof(uint), true),
