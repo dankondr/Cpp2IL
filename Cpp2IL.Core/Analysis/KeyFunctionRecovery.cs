@@ -5,6 +5,7 @@ using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.Il2CppApiFunctions;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using LibCpp2IL;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -14,6 +15,42 @@ namespace Cpp2IL.Core.Analysis;
 /// </summary>
 public static class KeyFunctionRecovery
 {
+    // EH needs only this predicate's ABI. Do not add aliases to the general
+    // key-function rewrite table: a class predicate is not Object::IsInst.
+    internal static bool IsClassIsAssignableFrom(Il2CppBinary binary, ulong target)
+    {
+        if (binary.InstructionSetId != DefaultInstructionSets.ARM_V8) return false;
+        try
+        {
+            var export = binary.GetVirtualAddressOfExportedFunctionByName("il2cpp_class_is_assignable_from");
+            return MatchClassIsAssignableFrom(export, target, address => BitConverter.ToUInt32(
+                binary.GetRawBinaryContent().Slice((int)binary.MapVirtualAddressToRaw(address), 4)));
+        }
+        catch (Exception) { return false; }
+    }
+
+    internal static bool MatchClassIsAssignableFrom(ulong export, ulong target, Func<ulong, uint> read)
+    {
+        if (export == 0 || target == 0) return false;
+        var body = Follow(export);
+        return body != 0 && body == Follow(target);
+
+        ulong Follow(ulong address)
+        {
+            // ponytail: only bounded pure B veneers preserve the exported ABI;
+            // argument shuffles or indirect wrappers need their own proof.
+            var seen = new HashSet<ulong>();
+            while (seen.Count < 8 && seen.Add(address))
+            {
+                var word = read(address);
+                if ((word & 0xfc000000) != 0x14000000) return address;
+                var delta = (long)((int)(word << 6) >> 4);
+                address = unchecked((ulong)((long)address + delta));
+            }
+            return 0;
+        }
+    }
+
     //All of these have the same params in the same order so we treat them as equal.
     private static readonly HashSet<string> ObjectNewFunctions =
     [
