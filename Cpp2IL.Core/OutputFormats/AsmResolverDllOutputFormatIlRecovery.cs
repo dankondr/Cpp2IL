@@ -68,6 +68,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
                     RecoveryModuleIdentity.Assign(module, buildIdentity);
                     RelocateLargeStrings(module);
                 }
+            RestoreFieldLikeEventBackingFields(context);
             RestoreInternalsVisibleTo(assemblies);
             // The injected friend-assembly attributes introduce their own
             // framework-type references; re-run the (emit-if-missing) pass.
@@ -81,6 +82,133 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         {
             AccessibilityExtensions.EmittedInternalsAreShared = false;
         }
+    }
+
+    // The original C# compiles a field-like `event T E` to a private backing
+    // field `E` plus public add_/remove_ accessors, and il2cpp metadata keeps
+    // that private declaration. Body emission widens any field a lifted
+    // instruction names to public (MemberAccessibility.EnsureAccessible), so a
+    // backing field only ever touched inside its own declaring type - which
+    // private access already permits - leaves the stub assembly as a public
+    // field `E` sitting next to `event E`: two members with one name, which
+    // decompilers refuse to fold back into an event and C# rejects as a
+    // duplicate definition (CS0102). Restore the declared access when every
+    // emitted reference stays inside the declaring type's private scope; a
+    // wider access stays when a foreign body proved a direct (inlined) access.
+    internal static void RestoreFieldLikeEventBackingFields(ApplicationAnalysisContext context)
+    {
+        var candidates = new List<(FieldDefinition Field, FieldAttributes DeclaredAccess)>();
+        var byDefinition = new Dictionary<FieldDefinition, int>();
+        var byMemberReferenceKey = new Dictionary<(string DeclaringType, string Name), List<int>>();
+        foreach (var assemblyContext in context.Assemblies)
+            foreach (var typeContext in assemblyContext.Types)
+            {
+                if (typeContext.Events.Count == 0)
+                    continue;
+                foreach (var eventContext in typeContext.Events)
+                    foreach (var fieldContext in typeContext.Fields)
+                    {
+                        if (fieldContext.Name != eventContext.Name
+                            || fieldContext.IsStatic != eventContext.IsStatic
+                            || fieldContext.GetExtraData<FieldDefinition>("AsmResolverField") is not { } field
+                            || field.DeclaringType is null)
+                            continue;
+                        var declaredAccess = (FieldAttributes)fieldContext.Visibility;
+                        if ((field.Attributes & FieldAttributes.FieldAccessMask) == declaredAccess)
+                            continue; // never promoted - nothing to restore
+                        var index = candidates.Count;
+                        candidates.Add((field, declaredAccess));
+                        byDefinition[field] = index;
+                        var key = (field.DeclaringType.FullName, field.Name?.ToString() ?? "");
+                        if (!byMemberReferenceKey.TryGetValue(key, out var list))
+                            byMemberReferenceKey[key] = list = [];
+                        list.Add(index);
+                    }
+            }
+
+        if (candidates.Count == 0)
+            return;
+
+        // Every body that touches a candidate decides whether the field must
+        // stay widened. References arrive either as the FieldDefinition itself
+        // or - for generic-instance receivers and cross-assembly uses - as a
+        // MemberReference naming the declaring type.
+        var referencingTypes = new HashSet<TypeDefinition>[candidates.Count];
+        foreach (var assemblyContext in context.Assemblies)
+            if (assemblyContext.GetExtraData<AssemblyDefinition>("AsmResolverAssembly") is { } assembly)
+                foreach (var module in assembly.Modules)
+                    foreach (var type in module.GetAllTypes())
+                        foreach (var method in type.Methods)
+                        {
+                            if (method.DeclaringType is not { } accessingType
+                                || method.CilMethodBody is not { } body)
+                                continue;
+                            foreach (var instruction in body.Instructions)
+                                switch (instruction.Operand)
+                                {
+                                    case FieldDefinition field
+                                        when byDefinition.TryGetValue(field, out var index):
+                                        (referencingTypes[index] ??= []).Add(accessingType);
+                                        break;
+                                    case MemberReference { Signature: FieldSignature, Name: { } name } reference
+                                        when byMemberReferenceKey.TryGetValue(
+                                                (DeclaringTypeName(reference.DeclaringType) ?? "", name.ToString()),
+                                                out var indices):
+                                        var scopeName = DeclaringAssemblyName(reference.DeclaringType);
+                                        foreach (var index in indices)
+                                            if (scopeName is null
+                                                || scopeName == candidates[index].Field.DeclaringModule?.Assembly?.Name)
+                                                (referencingTypes[index] ??= []).Add(accessingType);
+                                        break;
+                                }
+                        }
+
+        var restored = 0;
+        for (var i = 0; i < candidates.Count; i++)
+        {
+            var (field, declaredAccess) = candidates[i];
+            if (referencingTypes[i] is { } accessors
+                && !accessors.All(accessor => WithinPrivateScope(accessor, field.DeclaringType!)))
+                continue;
+            field.Attributes = (field.Attributes & ~FieldAttributes.FieldAccessMask) | declaredAccess;
+            restored++;
+        }
+
+        if (restored > 0)
+            Logger.InfoNewline($"Restored declared access on {restored} field-like event backing field(s).", "DllOutput");
+    }
+
+    // A private member is reachable only from its own declaring type and from
+    // types nested inside it, at any depth.
+    private static bool WithinPrivateScope(TypeDefinition accessing, TypeDefinition declaring)
+    {
+        for (var type = accessing; type is not null; type = type.DeclaringType)
+            if (ReferenceEquals(type, declaring))
+                return true;
+        return false;
+    }
+
+    // MemberReferences on a generic instantiation carry the field's declaring
+    // type as a TypeSpecification; unwrap to the underlying definition's name.
+    private static string? DeclaringTypeName(ITypeDefOrRef? declaringType)
+    {
+        while (declaringType is TypeSpecification { Signature: GenericInstanceTypeSignature { GenericType: { } generic } })
+            declaringType = generic;
+        return declaringType?.FullName;
+    }
+
+    private static string? DeclaringAssemblyName(ITypeDefOrRef? declaringType)
+    {
+        while (declaringType is TypeSpecification { Signature: GenericInstanceTypeSignature { GenericType: { } generic } })
+            declaringType = generic;
+        return declaringType switch
+        {
+            TypeDefinition definition => definition.DeclaringModule?.Assembly?.Name?.ToString(),
+            TypeReference { Scope: AssemblyReference scope } => scope.Name?.ToString(),
+            TypeReference { Scope: TypeReference parent } => DeclaringAssemblyName(parent),
+            TypeReference { Scope: ModuleDefinition module } => module.Assembly?.Name?.ToString(),
+            _ => null,
+        };
     }
 
     // il2cpp metadata does not preserve assembly-level attributes, so recovered
