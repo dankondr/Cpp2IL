@@ -315,6 +315,7 @@ public static class LocalVariables
         var changed = true;
         var loopCount = 0;
         var hiddenReturnsSharpened = false;
+        var allowCanonicalCallTypes = false;
 
         while (changed)
         {
@@ -325,12 +326,12 @@ public static class LocalVariables
             changed |= MetadataResolver.ResolveCallsViaMethodInfo(method);
             changed |= MetadataResolver.ResolveAmbiguousCalls(method);
             changed |= MetadataResolver.ResolveVirtualCalls(method);
-            changed |= PropagateFromCallParameters(method);
+            changed |= PropagateFromCallParameters(method, allowCanonicalCallTypes);
             changed |= MetadataResolver.ResolveFieldOffsets(method);
             changed |= ResolveSharpenedFieldOwners(method);
             changed |= RgctxResolver.Run(method);
             changed |= PropagateStaticFieldStorage(method);
-            changed |= TypeAddressedLocals(method);
+            changed |= TypeAddressedLocals(method, allowCanonicalCallTypes);
             changed |= PropagateTypesOnce(method);
             changed |= ResolveStackAggregateFields(method);
             changed |= RewriteAggregateFieldStores(method);
@@ -343,6 +344,19 @@ public static class LocalVariables
             {
                 hiddenReturnsSharpened = true;
                 changed = SharpenHiddenReturnBuffers(method);
+            }
+
+            // Let metadata copies, RGCTX loads and receiver producers settle before a shared
+            // implementation can seed erased types. Otherwise those types survive a later
+            // concrete MethodInfo resolution and poison copies/phis and field lookup.
+            if (!changed && !allowCanonicalCallTypes)
+            {
+                changed = MetadataResolver.ResolveAmbiguousCalls(method, specializeReceivers: true);
+                if (!changed)
+                {
+                    allowCanonicalCallTypes = true;
+                    changed = true;
+                }
             }
         }
 
@@ -1280,7 +1294,7 @@ public static class LocalVariables
     }
     
     //Handles typing of locals for ref/out params. Returns whether anything new was typed
-    public static bool TypeAddressedLocals(MethodAnalysisContext method)
+    public static bool TypeAddressedLocals(MethodAnalysisContext method, bool allowCanonicalCallTypes = true)
     {
         var changed = false;
 
@@ -1288,11 +1302,14 @@ public static class LocalVariables
         {
             if (!instruction.IsCall || instruction.Operands[0] is not MethodAnalysisContext calledMethod)
                 continue;
+            var deferGenericSlots = !allowCanonicalCallTypes
+                && MetadataResolver.ErasedGenericArgumentCount(calledMethod) > 0;
+            var definition = (calledMethod as ConcreteGenericMethodAnalysisContext)?.BaseMethodContext ?? calledMethod;
 
             var firstArg = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
 
             // the receiver of a value type's instance method is a pointer to the value
-            if (!calledMethod.IsStatic && firstArg < instruction.Operands.Count
+            if (!deferGenericSlots && !calledMethod.IsStatic && firstArg < instruction.Operands.Count
                 && instruction.Operands[firstArg] is AddressOf { Target: LocalVariable receiver }
                 && calledMethod.DeclaringType is { IsValueType: true } declaringType)
                 changed |= SetTypeIfUnknown(receiver, declaringType);
@@ -1303,6 +1320,9 @@ public static class LocalVariables
             {
                 var parameterIndex = i - paramOffset;
                 if (parameterIndex > calledMethod.Parameters.Count - 1) // Probably MethodInfo*
+                    continue;
+
+                if (deferGenericSlots && definition.Parameters[parameterIndex].ParameterType.HasAnyGenericParameters())
                     continue;
 
                 if (instruction.Operands[i] is AddressOf { Target: LocalVariable referenced }
@@ -2176,15 +2196,18 @@ public static class LocalVariables
         return changed;
     }
 
-    private static bool PropagateFromCallParameters(MethodAnalysisContext method)
+    private static bool PropagateFromCallParameters(MethodAnalysisContext method, bool allowCanonicalCallTypes)
     {
         var changed = false;
 
         // A lea and the call it's passed to are still separate here. The address only gets folded into the
         // call later, so an argument's address-of has to be found through the local carrying it.
         var addressesOf = new Dictionary<LocalVariable, LocalVariable>();
+        var defined = new HashSet<LocalVariable>(method.ParameterLocals);
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
+            if (instruction.Destination is LocalVariable destination)
+                defined.Add(destination);
             if (instruction.OpCode == OpCode.Move
                 && instruction.Operands[0] is LocalVariable pointer
                 && instruction.Operands[1] is AddressOf { Target: LocalVariable pointee })
@@ -2198,6 +2221,12 @@ public static class LocalVariables
             _ => null
         };
 
+        var addressUses = new Dictionary<LocalVariable, int>();
+        foreach (var call in method.ControlFlowGraph.Instructions.Where(instruction => instruction.IsCall))
+        foreach (var operand in call.Operands)
+            if (Addressed(operand) is { } cell)
+                addressUses[cell] = addressUses.GetValueOrDefault(cell) + 1;
+
         foreach (var instruction in method.ControlFlowGraph.Instructions)
         {
             if (!instruction.IsCall)
@@ -2206,15 +2235,37 @@ public static class LocalVariables
             if (instruction.Operands[0] is not MethodAnalysisContext calledMethod)
                 continue;
 
+            var deferGenericSlots = !allowCanonicalCallTypes
+                && MetadataResolver.ErasedGenericArgumentCount(calledMethod) > 0;
+            var definition = (calledMethod as ConcreteGenericMethodAnalysisContext)?.BaseMethodContext ?? calledMethod;
+
             var thisParamIndex = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
 
             // Return value: a constructor yields its declaring type, otherwise the declared return type.
-            if (instruction.Destination is LocalVariable returnValue)
+            if (instruction.Destination is LocalVariable returnValue
+                && (!deferGenericSlots || definition.Name is not (".ctor" or ".cctor")
+                    && !definition.ReturnType.HasAnyGenericParameters()))
             {
                 var producedType = calledMethod.Name is ".ctor" or ".cctor" ? calledMethod.DeclaringType : calledMethod.ReturnType;
 
                 if (producedType != method.AppContext.SystemTypes.SystemVoidType)
-                    changed |= SetTypeIfUnknown(returnValue, producedType);
+                {
+                    // A proven generic producer wins over a type inferred backwards from
+                    // another use (e.g. Object.op_Inequality consuming a T result).
+                    // Hidden struct returns also need their storage uses rewritten by
+                    // SharpenHiddenReturnBuffers; leave their type change to that pass.
+                    if (calledMethod is ConcreteGenericMethodAnalysisContext
+                        && returnValue.HiddenReturnBuffer == null
+                        && definition.ReturnType.HasAnyGenericParameters()
+                        && MetadataResolver.ErasedGenericArgumentCount(calledMethod) == 0
+                        && returnValue.Type?.FullName != producedType?.FullName)
+                    {
+                        returnValue.Type = producedType;
+                        changed = true;
+                    }
+                    else
+                        changed |= SetTypeIfUnknown(returnValue, producedType);
+                }
             }
 
 
@@ -2229,14 +2280,14 @@ public static class LocalVariables
             // 1. thisParam
             // ... parameters
             // 'this' param
-            if (!calledMethod.IsStatic
+            if (!deferGenericSlots && !calledMethod.IsStatic
                 && instruction.Operands[thisParamIndex] is LocalVariable thisParam)
             {
                 changed |= SetTypeIfUnknown(thisParam, calledMethod.DeclaringType);
             }
 
             // Value type instance method, first arg is address of value, but we need to type the value
-            if (!calledMethod.IsStatic
+            if (!deferGenericSlots && !calledMethod.IsStatic
                 && Addressed(instruction.Operands[thisParamIndex]) is { } addressedReceiver
                 && calledMethod.DeclaringType is { IsValueType: true } valueType)
             {
@@ -2254,13 +2305,25 @@ public static class LocalVariables
                 if (parameterIndex > calledMethod.Parameters.Count - 1) // Probably MethodInfo*
                     continue;
 
+                if (deferGenericSlots && definition.Parameters[parameterIndex].ParameterType.HasAnyGenericParameters())
+                    continue;
                 var parameterType = calledMethod.Parameters[parameterIndex].ParameterType;
 
                 if (parameterType is ByRefTypeAnalysisContext { ElementType: { } referencedType }
                     && Addressed(instruction.Operands[i]) is { } referenced)
                 {
-                    if (referenced.Type == method.AppContext.SystemTypes.SystemObjectType
-                        && referencedType != method.AppContext.SystemTypes.SystemObjectType)
+                    // An out cell with no other producer is defined by this call, not by
+                    // the weaker parameter type of a later consumer. Do not retype a
+                    // caller parameter or storage that already has a definition.
+                    var producedOut = calledMethod is ConcreteGenericMethodAnalysisContext
+                        && definition.Parameters[parameterIndex].ParameterType.HasAnyGenericParameters()
+                        && calledMethod.Parameters[parameterIndex].Attributes.HasFlag(ParameterAttributes.Out)
+                        && MetadataResolver.ErasedGenericArgumentCount(calledMethod) == 0
+                        && !defined.Contains(referenced)
+                        && addressUses.GetValueOrDefault(referenced) == 1;
+                    if ((referenced.Type == method.AppContext.SystemTypes.SystemObjectType || producedOut)
+                        && referencedType != method.AppContext.SystemTypes.SystemObjectType
+                        && referenced.Type?.FullName != referencedType.FullName)
                     {
                         referenced.Type = referencedType;
                         changed = true;

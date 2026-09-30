@@ -1619,7 +1619,7 @@ public static class MetadataResolver
     /// type matches the receiver's type. Anything still untyped or ambiguous is left for a later
     /// pass, or left unresolved - it never guesses.
     /// </summary>
-    public static bool ResolveAmbiguousCalls(MethodAnalysisContext method)
+    public static bool ResolveAmbiguousCalls(MethodAnalysisContext method, bool specializeReceivers = false)
     {
         var changed = false;
 
@@ -1627,6 +1627,17 @@ public static class MetadataResolver
         {
             if (!instruction.IsCall)
                 continue;
+
+            // A concrete receiver proves the declaring instantiation even when no MethodInfo
+            // survived. Resolve this before the shared signature can type the call operands.
+            if (specializeReceivers && instruction.Operands[0] is MethodAnalysisContext resolved
+                && InstantiateForReceiver(instruction, resolved) is { } instantiated)
+            {
+                instruction.SetOperand(0, instantiated);
+                instantiated.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, instantiated);
+                changed = true;
+                continue;
+            }
 
             // A resolved call's target is a method/key-function name; only unresolved ones are still numeric.
             if (instruction.Operands[0] is not Immediate target)
@@ -1694,6 +1705,49 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    private static MethodAnalysisContext? InstantiateForReceiver(Instruction call, MethodAnalysisContext callee)
+    {
+        var firstArg = call.OpCode == OpCode.CallVoid ? 1 : 2;
+        if (callee.IsStatic || firstArg >= call.Operands.Count || ErasedGenericArgumentCount(callee) == 0)
+            return null;
+
+        // An explicit descriptor can legitimately spell T=object. Receiver inference
+        // must not replace an instantiation already proven by that descriptor.
+        if (ReferenceEquals(GetMethodInfoArgument(call)?.RepresentedMethod, callee))
+            return null;
+
+        var receiver = OperandEmittedType(call.Operands[firstArg]);
+        if (receiver is ByRefTypeAnalysisContext byRef)
+            receiver = byRef.ElementType;
+        var definition = BaseMethodOf(callee);
+        if (receiver is not GenericInstanceTypeAnalysisContext instance
+            || !ReferenceEquals(instance.GenericType, definition.DeclaringType))
+            return null;
+
+        IReadOnlyList<TypeAnalysisContext> previous = (callee.DeclaringType as GenericInstanceTypeAnalysisContext)?.GenericArguments
+            ?? (IReadOnlyList<TypeAnalysisContext>)definition.DeclaringType!.GenericParameters;
+        if (previous.Count != instance.GenericArguments.Count
+            || !previous.Zip(instance.GenericArguments, CanSpecialize).All(match => match))
+            return null;
+
+        var concrete = new ConcreteGenericMethodAnalysisContext(definition, instance.GenericArguments,
+            (callee as ConcreteGenericMethodAnalysisContext)?.MethodGenericParameters ?? []);
+        return ErasedGenericArgumentCount(concrete) < ErasedGenericArgumentCount(callee)
+            && InaccessibleCalleeRecovery.SatisfiesDeclaredConstraints(concrete) ? concrete : null;
+    }
+
+    private static bool CanSpecialize(TypeAnalysisContext previous, TypeAnalysisContext concrete)
+    {
+        if (IsSameType(previous, concrete))
+            return true;
+        if (previous is GenericInstanceTypeAnalysisContext oldInstance)
+            return concrete is GenericInstanceTypeAnalysisContext newInstance
+                && ReferenceEquals(oldInstance.GenericType, newInstance.GenericType)
+                && oldInstance.GenericArguments.Count == newInstance.GenericArguments.Count
+                && oldInstance.GenericArguments.Zip(newInstance.GenericArguments, CanSpecialize).All(match => match);
+        return IlGenerator.ContainsErasedSharedArgument(previous);
     }
 
     private static bool AreInterchangeable(List<MethodAnalysisContext> candidates)
@@ -1932,15 +1986,25 @@ public static class MetadataResolver
         return changed;
     }
 
-    private static int ErasedGenericArgumentCount(MethodAnalysisContext method)
+    // An argument supplied as the caller's T is an actual instantiation too; it must
+    // not be treated like the Object/enum placeholder of shared native code.
+    private static bool ContainsCanonicalArgument(TypeAnalysisContext argument) => argument switch
+    {
+        GenericParameterTypeAnalysisContext => false,
+        GenericInstanceTypeAnalysisContext instance => instance.GenericArguments.Any(ContainsCanonicalArgument),
+        _ => IlGenerator.ContainsErasedSharedArgument(argument),
+    };
+
+    internal static int ErasedGenericArgumentCount(MethodAnalysisContext method)
     {
         var count = method.DeclaringType is GenericInstanceTypeAnalysisContext declaring
-            ? declaring.GenericArguments.Count(argument => argument.FullName == "System.Object"
-                || argument is GenericParameterTypeAnalysisContext)
-            : 0;
+            ? declaring.GenericArguments.Count(ContainsCanonicalArgument)
+            : method.DeclaringType?.GenericParameters.Count ?? 0;
         if (method is ConcreteGenericMethodAnalysisContext concrete)
-            count += concrete.MethodGenericParameters.Count(argument => argument.FullName == "System.Object"
-                || argument is GenericParameterTypeAnalysisContext);
+            count += concrete.IsPartialInstantiation ? concrete.BaseMethodContext.GenericParameters.Count
+                : concrete.MethodGenericParameters.Count(ContainsCanonicalArgument);
+        else
+            count += method.GenericParameters.Count;
         return count;
     }
 
