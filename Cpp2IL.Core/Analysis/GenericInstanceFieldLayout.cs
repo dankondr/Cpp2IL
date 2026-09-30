@@ -155,6 +155,41 @@ public static class GenericInstanceFieldLayout
         return offset;
     }
 
+    // A value type's instance fields at their byte offsets: the metadata's
+    // FieldOffset when present, the computed sequential layout otherwise -
+    // the same walk InstanceSize takes, collected. Null when any member's
+    // layout is unknowable.
+    internal static List<(FieldAnalysisContext Field, long Offset, long Size)>? EnumerateInstanceFields(
+        TypeAnalysisContext type, int pointerSize)
+    {
+        var fields = type is GenericInstanceTypeAnalysisContext instance
+            ? instance.GenericType.Fields.Where(field => !field.IsStatic)
+                .Select(field => (FieldAnalysisContext)new ConcreteGenericFieldAnalysisContext(field, instance))
+            : type.Fields.Where(field => !field.IsStatic);
+
+        var layout = new List<(FieldAnalysisContext Field, long Offset, long Size)>();
+        long offset = 0;
+        foreach (var field in fields)
+        {
+            if (GetSizeAndAlignment(field.FieldType, pointerSize) is not var (size, alignment))
+                return null;
+
+            var metadataOffset = field.BackingData?.FieldOffset ?? field.Offset;
+            if (metadataOffset > 0)
+            {
+                layout.Add((field, metadataOffset, size));
+                offset = System.Math.Max(offset, metadataOffset + size);
+            }
+            else
+            {
+                offset = (offset + alignment - 1) & ~(alignment - 1);
+                layout.Add((field, offset, size));
+                offset += size;
+            }
+        }
+        return layout;
+    }
+
     private static (long Size, long Alignment)? GetSizeAndAlignment(TypeAnalysisContext fieldType, int pointerSize)
         => GetSizeAndAlignment(fieldType, pointerSize, []);
 

@@ -4067,10 +4067,20 @@ public static class IlGenerator
                 instructions.Add(literalType.FullName == "System.UIntPtr" ? CilOpCodes.Conv_U : CilOpCodes.Conv_I);
                 break;
             case Immediate immediate when literalType?.FullName == "System.Single":
-                instructions.Add(CilOpCodes.Ldc_R4, (float)immediate.Value);
+                // The register's bits, not its integer value: the float slot is
+                // what proves the immediate is a bit pattern.
+                instructions.Add(CilOpCodes.Ldc_R4,
+                    System.BitConverter.Int32BitsToSingle(unchecked((int)immediate.Value)));
                 break;
-            case Immediate immediate when literalType?.FullName == "System.Double":
-                instructions.Add(CilOpCodes.Ldc_R8, (double)immediate.Value);
+            case Immediate immediate when literalType?.FullName == "System.Double"
+                    && (immediate.Value == 0 || (ulong)immediate.Value > uint.MaxValue):
+                // An 8-byte bit pattern needs an X-register write: only a value
+                // too wide for W proves one (ImmediateProvenBytes); a folded
+                // movk may have hidden the high half, so a narrow immediate
+                // falls through to the diagnosed default below. Zero is the
+                // all-zero value under either width, so it still emits.
+                instructions.Add(CilOpCodes.Ldc_R8,
+                    System.BitConverter.Int64BitsToDouble(immediate.Value));
                 break;
             case Immediate immediate when literalType?.FullName is "System.Int64" or "System.UInt64":
                 if (immediate.Value is >= int.MinValue and <= int.MaxValue)
@@ -4117,6 +4127,32 @@ public static class IlGenerator
                 else
                     instructions.Add(CilOpCodes.Ldc_I8, immediate.Value);
                 instructions.Add(CilOpCodes.Conv_I);
+                break;
+            // A plain-data value-type slot the literal's bits provably cover takes
+            // them raw through a zero-initialized temp - the same machine-word store
+            // the binary made. Pointer-carrying or wider contracts fall through to
+            // the diagnosed default below.
+            case Immediate immediate when literalType is { } plainContract
+                    && callingContext != null
+                    && LiteralBitsFillContract(ImmediateProvenBytes(immediate),
+                        plainContract, callingContext)
+                    && TypeTokenUsableFrom(plainContract, callingContext):
+                EmitLiteralBitsLocal(plainContract, immediate.Value, ImmediateProvenBytes(immediate),
+                    method, instructions, callingContext);
+                break;
+            case FloatLiteral floatLiteral when literalType is { } floatContract
+                    && callingContext != null
+                    && LiteralBitsFillContract(4, floatContract, callingContext)
+                    && TypeTokenUsableFrom(floatContract, callingContext):
+                EmitLiteralBitsLocal(floatContract, (uint)System.BitConverter.SingleToInt32Bits(floatLiteral.Value),
+                    4, method, instructions, callingContext);
+                break;
+            case DoubleLiteral doubleLiteral when literalType is { } doubleContract
+                    && callingContext != null
+                    && LiteralBitsFillContract(8, doubleContract, callingContext)
+                    && TypeTokenUsableFrom(doubleContract, callingContext):
+                EmitLiteralBitsLocal(doubleContract, System.BitConverter.DoubleToInt64Bits(doubleLiteral.Value),
+                    8, method, instructions, callingContext);
                 break;
             // A literal in a non-primitive value-type or generic-parameter slot is a
             // dropped operand, not a real value; default(T) is the only honest filler.
@@ -5196,6 +5232,130 @@ public static class IlGenerator
         instructions.Add(CilOpCodes.Initobj, signature.ToTypeDefOrRef());
         instructions.Add(CilOpCodes.Ldloc, tempLocal);
     }
+
+    // A literal that provably covers a plain-data value-type slot is the slot's
+    // raw bytes: a zero-initialized temp, the proven bytes written field by
+    // field through stfld (a verifier-typed store - the machine-word stind a
+    // managed & cannot spell), the value pushed back. initobj guarantees
+    // definite assignment for the trailing ldloc and zeroes the bytes the
+    // register never proved.
+    private static void EmitLiteralBitsLocal(TypeAnalysisContext type, long bits, int provenBytes,
+        MethodDefinition method, CilInstructionCollection instructions, MethodAnalysisContext context)
+    {
+        var signature = type.ToTypeSignature();
+        var tempLocal = new CilLocalVariable(signature);
+        method.CilMethodBody!.LocalVariables.Add(tempLocal);
+        instructions.Add(CilOpCodes.Ldloca, tempLocal);
+        instructions.Add(CilOpCodes.Initobj, signature.ToTypeDefOrRef());
+        foreach (var (path, leaf, offset, _) in PlainContractFieldSlices(type, provenBytes, context)!)
+        {
+            instructions.Add(CilOpCodes.Ldloca, tempLocal);
+            // stfld consumes the leaf's declaring struct's address: ldflda
+            // every intermediate hop, not the leaf itself.
+            for (var hop = 0; hop < path.Count - 1; hop++)
+                instructions.Add(CilOpCodes.Ldflda, path[hop].ToFieldDescriptor());
+            EmitLiteralSlice(bits, leaf.FieldType, offset, instructions);
+            instructions.Add(CilOpCodes.Stfld, leaf.ToFieldDescriptor());
+        }
+        instructions.Add(CilOpCodes.Ldloc, tempLocal);
+    }
+
+    // The `provenBytes` slice of the literal at a leaf field's byte offset,
+    // pushed as the constant of the field's own declared type: stfld binds the
+    // raw bit pattern through the field, not a numeric conversion.
+    private static void EmitLiteralSlice(long bits, TypeAnalysisContext fieldType, long offset,
+        CilInstructionCollection instructions)
+    {
+        var shift = (int)offset * 8;
+        switch (fieldType.FullName)
+        {
+            case "System.Boolean" or "System.Byte" or "System.SByte":
+                instructions.Add(CilOpCodes.Ldc_I4, (int)((bits >> shift) & 0xFF));
+                break;
+            case "System.Char" or "System.Int16" or "System.UInt16":
+                instructions.Add(CilOpCodes.Ldc_I4, (int)((bits >> shift) & 0xFFFF));
+                break;
+            case "System.Int32" or "System.UInt32":
+                instructions.Add(CilOpCodes.Ldc_I4, unchecked((int)(bits >> shift)));
+                break;
+            case "System.Single":
+                instructions.Add(CilOpCodes.Ldc_R4,
+                    System.BitConverter.Int32BitsToSingle(unchecked((int)(bits >> shift))));
+                break;
+            case "System.Double":
+                instructions.Add(CilOpCodes.Ldc_R8, System.BitConverter.Int64BitsToDouble(bits >> shift));
+                break;
+            default:
+                instructions.Add(CilOpCodes.Ldc_I8, bits >> shift);
+                break;
+        }
+    }
+
+    // The contract's leaf scalar fields with their absolute byte offsets in
+    // the register image: `Path` is the nested field chain to ldflda through
+    // (empty for a top-level field). Null when the layout is unknowable or any
+    // leaf isn't a plain scalar a stfld can spell.
+    private static List<(List<FieldAnalysisContext> Path, FieldAnalysisContext Leaf, long Offset, int Size)>?
+        PlainContractFieldSlices(TypeAnalysisContext contract, int provenBytes, MethodAnalysisContext context)
+    {
+        var leaves = new List<(List<FieldAnalysisContext>, FieldAnalysisContext, long, int)>();
+        var path = new List<FieldAnalysisContext>();
+        return CollectPlainFieldSlices(contract, 0, provenBytes, path, leaves, context) && leaves.Count > 0
+            ? leaves
+            : null;
+    }
+
+    private static bool CollectPlainFieldSlices(TypeAnalysisContext container, long baseOffset, int provenBytes,
+        List<FieldAnalysisContext> path,
+        List<(List<FieldAnalysisContext> Path, FieldAnalysisContext Leaf, long Offset, int Size)> leaves,
+        MethodAnalysisContext context)
+    {
+        var fields = Analysis.GenericInstanceFieldLayout.EnumerateInstanceFields(container,
+            context.AppContext.Binary.PointerSizeBytes);
+        if (fields == null)
+            return false;
+        foreach (var (field, offset, size) in fields)
+        {
+            var absolute = baseOffset + offset;
+            if (absolute + size > provenBytes)
+                return false;
+            var fieldType = field.FieldType;
+            var scalar = ScalarFieldBytes(fieldType);
+            if (scalar > 0)
+            {
+                if (scalar != size || !FieldUsableFrom(field, context, writeAccess: true,
+                        receiverType: container))
+                    return false;
+                leaves.Add((new List<FieldAnalysisContext>(path) { field }, field, absolute, (int)size));
+                continue;
+            }
+            // A nested plain struct contributes its own leaves through a ldflda
+            // hop; anything else - enum slots (stfld cannot bind an Int32 to an
+            // enum-typed field), open parameters - is not spellable as bits.
+            if (fieldType is { IsValueType: true, IsEnumType: false }
+                and not GenericParameterTypeAnalysisContext
+                && FieldUsableFrom(field, context, receiverType: container))
+            {
+                path.Add(field);
+                var nested = CollectPlainFieldSlices(fieldType, absolute, provenBytes, path, leaves, context);
+                path.RemoveAt(path.Count - 1);
+                if (!nested)
+                    return false;
+                continue;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    private static int ScalarFieldBytes(TypeAnalysisContext type) => type.FullName switch
+    {
+        "System.Boolean" or "System.Byte" or "System.SByte" => 1,
+        "System.Char" or "System.Int16" or "System.UInt16" => 2,
+        "System.Int32" or "System.UInt32" or "System.Single" => 4,
+        "System.Int64" or "System.UInt64" or "System.Double" => 8,
+        _ => 0,
+    };
 
     private static bool HasEmittedLocalOfType(TypeAnalysisContext type, MethodDefinition method)
     {
@@ -6307,6 +6467,32 @@ public static class IlGenerator
             || TypeSizes.MinimumUnboxedSize(contract, context.AppContext.Binary.PointerSizeBytes)
                 <= context.AppContext.Binary.PointerSizeBytes;
 
+    // A nonzero literal fills a plain-data value-type slot raw when the
+    // register's proven bytes cover every field of the contract's layout - the
+    // same machine-word store the binary made, spelled through stfld so the
+    // verifier types each write. `provenBytes` is what the literal's own
+    // materialization proves: four for a W-register immediate or an
+    // `ldr s`/`fmov s` float, eight for an X-register-proven value or an
+    // `ldr d`/`fmov d` double. Pointer-carrying contracts (a literal there is
+    // an address or handle, not spellable bits), enum leaves (stfld cannot
+    // bind an Int32 to an enum-typed field), open parameters and unknowable
+    // layouts are not bit-plain. References, enums and primitive numerics
+    // never reach here: they are handled by their own literal arms above.
+    private static bool LiteralBitsFillContract(int provenBytes, TypeAnalysisContext contract,
+        MethodAnalysisContext context)
+    {
+        if (contract is not { IsValueType: true, IsEnumType: false } || ContractMayCarryPointer(contract))
+            return false;
+        return PlainContractFieldSlices(contract, provenBytes, context) is { Count: > 0 };
+    }
+
+    // The register width an `Immediate`'s materialization proves: a value a
+    // W register could not have produced means an X-register write, eight
+    // bytes; anything narrower is ambiguous (the collapse may have folded a
+    // movk's high bits away) and proves only four.
+    private static int ImmediateProvenBytes(Immediate immediate) =>
+        (ulong)immediate.Value > uint.MaxValue ? 8 : 4;
+
     private static TypeAnalysisContext? NullComparisonType(Instruction instruction, int operandIndex, MethodAnalysisContext context)
     {
         if (instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual)
@@ -6501,8 +6687,16 @@ public static class IlGenerator
                 => EmittedGenericCastOperandType(genericCast, genericCastTarget, context),
             ReferenceCast cast => EmittableLocalType(cast.Type, context),
             StringLiteral => context.AppContext.SystemTypes.SystemStringType,
-            FloatLiteral => context.AppContext.SystemTypes.SystemSingleType,
-            DoubleLiteral => context.AppContext.SystemTypes.SystemDoubleType,
+            FloatLiteral => expectedType != null
+                    && LiteralBitsFillContract(4, expectedType, context)
+                    && TypeTokenUsableFrom(expectedType, context)
+                ? expectedType
+                : context.AppContext.SystemTypes.SystemSingleType,
+            DoubleLiteral => expectedType != null
+                    && LiteralBitsFillContract(8, expectedType, context)
+                    && TypeTokenUsableFrom(expectedType, context)
+                ? expectedType
+                : context.AppContext.SystemTypes.SystemDoubleType,
             Vector128Literal => expectedType,
             RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext
                 => expectedType?.FullName is "System.RuntimeMethodHandle" or "System.RuntimeFieldHandle"
@@ -6653,6 +6847,11 @@ public static class IlGenerator
                 "System.Int64" or "System.UInt64" => literalType,
                 "System.Int32" or "System.UInt32" or "System.Boolean" or "System.Byte" or "System.SByte"
                     or "System.Int16" or "System.UInt16" or "System.Char" => systemTypes.SystemInt32Type,
+                _ when literalType != null
+                    && LiteralBitsFillContract(ImmediateProvenBytes(immediate),
+                        literalType, context)
+                    && TypeTokenUsableFrom(literalType, context)
+                    => literalType,
                 _ => immediate.Value is >= int.MinValue and <= int.MaxValue
                     ? systemTypes.SystemInt32Type
                     : systemTypes.SystemInt64Type,
@@ -6989,6 +7188,15 @@ public static class IlGenerator
             ? $"Ref struct cannot cross the value/reference boundary: dropped {from?.FullName ?? "unknown"} operand for {contract?.FullName ?? "unknown"} slot"
             : $"No legal conversion from {from?.FullName ?? "unavailable"} operand to {contract?.FullName ?? "unknown"} slot; substituting a synthetic default value.";
 
+    // Same text, with the withheld proven spelling named when a `&` operand's
+    // `Unsafe.AsPointer<T>` bridge exists but is gated off at this site.
+    private static string SlotDefaultReasonFor(TypeAnalysisContext? from, TypeAnalysisContext? contract,
+        MethodAnalysisContext? context)
+        => from is ByRefTypeAnalysisContext byRefOperand
+            && Analysis.UnsafeAsPointerEmission.BlockedReason(byRefOperand, contract, context) is { } blocked
+            ? $"No legal conversion from {from.FullName} operand to {contract?.FullName ?? "unknown"} slot; {blocked}; substituting a synthetic default value."
+            : SlotDefaultReason(from, contract);
+
     // Native width of the type's evaluation-stack representation: 4 for anything
     // narrowing to i32, 8 for 64-bit primitives, -1 for native-int/pointer/byref
     // values and 0 for non-integral stack kinds.
@@ -7097,17 +7305,22 @@ public static class IlGenerator
             fromWidth = -1;
         }
 
-        // `&T` into a native-int or unmanaged-pointer slot is the pinned-address
-        // idiom, but no verifiable IL converts `&` to `*`/nint - conv.* reject
-        // managed pointers outright (ECMA III.1.5 keeps the conversion
-        // unverifiable). The honest emission drops the address and defaults
-        // the slot - the same placeholder an unresolvable operand gets -
-        // instead of fabricating a value-as-pointer or leaving a raw `&`.
-        if (from is ByRefTypeAnalysisContext
+        // `&T` into a native-int or `void*` slot is the pinned-address idiom.
+        // conv.* reject managed pointers outright (ECMA III.1.5 keeps the
+        // conversion unverifiable), but `Unsafe.AsPointer<T>` is the verifiable
+        // spelling: it returns the address as `void*`, a native int to the
+        // verifier, carrying exactly the value the binary moved. A `T*` slot
+        // cannot accept `void*`, and an unproven site - no corlib helper or an
+        // element that cannot be a generic argument - keeps the diagnosed
+        // default rather than a fabricated value-as-pointer or a raw `&`.
+        if (from is ByRefTypeAnalysisContext byRefOperand
             && to is PointerTypeAnalysisContext or { FullName: "System.IntPtr" or "System.UIntPtr" })
         {
+            if (Analysis.UnsafeAsPointerEmission.ServesSlot(to)
+                && Analysis.UnsafeAsPointerEmission.TryEmit(byRefOperand, context, instructions))
+                return true;
             instructions.Add(CilOpCodes.Pop);
-            PushDefaultOf(to, method, instructions, context, SlotDefaultReason(from, to));
+            PushDefaultOf(to, method, instructions, context, SlotDefaultReasonFor(from, to, context));
             return true;
         }
 
@@ -7465,17 +7678,24 @@ public static class IlGenerator
         // immediately throws away (e.g. ldloca on a & local, which no C#
         // spelling renders - ilspy prints it as `ref ref x`).
         if (to is PointerTypeAnalysisContext)
-            return from is not ByRefTypeAnalysisContext && fromWidth != 0;
+            return from is not ByRefTypeAnalysisContext && fromWidth != 0
+                || from is ByRefTypeAnalysisContext byRefIntoVoid
+                    && Analysis.UnsafeAsPointerEmission.ServesSlot(to)
+                    && Analysis.UnsafeAsPointerEmission.Satisfiable(byRefIntoVoid.ElementType, context);
 
         if (from is ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
         {
             // An unmanaged pointer already is a native int; the opt-in convertByRef
             // conv.i or the target's own width rules apply. A managed pointer can
             // only reach a non-& slot through dereference, so the mirror is the
-            // element's own satisfiability.
+            // element's own satisfiability - except a native-int slot, which the
+            // & operand reaches through Unsafe.AsPointer<T> when that helper is
+            // available for the element (mirrors EmitStackCoerce).
             if (from is PointerTypeAnalysisContext)
                 return toWidth != 0;
             var element = ((ByRefTypeAnalysisContext)from).ElementType;
+            if (to.FullName is "System.IntPtr" or "System.UIntPtr")
+                return Analysis.UnsafeAsPointerEmission.Satisfiable(element, context);
             return element is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
                 && (!element.IsValueType || TypeTokenUsableFrom(element, context))
                 && StackContractSatisfied(element, to, context, convertByRef);
@@ -7544,7 +7764,8 @@ public static class IlGenerator
             {
                 var body = method.CilMethodBody!.Instructions;
                 body.Add(CilOpCodes.Pop);
-                PushDefaultOf(contract, method, body, context, SlotDefaultReason(emitted, contract));
+                if (!TryEmitAwaiterCall(operand, emitted, contract, method, context, locals))
+                    PushDefaultOf(contract, method, body, context, SlotDefaultReasonFor(emitted, contract, context));
             }
             return true;
         }
@@ -7558,7 +7779,8 @@ public static class IlGenerator
             && TryEmitReferentMemoLoad(unspellableField, contract, context, method, locals,
                 instructions, convertByRef))
             return true;
-        PushDefaultOf(contract, method, instructions, context, SlotDefaultReason(emitted, contract));
+        if (!TryEmitAwaiterCall(operand, emitted, contract, method, context, locals))
+            PushDefaultOf(contract, method, instructions, context, SlotDefaultReasonFor(emitted, contract, context));
         return true;
     }
 
@@ -7662,6 +7884,147 @@ public static class IlGenerator
                 SlotDefaultReason(field.Field.FieldType, contract));
         }
         return true;
+    }
+
+    // A value-typed source can only reach an awaiter-typed slot through the
+    // conversion the source-level await wrote: the awaitable's awaiter-producing
+    // call - T.GetAwaiter(), or DisposeAsync() for an `await using` disposable
+    // whose returned awaiter performs the switch. IL2CPP inlines that trivial
+    // wrapper - the binary moves the awaitable's bits into the awaiter slot -
+    // so where the operand's type declares a usable producer returning exactly
+    // the slot type, emitting the real call reproduces the conversion the
+    // binary made instead of standing a default in for it.
+    private static bool TryEmitAwaiterCall(IOperand operand, TypeAnalysisContext? emitted,
+        TypeAnalysisContext? contract, MethodDefinition method, MethodAnalysisContext context,
+        Dictionary<LocalVariable, CilLocalVariable> locals)
+    {
+        if (contract is not { IsValueType: true } or ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+            || emitted is not { IsValueType: true } or ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+            || ThisConstructorCallPlan.SameTypeIdentity(emitted, contract))
+            return false;
+        // Awaiter types sit nested inside the awaitable that produces them
+        // (UniTask.Awaiter, ReturnToSynchronizationContext.Awaiter). Requiring
+        // that pairing keeps this to the proven conversion - a parameterless
+        // method on an unrelated type could do real work, which a bit move
+        // never implies.
+        if (contract.DeclaringType is not { } contractDeclaring
+            || !ThisConstructorCallPlan.SameTypeIdentity(contractDeclaring, emitted))
+            return false;
+        if (operand is not LocalVariable local || !locals.TryGetValue(local, out var cilLocal))
+            return false;
+
+        var definition = (emitted as GenericInstanceTypeAnalysisContext)?.GenericType ?? emitted;
+        foreach (var candidate in definition.Methods)
+        {
+            if (candidate is not { IsStatic: false, Name: "GetAwaiter" or "DisposeAsync" } || candidate.Parameters.Count != 0)
+                continue;
+            var getAwaiter = emitted is GenericInstanceTypeAnalysisContext instance
+                ? new ConcreteGenericMethodAnalysisContext(candidate, instance.GenericArguments, [])
+                : candidate;
+            if (!ThisConstructorCallPlan.SameTypeIdentity(getAwaiter.ReturnType, contract)
+                || !CalleeUsableFrom(getAwaiter, context)
+                || !ProducerBodyIsBitCopy(candidate, getAwaiter, context))
+                continue;
+            var instructions = method.CilMethodBody!.Instructions;
+            instructions.Add(CilOpCodes.Ldloca, cilLocal);
+            instructions.Add(CilOpCodes.Call, getAwaiter.ToMethodDescriptor());
+            return true;
+        }
+        return false;
+    }
+
+    // The conversion above is only proven when the producer's own lifted body
+    // is the copy the binary made: no call, allocation or branch, and every
+    // write building the returned awaiter out of the receiver's fields - never
+    // into the receiver itself, which would be a side effect a bit move does
+    // not reproduce.
+    private static bool ProducerBodyIsBitCopy(MethodAnalysisContext candidate,
+        MethodAnalysisContext producer, MethodAnalysisContext context)
+    {
+        var body = producer;
+        if (producer is ConcreteGenericMethodAnalysisContext { MethodRef: null } concrete
+            && context.AppContext.ConcreteGenericMethodsByRef.Values.FirstOrDefault(variant =>
+                variant.BaseMethodContext == candidate
+                && variant.MethodGenericParameters.Count == 0
+                && variant.TypeGenericParameters.Count == concrete.TypeGenericParameters.Count
+                && variant.TypeGenericParameters.Zip(concrete.TypeGenericParameters).All(pair =>
+                    ThisConstructorCallPlan.SameTypeIdentity(pair.First, pair.Second))) is { } variant)
+            body = variant;
+        if (body.ConvertedIsil == null && body.UnderlyingPointer != 0)
+            body.Analyze();
+        var isil = body.ConvertedIsil;
+        if (isil is not { Count: > 0 })
+            return false;
+        var definitions = new Dictionary<IOperand, List<IOperand>>();
+        foreach (var instruction in isil)
+        {
+            if (instruction.Operands.Count < 2 || definitions.ContainsKey(instruction.Operands[0]))
+                continue;
+            definitions[instruction.Operands[0]] = instruction.Operands.Skip(1).ToList();
+        }
+        foreach (var instruction in isil)
+        {
+            switch (instruction.OpCode)
+            {
+                case OpCode.Move or OpCode.MemoryCopy or OpCode.MemoryMove or OpCode.MemorySet:
+                    if (instruction.Operands.Count == 0 || WriteRootsInReceiver(instruction.Operands[0], definitions))
+                        return false;
+                    break;
+                case OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
+                    or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And or OpCode.Or or OpCode.Xor
+                    or OpCode.Not or OpCode.Negate or OpCode.VectorMin or OpCode.VectorMax
+                    or OpCode.SignExtend32 or OpCode.Nop or OpCode.Return:
+                    break;
+                default:
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    // A write destination proves a receiver mutation only when its base address
+    // resolves back to `this`: field or memory destinations rooted in the
+    // receiver are side effects; roots in parameters, locals or the return
+    // buffer are the copy the await wrote.
+    private static bool WriteRootsInReceiver(IOperand destination,
+        Dictionary<IOperand, List<IOperand>> definitions)
+    {
+        return destination switch
+        {
+            FieldReference field => RootedInReceiver(field.Local, definitions, 0),
+            MemoryOperand memory => (memory.Base != null && RootedInReceiver(memory.Base, definitions, 0))
+                || (memory.Index != null && RootedInReceiver(memory.Index, definitions, 0)),
+            _ => false,
+        };
+    }
+
+    private static bool RootedInReceiver(IOperand operand,
+        Dictionary<IOperand, List<IOperand>> definitions, int depth)
+    {
+        if (depth > 12)
+            return true;
+        switch (operand)
+        {
+            case FieldReference field:
+                return RootedInReceiver(field.Local, definitions, depth + 1);
+            case MemoryOperand memory:
+                return (memory.Base != null && RootedInReceiver(memory.Base, definitions, depth + 1))
+                    || (memory.Index != null && RootedInReceiver(memory.Index, definitions, depth + 1));
+            case AddressOf address:
+                return RootedInReceiver(address.Target, definitions, depth + 1);
+            case LocalVariable local:
+                if (local.IsThis || local.Name == "this")
+                    return true;
+                if (definitions.TryGetValue(local, out var sources))
+                    return sources.Any(source => RootedInReceiver(source, definitions, depth + 1));
+                return false;
+            case Register register:
+                if (definitions.TryGetValue(register, out var registerSources))
+                    return registerSources.Any(source => RootedInReceiver(source, definitions, depth + 1));
+                return false;
+            default:
+                return false;
+        }
     }
 
     // Resolves the operand form a slot load emits and whether its emitted type
@@ -9010,7 +9373,7 @@ public static class IlGenerator
     // over corlib-internal marker types (List<System.Int32Enum>) that produce a token the
     // verifier rejects, so every token-bearing op routes through here instead of
     // CanEmitTypeToken alone.
-    private static bool TypeTokenUsableFrom(TypeAnalysisContext? type, MethodAnalysisContext? context) =>
+    internal static bool TypeTokenUsableFrom(TypeAnalysisContext? type, MethodAnalysisContext? context) =>
         type != null
             && !ContainsSharedEnumMarker(type)
             && CanEmitTypeToken(type)
