@@ -244,6 +244,39 @@ public class AddressIntoIntPtrSlotTests
     }
 
     [Test]
+    public void UnusedVendoredUnsafeAddressIntoIntPtrSlotEmitsAsPointer()
+    {
+        // A second `System.Runtime.CompilerServices.Unsafe` exists in the
+        // corpus (a vendored facade in an assembly the caller's members never
+        // bind), so the emitted module cannot see it - the corlib helper name
+        // is unambiguous and the proven spelling must still be emitted.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("AddrIntPtrUnused.dll");
+        InjectUnsafeAsPointer(app, module);
+        app.AssembliesByName["System.Xml"].InjectType(
+            "System.Runtime.CompilerServices", "Unsafe", app.SystemTypes.SystemObjectType,
+            R.TypeAttributes.Public | R.TypeAttributes.Abstract | R.TypeAttributes.Sealed);
+
+        var intLocal = new LocalVariable("value", new Register(null, "value"),
+            app.SystemTypes.SystemInt32Type);
+        var ptrLocal = new LocalVariable("intptr", new Register(null, "intptr"),
+            app.SystemTypes.SystemIntPtrType);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemIntPtrType, app.SystemTypes.SystemVoidType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, ptrLocal, new AddressOf(intLocal)),
+            new(1, OpCode.Return)], [intLocal, ptrLocal]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.That(CallsAsPointer(il, "AsPointer"), Is.True,
+            () => string.Join("\n", il.Select(i => i.ToString())));
+    }
+
+    [Test]
     public void ByRefElementAddressIntoIntPtrSlotKeepsDiagnostic()
     {
         // `intptr = (IntPtr)&cell` where cell is byte& - the operand is byte&&

@@ -1,10 +1,12 @@
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Linq;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.PE.DotNet.Cil;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils.AsmResolver;
+using ISIL = Cpp2IL.Core.ISIL;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -77,24 +79,188 @@ internal static class UnsafeAsPointerEmission
 
     // CS0433 territory: the type name `System.Runtime.CompilerServices.Unsafe`
     // exists in the real BCL and in the vendored NuGet assembly, and a caller
-    // whose own or directly-referenced assemblies expose more than one such
-    // type resolves the unqualified name ambiguously - no C# spelling of ours
-    // picks between them, so the site is unproven there. Transitive references
-    // do not reach the compile (the emitted csproj lists only the declared
-    // set), so the scan is caller plus `ReferencedAssemblies`, not a closure.
-    private static bool UnsafeAmbiguousFor(MethodAnalysisContext? context)
+    // whose compilation can see more than one such type resolves the
+    // unqualified name ambiguously - no C# spelling of ours picks between
+    // them, so the site is unproven there. What the compile sees is the
+    // caller's emitted reference set - the assemblies its members actually
+    // bind, not the metadata-declared list: an emitted module drops a declared
+    // reference nothing uses, so a declared-but-unused Unsafe never reaches
+    // the csproj. `ReferencedAssemblies` rebuilds that used set from the
+    // caller's decoded instructions and member signatures; the decode is the
+    // same pure call analysis performs, safe while bodies emit in parallel.
+    private static readonly ConcurrentDictionary<AssemblyAnalysisContext, HashSet<AssemblyAnalysisContext>>
+        ReferencedAssemblies = new();
+
+    private static bool UnsafeAmbiguousFor(MethodAnalysisContext? context) =>
+        context?.CustomAttributeAssembly is { } caller
+        && UnsafeCountFor(caller) > 1;
+
+    private static int UnsafeCountFor(AssemblyAnalysisContext caller)
     {
-        var callerDef = context?.CustomAttributeAssembly?.Definition;
-        if (callerDef == null)
-            return false;
-        var candidates = 0;
-        foreach (var reference in callerDef.ReferencedAssemblies.Append(callerDef))
+        var referenced = ReferencedAssemblies.GetOrAdd(caller, CollectReferenced);
+        var count = 0;
+        foreach (var candidate in caller.AppContext.AssembliesByName.Values)
         {
-            if (context.AppContext.ResolveContextForAssembly(reference) is { } assembly
-                && assembly.TopLevelTypes.Any(type => type.FullName == UnsafeFullName))
-                candidates++;
+            if (candidate.GetTypeByFullName(UnsafeFullName) != null
+                && (candidate == caller || referenced.Contains(candidate)))
+                count++;
         }
-        return candidates > 1;
+        return count;
+    }
+
+    private static HashSet<AssemblyAnalysisContext> CollectReferenced(AssemblyAnalysisContext caller)
+    {
+        var referenced = new HashSet<AssemblyAnalysisContext>();
+        void Mark(AssemblyAnalysisContext? assembly)
+        {
+            if (assembly != null)
+                referenced.Add(assembly);
+        }
+        void MarkType(TypeAnalysisContext? type)
+        {
+            switch (type)
+            {
+                case null:
+                    return;
+                case WrappedTypeAnalysisContext wrapped:
+                    MarkType(wrapped.ElementType);
+                    return;
+                case GenericInstanceTypeAnalysisContext generic:
+                    foreach (var argument in generic.GenericArguments)
+                        MarkType(argument);
+                    return;
+                default:
+                    Mark(type.DeclaringAssembly);
+                    return;
+            }
+        }
+        void MarkOperand(ISIL.IOperand? operand)
+        {
+            switch (operand)
+            {
+                case null:
+                    return;
+                case MethodAnalysisContext method:
+                    Mark(method.CustomAttributeAssembly);
+                    MarkType(method.DeclaringType);
+                    if (method is ConcreteGenericMethodAnalysisContext concrete)
+                    {
+                        foreach (var argument in concrete.TypeGenericParameters)
+                            MarkType(argument);
+                        foreach (var argument in concrete.MethodGenericParameters)
+                            MarkType(argument);
+                    }
+                    return;
+                case RuntimeClassTypeAnalysisContext runtimeType:
+                    MarkType(runtimeType.RepresentedType);
+                    return;
+                case RuntimeMethodInfoAnalysisContext runtimeMethod:
+                    Mark(runtimeMethod.RepresentedMethod.CustomAttributeAssembly);
+                    MarkType(runtimeMethod.RepresentedMethod.DeclaringType);
+                    return;
+                case RuntimeFieldInfoAnalysisContext runtimeField:
+                    Mark(runtimeField.RepresentedField.CustomAttributeAssembly);
+                    MarkType(runtimeField.RepresentedField.FieldType);
+                    return;
+                case TypeAnalysisContext type:
+                    MarkType(type);
+                    return;
+                case FieldAnalysisContext field:
+                    Mark(field.CustomAttributeAssembly);
+                    MarkType(field.FieldType);
+                    return;
+                case ISIL.FieldReference reference:
+                    MarkOperand(reference.Local);
+                    Mark(reference.Field.CustomAttributeAssembly);
+                    MarkType(reference.Field.FieldType);
+                    foreach (var container in reference.Containers)
+                    {
+                        Mark(container.CustomAttributeAssembly);
+                        MarkType(container.FieldType);
+                    }
+                    return;
+                case ISIL.SelectedFieldReference selector:
+                    MarkOperand(selector.Selector);
+                    foreach (var (_, field) in selector.Choices)
+                        MarkOperand(field);
+                    return;
+                case ISIL.ArrayElementFieldReference element:
+                    MarkOperand(element.Array);
+                    MarkOperand(element.Index);
+                    Mark(element.Field.CustomAttributeAssembly);
+                    return;
+                case ISIL.AddressOf address:
+                    MarkOperand(address.Target);
+                    return;
+                case ISIL.MemoryOperand memory:
+                    MarkOperand(memory.Base);
+                    MarkOperand(memory.Index);
+                    return;
+                case ISIL.ReferenceCast cast:
+                    MarkOperand(cast.Value);
+                    MarkType(cast.Type);
+                    return;
+                case ISIL.ArrayAccess access:
+                    MarkOperand(access.Array);
+                    MarkOperand(access.Index);
+                    return;
+                case ISIL.ArrayLength length:
+                    MarkOperand(length.Array);
+                    return;
+                case ISIL.LocalVariable local:
+                    MarkType(local.Type);
+                    return;
+                case ISIL.Instruction instruction:
+                    foreach (var inner in instruction.Operands)
+                        MarkOperand(inner);
+                    return;
+            }
+        }
+
+        foreach (var type in caller.Types)
+        {
+            MarkType(type);
+            foreach (var field in type.Fields)
+            {
+                Mark(field.CustomAttributeAssembly);
+                MarkType(field.FieldType);
+            }
+            foreach (var method in type.Methods)
+            {
+                MarkType(method.ReturnType);
+                foreach (var parameter in method.Parameters)
+                    MarkType(parameter.ParameterType);
+                foreach (var operand in method.ParameterOperands)
+                    MarkOperand(operand);
+                if (method.Definition == null || method.RawBytes.Length == 0
+                    || (MethodAnalysisContext.MaxMethodSizeBytes != -1
+                        && method.RawBytes.Length > MethodAnalysisContext.MaxMethodSizeBytes))
+                    continue;
+                List<ISIL.Instruction> isil;
+                try
+                {
+                    isil = caller.AppContext.InstructionSet.GetIsilFromMethod(method);
+                }
+                catch
+                {
+                    // A method that will not decode cannot prove its own
+                    // reference set; count every Unsafe-declaring assembly as
+                    // visible so the site stays on its diagnosed default.
+                    foreach (var candidate in caller.AppContext.AssembliesByName.Values)
+                    {
+                        if (candidate.GetTypeByFullName(UnsafeFullName) != null)
+                            Mark(candidate);
+                    }
+                    return referenced;
+                }
+                foreach (var instruction in isil)
+                {
+                    foreach (var operand in instruction.Operands)
+                        MarkOperand(operand);
+                }
+            }
+        }
+        return referenced;
     }
 
     /// <summary>
