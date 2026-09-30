@@ -425,4 +425,71 @@ public class ScalarLanePackTests
                 () => string.Join("\n", il.Select(i => i.ToString())));
         });
     }
+
+    [Test]
+    public void FieldChainLanesSurrenderVectorArgument()
+    {
+        // `ldr s0,[holder.F]; ldr s1,[holder.F+4]; ldr s2,[holder.F+8]; bl Echo`
+        // - every lane store reads the same field's matching lane, so the pack
+        // was only standing in for `holder.F` and the call arg is the field
+        // itself, not a packed local.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = Vector3(app);
+        var module = new ModuleDefinition("LanePack.dll");
+        SeedCorLibTypes(app, module, vector, app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemSingleType, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemVoidType);
+        var echo = Echo(app, module, vector);
+        var carrier = new InjectedTypeAnalysisContext(app.AssembliesByName["UnityEngine.CoreModule"],
+            "Tests", "Carrier", app.SystemTypes.SystemObjectType,
+            R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var carrierDef = new TypeDefinition("Tests", "Carrier",
+            TypeAttributes.Public | TypeAttributes.Class, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(carrierDef);
+        carrier.PutExtraData("AsmResolverType", carrierDef);
+        var mVec = new InjectedFieldAnalysisContext("m_vec", vector,
+            R.FieldAttributes.Public, carrier, 0);
+        carrier.Fields.Add(mVec);
+        var mVecDef = new FieldDefinition("m_vec", FieldAttributes.Public,
+            new FieldSignature(vector.GetExtraData<TypeDefinition>("AsmResolverType")!
+                .ToTypeSignature()));
+        carrierDef.Fields.Add(mVecDef);
+        mVec.PutExtraData("AsmResolverField", mVecDef);
+        var holder = new LocalVariable("holder", new Register(null, "holder"), carrier);
+        var lanes = vector.Fields.OfType<InjectedFieldAnalysisContext>().ToList();
+
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, new Register(null, "V0"), new FieldReference(lanes[0], holder, 0, [mVec])),
+            new(1, OpCode.Move, new Register(null, "V1"), new FieldReference(lanes[1], holder, 4, [mVec])),
+            new(2, OpCode.Move, new Register(null, "V2"), new FieldReference(lanes[2], holder, 8, [mVec])),
+            new(6, OpCode.CallVoid, echo, new Register(null, "V0")),
+            new(7, OpCode.Return)], [holder]);
+        caller.DominatorInfo = new DominatorInfo(caller.ControlFlowGraph!);
+
+        LocalVariables.CreateAll(caller);
+        LocalVariables.ResolveTypesAndFields(caller);
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            // The argument loads holder.m_vec directly.
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldfld
+                    && (i.Operand as IFieldDescriptor)?.Name?.ToString() == "m_vec"), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call
+                    && i.Operand is IMethodDescriptor named
+                    && named.Name?.ToString() == "Echo"), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            // No pack materializes - no lane stores, no synthetic default.
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stfld), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr && i.Operand is string text
+                    && (text.Contains("synthetic default value")
+                        || text.Contains("No legal conversion"))), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+        });
+    }
 }
