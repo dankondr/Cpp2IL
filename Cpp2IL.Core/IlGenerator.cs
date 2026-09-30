@@ -4065,7 +4065,13 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldc_R4,
                     System.BitConverter.Int32BitsToSingle(unchecked((int)immediate.Value)));
                 break;
-            case Immediate immediate when literalType?.FullName == "System.Double":
+            case Immediate immediate when literalType?.FullName == "System.Double"
+                    && (immediate.Value == 0 || (ulong)immediate.Value > uint.MaxValue):
+                // An 8-byte bit pattern needs an X-register write: only a value
+                // too wide for W proves one (ImmediateProvenBytes); a folded
+                // movk may have hidden the high half, so a narrow immediate
+                // falls through to the diagnosed default below. Zero is the
+                // all-zero value under either width, so it still emits.
                 instructions.Add(CilOpCodes.Ldc_R8,
                     System.BitConverter.Int64BitsToDouble(immediate.Value));
                 break;

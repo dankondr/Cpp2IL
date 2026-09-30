@@ -63,7 +63,7 @@ public class NonzeroLiteralEmissionTests
     {
         var il = method.CilMethodBody!.Instructions;
         Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
-                && i.Operand is string text && text.Contains("No legal conversion")), Is.True,
+                && i.Operand is string text && text.Contains("substituting")), Is.True,
             () => string.Join("\n", il.Select(i => i.ToString())));
     }
 
@@ -113,6 +113,49 @@ public class NonzeroLiteralEmissionTests
                 && i.Operand is double d && d == 1d), Is.True,
             () => string.Join("\n", il.Select(i => i.ToString())));
         AssertNoDiagnostic(method);
+    }
+
+    [Test]
+    public void NarrowNonzeroLiteralIntoDoubleSlotKeepsDiagnostic()
+    {
+        // Only an X-register write proves 8 bytes; a value any W register
+        // could have made may be a folded movk's residue, so a narrow
+        // immediate into a Double slot keeps its named note.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("NarrowDoubleSlot.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemDoubleType, app.SystemTypes.SystemVoidType);
+        var (caller, method) = Build(app, module, app.SystemTypes.SystemDoubleType,
+            new Immediate(0x3F800000));
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldc_R8), Is.False,
+            () => string.Join("\n", il.Select(i => i.ToString())));
+        AssertDiagnosticSubstitution(method);
+    }
+
+    [Test]
+    public void ZeroLiteralIntoDoubleSlotEmitsZeroBits()
+    {
+        // Zero is the all-zero value under either width reading, so it still
+        // emits the bit pattern without a diagnostic.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("ZeroDoubleSlot.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemDoubleType, app.SystemTypes.SystemVoidType);
+        var (caller, method) = Build(app, module, app.SystemTypes.SystemDoubleType,
+            new Immediate(0));
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldc_R8
+                && i.Operand is double d && d == 0d), Is.True,
+            () => string.Join("\n", il.Select(i => i.ToString())));
     }
 
     [Test]
