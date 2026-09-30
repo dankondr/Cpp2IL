@@ -67,7 +67,10 @@ public class IsilDumpOutputFormat : Cpp2IlOutputFormat
                             continue;
                         }
 
-                        foreach (var isilInsn in method.ConvertedIsil)
+                        // The graph is what the generator emits from: passes insert and remove
+                        // instructions there, and the converted list does not see them.
+                        foreach (var isilInsn in method.ControlFlowGraph?.Blocks.SelectMany(block => block.Instructions)
+                                     ?? method.ConvertedIsil)
                         {
                             typeDump.Append('\t').Append(isilInsn).AppendLine();
                         }

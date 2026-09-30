@@ -607,7 +607,19 @@ public static class IlGenerator
                             LoadFieldReceiver(field, context, method, locals, writeLine, forWrite: true);
                     }
 
-                    if (LoadOperandIntoSlot(instruction.Operands[1], field.Field.FieldType, context, method, locals, writeLine))
+                    // A literal zero proves one register's bytes, but the store's recorded
+                    // width can prove more: a 16-byte vector store, or adjacent zero stores
+                    // the resolver merged. When it covers the whole value-type field the
+                    // store is default(T).
+                    var zeroesWholeField = IsZeroConstant(instruction.Operands[1])
+                        && field.Field.FieldType is { IsValueType: true } zeroed
+                        && SlotTakesZeroLiteralDefault(zeroed) && TypeTokenUsableFrom(zeroed, context)
+                        && TypeSizes.MinimumUnboxedSize(zeroed, context.AppContext.Binary.PointerSizeBytes)
+                            is > 0 and var zeroedSize && field.AccessSize >= zeroedSize;
+                    if (zeroesWholeField)
+                        PushDefaultValue(field.Field.FieldType, method, instructions, context);
+                    if (zeroesWholeField
+                        || LoadOperandIntoSlot(instruction.Operands[1], field.Field.FieldType, context, method, locals, writeLine))
                         instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
                             field.Field.IsStatic ? field.Field.ToFieldDescriptor()
                                 : FieldDescriptorFor(field.Field, FieldReceiverType(field, context)));
@@ -4271,8 +4283,15 @@ public static class IlGenerator
                 LoadLocal(referenceCast.Value, method, locals, callingContext);
                 // A cast to the value's own type verifies without the opcode.
                 if (!ThisConstructorCallPlan.SameTypeIdentity(castValueType, castTarget))
+                {
+                    // isinst/castclass take an object reference: a value of a generic
+                    // parameter type is boxed first, as the C# compiler emits it (for a
+                    // reference-type argument the box is the reference itself).
+                    if (castValueType is GenericParameterTypeAnalysisContext && CanEmitTypeToken(castValueType))
+                        instructions.Add(CilOpCodes.Box, castValueType.ToTypeSignature().ToTypeDefOrRef());
                     instructions.Add(referenceCast.NullOnFailure ? CilOpCodes.Isinst : CilOpCodes.Castclass,
                         castTarget.ToTypeSignature().ToTypeDefOrRef());
+                }
                 break;
             case ArrayLength arrayLength:
                 LoadArrayBase(arrayLength.Array, method, locals, callingContext);
@@ -8220,7 +8239,7 @@ public static class IlGenerator
             candidates.Add(flat);
         foreach (var found in candidates)
         {
-            if (found.Containers.Count == 0 && !FieldStoreWidthMatches(memory, found.Field, context))
+            if (found.Containers.Count == 0 && !FieldStoreWidthMatches(memory, source, found.Field, context))
                 continue;
             // A nested store spells `receiver.c1...cN.leaf = v`: the first
             // ldflda reads `receiver.c1`, so the receiver itself must already
@@ -9113,11 +9132,20 @@ public static class IlGenerator
     // 16-byte vector spills, so they match only fields of exactly that size;
     // a narrower target would be clobbered and a wider one only partly
     // written.
-    private static bool FieldStoreWidthMatches(MemoryOperand memory, FieldAnalysisContext field,
+    private static bool FieldStoreWidthMatches(MemoryOperand memory, IOperand source, FieldAnalysisContext field,
         MethodAnalysisContext context)
     {
         var size = TypeSizes.MinimumUnboxedSize(field.FieldType, context.AppContext.Binary.PointerSizeBytes);
-        return memory.AccessSize == 0 ? size == 16 : size == memory.AccessSize;
+        if (memory.AccessSize != 0)
+            return size == memory.AccessSize;
+        // A width-0 store is float-family (str s/d/q): the register it came from is the
+        // width, and a scalar source says which one - `str s0` writes a float field whole.
+        return size == 16 || EmittedOperandType(source, context)?.FullName switch
+        {
+            "System.Single" => size == 4 && field.FieldType.FullName == "System.Single",
+            "System.Double" => size == 8 && field.FieldType.FullName == "System.Double",
+            _ => false,
+        };
     }
 
     private static FieldReference? NestedValueFieldForContract(FieldReference field,
@@ -9645,8 +9673,13 @@ public static class IlGenerator
             return;
         }
 
-        switch (instruction.OpCode)
-        {
+        // A block write covering exactly a proven value type through managed
+        // pointers to that type is the type's assignment - verifiable IL, and
+        // barrier-correct where cpblk would skip a managed-reference field.
+        if (!TryEmitTypedBlockOperation(instruction, destination, content, count, context, method, locals,
+                writeLine))
+            switch (instruction.OpCode)
+            {
             case OpCode.MemoryCopy:
                 // cpblk accepts a managed pointer or native int for both addresses.
                 EmitBlockPointerOperand(destination, false, context, method, locals, writeLine);
@@ -9736,6 +9769,51 @@ public static class IlGenerator
             ? unsigned ? CilOpCodes.Conv_U8 : CilOpCodes.Conv_I8
             : unsigned ? CilOpCodes.Conv_U4 : CilOpCodes.Conv_I4);
     }
+
+    // A block copy or zeroing whose extent equals a proven value type's size,
+    // on managed pointers to that type, is the type's assignment: ldobj/stobj
+    // for a copy (memmove's ordering is the same single typed read+write),
+    // initobj for a zeroing. Returns false when no such type is proven - the
+    // raw cpblk/initblk path handles those.
+    private static bool TryEmitTypedBlockOperation(Instruction instruction, IOperand destination,
+        IOperand content, IOperand count, MethodAnalysisContext context, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        if (count is not Immediate { Value: > 0 } byteCount
+            || BlockCopyPointee(destination, context) is not { IsValueType: true } pointee
+            || pointee is GenericInstanceTypeAnalysisContext or GenericParameterTypeAnalysisContext
+            || pointee.Definition?.Size is not { } pointeeSize
+            || byteCount.Value != pointeeSize
+            || !TypeTokenUsableFrom(pointee, context))
+            return false;
+
+        var instructions = method.CilMethodBody!.Instructions;
+        var pointeeRef = pointee.ToTypeSignature().ToTypeDefOrRef();
+        switch (instruction.OpCode)
+        {
+            case OpCode.MemoryCopy or OpCode.MemoryMove
+                when ThisConstructorCallPlan.SameTypeIdentity(pointee, BlockCopyPointee(content, context)):
+                EmitBlockPointerOperand(destination, false, context, method, locals, writeLine);
+                EmitBlockPointerOperand(content, false, context, method, locals, writeLine);
+                instructions.Add(CilOpCodes.Ldobj, pointeeRef);
+                instructions.Add(CilOpCodes.Stobj, pointeeRef);
+                return true;
+            case OpCode.MemorySet when content is Immediate { Value: 0 }:
+                EmitBlockPointerOperand(destination, false, context, method, locals, writeLine);
+                instructions.Add(CilOpCodes.Initobj, pointeeRef);
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // The element type a block-op address provably holds when it emits `&T`:
+    // only a managed pointer carries a referent the type system can name - a
+    // native-int address (PointerType local, raw Immediate) does not.
+    private static TypeAnalysisContext? BlockCopyPointee(IOperand operand, MethodAnalysisContext context) =>
+        EmittedOperandType(operand, context) is ByRefTypeAnalysisContext byRef
+            ? byRef.ElementType
+            : null;
 
     // Integer ops on operands that cannot legally sit in an integer slot are
     // native idioms the lifter mistyped: `&slot | N`/`&slot + N` names a field

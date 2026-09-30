@@ -730,11 +730,17 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         InlinedListAddRecovery.Run(this);
 
         // ARM64 ELF block-memory imports (`bl` into a GOT veneer whose relocated symbol
-        // is memcpy/memset/memmove) become dedicated block ops. This runs last so it
-        // sees the final operand forms - after copy forwarding, SSA removal and local
+        // is memcpy/memset/memmove) become dedicated block ops, scalar imports get a
+        // managed equivalent or their symbol name. This runs last so it sees the
+        // final operand forms - after copy forwarding, SSA removal and local
         // coalescing - which is what emission will see too, and destination/provenance
         // checks cannot drift between the two.
         BlockMemoryImportRecovery.Run(this);
+
+        // The stack protector's canary compare + __stack_chk_fail call survives as
+        // dead machinery once imports are named; excise it while dead-code
+        // elimination still runs below to sweep the freed operands.
+        StackProtectorRecovery.Run(this);
 
         // Some helpers only acquire their canonical key-function name in late recovery. This final
         // cleanup prevents runtime-only metadata/class-init helpers from reaching managed IL.

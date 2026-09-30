@@ -549,7 +549,15 @@ public class BlockMemoryImportRecoveryTests
         var definition = Definition(module, "Copy", _app.SystemTypes.SystemVoidType, parameters);
         var (_, method) = EmitAssembly(caller, definition, module);
 
-        Assert.That(definition.CilMethodBody!.Instructions.Any(i => i.OpCode == CilOpCodes.Cpblk), Is.True);
+        // A one-byte copy between byte& operands is Byte's typed assignment
+        // (ldobj/stobj); larger extents keep cpblk.
+        if (count == 1)
+        {
+            Assert.That(definition.CilMethodBody!.Instructions.Any(i => i.OpCode == CilOpCodes.Ldobj), Is.True);
+            Assert.That(definition.CilMethodBody!.Instructions.Any(i => i.OpCode == CilOpCodes.Stobj), Is.True);
+        }
+        else
+            Assert.That(definition.CilMethodBody!.Instructions.Any(i => i.OpCode == CilOpCodes.Cpblk), Is.True);
 
         var dst = Enumerable.Repeat((byte)0xEE, 16).ToArray();
         var src = Enumerable.Range(0, 16).Select(i => (byte)i).ToArray();
@@ -716,5 +724,280 @@ public class BlockMemoryImportRecoveryTests
         Assert.That(() => method.Invoke(null, [dst, src]),
             Throws.TypeOf<R.TargetInvocationException>(), "the body must throw, not silently copy");
         Assert.That(dst, Is.EqualTo(new[] { "a", "b" }), "destination must be untouched");
+    }
+
+    // A block write covering exactly a proven value type's bytes is the type's
+    // assignment: ldobj/stobj when both addresses hold that type, initobj for a
+    // zeroing - verifiable IL where cpblk/initblk are not.
+    private TypeAnalysisContext FixtureDecimal() =>
+        _app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Decimal")
+        ?? throw new InvalidOperationException("fixture mscorlib lacks System.Decimal");
+
+    // EmitModule's placeholder carries no layout; four int fields give the test
+    // struct the 16 bytes the metadata type declares.
+    private static TypeDefinition DecimalDef(ModuleDefinition module, TypeAnalysisContext decimal_)
+    {
+        var def = decimal_.GetExtraData<TypeDefinition>("AsmResolverType")!;
+        for (var i = 0; i < 4; i++)
+            def.Fields.Add(new FieldDefinition($"f{i}", FieldAttributes.Public,
+                module.CorLibTypeFactory.Int32));
+        return def;
+    }
+
+    [Test]
+    public void MemoryCopyWholeValueTypeEmitsLdobjStobj()
+    {
+        var decimal_ = FixtureDecimal();
+        Assert.That(decimal_.IsValueType && decimal_.Definition?.Size == 16, Is.True,
+            "the fixture must give System.Decimal its metadata size");
+
+        var byref = new ByRefTypeAnalysisContext(decimal_);
+        var parameters = new (TypeAnalysisContext Type, string Name)[] { (byref, "dst"), (byref, "src") };
+        var caller = RunnerMethod("TypedCopy", _app.SystemTypes.SystemVoidType, parameters, out var locals);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.MemoryCopy, locals[0], locals[1], new Immediate(16)),
+            new Instruction(1, OpCode.Return),
+        ]);
+
+        var module = NewModule(decimal_);
+        DecimalDef(module, decimal_);
+        var definition = Definition(module, "TypedCopy", _app.SystemTypes.SystemVoidType, parameters);
+        var (loaded, method) = EmitAssembly(caller, definition, module);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldobj), Is.True,
+            "a whole-struct copy between same-typed pointers emits ldobj");
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stobj), Is.True);
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Cpblk), Is.False,
+            "a proven same-type copy must not degrade to cpblk");
+
+        var runtimeDecimal = loaded.GetType("System.Decimal")!;
+        var fields = runtimeDecimal.GetFields();
+        var dst = Activator.CreateInstance(runtimeDecimal)!;
+        var src = Activator.CreateInstance(runtimeDecimal)!;
+        for (var i = 0; i < fields.Length; i++)
+            fields[i].SetValue(src, 0x11 * (i + 1));
+        object[] args = [dst, src];
+        method.Invoke(null, args);
+        foreach (var field in fields)
+            Assert.That(field.GetValue(args[0]), Is.EqualTo(field.GetValue(args[1])),
+                $"field {field.Name} must copy");
+    }
+
+    [Test]
+    public void MemorySetZeroOnWholeValueTypeEmitsInitobj()
+    {
+        var decimal_ = FixtureDecimal();
+        var byref = new ByRefTypeAnalysisContext(decimal_);
+        var parameters = new (TypeAnalysisContext Type, string Name)[] { (byref, "dst") };
+        var caller = RunnerMethod("TypedInit", _app.SystemTypes.SystemVoidType, parameters, out var locals);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.MemorySet, locals[0], new Immediate(0), new Immediate(16)),
+            new Instruction(1, OpCode.Return),
+        ]);
+
+        var module = NewModule(decimal_);
+        DecimalDef(module, decimal_);
+        var definition = Definition(module, "TypedInit", _app.SystemTypes.SystemVoidType, parameters);
+        var (loaded, method) = EmitAssembly(caller, definition, module);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Initobj), Is.True,
+            "zeroing a whole struct emits initobj");
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Initblk), Is.False);
+
+        var runtimeDecimal = loaded.GetType("System.Decimal")!;
+        var dst = Activator.CreateInstance(runtimeDecimal)!;
+        foreach (var field in runtimeDecimal.GetFields())
+            field.SetValue(dst, 0x77);
+        object[] args = [dst];
+        method.Invoke(null, args);
+        foreach (var field in runtimeDecimal.GetFields())
+            Assert.That(field.GetValue(args[0]), Is.EqualTo(0), $"field {field.Name} must be zeroed");
+    }
+
+    [Test]
+    public void MemoryCopyValueTypeWithWrongSizeStaysRaw()
+    {
+        var decimal_ = FixtureDecimal();
+        var byref = new ByRefTypeAnalysisContext(decimal_);
+        var parameters = new (TypeAnalysisContext Type, string Name)[] { (byref, "dst"), (byref, "src") };
+        var caller = RunnerMethod("PartialCopy", _app.SystemTypes.SystemVoidType, parameters, out var locals);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.MemoryCopy, locals[0], locals[1], new Immediate(8)),
+            new Instruction(1, OpCode.Return),
+        ]);
+
+        var module = NewModule(decimal_);
+        DecimalDef(module, decimal_);
+        var definition = Definition(module, "PartialCopy", _app.SystemTypes.SystemVoidType, parameters);
+        var (loaded, method) = EmitAssembly(caller, definition, module);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldobj), Is.False,
+            "a count that is not exactly the type's size is not a typed assignment");
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Cpblk), Is.True);
+
+        var runtimeDecimal = loaded.GetType("System.Decimal")!;
+        var fields = runtimeDecimal.GetFields();
+        var dst = Activator.CreateInstance(runtimeDecimal)!;
+        var src = Activator.CreateInstance(runtimeDecimal)!;
+        for (var i = 0; i < fields.Length; i++)
+        {
+            fields[i].SetValue(dst, 0x99 * (i + 1));
+            fields[i].SetValue(src, 0x11 * (i + 1));
+        }
+        object[] args = [dst, src];
+        method.Invoke(null, args);
+        Assert.That(fields[0].GetValue(args[0]), Is.EqualTo(0x11), "first half copies");
+        Assert.That(fields[1].GetValue(args[0]), Is.EqualTo(0x22), "first half copies");
+        Assert.That(fields[2].GetValue(args[0]), Is.EqualTo(0x99 * 3), "second half untouched");
+        Assert.That(fields[3].GetValue(args[0]), Is.EqualTo(0x99 * 4), "second half untouched");
+    }
+
+    [Test]
+    public void MemoryCopyValueTypeWithDifferentSourceTypeStaysRaw()
+    {
+        var decimal_ = FixtureDecimal();
+        var parameters = new (TypeAnalysisContext Type, string Name)[]
+        {
+            (new ByRefTypeAnalysisContext(decimal_), "dst"),
+            (new ByRefTypeAnalysisContext(_int64), "src"),
+        };
+        var caller = RunnerMethod("MixedCopy", _app.SystemTypes.SystemVoidType, parameters, out var locals);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.MemoryCopy, locals[0], locals[1], new Immediate(16)),
+            new Instruction(1, OpCode.Return),
+        ]);
+
+        var module = NewModule(decimal_, _int64);
+        DecimalDef(module, decimal_);
+        var definition = Definition(module, "MixedCopy", _app.SystemTypes.SystemVoidType, parameters);
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldobj), Is.False,
+            "source and destination of different types cannot spell a typed assignment");
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Cpblk), Is.True);
+    }
+
+    // ---------- Import naming and scalar out-parameter imports ----------
+
+    // Any import the resolver names gets a StringLiteral target, so an unproven
+    // use stays diagnosed as `Unknown call target operand: "name"` instead of an
+    // anonymous address.
+    [Test]
+    public void ResolvedButUnhandledImportGetsNamedTarget()
+    {
+        var caller = CallerWithUnresolvedCall(out var call);
+        BlockMemoryImportRecovery.Run(caller, va => va == 0x10000 ? "qsort" : null);
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+        Assert.That(call.Operands[0], Is.TypeOf<StringLiteral>());
+        Assert.That(((StringLiteral)call.Operands[0]).Value, Is.EqualTo("qsort"));
+    }
+
+    [Test]
+    public void UnresolvedCallTargetStaysUnnamed()
+    {
+        var caller = CallerWithUnresolvedCall(out var call);
+        BlockMemoryImportRecovery.Run(caller, _ => null);
+        Assert.That(call.Operands[0], Is.TypeOf<Immediate>());
+    }
+
+    // A call already carrying a name (e.g. named by an earlier run) is still
+    // eligible for a rewrite.
+    [Test]
+    public void AlreadyNamedImportStillRewrites()
+    {
+        var caller = CallerWithUnresolvedCall(out var call);
+        call.SetOperand(0, new StringLiteral("memset"));
+        call.SetOperand(3, new Immediate(0));
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memset"), Is.True);
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.MemorySet));
+    }
+
+    // Inject a System.Math member into the fixture corlib (the test game's
+    // mscorlib is minimal and lacks Truncate/Sin/Cos). Returns the member.
+    private MethodAnalysisContext InjectMathMember(string name, TypeAnalysisContext type,
+        params TypeAnalysisContext[] paramTypes)
+    {
+        var math = _app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Math")!;
+        var member = new InjectedMethodAnalysisContext(math, name, type,
+            R.MethodAttributes.Public | R.MethodAttributes.Static, paramTypes);
+        math.Methods.Add(member);
+        return member;
+    }
+
+    // modf(x, *iptr): the managed shape is `Math.Truncate(x)` stored through the
+    // out pointer, and the result is `x - trunc(x)`.
+    [Test]
+    public void ModfRewritesToTruncateAndSubtract()
+    {
+        InjectMathMember("Truncate", _app.SystemTypes.SystemDoubleType, _app.SystemTypes.SystemDoubleType);
+        var caller = CallerWithUnresolvedCall(out var call);
+        var slot = new LocalVariable("iptr", new Register(null, "stack"), _app.SystemTypes.SystemDoubleType);
+        caller.Locals!.Add(slot);
+        call.SetOperand(2, new AddressOf(slot));
+
+        BlockMemoryImportRecovery.Run(caller, _ => "modf");
+
+        var instructions = caller.ControlFlowGraph!.Instructions;
+        var truncate = instructions.FirstOrDefault(i =>
+            i.OpCode == OpCode.Call && i.Operands[0] is MethodAnalysisContext);
+        Assert.That(truncate, Is.Not.Null, "a Math.Truncate call must be inserted");
+        Assert.That(((MethodAnalysisContext)truncate!.Operands[0]).Name, Is.EqualTo("Truncate"));
+        Assert.That(truncate.Operands[2], Is.SameAs(call.Operands[1]),
+            "Truncate's argument is the Subtract's left-hand side (x)");
+        var store = instructions.FirstOrDefault(i =>
+            i.OpCode == OpCode.Move && ReferenceEquals(i.Destination, slot));
+        Assert.That(store, Is.Not.Null, "the out pointer's store must be inserted");
+        Assert.That(store!.Operands[1], Is.SameAs(truncate.Operands[1]),
+            "the stored value is Truncate's result");
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.Subtract));
+        Assert.That(call.Operands[2], Is.SameAs(truncate.Operands[1]));
+    }
+
+    // sincos(x, *s, *c): two managed calls and two stores; the void import's
+    // own result slot drops away with the call.
+    [Test]
+    public void SincosRewritesToSinAndCos()
+    {
+        InjectMathMember("Sin", _app.SystemTypes.SystemDoubleType, _app.SystemTypes.SystemDoubleType);
+        InjectMathMember("Cos", _app.SystemTypes.SystemDoubleType, _app.SystemTypes.SystemDoubleType);
+        var caller = CallerWithUnresolvedCall(out var call);
+        var sin = new LocalVariable("s", new Register(null, "stack"), _app.SystemTypes.SystemDoubleType);
+        var cos = new LocalVariable("c", new Register(null, "stack"), _app.SystemTypes.SystemDoubleType);
+        caller.Locals!.Add(sin);
+        caller.Locals!.Add(cos);
+        call.SetOperand(2, new AddressOf(sin));
+        call.SetOperand(3, new AddressOf(cos));
+
+        BlockMemoryImportRecovery.Run(caller, _ => "sincos");
+
+        var instructions = caller.ControlFlowGraph!.Instructions;
+        var names = instructions.Where(i => i.OpCode == OpCode.Call && i.Operands[0] is MethodAnalysisContext)
+            .Select(i => ((MethodAnalysisContext)i.Operands[0]).Name).ToList();
+        Assert.That(names, Is.EqualTo(new[] { "Sin", "Cos" }));
+        Assert.That(instructions.Any(i => i.OpCode == OpCode.Move && ReferenceEquals(i.Destination, sin)), Is.True);
+        Assert.That(instructions.Any(i => i.OpCode == OpCode.Move && ReferenceEquals(i.Destination, cos)), Is.True);
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.Nop));
+    }
+
+    // An out pointer that cannot be proven - an opaque integer local here -
+    // keeps the call as a named diagnostic rather than emitting a raw store.
+    [Test]
+    public void UnprovenModfOutPointerStaysNamedCall()
+    {
+        var caller = CallerWithUnresolvedCall(out var call);
+        call.SetOperand(2, Reg("X0", _int64)); // opaque pointer value, no provenance
+
+        BlockMemoryImportRecovery.Run(caller, _ => "modf");
+
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+        Assert.That(call.Operands[0], Is.TypeOf<StringLiteral>());
+        Assert.That(((StringLiteral)call.Operands[0]).Value, Is.EqualTo("modf"));
+        Assert.That(caller.ControlFlowGraph!.Instructions.Any(i =>
+            i.OpCode == OpCode.Call && i.Operands[0] is MethodAnalysisContext), Is.False,
+            "no managed math call may be emitted when the out pointer is unproven");
     }
 }

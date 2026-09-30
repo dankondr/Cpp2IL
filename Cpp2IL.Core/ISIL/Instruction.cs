@@ -63,6 +63,11 @@ public class Instruction : IOperand
     // still needs the width to distinguish a whole struct from one of its fields.
     public int? NativeMemoryAccessSize;
 
+    // Bytes a store writes, from the register it stores. Float and vector stores keep
+    // AccessSize 0 on their memory operand (a convention other passes read); this is
+    // their real width.
+    public int? NativeStoreWidthBytes;
+
     public bool IsFallThrough =>
         OpCode switch
         {
