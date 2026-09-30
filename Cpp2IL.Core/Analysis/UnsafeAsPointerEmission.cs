@@ -1,12 +1,10 @@
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Linq;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.PE.DotNet.Cil;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils.AsmResolver;
-using LibCpp2IL.Metadata;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -79,33 +77,24 @@ internal static class UnsafeAsPointerEmission
 
     // CS0433 territory: the type name `System.Runtime.CompilerServices.Unsafe`
     // exists in the real BCL and in the vendored NuGet assembly, and a caller
-    // whose reference closure can see both resolves the unqualified name
-    // ambiguously - no C# spelling of ours picks between them, so the site is
-    // unproven there. An `Unsafe` declared in the caller's own assembly would
-    // also shadow the corlib helper's binding, so the count includes self.
+    // whose own or directly-referenced assemblies expose more than one such
+    // type resolves the unqualified name ambiguously - no C# spelling of ours
+    // picks between them, so the site is unproven there. Transitive references
+    // do not reach the compile (the emitted csproj lists only the declared
+    // set), so the scan is caller plus `ReferencedAssemblies`, not a closure.
     private static bool UnsafeAmbiguousFor(MethodAnalysisContext? context)
     {
         var callerDef = context?.CustomAttributeAssembly?.Definition;
         if (callerDef == null)
             return false;
-        var visible = new HashSet<Il2CppAssemblyDefinition> { callerDef };
-        CollectReferences(callerDef, visible);
         var candidates = 0;
-        foreach (var reference in visible)
+        foreach (var reference in callerDef.ReferencedAssemblies.Append(callerDef))
         {
-            if (context!.AppContext.ResolveContextForAssembly(reference) is { } assembly
+            if (context.AppContext.ResolveContextForAssembly(reference) is { } assembly
                 && assembly.TopLevelTypes.Any(type => type.FullName == UnsafeFullName))
                 candidates++;
         }
         return candidates > 1;
-    }
-
-    private static void CollectReferences(Il2CppAssemblyDefinition assembly,
-        HashSet<Il2CppAssemblyDefinition> visited)
-    {
-        foreach (var reference in assembly.ReferencedAssemblies)
-            if (visited.Add(reference))
-                CollectReferences(reference, visited);
     }
 
     /// <summary>
