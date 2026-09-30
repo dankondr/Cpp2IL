@@ -1,9 +1,11 @@
+using System.Collections.Generic;
 using System.Linq;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
 using AsmResolver.PE.DotNet.Metadata.Tables;
+using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using LibCpp2IL.BinaryStructures;
@@ -135,6 +137,109 @@ public class AddressIntoIntPtrSlotTests
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
                     && i.Operand is string text && text.Contains("No legal conversion")), Is.False,
                 () => string.Join("\n", il.Select(i => i.ToString())));
+        });
+    }
+
+    private static (MethodAnalysisContext caller, MethodDefinition method) StateMachineMoveNext(
+        ApplicationAnalysisContext app, ModuleDefinition module, List<Instruction> instructions,
+        List<LocalVariable> locals, string name)
+    {
+        var sm = new InjectedTypeAnalysisContext(app.AssembliesByName["UnityEngine.CoreModule"],
+            "Tests", name, app.SystemTypes.SystemValueTypeType,
+            R.TypeAttributes.Public | R.TypeAttributes.Sealed);
+        var caller = sm.InjectMethodContext("MoveNext", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Private);
+        caller.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        caller.Locals = locals;
+        caller.ParameterLocals = [];
+        caller.AnalysisWarnings = [];
+        var type = new TypeDefinition("Tests", name, TypeAttributes.Public | TypeAttributes.Sealed
+            | TypeAttributes.SequentialLayout,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType"));
+        module.TopLevelTypes.Add(type);
+        var method = new MethodDefinition("MoveNext", MethodAttributes.Private,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        type.Methods.Add(method);
+        return (caller, method);
+    }
+
+    [Test]
+    public void StateMachineMoveNextAddressIntoIntPtrSlotKeepsDiagnostic()
+    {
+        // `intptr = (IntPtr)&value` inside a compiler-generated state machine's
+        // MoveNext - ilspy renders the generated body without an unsafe
+        // context, so a `void*` call there cannot compile. The site keeps its
+        // diagnosed default and the note names the withheld spelling.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("AddrIntPtrMoveNext.dll");
+        InjectUnsafeAsPointer(app, module);
+
+        var intLocal = new LocalVariable("value", new Register(null, "value"),
+            app.SystemTypes.SystemInt32Type);
+        var ptrLocal = new LocalVariable("intptr", new Register(null, "intptr"),
+            app.SystemTypes.SystemIntPtrType);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemIntPtrType, app.SystemTypes.SystemVoidType);
+        var (caller, method) = StateMachineMoveNext(app, module, [
+            new(0, OpCode.Move, ptrLocal, new AddressOf(intLocal)),
+            new(1, OpCode.Return)], [intLocal, ptrLocal], "<FetchAsync>d__3");
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(CallsAsPointer(il, "AsPointer"), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("No legal conversion")
+                    && text.Contains("state-machine")), Is.True,
+                "the note must name why the proven spelling is withheld\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
+        });
+    }
+
+    [Test]
+    public void AmbiguousUnsafeAddressIntoIntPtrSlotKeepsDiagnostic()
+    {
+        // `intptr = (IntPtr)&value` where the caller can see a second
+        // System.Runtime.CompilerServices.Unsafe (a vendored copy in the
+        // caller's own assembly standing in for the NuGet facade). The
+        // unqualified helper name is then ambiguous for the emitted source -
+        // the site keeps its diagnosed default and the note names why.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("AddrIntPtrAmbig.dll");
+        InjectUnsafeAsPointer(app, module);
+        app.AssembliesByName["UnityEngine.CoreModule"].InjectType(
+            "System.Runtime.CompilerServices", "Unsafe", app.SystemTypes.SystemObjectType,
+            R.TypeAttributes.Public | R.TypeAttributes.Abstract | R.TypeAttributes.Sealed);
+
+        var intLocal = new LocalVariable("value", new Register(null, "value"),
+            app.SystemTypes.SystemInt32Type);
+        var ptrLocal = new LocalVariable("intptr", new Register(null, "intptr"),
+            app.SystemTypes.SystemIntPtrType);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemIntPtrType, app.SystemTypes.SystemVoidType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, ptrLocal, new AddressOf(intLocal)),
+            new(1, OpCode.Return)], [intLocal, ptrLocal]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(CallsAsPointer(il, "AsPointer"), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("No legal conversion")
+                    && text.Contains("more than one System.Runtime.CompilerServices.Unsafe")), Is.True,
+                "the note must name why the proven spelling is withheld\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
         });
     }
 

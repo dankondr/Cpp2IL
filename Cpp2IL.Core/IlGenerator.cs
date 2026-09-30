@@ -6950,6 +6950,15 @@ public static class IlGenerator
             ? $"Ref struct cannot cross the value/reference boundary: dropped {from?.FullName ?? "unknown"} operand for {contract?.FullName ?? "unknown"} slot"
             : $"No legal conversion from {from?.FullName ?? "unavailable"} operand to {contract?.FullName ?? "unknown"} slot; substituting a synthetic default value.";
 
+    // Same text, with the withheld proven spelling named when a `&` operand's
+    // `Unsafe.AsPointer<T>` bridge exists but is gated off at this site.
+    private static string SlotDefaultReasonFor(TypeAnalysisContext? from, TypeAnalysisContext? contract,
+        MethodAnalysisContext? context)
+        => from is ByRefTypeAnalysisContext byRefOperand
+            && Analysis.UnsafeAsPointerEmission.BlockedReason(byRefOperand, contract, context) is { } blocked
+            ? $"No legal conversion from {from.FullName} operand to {contract?.FullName ?? "unknown"} slot; {blocked}; substituting a synthetic default value."
+            : SlotDefaultReason(from, contract);
+
     // Native width of the type's evaluation-stack representation: 4 for anything
     // narrowing to i32, 8 for 64-bit primitives, -1 for native-int/pointer/byref
     // values and 0 for non-integral stack kinds.
@@ -7073,7 +7082,7 @@ public static class IlGenerator
                 && Analysis.UnsafeAsPointerEmission.TryEmit(byRefOperand, context, instructions))
                 return true;
             instructions.Add(CilOpCodes.Pop);
-            PushDefaultOf(to, method, instructions, context, SlotDefaultReason(from, to));
+            PushDefaultOf(to, method, instructions, context, SlotDefaultReasonFor(from, to, context));
             return true;
         }
 
@@ -7517,11 +7526,11 @@ public static class IlGenerator
             {
                 var instructions = method.CilMethodBody!.Instructions;
                 instructions.Add(CilOpCodes.Pop);
-                PushDefaultOf(contract, method, instructions, context, SlotDefaultReason(emitted, contract));
+                PushDefaultOf(contract, method, instructions, context, SlotDefaultReasonFor(emitted, contract, context));
             }
             return true;
         }
-        PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context, SlotDefaultReason(emitted, contract));
+        PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context, SlotDefaultReasonFor(emitted, contract, context));
         return true;
     }
 
