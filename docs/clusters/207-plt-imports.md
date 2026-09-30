@@ -19,7 +19,13 @@ Named imports then dispatch:
 
 - `memcpy`, `memmove`, `memset` — verified block copy/fill when destination,
   source and size operands are all proven; otherwise the call stays named and
-  diagnosed.
+  diagnosed. At emission (`EmitBlockMemoryOperation`) a proven block write
+  whose extent equals a value type's declared size, on managed pointers to
+  that type, lowers to the type's own assignment — `ldobj`/`stobj` for a copy
+  (memmove shares it: a single typed read+write), `initobj` for a zeroing —
+  verifiable IL, and barrier-correct where `cpblk` would skip a
+  managed-reference field. `cpblk`/`initblk` remain only for extents no type
+  is proven for.
 - `modf`/`modff` — `System.Math.Truncate` (or `MathF`) call followed by
   `x - trunc(x)` subtraction and a store through the proven out-pointer.
 - `sincos`/`sincosf` — `System.Math.Sin`/`Cos` (`MathF.Sin`/`Cos`) with stores
@@ -86,5 +92,9 @@ cells carrying real data are never touched.
 `ModfRewritesToTruncateAndSubtract`, `SincosRewritesToSinAndCos`,
 `ResolvedButUnhandledImportGetsNamedTarget`,
 `UnresolvedCallTargetStaysUnnamed`, `AlreadyNamedImportStillRewrites`,
-`UnprovenModfOutPointerStaysNamedCall` plus the pre-existing block-memory
-cases.
+`UnprovenModfOutPointerStaysNamedCall` plus the value-type lowering cases
+`MemoryCopyWholeValueTypeEmitsLdobjStobj`,
+`MemorySetZeroOnWholeValueTypeEmitsInitobj`,
+`MemoryCopyValueTypeWithWrongSizeStaysRaw`,
+`MemoryCopyValueTypeWithDifferentSourceTypeStaysRaw`, and the pre-existing
+block-memory cases.

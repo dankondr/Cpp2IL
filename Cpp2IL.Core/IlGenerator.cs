@@ -9647,8 +9647,13 @@ public static class IlGenerator
             return;
         }
 
-        switch (instruction.OpCode)
-        {
+        // A block write covering exactly a proven value type through managed
+        // pointers to that type is the type's assignment - verifiable IL, and
+        // barrier-correct where cpblk would skip a managed-reference field.
+        if (!TryEmitTypedBlockOperation(instruction, destination, content, count, context, method, locals,
+                writeLine))
+            switch (instruction.OpCode)
+            {
             case OpCode.MemoryCopy:
                 // cpblk accepts a managed pointer or native int for both addresses.
                 EmitBlockPointerOperand(destination, false, context, method, locals, writeLine);
@@ -9738,6 +9743,51 @@ public static class IlGenerator
             ? unsigned ? CilOpCodes.Conv_U8 : CilOpCodes.Conv_I8
             : unsigned ? CilOpCodes.Conv_U4 : CilOpCodes.Conv_I4);
     }
+
+    // A block copy or zeroing whose extent equals a proven value type's size,
+    // on managed pointers to that type, is the type's assignment: ldobj/stobj
+    // for a copy (memmove's ordering is the same single typed read+write),
+    // initobj for a zeroing. Returns false when no such type is proven - the
+    // raw cpblk/initblk path handles those.
+    private static bool TryEmitTypedBlockOperation(Instruction instruction, IOperand destination,
+        IOperand content, IOperand count, MethodAnalysisContext context, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        if (count is not Immediate { Value: > 0 } byteCount
+            || BlockCopyPointee(destination, context) is not { IsValueType: true } pointee
+            || pointee is GenericInstanceTypeAnalysisContext or GenericParameterTypeAnalysisContext
+            || pointee.Definition?.Size is not { } pointeeSize
+            || byteCount.Value != pointeeSize
+            || !TypeTokenUsableFrom(pointee, context))
+            return false;
+
+        var instructions = method.CilMethodBody!.Instructions;
+        var pointeeRef = pointee.ToTypeSignature().ToTypeDefOrRef();
+        switch (instruction.OpCode)
+        {
+            case OpCode.MemoryCopy or OpCode.MemoryMove
+                when ThisConstructorCallPlan.SameTypeIdentity(pointee, BlockCopyPointee(content, context)):
+                EmitBlockPointerOperand(destination, false, context, method, locals, writeLine);
+                EmitBlockPointerOperand(content, false, context, method, locals, writeLine);
+                instructions.Add(CilOpCodes.Ldobj, pointeeRef);
+                instructions.Add(CilOpCodes.Stobj, pointeeRef);
+                return true;
+            case OpCode.MemorySet when content is Immediate { Value: 0 }:
+                EmitBlockPointerOperand(destination, false, context, method, locals, writeLine);
+                instructions.Add(CilOpCodes.Initobj, pointeeRef);
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // The element type a block-op address provably holds when it emits `&T`:
+    // only a managed pointer carries a referent the type system can name - a
+    // native-int address (PointerType local, raw Immediate) does not.
+    private static TypeAnalysisContext? BlockCopyPointee(IOperand operand, MethodAnalysisContext context) =>
+        EmittedOperandType(operand, context) is ByRefTypeAnalysisContext byRef
+            ? byRef.ElementType
+            : null;
 
     // Integer ops on operands that cannot legally sit in an integer slot are
     // native idioms the lifter mistyped: `&slot | N`/`&slot + N` names a field
