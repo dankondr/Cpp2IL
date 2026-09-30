@@ -152,6 +152,68 @@ public class ExceptionRegionRecoveryTests
 
     [TestCase(true)]
     [TestCase(false)]
+    public void HandlerLocalMustBeAssignedOnEveryIncomingPath(bool assignRight)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Diamond",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var caller = owner.InjectMethodContext("M", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public | R.MethodAttributes.Static, []);
+        var cleanup = owner.InjectMethodContext("Cleanup", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public | R.MethodAttributes.Static, [app.SystemTypes.SystemInt32Type]);
+        var work = owner.InjectMethodContext("Work", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public | R.MethodAttributes.Static, []);
+        Instruction At(ulong address, OpCode op, params IOperand[] operands)
+            => new(0, op, operands.ToList()) { NativeAddress = address };
+        var receiver = new Register(null, "X19");
+        var exception = new Register(null, "X20");
+        var left = At(0x1004, OpCode.Move, receiver, new Immediate(42));
+        var right = At(0x100C, OpCode.Move, receiver, new Immediate(42));
+        var call = At(0x1010, OpCode.CallVoid, work);
+        var branch = At(0x1000, OpCode.ConditionalJump, right, new Register(null, "X8"));
+        var join = At(0x1008, OpCode.Jump, call);
+        var dispose = At(0x1014, OpCode.CallVoid, cleanup, receiver);
+        var ret = At(0x1018, OpCode.Return);
+        caller.ConvertedIsil = [branch, left, join, right, call, dispose, ret,
+            At(0x2000, OpCode.Move, exception, new Register(null, "X0")),
+            At(0x2004, OpCode.CallVoid, cleanup, receiver),
+            At(0x2008, OpCode.CallVoid, new StringLiteral("_Unwind_Resume"), exception)];
+        caller.UnwindInfo = new EhFunctionInfo { Start = 0x1000, Size = 0x100C };
+        caller.UnwindInfo.CallSites.Add(new EhCallSiteInfo(0x1010, 4, 0x2000, 0) { Actions = [new EhActionInfo(0, null)] });
+        EhRegionPartition.Partition(caller);
+        var module = new ModuleDefinition("Diamond.dll");
+        var definition = new MethodDefinition("M", AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.Boolean]));
+        definition.CilMethodBody = new();
+        var local = new CilLocalVariable(module.CorLibTypeFactory.Int32);
+        definition.CilMethodBody.LocalVariables.Add(local);
+        var cleanupDefinition = new MethodDefinition("Cleanup", AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.Int32]));
+        cleanup.PutExtraData("AsmResolverMethod", cleanupDefinition);
+        var workDefinition = new MethodDefinition("Work", AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        var rightStart = new CilInstruction(assignRight ? CilOpCodes.Ldc_I4 : CilOpCodes.Nop);
+        if (assignRight) rightStart.Operand = 42;
+        var workCall = new CilInstruction(CilOpCodes.Call, workDefinition);
+        var map = new Dictionary<Instruction, List<CilInstruction>>
+        {
+            [branch] = [new(CilOpCodes.Ldarg_0), new(CilOpCodes.Brtrue, new CilInstructionLabel(rightStart))],
+            [left] = [new(CilOpCodes.Ldc_I4, 42), new(CilOpCodes.Stloc, local)],
+            [join] = [new(CilOpCodes.Br, new CilInstructionLabel(workCall))],
+            [right] = assignRight ? [rightStart, new(CilOpCodes.Stloc, local)] : [rightStart],
+            [call] = [workCall],
+            [dispose] = [new(CilOpCodes.Ldloc, local), new(CilOpCodes.Call, cleanupDefinition)],
+            [ret] = [new(CilOpCodes.Ret)]
+        };
+        foreach (var instruction in map.Values.SelectMany(i => i)) definition.CilMethodBody.Instructions.Add(instruction);
+        ExceptionRegionRecovery.Apply(caller, definition, map);
+        Assert.That(definition.CilMethodBody.ExceptionHandlers.Count, Is.EqualTo(assignRight ? 1 : 0));
+        Assert.That(caller.AnalysisWarnings.Count, Is.EqualTo(assignRight ? 0 : 1));
+        Assert.That(definition.CilMethodBody.ComputeMaxStack(), Is.EqualTo(1));
+    }
+
+    [TestCase(true)]
+    [TestCase(false)]
     public void CleanupSequencesPreserveFlatOrNestedSemantics(bool nested)
     {
         var app = Cpp2IlApi.CurrentAppContext!;

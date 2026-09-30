@@ -98,6 +98,7 @@ internal static class ExceptionRegionRecovery
             foreach (var next in unit.Next) next.Previous.Add(unit);
         }
         var dominators = Dominators(units);
+        var assigned = AssignedOnEntry(units, dominators);
         var nativeCalls = context.ExceptionRegionInstructions.Where(i => (i.IsCall || i.OpCode == OpCode.IndirectCall)
             && i.Operands[0] is not MethodAnalysisContext { UnderlyingPointer: 0 }).Select(i => i.NativeAddress).ToHashSet();
         bool NativeCall(Unit u) => u.Source is { } i && (i.IsCall || i.OpCode is OpCode.IndirectCall or OpCode.Throw)
@@ -186,14 +187,9 @@ internal static class ExceptionRegionRecovery
                 foreach (var seed in seeds.Skip(1)) common.IntersectWith(dominators[seed]);
                 var entry = common.OrderByDescending(u => dominators[u].Count).FirstOrDefault();
                 if (entry == null || cleanups.Contains(entry)) continue;
-                // The lifted normal copy can name a temporary introduced just before cleanup.
-                // Such a temporary does not exist on an exceptional exit. Only established
-                // storage (defined before try entry) is safe to load from the finally body.
-                var handlerLocals = handler.Where(i => i.OpCode.Code is CilCode.Ldloc or CilCode.Ldloc_S
-                        or CilCode.Ldloca or CilCode.Ldloca_S).Select(i => i.Operand).OfType<CilLocalVariable>();
-                if (handlerLocals.Any(local => !dominators[entry].Any(u => u != entry && u.Code.Any(i =>
-                        i.OpCode.Code is CilCode.Stloc or CilCode.Stloc_S && ReferenceEquals(i.Operand, local)))))
-                    continue;
+                // Different incoming branches may establish the same local. Require
+                // assignment on every path, not one store dominating all paths.
+                if (!HandlerLocalsAssigned(handler, assigned[entry])) continue;
                 var protectedUnits = new HashSet<Unit>();
                 var pending = new Stack<Unit>();
                 pending.Push(entry);
@@ -392,6 +388,72 @@ internal static class ExceptionRegionRecovery
                 });
             }
         }
+    }
+
+    private static Dictionary<Unit, HashSet<CilLocalVariable>> AssignedOnEntry(List<Unit> units,
+        Dictionary<Unit, HashSet<Unit>> dominators)
+    {
+        var reachable = dominators.Keys.ToList();
+        var stores = reachable.ToDictionary(u => u, u => u.Code.Where(i => i.OpCode.Code is CilCode.Stloc or CilCode.Stloc_S)
+            .Select(i => i.Operand).OfType<CilLocalVariable>().Where(local => WrittenOnEveryExit(u, local))
+            .ToHashSet<CilLocalVariable>(ReferenceEqualityComparer.Instance));
+        var all = stores.Values.SelectMany(s => s).ToHashSet<CilLocalVariable>(ReferenceEqualityComparer.Instance);
+        var before = reachable.ToDictionary(u => u, u => u == units[0]
+            ? new HashSet<CilLocalVariable>(ReferenceEqualityComparer.Instance) : new(all, ReferenceEqualityComparer.Instance));
+        var after = reachable.ToDictionary(u => u, u => new HashSet<CilLocalVariable>(before[u].Concat(stores[u]), ReferenceEqualityComparer.Instance));
+        var changed = true;
+        while (changed)
+        {
+            changed = false;
+            foreach (var unit in reachable)
+            {
+                var parents = unit.Previous.Where(dominators.ContainsKey).ToList();
+                var assigned = unit == units[0] || parents.Count == 0
+                    ? new HashSet<CilLocalVariable>(ReferenceEqualityComparer.Instance) : new(after[parents[0]], ReferenceEqualityComparer.Instance);
+                foreach (var parent in parents.Skip(1)) assigned.IntersectWith(after[parent]);
+                before[unit] = assigned;
+                var output = new HashSet<CilLocalVariable>(assigned, ReferenceEqualityComparer.Instance);
+                output.UnionWith(stores[unit]);
+                if (!after[unit].SetEquals(output)) { after[unit] = output; changed = true; }
+            }
+        }
+        return before;
+
+        static bool WrittenOnEveryExit(Unit unit, CilLocalVariable local)
+        {
+            var pending = new Stack<int>();
+            var seen = new HashSet<int>();
+            pending.Push(0);
+            while (pending.TryPop(out var index))
+            {
+                if (index == unit.Code.Count) { if (unit.Fallthrough != null) return false; continue; }
+                if (!seen.Add(index)) continue;
+                var instruction = unit.Code[index];
+                if (instruction.OpCode.Code is CilCode.Stloc or CilCode.Stloc_S && ReferenceEquals(instruction.Operand, local)) continue;
+                if (instruction.Operand is CilInstructionLabel { Instruction: { } target })
+                {
+                    var next = unit.Code.FindIndex(i => ReferenceEquals(i, target));
+                    if (next < 0) return false;
+                    pending.Push(next);
+                }
+                if (instruction.OpCode.FlowControl is not (CilFlowControl.Branch or CilFlowControl.Return or CilFlowControl.Throw))
+                    pending.Push(index + 1);
+            }
+            return true;
+        }
+    }
+
+    private static bool HandlerLocalsAssigned(List<CilInstruction> handler, HashSet<CilLocalVariable> entry)
+    {
+        var assigned = new HashSet<CilLocalVariable>(entry, ReferenceEqualityComparer.Instance);
+        foreach (var instruction in handler)
+        {
+            if (instruction.Operand is not CilLocalVariable local) continue;
+            if (instruction.OpCode.Code is CilCode.Stloc or CilCode.Stloc_S) assigned.Add(local);
+            else if (instruction.OpCode.Code is CilCode.Ldloc or CilCode.Ldloc_S or CilCode.Ldloca or CilCode.Ldloca_S
+                && !assigned.Contains(local)) return false;
+        }
+        return true;
     }
 
     private static bool Equivalent(List<CilInstruction> a, List<CilInstruction> b) => a.Count == b.Count
