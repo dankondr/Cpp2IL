@@ -9770,8 +9770,11 @@ public static class IlGenerator
         if (count is not Immediate { Value: > 0 } byteCount
             || BlockCopyPointee(destination, context) is not { IsValueType: true } pointee
             || pointee is GenericParameterTypeAnalysisContext
-            || (pointee is not GenericInstanceTypeAnalysisContext && pointee.Definition?.Size is { } metadataSize
-                ? metadataSize
+            // The managed size (instance size less the object header), not the marshaled native
+            // size, which is -1 for a struct holding references.
+            || (pointee is not GenericInstanceTypeAnalysisContext
+                && TypeSizes.UnboxedSize(pointee, context.AppContext.Binary.PointerSizeBytes) is > 0 and var managedSize
+                ? managedSize
                 : TypeSizes.LaidOutSize(pointee, context.AppContext.Binary.PointerSizeBytes) is > 0 and var laidOut
                     ? laidOut : (long?)null) is not { } pointeeSize
             || byteCount.Value != pointeeSize
