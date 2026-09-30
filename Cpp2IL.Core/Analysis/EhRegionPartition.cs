@@ -35,6 +35,8 @@ public static class EhRegionPartition
         if (unwind is null || unwind.CallSites.Count == 0)
             return;
 
+        context.ExceptionRegionInstructions = NativeExceptionRegionProof.Snapshot(isil);
+
         var callSitesByPad = new SortedDictionary<ulong, List<EhCallSiteInfo>>();
         foreach (var site in unwind.CallSites)
         {

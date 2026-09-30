@@ -153,6 +153,9 @@ public static class IlGenerator
         // store typed and width-mismatched loads keep the load diagnostic.
         RewriteFrameSlotLoads(context, frameSlotLocals);
 
+        var catchProofs = new Analysis.NativeExceptionRegionProof(context).FindCatches();
+        foreach (var proof in catchProofs) context.Locals.Add(proof.ExceptionLocal);
+
         // Map ISIL locals to IL. The declared type joins the method body's locals
         // signature, so a local whose recovered type cannot be named here is
         // declared as the closest verifier-legal placeholder instead.
@@ -324,6 +327,22 @@ public static class IlGenerator
         // it was compiled from: exit copies of the base call become leaves out of the
         // try, and the handler carries base.Finalize + endfinally.
         Analysis.FinalizerEhRecovery.Apply(context, definition, instructionMap);
+        var catchHandlers = new Dictionary<Analysis.NativeExceptionRegionProof.CatchResult, List<CilInstruction>>();
+        foreach (var proof in catchProofs)
+        {
+            var start = body.Instructions.Count;
+            body.Instructions.Add(CilOpCodes.Stloc, locals[proof.ExceptionLocal]);
+            foreach (var instruction in proof.Handler)
+                GenerateInstructions(instruction, context, definition, locals, writeLine, constructorPairs, thisConstructorCalls, frameSlotLocals);
+            var handler = body.Instructions.Skip(start).ToList();
+            while (body.Instructions.Count > start) body.Instructions.RemoveAt(start);
+            if (handler.Count(i => i.OpCode.FlowControl == CilFlowControl.Call) == proof.Handler.Count
+                && !handler.Any(i => i.Operand is string diagnostic && diagnostic.Length > 0
+                    || i.OpCode.FlowControl is CilFlowControl.Branch or CilFlowControl.ConditionalBranch
+                        or CilFlowControl.Return or CilFlowControl.Throw))
+                catchHandlers[proof] = handler;
+        }
+        Analysis.ExceptionRegionRecovery.Apply(context, definition, instructionMap, catchHandlers);
 
         RemoveDiscardedDefaults(definition, writeLine);
 

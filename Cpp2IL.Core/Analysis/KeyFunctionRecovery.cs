@@ -619,7 +619,7 @@ public static class KeyFunctionRecovery
         _ => false,
     };
 
-    private static bool IsExceptionWrapperTypeInfo(MethodAnalysisContext method, IOperand operand)
+    internal static bool IsExceptionWrapperTypeInfo(MethodAnalysisContext method, IOperand operand)
     {
         if (operand is not Immediate typeInfo)
             return false;
