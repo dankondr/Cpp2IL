@@ -200,6 +200,7 @@ public static class MetadataResolver
             if (operand is MemoryOperand { Base: LocalVariable baseLocal })
                 loadBases.Add(baseLocal);
 
+        var splitStores = new List<(Instruction After, List<Instruction> Others)>();
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             for (var i = 0; i < instruction.Operands.Count; i++)
@@ -268,6 +269,54 @@ public static class MetadataResolver
                 if (memory.Index != null || memory.Scale != 0)
                     continue;
 
+                if (byRefElement != null && CoversWholeScalar(byRefElement, memory))
+                    continue;
+
+                var storeWidth = memory.AccessSize > 0 ? memory.AccessSize : instruction.NativeStoreWidthBytes ?? 0;
+                if (i == 0 && instruction.OpCode == OpCode.Move
+                    && instruction.Operands.Count == 2 && storeWidth > 0)
+                {
+                    // `STP XZR, XZR, [x]` is two stores; together they are one zeroed range.
+                    var run = AdjacentZeroStores(method, instruction, memory, local);
+                    var width = storeWidth + run.Sum(absorbed => ((MemoryOperand)absorbed.Operands[0]).AccessSize);
+                    var parts = SplitConstantStore(method, instruction, local, owner, memory.Addend, width,
+                        merged: run.Count > 0, definitions, staticOwner != null);
+                    if (parts == null && run.Count > 0 && byRefElement != null && memory.Addend == 0
+                        && TypeSizes.MinimumUnboxedSize(byRefElement, method.AppContext.Binary.PointerSizeBytes)
+                            is > 0 and var referentSize && width >= referentSize)
+                    {
+                        // The run zeroes the whole referent: it stays one dereference, which
+                        // the generator stores as default(T).
+                        instruction.SetOperand(0, new MemoryOperand(local, null, 0, 0, width));
+                        foreach (var absorbed in run)
+                        {
+                            absorbed.OpCode = OpCode.Nop;
+                            absorbed.SetOperands();
+                        }
+                        changed = true;
+                        continue;
+                    }
+                    if (parts == null && run.Count > 0)
+                    {
+                        run = [];
+                        parts = SplitConstantStore(method, instruction, local, owner, memory.Addend,
+                            storeWidth, merged: false, definitions, staticOwner != null);
+                    }
+                    if (parts != null)
+                    {
+                        instruction.SetOperands(parts[0].Field, parts[0].Value);
+                        splitStores.Add((instruction, parts.Skip(1)
+                            .Select(part => new Instruction(-1, OpCode.Move, part.Field, part.Value)).ToList()));
+                        foreach (var absorbed in run)
+                        {
+                            absorbed.OpCode = OpCode.Nop;
+                            absorbed.SetOperands();
+                        }
+                        changed = true;
+                        break;
+                    }
+                }
+
                 var resolved = ResolveField(owner, staticOwner, memory.Addend, memory.AccessSize,
                     byRefElement != null);
                 var field = resolved?.Field;
@@ -307,8 +356,201 @@ public static class MetadataResolver
             }
         }
 
+        foreach (var (after, rest) in splitStores)
+        {
+            var block = method.ControlFlowGraph!.Blocks.First(b => b.Instructions.Contains(after));
+            block.Instructions.InsertRange(block.Instructions.IndexOf(after) + 1, rest);
+        }
+
         changed |= ResolveAddressedStorageReads(method, definitions, loadBases);
         return changed;
+    }
+
+    /// <summary>
+    /// The fields of <paramref name="owner"/>'s layout that the bytes
+    /// [offset, offset + size) cover, each with its container path, in address
+    /// order. A struct field cut by the range is descended into; one that lies
+    /// wholly inside it is returned whole when <paramref name="wholeStructs"/> is
+    /// set, as its leaves otherwise. Null unless the range is a whole number of
+    /// such parts: a leaf cut in half, overlapping fields (explicit layout) or a
+    /// layout that is not known here (generic types) have no such answer.
+    /// Padding between fields may be covered; nothing can observe it.
+    /// </summary>
+    internal static List<(FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers, long Offset, int Size)>?
+        CoveredFields(TypeAnalysisContext owner, long offset, int size, bool wholeStructs, bool statics = false)
+    {
+        var parts = new List<(FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers, long Offset, int Size)>();
+        if (size <= 0 || !CollectCoveredFields(owner, 0, offset, offset + size, [], parts,
+                owner.AppContext.Binary.PointerSizeBytes, wholeStructs, statics, 0))
+            return null;
+        parts.Sort((a, b) => a.Offset.CompareTo(b.Offset));
+        for (var i = 1; i < parts.Count; i++)
+            if (parts[i].Offset < parts[i - 1].Offset + parts[i - 1].Size)
+                return null;
+        return parts;
+    }
+
+    private static bool CollectCoveredFields(TypeAnalysisContext type, long baseOffset, long start, long end,
+        IReadOnlyList<FieldAnalysisContext> path,
+        List<(FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers, long Offset, int Size)> parts,
+        int pointerSize, bool wholeStructs, bool statics, int depth)
+    {
+        if (depth > 8)
+            return false;
+        // Static storage holds the type's own static fields; an instance holds the chain's.
+        for (var candidate = type; candidate != null; candidate = statics ? null : candidate.BaseType)
+        {
+            if (candidate.GenericParameters.Count > 0)
+                return false;
+            if (candidate is GenericInstanceTypeAnalysisContext generic)
+            {
+                // ponytail: a generic type's own fields are laid out by GenericInstanceFieldLayout
+                // and are not split here. A generic base is passed over when the range
+                // touches none of its fields.
+                if (ReferenceEquals(candidate, type) || baseOffset != 0)
+                    return false;
+                for (var probe = start; probe < end; probe++)
+                    if (GenericInstanceFieldLayout.FindFieldContainingOffset(generic, probe) != null)
+                        return false;
+                continue;
+            }
+            foreach (var field in candidate.Fields.Where(f => f.IsStatic == statics
+                         && (f.Attributes & FieldAttributes.Literal) == 0))
+            {
+                var fieldStart = baseOffset + (field.BackingData?.FieldOffset ?? field.Offset);
+                if (fieldStart >= end)
+                    continue;
+                var fieldSize = LeafStorageSize(field.FieldType, pointerSize);
+                if (fieldSize <= 0)
+                    return false;
+                if (fieldStart + fieldSize <= start)
+                    continue;
+                var inside = fieldStart >= start && fieldStart + fieldSize <= end;
+                if (field.FieldType.IsValueType && PrimitiveStorageSize(field.FieldType, pointerSize) == null
+                    && !(inside && wholeStructs))
+                {
+                    if (!CollectCoveredFields(field.FieldType, fieldStart, start, end,
+                            path.Append(field).ToList(), parts, pointerSize, wholeStructs, false, depth + 1))
+                        return false;
+                    continue;
+                }
+                if (!inside)
+                    return false;
+                parts.Add((field, path, fieldStart, (int)fieldSize));
+            }
+        }
+        return true;
+    }
+
+    // The zero stores that directly follow `first` in its block and continue its byte
+    // range through the same base.
+    private static List<Instruction> AdjacentZeroStores(MethodAnalysisContext method, Instruction first,
+        MemoryOperand memory, LocalVariable local)
+    {
+        var run = new List<Instruction>();
+        if (first.Operands[1] is not Immediate { Value: 0 })
+            return run;
+        var block = method.ControlFlowGraph!.Blocks.FirstOrDefault(b => b.Instructions.Contains(first));
+        if (block == null)
+            return run;
+        if (memory.AccessSize <= 0)
+            return run;
+        var next = memory.Addend + memory.AccessSize;
+        for (var j = block.Instructions.IndexOf(first) + 1; j < block.Instructions.Count; j++)
+        {
+            var candidate = block.Instructions[j];
+            if (candidate.OpCode == OpCode.Nop)
+                continue;
+            if (candidate.OpCode != OpCode.Move || candidate.Operands.Count != 2
+                || candidate.Operands[1] is not Immediate { Value: 0 }
+                || candidate.Operands[0] is not MemoryOperand { Index: null, Scale: 0, AccessSize: > 0 } store
+                || !ReferenceEquals(store.Base, local) || store.Addend != next)
+                break;
+            run.Add(candidate);
+            next += store.AccessSize;
+        }
+        return run;
+    }
+
+    // The bits a store's source holds when they are known at this point: a literal, or
+    // a register whose one definition moves or shifts one. FromLiteral marks a float or
+    // vector literal, whose bits mean nothing until the layout says which fields they are.
+    private static (ulong Low, ulong High, bool FromLiteral)? ConstantBits(IOperand operand,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions, int depth = 0)
+    {
+        switch (operand)
+        {
+            case Immediate immediate:
+                return (immediate.UnsignedValue, 0, false);
+            case FloatLiteral literal:
+                return ((uint)System.BitConverter.SingleToInt32Bits(literal.Value), 0, true);
+            case DoubleLiteral literal:
+                return ((ulong)System.BitConverter.DoubleToInt64Bits(literal.Value), 0, true);
+            case Vector128Literal vector:
+                static ulong Pair(float low, float high) => (uint)System.BitConverter.SingleToInt32Bits(low)
+                    | (ulong)(uint)System.BitConverter.SingleToInt32Bits(high) << 32;
+                return (Pair(vector.X, vector.Y), Pair(vector.Z, vector.W), true);
+            case LocalVariable local when depth < 8 && definitions.TryGetValue(local, out var definition):
+                if (definition is { OpCode: OpCode.Move, Operands.Count: 2 })
+                    return ConstantBits(definition.Operands[1], definitions, depth + 1);
+                if (definition is { OpCode: OpCode.ShiftRight, Operands: [_, var shifted, Immediate { Value: > 0 and < 64 } amount] }
+                    && ConstantBits(shifted, definitions, depth + 1) is { } source)
+                {
+                    var by = (int)amount.Value;
+                    return (source.Low >> by | source.High << (64 - by), source.High >> by, source.FromLiteral);
+                }
+                return null;
+            default:
+                return null;
+        }
+    }
+
+    // A constant stored over several fields at once (`STP XZR, XZR, [this + 0x20]`
+    // zeroes a Vector3 and the first lane of the next one) is one store per field,
+    // each taking its own bytes of the constant, typed by the field: the register a
+    // literal travelled in (`LDR Q0` of four ints, `LDR D0` of two floats) says nothing
+    // about what its bytes are. A zeroed struct field is stored whole; its members may
+    // not be nameable from here.
+    private static List<(FieldReference Field, IOperand Value)>? SplitConstantStore(MethodAnalysisContext method,
+        Instruction instruction, LocalVariable local, TypeAnalysisContext owner, long offset, int width,
+        bool merged, IReadOnlyDictionary<LocalVariable, Instruction> definitions, bool statics)
+    {
+        if (ConstantBits(instruction.Operands[1], definitions) is not { } constant
+            || CoveredFields(owner, offset, width, wholeStructs: constant is { Low: 0, High: 0 }, statics) is not { } fields
+            // one exact field written by one integer store is the ordinary resolution's business
+            || fields.Count == 0 || (fields.Count == 1 && !merged && !constant.FromLiteral)
+            || (!statics && !LocalSuppliesFieldBase(local, owner, method.DeclaringType, method)))
+            return null;
+
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        var parts = new List<(FieldReference Field, IOperand Value)>();
+        foreach (var part in fields)
+        {
+            if (MemberPathUnspellable((part.Field, part.Containers), method, store: true, addressed: false)
+                || NeedsAccessor(part.Field, method) || part.Containers.Any(c => NeedsAccessor(c, method)))
+                return null;
+            var shift = (int)(part.Offset - offset) * 8;
+            var bits = shift >= 64 ? constant.High >> (shift - 64)
+                : shift == 0 ? constant.Low : constant.Low >> shift | constant.High << (64 - shift);
+            if (part.Size < 8)
+                bits &= (1UL << (part.Size * 8)) - 1;
+            var type = part.Field.FieldType;
+            IOperand? value = type.FullName switch
+            {
+                "System.Single" => new FloatLiteral(System.BitConverter.Int32BitsToSingle((int)bits)),
+                "System.Double" => new DoubleLiteral(System.BitConverter.Int64BitsToDouble((long)bits)),
+                _ when !type.IsValueType || PrimitiveStorageSize(type, pointerSize) == null
+                    // null, or default of a whole struct
+                    => bits == 0 && (part.Size <= 8 || constant is { Low: 0, High: 0 }) ? new Immediate(0) : null,
+                // sign-extend from the field's width: the same bits, spelled as the literal IL loads
+                _ => new Immediate(part.Size >= 8 ? (long)bits
+                    : (long)(bits << (64 - part.Size * 8)) >> (64 - part.Size * 8)),
+            };
+            if (value == null)
+                return null;
+            parts.Add((new FieldReference(part.Field, local, (int)part.Offset, part.Containers, part.Size), value));
+        }
+        return parts;
     }
 
     /// <summary>
@@ -337,6 +579,8 @@ public static class MetadataResolver
             && localType is ByRefTypeAnalysisContext { ElementType.IsValueType: true } byRef
             ? byRef.ElementType : null;
         var owner = staticOwner ?? byRefElement ?? localType;
+        if (byRefElement != null && CoversWholeScalar(byRefElement, memory))
+            return null;
         if (ResolveField(owner, staticOwner, memory.Addend, memory.AccessSize,
                     byRefElement != null) is not { } resolved
             || MemberPathUnspellable(resolved, method, store: false, addressed: false)
@@ -707,6 +951,16 @@ public static class MetadataResolver
         return emitted is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
                && !emitted.IsValueType;
     }
+
+    // A primitive or an enum has no member managed code can name: an access through
+    // `ref T` that covers the whole referent is `*ref`, not the type's private
+    // `m_value`/`value__` field. The operand stays the dereference it is, which the
+    // generator spells as ldobj/stobj.
+    private static bool CoversWholeScalar(TypeAnalysisContext referent, MemoryOperand memory)
+        => memory.Addend == 0 && memory.Index == null && memory.Scale == 0
+           && referent.IsValueType
+           && PrimitiveStorageSize(referent, referent.AppContext.Binary.PointerSizeBytes) is { } size
+           && (memory.AccessSize <= 0 || memory.AccessSize == size);
 
     private static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)? ResolveField(
         TypeAnalysisContext owner, TypeAnalysisContext? staticOwner, long offset, int accessSize,
@@ -1079,7 +1333,8 @@ public static class MetadataResolver
 
         for (var candidate = owner; candidate != null; candidate = candidate.BaseType)
         foreach (var container in candidate.Fields.Where(field => field.IsStatic
-                         && (field.Attributes & FieldAttributes.Literal) == 0 && field.FieldType.IsValueType)
+                         && (field.Attributes & FieldAttributes.Literal) == 0 && field.FieldType.IsValueType
+                         && PrimitiveStorageSize(field.FieldType, owner.AppContext.Binary.PointerSizeBytes) == null)
                      .OrderByDescending(field => field.Offset))
         {
             var relativeOffset = offset - container.Offset;
@@ -1302,8 +1557,8 @@ public static class MetadataResolver
                 var containerSize = TypeSizes.MinimumUnboxedSize(container.FieldType, pointerSize);
                 if (containerSize > 0 && relativeOffset >= containerSize)
                     continue;
-                if (PrimitiveStorageSize(container.FieldType, pointerSize) == accessSize)
-                    continue; // the load is the whole container - the flat lookup names it
+                if (PrimitiveStorageSize(container.FieldType, pointerSize) != null)
+                    continue; // a primitive or enum is a leaf whatever the access width: the flat lookup names it
 
                 if (FindFieldPathWithin(container.FieldType, relativeOffset, accessSize, pointerSize)
                         is { } inner)
@@ -1332,7 +1587,7 @@ public static class MetadataResolver
 
         foreach (var container in owner.Fields.Where(f => !f.IsStatic
                      && (f.Attributes & FieldAttributes.Literal) == 0 && f.FieldType.IsValueType
-                     && PrimitiveStorageSize(f.FieldType, pointerSize) != accessSize)
+                     && PrimitiveStorageSize(f.FieldType, pointerSize) == null)
                      .OrderByDescending(f => f.BackingData?.FieldOffset ?? f.Offset))
         {
             var relativeOffset = offset - (container.BackingData?.FieldOffset ?? container.Offset);
@@ -1355,7 +1610,8 @@ public static class MetadataResolver
     {
         var containing = GenericInstanceFieldLayout.FindFieldContainingOffset(genericOwner, offset);
         if (containing is not { Field.FieldType.IsValueType: true } range
-            || range.Size == accessSize)
+            || range.Size == accessSize
+            || PrimitiveStorageSize(range.Field.FieldType, pointerSize) != null)
             return null;
         var relativeOffset = offset - range.Offset;
         var nested = range.Field.FieldType is GenericInstanceTypeAnalysisContext nestedGeneric

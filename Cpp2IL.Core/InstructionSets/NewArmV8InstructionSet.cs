@@ -980,8 +980,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     }
                 };
                 EmitWriteback(beforeAccess: true);
-                Add(address, OpCode.Move, MemOperand(accessSize: storeSize), ConvertOperand(instruction, 0))
-                    .NativeMemoryAccessSize = storeSize;
+                var store = Add(address, OpCode.Move, MemOperand(accessSize: storeSize), ConvertOperand(instruction, 0));
+                store.NativeMemoryAccessSize = storeSize;
+                store.NativeStoreWidthBytes = storeSize != 0 ? storeSize : RegisterWidthBytes(instruction.Op0Reg);
                 EmitWriteback(beforeAccess: false);
                 break;
             }
@@ -1004,10 +1005,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     {
                         var storeSize = instruction.Op0Reg is >= Arm64Register.X0 and <= Arm64Register.X31
                             or >= Arm64Register.W0 and <= Arm64Register.W31 ? pairSize : 0;
-                        Add(address, OpCode.Move, MemOperand(accessSize: storeSize), ConvertOperand(instruction, 0))
-                            .NativeMemoryAccessSize = storeSize;
-                        Add(address, OpCode.Move, MemOperand(pairSize, storeSize), ConvertOperand(instruction, 1))
-                            .NativeMemoryAccessSize = storeSize;
+                        var first = Add(address, OpCode.Move, MemOperand(accessSize: storeSize), ConvertOperand(instruction, 0));
+                        first.NativeMemoryAccessSize = storeSize;
+                        first.NativeStoreWidthBytes = pairSize;
+                        var second = Add(address, OpCode.Move, MemOperand(pairSize, storeSize), ConvertOperand(instruction, 1));
+                        second.NativeMemoryAccessSize = storeSize;
+                        second.NativeStoreWidthBytes = pairSize;
                     }
                     else
                     {

@@ -172,6 +172,10 @@ internal sealed class Arm64VectorScalarizer
     public void BeginInstruction(ulong address)
     {
         _claimedDests.Clear();
+        // A cached shift names its source by register, not by value: once the next
+        // instruction may have redefined that register, the temporary holds the high
+        // half of the old value. It is only reused within one instruction.
+        _shiftTemps.Clear();
         if (_mergeTargets.Contains(address) || _clearProvenanceNext)
         {
             _vectors.Clear();
