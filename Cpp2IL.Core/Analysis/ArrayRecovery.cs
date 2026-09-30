@@ -63,6 +63,9 @@ public static class ArrayRecovery
             return;
 
         var int32 = method.AppContext.SystemTypes.SystemInt32Type;
+        var allDefinitions = cfg.Instructions.Where(d => d.Destination is LocalVariable)
+            .GroupBy(d => (LocalVariable)d.Destination!).ToDictionary(g => g.Key, g => g.ToList());
+        var columns = new Dictionary<LocalVariable, LocalVariable>();
         var getLength = method.AppContext.SystemTypes.SystemArrayType?.Methods
             .FirstOrDefault(m => m.Name == "GetLength" && m.Parameters.Count == 1);
         var created = 0;
@@ -71,10 +74,13 @@ public static class ArrayRecovery
         foreach (var instruction in cfg.Instructions.ToList())
         for (var i = 0; i < instruction.Operands.Count; i++)
         {
-            if (instruction.Operands[i] is not MemoryOperand { Base: LocalVariable pointer, Index: null, Scale: 0 } memory
-                || !definitions.TryGetValue(pointer, out var address)
-                || address is not { OpCode: OpCode.Add, Operands: [_, var left, var right] }
-                || (Element(left, right, memory, instruction, i) ?? Element(right, left, memory, instruction, i)) is not { } element)
+            if (instruction.Operands[i] is not MemoryOperand { Base: LocalVariable pointer, Index: null, Scale: 0 } memory)
+                continue;
+            var matched = definitions.TryGetValue(pointer, out var address)
+                          && address is { OpCode: OpCode.Add, Operands: [_, var left, var right] }
+                ? Element(left, right, memory, instruction, i) ?? Element(right, left, memory, instruction, i)
+                : null;
+            if ((matched ?? Walk(pointer, memory, instruction, i)) is not { } element)
                 continue;
 
             var (array, arrayType, indices, field) = element;
@@ -86,7 +92,7 @@ public static class ArrayRecovery
                 instruction.SetOperands([Accessor(arrayType, "Set"), array, .. indices, instruction.Operands[1]]);
                 break;
             }
-            if (field == null && instruction is { OpCode: OpCode.Move, Operands: [LocalVariable] } && i == 1)
+            if (field == null && instruction is { OpCode: OpCode.Move, Operands: [LocalVariable, _] } && i == 1)
             {
                 instruction.OpCode = OpCode.Call;
                 instruction.SetOperands([Accessor(arrayType, "Get"), instruction.Operands[0], array, .. indices]);
@@ -181,17 +187,182 @@ public static class ArrayRecovery
                 || indices.Select((index, dimension) => index is Immediate || Compared(index, array, dimension)).Any(ok => !ok))
                 return null;
 
-            var inner = memory.Addend - ElementsOffset(pointerSize);
+            return Part(elementType, size, memory.Addend - ElementsOffset(pointerSize), memory, user, operandIndex)
+                is { } part ? (array, arrayType, indices, part.Field) : null;
+        }
+
+        // What an access at `inner` bytes into an element reads: the whole element, or one field of
+        // a struct element.
+        (bool Whole, FieldAnalysisContext? Field)? Part(TypeAnalysisContext elementType, long size, long inner,
+            MemoryOperand memory, Instruction user, int operandIndex)
+        {
             if (inner == 0 && (!elementType.IsValueType || ElementSize(elementType, pointerSize) != 0
                                || memory.AccessSize == 0 || memory.AccessSize >= size
                                || ArgumentType(user, operandIndex) is { } parameter
                                   && parameter.FullName == elementType.FullName))
-                return (array, arrayType, indices, null);
+                return (true, null);
             return elementType.IsValueType && ElementSize(elementType, pointerSize) == 0
                 && FindValueTypeField(elementType, inner) is { } field
                 && (memory.AccessSize == 0 || PrimitiveElementFieldSize(field.FieldType, pointerSize) == memory.AccessSize)
-                ? (array, arrayType, indices, field)
+                ? (false, field)
                 : null;
+        }
+
+        long SizeOf(TypeAnalysisContext elementType) => elementType.IsValueType && ElementSize(elementType, pointerSize) == 0
+            ? MetadataElementSize(elementType, pointerSize)
+            : ElementSize(elementType, pointerSize);
+
+        static ArrayTypeAnalysisContext? GridType(IOperand operand) => operand switch
+        {
+            LocalVariable { Type: ArrayTypeAnalysisContext { Rank: 2 } local } => local,
+            FieldReference { Field.FieldType: ArrayTypeAnalysisContext { Rank: 2 } stored } => stored,
+            _ => null,
+        };
+
+        // Walks along the last dimension of a T[,] (only rank 2). A row walk starts a pointer at
+        // `data + len1·s` - s the row index scaled by the element size, directly or as a
+        // counter that steps with it - and advances it one element per step: the element is
+        // [row, column], column a counter the walk gets (0 at the start, +1 per step). An
+        // offset walk reads `[grid + off + 4p + k0·size]` with `off` stepping by the element
+        // size alongside a counter k from k0: the element is [0, k], and k must be compared with
+        // the row length like any index. The row must not change between the walk's start and
+        // the access.
+        (IOperand Array, ArrayTypeAnalysisContext Type, List<IOperand> Indices, FieldAnalysisContext? Field)?
+            Walk(LocalVariable pointer, MemoryOperand memory, Instruction user, int operandIndex)
+        {
+            if (!allDefinitions.TryGetValue(pointer, out var defs))
+                return null;
+
+            if (defs.Count == 1 && defs[0] is { OpCode: OpCode.Add, Operands: [_, var a, var b] })
+                foreach (var (array, offset) in new[] { (a, b), (b, a) })
+                {
+                    if (GridType(array) is not { } offsetGrid || offset is not LocalVariable off
+                        || Induction(off) is not { Start: 0 } offInduction)
+                        continue;
+                    var size = SizeOf(offsetGrid.ElementType);
+                    var relative = memory.Addend - ElementsOffset(pointerSize);
+                    if (size <= 0 || offInduction.Step != size || relative < 0)
+                        continue;
+                    var counter = allDefinitions.Keys.FirstOrDefault(k => Induction(k) is { Step: 1 } kInduction
+                        && kInduction.Start == relative / size && CoInductive(kInduction, offInduction, user));
+                    if (counter == null || !Compared(counter, array, 1)
+                        || Part(offsetGrid.ElementType, size, relative % size, memory, user, operandIndex) is not { } part)
+                        continue;
+                    return (array, offsetGrid, [new Immediate(0), counter], part.Field);
+                }
+
+            if (defs.Count != 2)
+                return null;
+            var step = defs.FirstOrDefault(d => d is { OpCode: OpCode.Add, Operands: [_, LocalVariable from, Immediate] }
+                && ReferenceEquals(from, pointer));
+            var start = defs.FirstOrDefault(d => !ReferenceEquals(d, step));
+            if (step == null || start is not { OpCode: OpCode.Add, Operands: [_, var x, var y] })
+                return null;
+            foreach (var (dataStart, rowOffset) in new[] { (x, y), (y, x) })
+            {
+                if (Definition(dataStart) is not { OpCode: OpCode.Add, Operands: [_, var array, Immediate header] }
+                    || header.Value != ElementsOffset(pointerSize) || GridType(array) is not { } grid)
+                    continue;
+                var size = SizeOf(grid.ElementType);
+                if (size <= 0 || ((Immediate)step.Operands[2]).Value != size || memory.Addend < 0 || memory.Addend >= size)
+                    continue;
+                var row = ScaledIndex(rowOffset, size, definitions, 0) is { } flat && Factor(flat, array, 1) is { } scaled
+                    ? Unextended(scaled)
+                    : Definition(rowOffset) is { OpCode: OpCode.Multiply, Operands: [_, var m, var n] }
+                      && (IsLength(m, array, 1) ? n : IsLength(n, array, 1) ? m : null) is LocalVariable s
+                      && Induction(s) is { Start: 0 } sInduction && sInduction.Step == size
+                        ? allDefinitions.Keys.FirstOrDefault(k => Induction(k) is { Start: 0, Step: 1 } kInduction
+                            && CoInductive(kInduction, sInduction, start))
+                        : null;
+                if (row == null || row is not Immediate && !Compared(row, array, 0)
+                    || row is LocalVariable rowLocal && ChangesBetween(rowLocal, start, user)
+                    || Part(grid.ElementType, size, memory.Addend, memory, user, operandIndex) is not { } part)
+                    continue;
+                if (!columns.TryGetValue(pointer, out var column))
+                {
+                    columns[pointer] = column = NewLocal(int32);
+                    InsertAfter(start, new Instruction(-1, OpCode.Move, column, new Immediate(0)));
+                    InsertAfter(step, new Instruction(-1, OpCode.Add, column, column, new Immediate(1)));
+                }
+                return (array, grid, [row, column], part.Field);
+            }
+            return null;
+        }
+
+        // `x = c; …; x = x + step`, nothing else.
+        (long Start, long Step, Instruction Init, Instruction Stepper)? Induction(LocalVariable local)
+        {
+            if (!allDefinitions.TryGetValue(local, out var defs) || defs.Count != 2)
+                return null;
+            var init = defs.FirstOrDefault(d => d is { OpCode: OpCode.Move, Operands: [_, Immediate] });
+            var stepper = defs.FirstOrDefault(d => d is { OpCode: OpCode.Add, Operands: [_, LocalVariable from, Immediate] }
+                && ReferenceEquals(from, local));
+            return init == null || stepper == null
+                ? null
+                : (((Immediate)init.Operands[1]).Value, ((Immediate)stepper.Operands[2]).Value, init, stepper);
+        }
+
+        // Two counters move together at `use` when they start in one block and either step in one
+        // block (`use` is not between the two steps), or neither steps before the first `use`,
+        // every cycle through `use` steps each, and neither steps again without passing `use`.
+        // Either way, wherever `use` runs both have stepped equally often.
+        bool CoInductive((long Start, long Step, Instruction Init, Instruction Stepper) first,
+            (long Start, long Step, Instruction Init, Instruction Stepper) second, Instruction use)
+        {
+            if (BlockOf(first.Init) != BlockOf(second.Init) || ReferenceEquals(first.Init, second.Init))
+                return false;
+            var steps = BlockOf(first.Stepper);
+            if (steps == BlockOf(second.Stepper))
+            {
+                if (steps != BlockOf(use))
+                    return true;
+                var (a, b, u) = (steps.Instructions.IndexOf(first.Stepper), steps.Instructions.IndexOf(second.Stepper),
+                    steps.Instructions.IndexOf(use));
+                return u < System.Math.Min(a, b) || u > System.Math.Max(a, b);
+            }
+            return new[] { first.Stepper, second.Stepper }.All(stepper =>
+                !Reaches(first.Init, stepper, use) && !Reaches(second.Init, stepper, use)
+                && !Reaches(use, use, stepper) && !Reaches(stepper, stepper, use));
+        }
+
+        Block BlockOf(Instruction instruction) => cfg.Blocks.First(b => b.Instructions.Contains(instruction));
+
+        void InsertAfter(Instruction anchor, Instruction inserted)
+        {
+            var owner = BlockOf(anchor);
+            owner.Instructions.Insert(owner.Instructions.IndexOf(anchor) + 1, inserted);
+            (allDefinitions.TryGetValue((LocalVariable)inserted.Destination!, out var list)
+                ? list : allDefinitions[(LocalVariable)inserted.Destination!] = []).Add(inserted);
+        }
+
+        // Whether `local` can be written after `from` and before `to` on some path that does not
+        // pass `from` again.
+        bool ChangesBetween(LocalVariable local, Instruction from, Instruction to)
+            => allDefinitions.TryGetValue(local, out var defs)
+               && defs.Any(def => Reaches(from, def, from) && Reaches(def, to, from));
+
+        bool Reaches(Instruction from, Instruction to, Instruction barrier)
+        {
+            var origin = BlockOf(from);
+            var work = new Stack<(Block Block, int Index)>([(origin, origin.Instructions.IndexOf(from) + 1)]);
+            var seen = new HashSet<Block>();
+            while (work.Count > 0)
+            {
+                var (block, index) = work.Pop();
+                var stopped = false;
+                for (var k = index; k < block.Instructions.Count && !stopped; k++)
+                {
+                    if (ReferenceEquals(block.Instructions[k], to))
+                        return true;
+                    stopped = ReferenceEquals(block.Instructions[k], barrier);
+                }
+                if (stopped)
+                    continue;
+                foreach (var successor in block.Successors)
+                    if (seen.Add(successor))
+                        work.Push((successor, 0));
+            }
+            return false;
         }
 
         // Row-major: flat = (…(i·len1 + j)·len2 + k…). A dimension whose length never multiplies

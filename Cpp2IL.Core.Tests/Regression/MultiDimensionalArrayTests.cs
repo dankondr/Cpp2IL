@@ -170,4 +170,113 @@ public class MultiDimensionalArrayTests
             Assert.That(calls.Count(m => m?.Name == "GetLength"), Is.EqualTo(2), () => Dump(grid.Method));
         });
     }
+
+    // for (i…) { p = &grid[i, 0]; for (…) { sum += *p; p++; } }, with the row start scaled by
+    // a counter s that steps by the element size alongside i (il2cpp's strength reduction).
+    private (MethodAnalysisContext Caller, Instruction Load, LocalVariable Grid, LocalVariable Row) RowWalk(bool rowChangesInside)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("Grid.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemBooleanType,
+            app.SystemTypes.SystemObjectType);
+        var int32 = app.SystemTypes.SystemInt32Type;
+        var grid = Local("grid", new ArrayTypeAnalysisContext(int32, 2));
+        LocalVariable data = Local("data"), i = Local("i", int32), s = Local("s"), sum = Local("sum", int32),
+            b = Local("bounds"), ci = Local("ci", app.SystemTypes.SystemBooleanType), m = Local("m"), p = Local("p"),
+            x = Local("x", int32), cj = Local("cj", app.SystemTypes.SystemBooleanType),
+            ck = Local("ck", app.SystemTypes.SystemBooleanType), n = Local("n", int32);
+        var outer = new Instruction(4, OpCode.Move, b, new MemoryOperand(grid, null, 0x10, 0, 8));
+        var load = new Instruction(8, OpCode.Move, x, new MemoryOperand(p, null, 0, 0, 4));
+        List<Instruction> instructions =
+        [
+            new(0, OpCode.Add, data, grid, new Immediate(0x20)),
+            new(1, OpCode.Move, i, new Immediate(0)),
+            new(2, OpCode.Move, s, new Immediate(0)),
+            new(3, OpCode.Move, sum, new Immediate(0)),
+            outer,
+            new(5, OpCode.CheckLess, ci, i, new MemoryOperand(b, null, 0, 0, 4)),
+            new(6, OpCode.Multiply, m, new MemoryOperand(b, null, 0x10, 0, 4), s),
+            new(7, OpCode.Add, p, data, m),
+            load,
+            new(9, OpCode.Add, p, p, new Immediate(4)),
+            new(10, OpCode.Add, sum, sum, x),
+        ];
+        if (rowChangesInside)
+            instructions.Add(new(11, OpCode.Add, i, i, new Immediate(1)));
+        instructions.AddRange([
+            new(12, OpCode.CheckLess, cj, sum, n),
+            new(13, OpCode.ConditionalJump, load, cj),
+        ]);
+        if (!rowChangesInside)
+            instructions.Add(new(14, OpCode.Add, i, i, new Immediate(1)));
+        instructions.AddRange([
+            new(15, OpCode.Add, s, s, new Immediate(4)),
+            new(16, OpCode.CheckLess, ck, i, n),
+            new(17, OpCode.ConditionalJump, outer, ck),
+            new(18, OpCode.Return, sum),
+        ]);
+        var (caller, _) = ForeignCaller(app, module, instructions, [grid, data, i, s, sum, b, ci, m, p, x, cj, ck, n]);
+        caller.ParameterLocals = [grid, n];
+        return (caller, load, grid, i);
+    }
+
+    [Test]
+    public void RowWalkIsTheElementAtRowAndAColumnCounter()
+    {
+        var (caller, load, grid, row) = RowWalk(rowChangesInside: false);
+
+        ArrayRecovery.RecoverMultiDimensionalAccesses(caller);
+
+        Assert.That(load.OpCode, Is.EqualTo(OpCode.Call), () => string.Join("\n", Instructions(caller)));
+        Assert.That(load.Operands[0], Is.InstanceOf<MethodAnalysisContext>().With.Property("Name").EqualTo("Get"));
+        Assert.That(load.Operands[2], Is.SameAs(grid));
+        Assert.That(load.Operands[3], Is.SameAs(row));
+        var column = (LocalVariable)load.Operands[4];
+        var writes = Instructions(caller).Where(i => ReferenceEquals(i.Destination, column)).ToList();
+        Assert.That(writes.Count, Is.EqualTo(2), () => string.Join("\n", Instructions(caller)));
+    }
+
+    [Test]
+    public void RowWalkWhoseRowChangesInsideKeepsTheLoad()
+    {
+        var (caller, load, _, _) = RowWalk(rowChangesInside: true);
+
+        ArrayRecovery.RecoverMultiDimensionalAccesses(caller);
+
+        Assert.That(load.Operands[1], Is.InstanceOf<MemoryOperand>());
+    }
+
+    [Test]
+    public void OffsetWalkIsTheElementAtItsCounter()
+    {
+        // for (k = 2; k < len1; k++) x = grid[0, k], strength-reduced to `grid + off + 0x28`
+        // with off stepping by 4 from 0.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("Grid.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemBooleanType,
+            app.SystemTypes.SystemObjectType);
+        var int32 = app.SystemTypes.SystemInt32Type;
+        var grid = Local("grid", new ArrayTypeAnalysisContext(int32, 2));
+        LocalVariable off = Local("off"), k = Local("k", int32), b = Local("bounds"),
+            ck = Local("ck", app.SystemTypes.SystemBooleanType), p = Local("p"), x = Local("x", int32);
+        var head = new Instruction(3, OpCode.CheckLess, ck, k, new MemoryOperand(b, null, 0x10, 0, 4));
+        var load = new Instruction(5, OpCode.Move, x, new MemoryOperand(p, null, 0x28, 0, 4));
+        var (caller, _) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, off, new Immediate(0)),
+            new(1, OpCode.Move, k, new Immediate(2)),
+            new(2, OpCode.Move, b, new MemoryOperand(grid, null, 0x10, 0, 8)),
+            head,
+            new(4, OpCode.Add, p, grid, off),
+            load,
+            new(6, OpCode.Add, off, off, new Immediate(4)),
+            new(7, OpCode.Add, k, k, new Immediate(1)),
+            new(8, OpCode.ConditionalJump, head, ck),
+            new(9, OpCode.Return, x)], [grid, off, k, b, ck, p, x]);
+        caller.ParameterLocals = [grid];
+
+        ArrayRecovery.RecoverMultiDimensionalAccesses(caller);
+
+        Assert.That(load.OpCode, Is.EqualTo(OpCode.Call), () => string.Join("\n", Instructions(caller)));
+        Assert.That(load.Operands.Skip(2), Is.EqualTo(new IOperand[] { grid, new Immediate(0), k }));
+    }
 }

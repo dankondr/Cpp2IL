@@ -24,14 +24,25 @@ row-major at `array + 4p + (i·len1 + j)·size`.
 - The address arithmetic the elements no longer read is removed before the
   lengths become calls.
 
-## Not covered
+## Walks along the last dimension (rank 2)
 
-Walks along the last dimension with a post-indexed pointer or a byte offset
-(`LDR W17, [X15], #4`; `grid + off`, `off += 16`) need induction recovery.
-`CastleBuildingController::GetSumOfCastleValuesFromGrid` is one of them.
+- A row walk: a pointer set to `data + len1·s` and stepped by the element size. `s` is the
+  row index scaled by the element size, directly (`i << log2 size`) or as a counter that
+  steps by the size alongside `i`. The element is `[i, column]`, `column` a counter the walk
+  gets (0 where the pointer is set, +1 where it steps). `i` must be compared with length 0
+  and must not change between the walk's start and the access.
+- An offset walk: `[grid + off + 4p + k0·size]` with `off` stepping by the element size from
+  0 alongside a counter `k` from `k0`. The element is `[0, k]`, and `k` must be compared
+  with length 1.
+- Two counters move together when both start in one block and either step in one block
+  (the access is not between the steps), or no step runs before the first access, every
+  cycle through the access runs each step, and no step repeats without the access.
+
+Walks depend on loop-carried copies surviving the post-SSA simplifier (dankondr/Cpp2IL#176).
 
 ## Tests
 
 `Cpp2IL.Core.Tests/Regression/MultiDimensionalArrayTests.cs`: read, write, a
-struct element field, an index never compared with its length, and the emitted
-IL (`int32[0..., 0...]::Get`, `System.Array::GetLength`).
+struct element field, an index never compared with its length, the emitted
+IL (`int32[0..., 0...]::Get`, `System.Array::GetLength`), a row walk, a row walk
+whose row changes inside it (kept), and an offset walk.
