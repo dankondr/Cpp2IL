@@ -1257,12 +1257,18 @@ public static class LocalVariables
     {
         var booleanType = method.AppContext.SystemTypes.SystemBooleanType;
 
+        var allDefinitions = method.ControlFlowGraph!.Instructions
+            .Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!)
+            .ToDictionary(g => g.Key, g => (IReadOnlyList<Instruction>)g.ToList());
+
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             if (instruction.OpCode is < OpCode.CheckEqual or > OpCode.CheckLessOrEqual)
                 continue;
 
-            if (instruction.Destination is LocalVariable destination)
+            if (instruction.Destination is LocalVariable destination
+                && TryClaimBoolean(destination, method, allDefinitions))
                 destination.Type = booleanType;
         }
     }
@@ -1400,6 +1406,11 @@ public static class LocalVariables
             .Where(g => g.Count() == 1)
             .ToDictionary(g => g.Key, g => g.Single());
 
+        var allDefinitions = method.ControlFlowGraph.Instructions
+            .Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!)
+            .ToDictionary(g => g.Key, g => (IReadOnlyList<Instruction>)g.ToList());
+
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             switch (instruction.OpCode)
@@ -1409,11 +1420,11 @@ public static class LocalVariables
                         changed |= SetTypeIfUnknown(extended, method.AppContext.SystemTypes.SystemInt64Type);
                     break;
                 case OpCode.Move:
-                    changed |= PropagateMove(instruction, method.AppContext.Binary.PointerSizeBytes,
-                        method.AppContext.SystemTypes.SystemInt32Type, definitions);
+                    changed |= PropagateMove(instruction, method, method.AppContext.Binary.PointerSizeBytes,
+                        method.AppContext.SystemTypes.SystemInt32Type, definitions, allDefinitions);
                     break;
                 case OpCode.Phi:
-                    changed |= PropagatePhi(instruction, definitions);
+                    changed |= PropagatePhi(instruction, method, definitions, allDefinitions);
                     break;
                 case OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.VectorMin or OpCode.VectorMax:
                     changed |= PropagateArithmetic(instruction, method);
@@ -1426,21 +1437,210 @@ public static class LocalVariables
                     // IlGenerator emits boolean Not as ceq 0, not bitwise complement.
                     // Keep its result typed even when the lifter introduced Not before
                     // comparison-result seeding (rather than the late flag simplifier).
-                    changed |= SetTypeIfUnknown(destination, method.AppContext.SystemTypes.SystemBooleanType);
+                    changed |= SetTypeRespectingBooleanClaim(destination, method.AppContext.SystemTypes.SystemBooleanType, method,
+                        allDefinitions);
                     break;
                 case OpCode.Negate:
                     changed |= PropagateArithmetic(instruction, method)
-                        || PropagateBooleanResult(instruction, method)
+                        || PropagateBooleanResult(instruction, method, allDefinitions)
                         || PropagateIntegerResult(instruction, method);
                     break;
                 case OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not
                     or OpCode.ShiftLeft or OpCode.ShiftRight:
-                    changed |= PropagateBooleanResult(instruction, method) || PropagateIntegerResult(instruction, method);
+                    changed |= PropagateBooleanResult(instruction, method, allDefinitions) || PropagateIntegerResult(instruction, method);
                     break;
             }
         }
 
         return changed;
+    }
+
+    // Types that reach a Boolean slot as raw bits: the flag itself or a 4-byte integer the
+    // store truncates to the same byte pattern the binary wrote. Anything else - a reference,
+    // a managed pointer, a wider value - has no legal conversion.
+    private static bool BooleanSlotTypeSatisfied(TypeAnalysisContext? type) =>
+        type?.FullName is "System.Boolean" or "System.Byte" or "System.SByte" or "System.Char"
+            or "System.Int16" or "System.UInt16" or "System.Int32" or "System.UInt32";
+
+    // A local may only claim System.Boolean when every definition feeding it proves a flag
+    // or a same-width integer. A definition-less local - a register the analysis never
+    // resolved - emits an unconstrained object and breaks the claim.
+    private static bool LocalBooleanClaimConsistent(LocalVariable local,
+        IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>> allDefinitions) =>
+        allDefinitions.TryGetValue(local, out var defs)
+        && defs.All(def => !DefBreaksBooleanClaim(def, allDefinitions, []));
+
+    // The claim is also kept when the local is read somewhere an emitted System.Object
+    // cannot honestly carry the flag: a branch condition (a boxed flag makes brtrue
+    // silently always-true), a comparison, arithmetic, a typed slot (an object reaching
+    // it needs a castclass/unbox the binary never made), or a member/address base. Only
+    // locals consumed exclusively through System.Object slots may honestly drop the claim.
+    private static bool MayClaimBoolean(LocalVariable local, MethodAnalysisContext method,
+        IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>> allDefinitions) =>
+        LocalBooleanClaimConsistent(local, allDefinitions)
+        || !AllUsesObjectCompatible(local, method, []);
+
+    private const string BooleanClaimVetoedKey = "BooleanClaimVetoed";
+
+    // A claim attempt the gate vetoes is recorded: the local falls back to an
+    // object slot, and IlGenerator wraps that slot's contract so any scalar
+    // edge reaching it keeps the named note the Boolean-typed slot emitted.
+    private static bool TryClaimBoolean(LocalVariable local, MethodAnalysisContext method,
+        IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>> allDefinitions)
+    {
+        if (MayClaimBoolean(local, method, allDefinitions))
+            return true;
+        if (method.GetExtraData<HashSet<LocalVariable>>(BooleanClaimVetoedKey) is not { } vetoed)
+            method.PutExtraData(BooleanClaimVetoedKey, vetoed = []);
+        vetoed.Add(local);
+        return false;
+    }
+
+    internal static bool CarriesVetoedBooleanClaim(LocalVariable local, MethodAnalysisContext context) =>
+        context.GetExtraData<HashSet<LocalVariable>>(BooleanClaimVetoedKey)?.Contains(local) == true;
+
+    private static bool SetTypeRespectingBooleanClaim(LocalVariable local, TypeAnalysisContext? type,
+        MethodAnalysisContext method,
+        IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>> allDefinitions) =>
+        type is { FullName: "System.Boolean" }
+            ? TryClaimBoolean(local, method, allDefinitions) && SetTypeIfUnknown(local, type)
+            : SetTypeIfUnknown(local, type);
+
+    private static bool IsObjectSlotType(TypeAnalysisContext? type) =>
+        type?.FullName == "System.Object";
+
+    // Whether every read of this local sits in a position where a System.Object value is
+    // both legal and semantics-preserving: only stores into object-typed slots and
+    // object-typed parameters/returns qualify. Any other use makes the Boolean claim the
+    // safer emission - the disagreeing producers then keep their named diagnostics.
+    private static bool AllUsesObjectCompatible(LocalVariable local, MethodAnalysisContext method,
+        HashSet<LocalVariable> visiting)
+    {
+        if (!visiting.Add(local))
+            return false;
+        var result = true;
+        foreach (var user in method.ControlFlowGraph!.Instructions)
+            for (var i = 0; i < user.Operands.Count; i++)
+            {
+                var operand = user.Operands[i];
+                if (!ContainsLocal(operand, local))
+                    continue;
+                // The destination position writes the local; it is not a use. A local
+                // nested inside a compound destination is read (a host, base or index).
+                if (ReferenceEquals(user.Destination, local) && ReferenceEquals(operand, local))
+                    continue;
+                if (!UseIsObjectCompatible(user, i, operand, local, method, visiting))
+                {
+                    result = false;
+                    break;
+                }
+            }
+        visiting.Remove(local);
+        return result;
+    }
+
+    private static bool UseIsObjectCompatible(Instruction user, int operandIndex, IOperand operand,
+        LocalVariable local, MethodAnalysisContext method, HashSet<LocalVariable> visiting)
+    {
+        switch (user.OpCode)
+        {
+            case OpCode.Move:
+                // Only a bare-local source reaching a plain slot can carry the object
+                // honestly; compound source operands and destination shapes are reads.
+                return operandIndex > 0 && ReferenceEquals(operand, local)
+                    && SlotAcceptsObjectValue(user.Operands[0], method, visiting);
+            case OpCode.Phi:
+                return ReferenceEquals(operand, local)
+                    && SlotAcceptsObjectValue(user.Operands[0], method, visiting);
+            case OpCode.Call or OpCode.CallVoid:
+            {
+                if (user.Operands.OfType<MethodAnalysisContext>().FirstOrDefault() is not { } target)
+                    return false;
+                var paramIndex = user.OpCode == OpCode.Call
+                    ? (target.IsStatic ? 2 : 3)
+                    : (target.IsStatic ? 1 : 2);
+                if (operandIndex < paramIndex || !ReferenceEquals(operand, local))
+                    return false;
+                var paramPosition = operandIndex - paramIndex;
+                return paramPosition < target.Parameters.Count
+                    && IsObjectSlotType(target.Parameters[paramPosition].ParameterType);
+            }
+            case OpCode.Return:
+                return ReferenceEquals(operand, local) && IsObjectSlotType(method.ReturnType);
+            default:
+                return false;
+        }
+    }
+
+    // Whether a slot written by a Move/Phi destination can receive the object's values:
+    // object-typed slots directly; an untyped local delegates to its own uses.
+    private static bool SlotAcceptsObjectValue(IOperand slot, MethodAnalysisContext method,
+        HashSet<LocalVariable> visiting) => slot switch
+    {
+        LocalVariable { Type: { } slotType } => IsObjectSlotType(slotType),
+        LocalVariable untyped => AllUsesObjectCompatible(untyped, method, visiting),
+        FieldReference field => IsObjectSlotType(field.Field.FieldType),
+        SelectedFieldReference selected => IsObjectSlotType(selected.FieldType),
+        ArrayAccess { Array.Type: SzArrayTypeAnalysisContext { ElementType: { } element } } =>
+            IsObjectSlotType(element),
+        _ => false,
+    };
+
+    // Whether the value this operand can carry is provably a flag or a same-width integer.
+    // Recurses through copy and merge definitions; cycles fail closed.
+    private static bool BooleanClaimSatisfied(IOperand operand,
+        IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>> allDefinitions,
+        HashSet<LocalVariable> visiting)
+    {
+        switch (operand)
+        {
+            case LocalVariable { Type: { } type }:
+                return BooleanSlotTypeSatisfied(type);
+            case LocalVariable local:
+                if (!visiting.Add(local))
+                    return false;
+                var consistent = allDefinitions.TryGetValue(local, out var defs)
+                    && defs.All(def => !DefBreaksBooleanClaim(def, allDefinitions, visiting));
+                visiting.Remove(local);
+                return consistent;
+            case FieldReference field:
+                return BooleanSlotTypeSatisfied(field.Field.FieldType);
+            case ArrayElementFieldReference elementField:
+                return BooleanSlotTypeSatisfied(elementField.Field.FieldType);
+            case ArrayAccess { Array.Type: SzArrayTypeAnalysisContext { ElementType: { } elementType } }:
+                return BooleanSlotTypeSatisfied(elementType);
+            case Immediate { Value: >= int.MinValue and <= uint.MaxValue }:
+            case ArrayLength:
+                return true;
+            case Instruction instruction:
+                return !DefBreaksBooleanClaim(instruction, allDefinitions, visiting);
+            default:
+                return false;
+        }
+    }
+
+    // Whether this definition can produce a value with no legal crossing into a
+    // System.Boolean slot.
+    private static bool DefBreaksBooleanClaim(Instruction def,
+        IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>> allDefinitions,
+        HashSet<LocalVariable> visiting)
+    {
+        switch (def.OpCode)
+        {
+            // A comparison or boolean-logic result is exactly the 0/1 flag the slot wants;
+            // integer arithmetic on satisfied operands yields a same-width integer.
+            case >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual:
+            case OpCode.Not or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Negate:
+            case OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+                or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight:
+            case OpCode.Move or OpCode.Phi:
+                return def.Operands.Skip(1).Any(operand => !BooleanClaimSatisfied(operand, allDefinitions, visiting));
+            case OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall or OpCode.Newobj:
+                var callee = def.Operands.OfType<MethodAnalysisContext>().FirstOrDefault();
+                return !BooleanSlotTypeSatisfied(callee?.ReturnType);
+            default:
+                return true;
+        }
     }
 
     private static bool IsGuardOnlyResult(LocalVariable local, Instruction producer, MethodAnalysisContext method)
@@ -1544,7 +1744,8 @@ public static class LocalVariables
         RecoverArrayBackedSpanStores(method);
     }
 
-    private static bool PropagateBooleanResult(Instruction instruction, MethodAnalysisContext method)
+    private static bool PropagateBooleanResult(Instruction instruction, MethodAnalysisContext method,
+        IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>> allDefinitions)
     {
         if (instruction.OpCode is not (OpCode.And or OpCode.Or or OpCode.Xor)
             || instruction.Destination is not LocalVariable { Type: null } destination
@@ -1552,7 +1753,8 @@ public static class LocalVariables
             || instruction.Sources.Any(source => source is not LocalVariable { Type.FullName: "System.Boolean" }))
             return false;
 
-        return SetTypeIfUnknown(destination, method.AppContext.SystemTypes.SystemBooleanType);
+        return SetTypeRespectingBooleanClaim(destination, method.AppContext.SystemTypes.SystemBooleanType, method,
+            allDefinitions);
     }
 
     // A local assigned a float/double literal (a lifted rodata constant load) is that float type
@@ -1778,8 +1980,10 @@ public static class LocalVariables
             _ => null,
         };
 
-    private static bool PropagateMove(Instruction move, int pointerSize, TypeAnalysisContext systemInt32Type,
-        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+    private static bool PropagateMove(Instruction move, MethodAnalysisContext method, int pointerSize,
+        TypeAnalysisContext systemInt32Type,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>> allDefinitions)
     {
         var destination = move.Operands[0];
         var source = move.Operands[1];
@@ -1794,7 +1998,8 @@ public static class LocalVariables
                 destLocal.Type = sourceType;
                 return true;
             }
-            return SetTypeIfUnknown(destLocal, sourceLocal.Type) || SetTypeIfUnknown(sourceLocal, destLocal.Type);
+            return SetTypeRespectingBooleanClaim(destLocal, sourceLocal.Type, method, allDefinitions)
+                || SetTypeRespectingBooleanClaim(sourceLocal, destLocal.Type, method, allDefinitions);
         }
 
         // Move local, field: a field load types its result with the field's type. This is the edge
@@ -1804,6 +2009,9 @@ public static class LocalVariables
             var fieldType = loadField.Field.FieldType;
             if (loadDest.Type?.FullName == fieldType.FullName)
                 return false;
+            if (fieldType.FullName == "System.Boolean")
+                return TryClaimBoolean(loadDest, method, allDefinitions)
+                    && SetTypeIfUnknown(loadDest, fieldType);
             loadDest.Type = fieldType;
             return true;
         }
@@ -1812,13 +2020,16 @@ public static class LocalVariables
         {
             if (selectedDest.Type?.FullName == selectedField.FieldType.FullName)
                 return false;
+            if (selectedField.FieldType.FullName == "System.Boolean")
+                return TryClaimBoolean(selectedDest, method, allDefinitions)
+                    && SetTypeIfUnknown(selectedDest, selectedField.FieldType);
             selectedDest.Type = selectedField.FieldType;
             return true;
         }
 
         // Move field, local: a field store types the stored value with the field's type.
         if (destination is FieldReference storeField && source is LocalVariable storeSource)
-            return SetTypeIfUnknown(storeSource, storeField.Field.FieldType);
+            return SetTypeRespectingBooleanClaim(storeSource, storeField.Field.FieldType, method, allDefinitions);
 
         // ArrayLength is emitted as ldlen/conv.i4, so its result is always Int32 when the
         // source is a recovered managed array. Do not infer this from arbitrary references.
@@ -1888,7 +2099,9 @@ public static class LocalVariables
 
     // A phi is a copy from each predecessor's value, so types flow both ways across it - mirroring
     // the bidirectional Move copies it decays into once SSA is destroyed.
-    private static bool PropagatePhi(Instruction phi, IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+    private static bool PropagatePhi(Instruction phi, MethodAnalysisContext method,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions,
+        IReadOnlyDictionary<LocalVariable, IReadOnlyList<Instruction>> allDefinitions)
     {
         if (phi.Operands[0] is not LocalVariable destination)
             return false;
@@ -1910,14 +2123,21 @@ public static class LocalVariables
             }
         }
 
-        // Forward: an untyped phi result takes the type of any typed input.
+        // Forward: an untyped phi result takes the type of any typed input - except a
+        // Boolean, which a phi may only claim when every input proves a flag or a 4-byte
+        // integer. A phi merging a 0/1 flag on one edge with a reference, pointer or wider
+        // value on another is a register holding unrelated contents across paths, not a
+        // bool slot: claiming System.Boolean manufactures a truthiness conversion the
+        // binary never made on every disagreeing edge.
         if (destination.Type == null)
         {
             for (var i = 1; i < phi.Operands.Count; i++)
             {
                 if (phi.Operands[i] is LocalVariable { Type: { } inputType })
                 {
-                    changed = SetTypeIfUnknown(destination, inputType);
+                    if (inputType.FullName != "System.Boolean"
+                        || TryClaimBoolean(destination, method, allDefinitions))
+                        changed = SetTypeIfUnknown(destination, inputType);
                     break;
                 }
             }
