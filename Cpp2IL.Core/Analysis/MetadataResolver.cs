@@ -200,6 +200,8 @@ public static class MetadataResolver
             if (operand is MemoryOperand { Base: LocalVariable baseLocal })
                 loadBases.Add(baseLocal);
 
+        changed |= NarrowWideLoads(method, definitions);
+
         var splitStores = new List<(Instruction After, List<Instruction> Others)>();
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
@@ -440,6 +442,68 @@ public static class MetadataResolver
             }
         }
         return true;
+    }
+
+    // A wide load read in part is a narrower load. Little-endian, a shift right by k
+    // bytes of a W-byte load is bytes [k, W) zero-extended, and a store of its low w
+    // bytes stores bytes [0, w): `LDR D0, [x, #o]` of two floats then `STR S0` and the
+    // shifted high lane are the float at o and the float at o + 4. The narrower load
+    // is placed right after the wide one, where the memory holds the same bytes. Only
+    // a part that is exactly one field is split: `long >> 8` is arithmetic, not a lane.
+    private static bool NarrowWideLoads(MethodAnalysisContext method,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+    {
+        var changed = false;
+        var created = 0;
+        foreach (var block in method.ControlFlowGraph!.Blocks)
+        foreach (var use in block.Instructions.ToList())
+        {
+            if (use is { OpCode: OpCode.ShiftRight, Operands: [LocalVariable result, LocalVariable shifted, Immediate { Value: var bits }] }
+                && bits > 0 && bits % 8 == 0
+                && WideLoad(shifted, (int)(bits / 8) + 1) is { } shiftedLoad
+                && Narrowed(shiftedLoad.Memory, (int)(bits / 8), shiftedLoad.Memory.AccessSize - (int)(bits / 8))
+                    is { } high)
+            {
+                InsertAfter(shiftedLoad.Load, new Instruction(-1, OpCode.Move, result, high));
+                use.OpCode = OpCode.Nop;
+                use.SetOperands();
+                changed = true;
+            }
+            else if (use is { OpCode: OpCode.Move, Operands: [MemoryOperand store, LocalVariable stored] }
+                     && (store.AccessSize > 0 ? store.AccessSize : use.NativeStoreWidthBytes ?? 0) is > 0 and var width
+                     && WideLoad(stored, width + 1) is { } storedLoad
+                     && Narrowed(storedLoad.Memory, 0, width) is { } low)
+            {
+                var part = new LocalVariable($"part{created}", new Register(null, $"PART{created++}_{use.Index}"));
+                method.Locals.Add(part);
+                InsertAfter(storedLoad.Load, new Instruction(-1, OpCode.Move, part, low));
+                use.SetOperand(1, part);
+                changed = true;
+            }
+        }
+        return changed;
+
+        (Instruction Load, MemoryOperand Memory)? WideLoad(LocalVariable value, int minimumWidth)
+            => definitions.TryGetValue(value, out var load)
+               && load is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable loadBase } memory] }
+               && memory.AccessSize >= minimumWidth
+               && EffectiveObjectType(loadBase, definitions, method.DeclaringType) is not null
+                ? (load, memory) : null;
+
+        MemoryOperand? Narrowed(MemoryOperand memory, int skip, int width)
+        {
+            var narrowed = new MemoryOperand(memory.Base, null, memory.Addend + skip, 0, width);
+            return ResolveScalarFieldAccess(method, narrowed) is FieldReference field
+                   && PrimitiveStorageSize(field.Field.FieldType, method.AppContext.Binary.PointerSizeBytes) == width
+                ? narrowed : null;
+        }
+
+        void InsertAfter(Instruction anchor, Instruction inserted)
+        {
+            inserted.NativeMemoryAccessSize = ((MemoryOperand)inserted.Operands[1]).AccessSize;
+            var owner = method.ControlFlowGraph.Blocks.First(b => b.Instructions.Contains(anchor));
+            owner.Instructions.Insert(owner.Instructions.IndexOf(anchor) + 1, inserted);
+        }
     }
 
     // The zero stores that directly follow `first` in its block and continue its byte
