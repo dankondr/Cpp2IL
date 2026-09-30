@@ -32,6 +32,26 @@ internal static class ByrefAliasForwarding
         if (graph == null)
             return;
 
+        // A copy whose source and destination spell the same cell emits a bare
+        // `v = v` the decompiler prints as an unassigned self-read. `[v+0]` and
+        // `v` spell the same cell for a non-managed-pointer local - the load
+        // and store shortcuts already treat it that way - so the move is a
+        // no-op and goes out here.
+        var removedCopies = false;
+        foreach (var block in graph.Blocks)
+        {
+            foreach (var instruction in block.Instructions)
+            {
+                if (instruction.OpCode == OpCode.Move
+                    && SameCell(instruction.Operands[0], instruction.Operands[1]))
+                {
+                    instruction.OpCode = OpCode.Nop;
+                    instruction.SetOperands();
+                    removedCopies = true;
+                }
+            }
+        }
+
         // Map every local to its defining instructions. A candidate is defined only by Move
         // copies - any other definition means the slot carries a computed value, not an alias.
         var definitions = new Dictionary<LocalVariable, List<Instruction>>();
@@ -157,11 +177,214 @@ internal static class ByrefAliasForwarding
             }
         }
 
-        if (removedAny)
+        // Candidates the component walk could not forward fall into two
+        // recoverable classes the single-root rule cannot see:
+        //
+        // - a local rebound to *different* roots on different paths (`r = &a`
+        //   on one edge, `r = &b` on another) - the join is real, but every
+        //   individual use is still reached by exactly one binding, so each
+        //   use reads its reaching pointee directly;
+        // - a uniform `r = &x` alias whose uses sit in compound positions -
+        //   the root operand `&x` cannot substitute `x.field`, but the
+        //   pointee `x` can.
+        //
+        // Either way the emitted alternative is a `ref` local retargeted
+        // between pointees - legal IL, illegal C# (a `ref` cannot rebind to a
+        // narrower scope, and binding an out parameter reads it unassigned).
+        // Resolving the uses removes the local outright. A use reached by
+        // bindings to different pointees vetoes the local: its value really
+        // is path-dependent and it stays a `ref` slot.
+        var remaining = candidates.Where(method.Locals.Contains).ToHashSet();
+        var progress = true;
+        while (progress)
+        {
+            progress = false;
+            foreach (var local in remaining.ToList())
+            {
+                if (TryResolvePerUse(graph, local, definitions[local], remaining))
+                {
+                    foreach (var def in definitions[local])
+                    {
+                        def.OpCode = OpCode.Nop;
+                        def.SetOperands();
+                    }
+                    method.Locals.Remove(local);
+                    remaining.Remove(local);
+                    removedCopies = true;
+                    progress = true;
+                }
+            }
+        }
+
+        if (removedAny || removedCopies)
         {
             graph.RemoveNops();
             graph.RemoveEmptyBlocks();
         }
+    }
+
+    // The cell an operand writes or reads as a whole: the local itself, or a
+    // zero-offset memory form over a non-managed-pointer local (which the
+    // emitter already spells as that local's slot). Byref bases spell a
+    // dereference, not the cell.
+    private static LocalVariable? CellOf(IOperand operand) => operand switch
+    {
+        LocalVariable local => local,
+        MemoryOperand { Index: null, Addend: 0, Scale: 0, Base: LocalVariable { Type: not ByRefTypeAnalysisContext } cell }
+            => cell,
+        _ => null,
+    };
+
+    private static bool SameCell(IOperand a, IOperand b) =>
+        CellOf(a) is { } cell && ReferenceEquals(cell, CellOf(b));
+
+    // Every definition of `local` must classify into a root the uses can
+    // substitute, and every use must be reached only by defs agreeing on one
+    // root. On success each use is substituted and true is returned; on any
+    // failure nothing is rewritten.
+    private static bool TryResolvePerUse(ISILControlFlowGraph graph, LocalVariable local,
+        List<Instruction> defs, HashSet<LocalVariable> candidates)
+    {
+        // &local binds name the pointee; a copied pointer names another slot's
+        // alias value; anything else forwardable is an opaque pointer only
+        // bare uses can take. A source naming a surviving candidate chains
+        // the resolution - the local is retried after that candidate's uses
+        // are substituted.
+        var roots = new (IOperand? pointer, LocalVariable? pointee)[defs.Count];
+        for (var i = 0; i < defs.Count; i++)
+        {
+            switch (defs[i].Operands[1])
+            {
+                case AddressOf { Target: LocalVariable pointee } bind
+                    when !candidates.Contains(pointee) && !ReferenceEquals(pointee, local):
+                    roots[i] = (bind, pointee);
+                    break;
+                case LocalVariable source
+                    when !candidates.Contains(source) && !ReferenceEquals(source, local):
+                    roots[i] = (source, source);
+                    break;
+                case { } other when IsForwardableRoot(other)
+                    && !LocalVariables.ContainsLocal(other, local):
+                    roots[i] = (other, null);
+                    break;
+                default:
+                    return false;
+            }
+        }
+
+        var defSet = new HashSet<Instruction>(defs);
+        var rootIndex = defs.Select((d, i) => (d, i)).ToDictionary(x => x.d, x => x.i);
+
+        // Reaching definitions per block: a def in a block shadows every
+        // earlier reaching def, so out[b] is the block's last def when it has
+        // one. Iterate the union over predecessors to a fixpoint.
+        var blocks = graph.Blocks;
+        var reachingIn = new Dictionary<Block, HashSet<Instruction>>(blocks.Count);
+        var reachingOut = new Dictionary<Block, HashSet<Instruction>>(blocks.Count);
+        foreach (var block in blocks)
+        {
+            reachingIn[block] = [];
+            reachingOut[block] = [];
+        }
+        var changed = true;
+        while (changed)
+        {
+            changed = false;
+            foreach (var block in blocks)
+            {
+                var next = new HashSet<Instruction>();
+                foreach (var predecessor in block.Predecessors)
+                    next.UnionWith(reachingOut[predecessor]);
+                if (!next.SetEquals(reachingIn[block]))
+                {
+                    reachingIn[block] = next;
+                    changed = true;
+                }
+                Instruction? lastDef = null;
+                foreach (var instruction in block.Instructions)
+                    if (defSet.Contains(instruction))
+                        lastDef = instruction;
+                var outSet = lastDef != null ? [lastDef] : new HashSet<Instruction>(next);
+                if (!outSet.SetEquals(reachingOut[block]))
+                {
+                    reachingOut[block] = outSet;
+                    changed = true;
+                }
+            }
+        }
+
+        // Validate every use: the defs reaching it must agree on one root, and
+        // the position must take that root's shape. Substitutions are applied
+        // only after the whole local validates.
+        var substitutions = new List<(Instruction instruction, int index, IOperand? compound, IOperand pointer)>();
+        foreach (var block in blocks)
+        {
+            var reaching = reachingIn[block];
+            for (var i = 0; i < block.Instructions.Count; i++)
+            {
+                var instruction = block.Instructions[i];
+                if (defSet.Contains(instruction))
+                {
+                    // A def's own source may still read the local (&local or a
+                    // compound over it) - that is a use at this point, resolved
+                    // against the defs reaching *before* it.
+                    if (!LocalVariables.ContainsLocal(instruction.Operands[1], local))
+                    {
+                        reaching = [instruction];
+                        continue;
+                    }
+                }
+                else if (!instruction.Operands.Any(operand => LocalVariables.ContainsLocal(operand, local)))
+                {
+                    continue;
+                }
+
+                if (reaching.Count == 0)
+                    return false; // a read no binding can reach - the local stays a ref slot
+
+                var reachingRoots = reaching.Select(d => roots[rootIndex[d]]).ToList();
+                var pointerRoot = reachingRoots[0].pointer;
+                var pointeeRoot = reachingRoots[0].pointee;
+                if (reachingRoots.Any(r => !RootEquals(r.pointer, pointerRoot)))
+                    return false; // path-dependent bindings - a real ref variable
+
+                for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
+                {
+                    var operand = instruction.Operands[operandIndex];
+                    if (!LocalVariables.ContainsLocal(operand, local))
+                        continue;
+                    if (instruction.OpCode == OpCode.Move && operandIndex == 0
+                        && ReferenceEquals(operand, local) && defSet.Contains(instruction))
+                        continue; // the binding side of its own def
+                    if (ReferenceEquals(operand, local))
+                    {
+                        if (pointerRoot == null)
+                            return false;
+                        substitutions.Add((instruction, operandIndex, null, pointerRoot));
+                        continue;
+                    }
+                    if (pointeeRoot == null || !CanSubstitute(operand, local, pointeeRoot))
+                        return false;
+                    substitutions.Add((instruction, operandIndex, pointeeRoot, pointeeRoot));
+                }
+
+                if (defSet.Contains(instruction))
+                    reaching = [instruction];
+            }
+        }
+
+        foreach (var (instruction, index, compound, pointer) in substitutions)
+        {
+            if (compound != null)
+                SubstituteOperand(instruction, index, local, compound);
+            else
+                instruction.SetOperand(index, pointer);
+        }
+
+        return true;
+
+        static bool RootEquals(IOperand? a, IOperand? b) =>
+            a == null ? b == null : a.Equals(b);
     }
 
     // Operands that can sit anywhere a `ref`-typed operand can: a local emits a load of the
