@@ -526,6 +526,14 @@ public abstract class Il2CppBinary(Stream input) : ClassReadingBinaryReader(inpu
 
     public virtual IEnumerable<KeyValuePair<string, ulong>> GetExportedFunctions() => [];
 
+    /// <summary>
+    /// Unwind (exception-handling) tables keyed by function start, when the binary format
+    /// provides them - ELF <c>.eh_frame</c>/<c>.gcc_except_table</c> today. Null means the
+    /// binary carries no usable unwind information and method extents fall back to the
+    /// next known function start.
+    /// </summary>
+    public virtual IReadOnlyDictionary<ulong, EhFunctionInfo>? EhFunctions => null;
+
     public virtual bool TryGetRelocatedSymbolNameAtPointerSlot(ulong slot,
         [NotNullWhen(true)] out string? name)
     {

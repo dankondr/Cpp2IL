@@ -69,6 +69,18 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     /// </summary>
     public DominatorInfo? DominatorInfo;
 
+    /// <summary>
+    /// The method's unwind-table entry when the binary provides one (ELF .eh_frame):
+    /// its true extent and the call-site ranges that unwind to landing pads.
+    /// </summary>
+    public EhFunctionInfo? UnwindInfo;
+
+    /// <summary>
+    /// Landing-pad handler regions split out of <see cref="ConvertedIsil"/> by
+    /// <see cref="Analysis.EhRegionPartition"/> - code only the unwinder enters.
+    /// </summary>
+    public List<LandingPadRegion> LandingPadRegions = [];
+
     public List<string> AnalysisWarnings = [];
 
     public static int MaxMethodSizeBytes = 30000; // 30KB
@@ -602,6 +614,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         if (ConvertedIsil.Count == 0)
             return; //Nothing to do, empty function
+
+        // Landing-pad handler code is not a continuation of the normal path; the unwind
+        // tables name it, so move it out before the graph is built.
+        EhRegionPartition.Partition(this);
 
         ControlFlowGraph = new ISILControlFlowGraph(ConvertedIsil);
 

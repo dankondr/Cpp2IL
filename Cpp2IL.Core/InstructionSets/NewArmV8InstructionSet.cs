@@ -86,8 +86,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
         if (context is not ConcreteGenericMethodAnalysisContext)
         {
-            //Managed method or attr gen => grab raw byte range between a and b
-            var startOfNextFunction = context.AppContext.GetAddressOfNextFunctionStart(context.UnderlyingPointer);
+            //Managed method or attr gen => grab raw byte range to the method's end (unwind-table extent when present)
+            var startOfNextFunction = context.AppContext.GetFunctionEnd(context.UnderlyingPointer);
             var count = (int)(startOfNextFunction - context.UnderlyingPointer);
 
             if (startOfNextFunction > 0)
@@ -244,7 +244,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         Instruction Add(ulong address, OpCode opCode, params List<IOperand> operands)
         {
             addresses.Add(address);
-            var newInstruction = new Instruction(instructions.Count, opCode, operands);
+            var newInstruction = new Instruction(instructions.Count, opCode, operands) { NativeAddress = address };
             instructions.Add(newInstruction);
             return newInstruction;
         }
