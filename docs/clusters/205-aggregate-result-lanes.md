@@ -40,6 +40,14 @@ for >16, else 1), spills a composite to the stack whole when it does not fit
 the remaining register file, and only exhausts the register file when a
 register-passed composite is the one that cannot fit — per AAPCS C.3/C.4.
 
+The method's own aggregate return is the mirror image: the lifter puts each
+lane register on the `Return`'s operands (`AttachReturnLanes`), and
+`RebuildAggregateReturns` stores every lane into the field its bytes hold of a
+local of the declared return type — `SCVTF S0,W19; SCVTF S1,W0; RET` of a
+`Vector2` method returns `new Vector2(x, y)` rather than one `Int32` lane.
+A `Return` whose lanes cannot all be proven keeps its extra operands for the
+default-fill note.
+
 ## Test
 
 `Cpp2IL.Core.Tests/Regression/AggregateResultLaneTests.cs` drives synthetic
@@ -54,3 +62,5 @@ ISIL through the real pipeline (`SsaForm`, `CreateAll`,
 - `SixteenByteStructReturnDefinesBothXRegisters` — X1 spells `hi` at offset 8.
 - `AggregateParameterLanesReadAsFields` — an entry `Vector3` parameter's V1
   read spells `p.y`.
+- `Vector2ReturnRebuildsStructFromLanes` — `Return(V0,V1)` of a `Vector2`
+  method returns a local whose `x`/`y` stores the lanes, no diagnostic.
