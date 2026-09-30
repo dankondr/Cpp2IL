@@ -27,11 +27,12 @@ public class AddressIntoIntPtrSlotTests
     // Injects a corlib `Unsafe` type carrying `static void* AsPointer<T>(ref T)`
     // the way the recovered mscorlib does, with emitted AsmResolver members.
     private static (InjectedTypeAnalysisContext unsafeType, InjectedMethodAnalysisContext asPointer)
-        InjectUnsafeAsPointer(ApplicationAnalysisContext app, ModuleDefinition module)
+        InjectUnsafeAsPointer(ApplicationAnalysisContext app, ModuleDefinition module, bool isPublic = true)
     {
         var unsafeType = app.AssembliesByName["mscorlib"].InjectType(
             "System.Runtime.CompilerServices", "Unsafe", app.SystemTypes.SystemObjectType,
-            R.TypeAttributes.Public | R.TypeAttributes.Abstract | R.TypeAttributes.Sealed);
+            (isPublic ? R.TypeAttributes.Public : R.TypeAttributes.NotPublic)
+                | R.TypeAttributes.Abstract | R.TypeAttributes.Sealed);
         var asPointer = unsafeType.InjectMethodContext("AsPointer",
             new PointerTypeAnalysisContext(app.SystemTypes.SystemVoidType),
             R.MethodAttributes.Public | R.MethodAttributes.Static);
@@ -202,13 +203,13 @@ public class AddressIntoIntPtrSlotTests
     }
 
     [Test]
-    public void AmbiguousUnsafeAddressIntoIntPtrSlotEmitsUnambiguousName()
+    public void AmbiguousUnsafeAddressIntoIntPtrSlotKeepsDiagnostic()
     {
         // `intptr = (IntPtr)&value` where the caller can see a second
         // System.Runtime.CompilerServices.Unsafe (a vendored copy in the
-        // caller's own assembly standing in for the NuGet facade). The proven
-        // spelling must still be emitted - through a uniquely-named forwarder
-        // type, so neither Unsafe name is ever spelled at the call site.
+        // caller's own assembly standing in for the NuGet facade). The
+        // unqualified helper name is then ambiguous for the emitted source -
+        // the site keeps its diagnosed default and the note names why.
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
         var app = Cpp2IlApi.CurrentAppContext!;
@@ -233,16 +234,50 @@ public class AddressIntoIntPtrSlotTests
         var il = method.CilMethodBody!.Instructions;
         Assert.Multiple(() =>
         {
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call
-                    && i.Operand is IMethodDescriptor called
-                    && called.Name?.ToString() == "AsPointer"
-                    && called.DeclaringType?.FullName == "Cpp2IL.Recovery.UnsafeInterop"), Is.True,
-                "the emitted call must bind the uniquely-named forwarder\n"
+            Assert.That(CallsAsPointer(il, "AsPointer"), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("No legal conversion")
+                    && text.Contains("more than one System.Runtime.CompilerServices.Unsafe")), Is.True,
+                "the note must name why the proven spelling is withheld\n"
                     + string.Join("\n", il.Select(i => i.ToString())));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call
-                    && i.Operand is IMethodDescriptor called
-                    && called.DeclaringType?.FullName == "System.Runtime.CompilerServices.Unsafe"), Is.False,
-                "the helper name itself must never be spelled\n"
+        });
+    }
+
+    [Test]
+    public void InaccessibleUnsafeAddressIntoIntPtrSlotKeepsDiagnostic()
+    {
+        // `intptr = (IntPtr)&value` where the only Unsafe is the recovered
+        // corlib's copy, declared internal, and the caller is outside its
+        // assembly - the emitted reference may not widen accessibility, so the
+        // site keeps its diagnosed default and the note names why.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("AddrIntPtrInacc.dll");
+        InjectUnsafeAsPointer(app, module, isPublic: false);
+
+        var intLocal = new LocalVariable("value", new Register(null, "value"),
+            app.SystemTypes.SystemInt32Type);
+        var ptrLocal = new LocalVariable("intptr", new Register(null, "intptr"),
+            app.SystemTypes.SystemIntPtrType);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemIntPtrType, app.SystemTypes.SystemVoidType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, ptrLocal, new AddressOf(intLocal)),
+            new(1, OpCode.Return)], [intLocal, ptrLocal]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(CallsAsPointer(il, "AsPointer"), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("No legal conversion")
+                    && text.Contains("not accessible")), Is.True,
+                "the note must name why the proven spelling is withheld\n"
                     + string.Join("\n", il.Select(i => i.ToString())));
         });
     }
