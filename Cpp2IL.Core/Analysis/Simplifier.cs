@@ -159,13 +159,36 @@ public static class Simplifier
             return changed;
         }
 
-        private static bool MayWriteMemory(Instruction instruction) => instruction.OpCode switch
+        // Whether the instruction can write the location a forwarded read came from. A field is
+        // one location per field (whatever the receiver); raw memory and block writes can reach
+        // any. Calls are left to MustPreserveFieldSnapshot, except for a raw memory read, which
+        // any call may change.
+        private static bool MayOverwrite(Instruction instruction, IOperand read)
         {
-            OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall or OpCode.Newobj or OpCode.MemoryCopy
-                or OpCode.MemorySet or OpCode.MemoryMove or OpCode.Interrupt or OpCode.NotImplemented => true,
-            OpCode.Move => instruction.Operands.Count > 0 && instruction.Operands[0] is not LocalVariable,
-            _ => false,
-        };
+            if (read is not (FieldReference or SelectedFieldReference or MemoryOperand or ArrayAccess
+                or ArrayElementFieldReference))
+                return false;
+            if (instruction.OpCode is OpCode.MemoryCopy or OpCode.MemorySet or OpCode.MemoryMove
+                or OpCode.Interrupt or OpCode.NotImplemented)
+                return true;
+            if (instruction.IsCall || instruction.OpCode is OpCode.IndirectCall)
+                return read is MemoryOperand;
+            if (instruction.OpCode != OpCode.Move || instruction.Operands.Count == 0
+                || instruction.Operands[0] is LocalVariable)
+                return false;
+            var written = instruction.Operands[0];
+            return written is MemoryOperand || read is MemoryOperand
+                || FieldsOf(written).Intersect(FieldsOf(read)).Any()
+                || written is ArrayAccess && read is ArrayAccess;
+
+            static IEnumerable<FieldAnalysisContext> FieldsOf(IOperand operand) => operand switch
+            {
+                FieldReference field => [field.Field, .. field.Containers],
+                SelectedFieldReference selected => selected.Choices.SelectMany(c => (IEnumerable<FieldAnalysisContext>)[c.Field.Field, .. c.Field.Containers]),
+                ArrayElementFieldReference element => [element.Field],
+                _ => [],
+            };
+        }
 
         private bool MustPreserveFieldSnapshot(Block block, int startIndex, LocalVariable value,
             LocalVariable? receiver)
@@ -297,10 +320,8 @@ public static class Simplifier
             // and a join that merges another definition of one of them ends it too.
             var replacementLocals = LocalVariables.OperandLocals(replacement).ToHashSet();
             stopAtJoins |= replacementLocals.Any(read => definitionCounts.TryGetValue(read, out var count) && count > 1);
-            // A value read from memory is only that value until something may write memory:
-            // `x = o.f; o.f = 5; return x` must not become `return o.f`.
-            var readsMemory = replacement is FieldReference or SelectedFieldReference or MemoryOperand
-                or ArrayAccess or ArrayElementFieldReference;
+            // A value read from memory is only that value until a write that can reach the same
+            // location: `x = o.f; o.f = 5; return x` must not become `return o.f`.
 
             var visited = new HashSet<Block>();
             var remaining = new Stack<(Block, int)>(_graph.Blocks.Count);
@@ -328,7 +349,7 @@ public static class Simplifier
 
                     // The instruction still reads the old value; what follows it does not.
                     pathEnds = instruction.Destination is LocalVariable written && replacementLocals.Contains(written)
-                               || readsMemory && MayWriteMemory(instruction);
+                               || MayOverwrite(instruction, replacement);
 
                     // Replace operands
                     for (var j = 0; j < instruction.Operands.Count; j++)
