@@ -93,7 +93,33 @@ internal static class UnsafeAsPointerEmission
 
     private static bool UnsafeAmbiguousFor(MethodAnalysisContext? context) =>
         context?.CustomAttributeAssembly is { } caller
-        && UnsafeCountFor(caller) > 1;
+        && (UnsafeDeclaredFor(caller) || UnsafeUsedBy(caller) > 1);
+
+    // The emitted module's AssemblyRef table sits inside the caller's declared
+    // references (plus the caller itself): any second Unsafe-declaring assembly
+    // in that set can end up as a -r on the csproj, making the unqualified
+    // helper name ambiguous for the compiler. Globals bound by ldtoken are one
+    // such binding that only this declared-refs signal sees - raw ISIL carries
+    // the pointer, not the type.
+    private static bool UnsafeDeclaredFor(AssemblyAnalysisContext caller)
+    {
+        if (caller.Definition is not { } callerDef)
+            return false;
+        var count = 0;
+        foreach (var reference in callerDef.ReferencedAssemblies.Append(callerDef))
+        {
+            if (caller.AppContext.ResolveContextForAssembly(reference) is { } assembly
+                && assembly.GetTypeByFullName(UnsafeFullName) != null)
+                count++;
+        }
+        return count > 1;
+    }
+
+    // The usage scan covers what declared refs cannot express: a caller whose
+    // emitted code binds an Unsafe-declaring assembly it never declared (e.g.
+    // through a generic instantiation resolved to a concrete context).
+    private static int UnsafeUsedBy(AssemblyAnalysisContext caller)
+        => UnsafeCountFor(caller);
 
     private static int UnsafeCountFor(AssemblyAnalysisContext caller)
     {
@@ -232,13 +258,29 @@ internal static class UnsafeAsPointerEmission
                     MarkType(parameter.ParameterType);
                 foreach (var operand in method.ParameterOperands)
                     MarkOperand(operand);
-                if (method.Definition == null || method.RawBytes.Length == 0
-                    || (MethodAnalysisContext.MaxMethodSizeBytes != -1
-                        && method.RawBytes.Length > MethodAnalysisContext.MaxMethodSizeBytes))
+                if (method.Definition == null)
+                    continue;
+                ulong pointer;
+                try
+                {
+                    pointer = method.UnderlyingPointer;
+                }
+                catch
+                {
+                    continue;
+                }
+                if (pointer == 0)
                     continue;
                 List<ISIL.Instruction> isil;
                 try
                 {
+                    // RawBytes is only populated by Analyze(); a method too
+                    // large to analyze emits no recovered body and so cannot
+                    // bind any assembly reference either.
+                    method.EnsureRawBytes();
+                    if (MethodAnalysisContext.MaxMethodSizeBytes != -1
+                        && method.RawBytes.Length > MethodAnalysisContext.MaxMethodSizeBytes)
+                        continue;
                     isil = caller.AppContext.InstructionSet.GetIsilFromMethod(method);
                 }
                 catch
