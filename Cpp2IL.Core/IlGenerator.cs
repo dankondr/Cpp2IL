@@ -6004,10 +6004,13 @@ public static class IlGenerator
                 || !ReferenceEquals(branchCondition, check.Destination))
                 continue;
             var nonNop = branchTarget.Instructions.Where(i => i.OpCode != OpCode.Nop).ToArray();
-            if (nonNop.Length is 1 or 2
+            // Only the block head matters: il2cpp merges every exception raise
+            // into shared tails, so InvalidCastException may be followed by
+            // NullReferenceException throws other paths use. A branch that
+            // lands on Throw InvalidCast throws it regardless of what follows.
+            if (nonNop.Length >= 1
                 && nonNop[0] is { OpCode: OpCode.Throw,
-                    Operands: [TypeAnalysisContext { FullName: "System.InvalidCastException" }] }
-                && (nonNop.Length == 1 || nonNop[1].OpCode == OpCode.Return))
+                    Operands: [TypeAnalysisContext { FullName: "System.InvalidCastException" }] })
                 return true;
         }
         return false;

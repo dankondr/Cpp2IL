@@ -472,6 +472,52 @@ public class ConcreteCallTypingTests
     }
 
     [Test]
+    public void KlassHierarchyCastCheckMergedThrowTail()
+    {
+        // il2cpp merges every exception raise into shared tails: the checked
+        // branch may land on a block that throws InvalidCastException and is
+        // followed by NullReferenceException throws other paths use. Landing
+        // on the head still proves the cast, so the typing holds.
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2022Game();
+        var corlib = app.AssembliesByName["mscorlib"];
+        var getCurrent = corlib.GetTypeByFullName("System.Collections.IEnumerator")!
+            .Methods.Single(m => m.Name == "get_Current");
+        var stream = corlib.GetTypeByFullName("System.IO.Stream")!;
+        var invalidCast = corlib.GetTypeByFullName("System.InvalidCastException")!;
+        var nullRef = corlib.GetTypeByFullName("System.NullReferenceException")!;
+        var observe = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Observe",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, [app.SystemTypes.SystemObjectType]);
+        var enumerator = new LocalVariable("enumerator", new Register(null, "X21"),
+            corlib.GetTypeByFullName("System.Collections.IEnumerator"));
+        var item = new LocalVariable("item", new Register(null, "X0"));
+        var klass = new LocalVariable("klass", new Register(null, "X8"));
+        var depth = new LocalVariable("depth", new Register(null, "W9"), app.SystemTypes.SystemInt32Type);
+        var address = new LocalVariable("address", new Register(null, "X9"));
+        var condition = new LocalVariable("condition", new Register(null, "cond"));
+        var throwInstruction = new Instruction(7, OpCode.Throw, invalidCast);
+        var throwTail = new Instruction(8, OpCode.Throw, nullRef);
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([
+                new(0, OpCode.Call, getCurrent, item, enumerator),
+                new(1, OpCode.Move, klass, new MemoryOperand(item)),
+                new(2, OpCode.Add, address, new MemoryOperand(klass, null, 0xC8), depth),
+                new(3, OpCode.CheckNotEqual, condition, new MemoryOperand(address, null, -8), stream),
+                new(4, OpCode.ConditionalJump, throwInstruction, condition),
+                new(5, OpCode.CallVoid, observe, item),
+                new(6, OpCode.Return),
+                throwInstruction,
+                throwTail])
+        };
+
+        LocalVariables.ResolveTypesAndFields(caller);
+
+        Assert.That(IlGenerator.EmittedLocalType(item, caller), Is.EqualTo(stream));
+    }
+
+    [Test]
     public void AddressTakenLocalStaysUntypedDespiteBooleanDefinitions()
     {
         // A slot that is memset/memcpy'd through `&v` is raw storage; literal
