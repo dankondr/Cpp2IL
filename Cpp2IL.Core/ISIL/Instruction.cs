@@ -29,8 +29,10 @@ public class Instruction : IOperand
 
     public OperandList Operands => new(_operands);
 
-    // Exists to clear the return register after a CallVoid, basically.
-    public Register? ImplicitDefinition;
+    // Registers a call or similar instruction defines besides its destination: the
+    // clobbered return register of a CallVoid, or the further registers an aggregate
+    // result spans (a Vector3's V1/V2 lanes, a 16-byte struct's X1).
+    public List<Register> ImplicitDefinitions = [];
 
     // The target was read from a runtime vtable; a direct call to a virtual
     // method (for example base.M()) must not acquire this flag.

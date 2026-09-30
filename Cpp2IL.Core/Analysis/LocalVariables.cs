@@ -241,6 +241,10 @@ public static class LocalVariables
     {
         var registers = new List<Register>();
 
+        foreach (var implicitDefinition in instruction.ImplicitDefinitions)
+            if (!registers.Contains(implicitDefinition))
+                registers.Add(implicitDefinition);
+
         foreach (var operand in instruction.Operands)
         {
             if (operand is AddressOf { Target: Register addressed })
@@ -326,6 +330,7 @@ public static class LocalVariables
             changed |= MetadataResolver.ResolveAmbiguousCalls(method);
             changed |= MetadataResolver.ResolveVirtualCalls(method);
             changed |= PropagateFromCallParameters(method);
+            changed |= AggregateResultLanes.Run(method);
             changed |= MetadataResolver.ResolveFieldOffsets(method);
             changed |= ResolveSharpenedFieldOwners(method);
             changed |= RgctxResolver.Run(method);

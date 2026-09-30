@@ -7,8 +7,19 @@ namespace Cpp2IL.Core.Utils;
 
 public abstract class BaseCallingConventionResolver
 {
+    // One register a value spans besides the first: a float aggregate's further
+    // lanes, or a 9-16 byte composite's high half. ByteOffset/AccessSize locate the
+    // lane inside the value for field projection.
+    public readonly record struct AggregateLane(Register Register, int ByteOffset, int AccessSize);
+
     public static bool IsFloatingPoint(TypeAnalysisContext type)
         => type == type.AppContext.SystemTypes.SystemSingleType || type == type.AppContext.SystemTypes.SystemDoubleType;
+
+    // The extra registers carrying lanes 1..n-1 when `type` passes in `firstLane`
+    // (register naming differs per ISA; the caller knows which register the value's
+    // lane 0 sits in). Empty for values that fit one register.
+    public virtual IReadOnlyList<AggregateLane> ExtraLanes(TypeAnalysisContext type, Register firstLane)
+        => [];
 
     protected static bool IsFloatingPoint(ParameterAnalysisContext par) => IsFloatingPoint(par.ParameterType);
 
@@ -69,6 +80,8 @@ public abstract class BaseCallingConventionResolver
     {
         var app = resolved.AppContext;
 
+        AttachResultLanes(call, resolved);
+
         if (!HasRawArgumentLayout(call, app))
             return;
 
@@ -111,6 +124,21 @@ public abstract class BaseCallingConventionResolver
         }
 
         call.SetOperands(operands);
+    }
+
+    // Once the callee is known, the registers a multi-register result occupies are
+    // provable. They arrive too late for SSA renaming, so they are attached as
+    // unversioned implicit definitions; AggregateResultLanes resolves them with
+    // dominator information instead.
+    public void AttachResultLanes(Instruction call, MethodAnalysisContext resolved)
+    {
+        if (call.OpCode != OpCode.Call || resolved.IsVoid || ReturnsViaHiddenBuffer(resolved))
+            return;
+
+        var firstLane = ReturnRegister(resolved);
+        foreach (var lane in ExtraLanes(resolved.ReturnType, firstLane))
+            if (!call.ImplicitDefinitions.Contains(lane.Register))
+                call.ImplicitDefinitions.Add(lane.Register);
     }
 
     protected static int ArgBase(Instruction call) => call.OpCode is OpCode.CallVoid ? 1 : 2;

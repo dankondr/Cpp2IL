@@ -298,6 +298,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                             ? new MemoryOperand(CallingConventions.HiddenReturnBufferRegister(ctx))
                             : CallingConventions.ReturnRegister(ctx));
 
+                // A multi-register result occupies its further lanes immediately: SSA
+                // sees them defined here, so the reads of V1..V3/X1 that store them
+                // away get the call's version instead of the method-entry value.
+                if (!ctx.IsVoid && !CallingConventions.ReturnsViaHiddenBuffer(ctx))
+                    foreach (var lane in CallingConventions.ExtraLanes(ctx.ReturnType,
+                                 CallingConventions.ReturnRegister(ctx)))
+                        call.ImplicitDefinitions.Add(lane.Register);
+
                 call.AddOperands(CallingConventions.ResolveForManaged(ctx));
             }
             else if (!TryEmitScalarMathImport(target))
