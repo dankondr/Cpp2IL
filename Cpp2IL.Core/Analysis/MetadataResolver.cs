@@ -312,6 +312,46 @@ public static class MetadataResolver
     }
 
     /// <summary>
+    /// Resolves a scalar `[base + addend]` read to the field the addend names -
+    /// the same referent <see cref="ResolveFieldOffsets"/> substitutes in
+    /// place, but returned as an operand instead of rewriting one. Passes that
+    /// run while register-lane definitions are still live (before dead-code
+    /// elimination removes them) use it to prove a lane load's source.
+    /// </summary>
+    internal static IOperand? ResolveScalarFieldAccess(MethodAnalysisContext method,
+        MemoryOperand memory)
+    {
+        if (memory.Base is not LocalVariable local || memory.Index != null || memory.Scale != 0)
+            return null;
+
+        var definitions = method.ControlFlowGraph!.Instructions
+            .Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!)
+            .Where(g => g.Count() == 1)
+            .ToDictionary(g => g.Key, g => g.Single());
+        if (EffectiveObjectType(local, definitions, method.DeclaringType) is not { } localType)
+            return null;
+
+        var staticOwner = (localType as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
+        var byRefElement = staticOwner == null
+            && localType is ByRefTypeAnalysisContext { ElementType.IsValueType: true } byRef
+            ? byRef.ElementType : null;
+        var owner = staticOwner ?? byRefElement ?? localType;
+        if (ResolveField(owner, staticOwner, memory.Addend, memory.AccessSize,
+                    byRefElement != null) is not { } resolved
+            || MemberPathUnspellable(resolved, method, store: false, addressed: false)
+            || (staticOwner == null
+                && !LocalSuppliesFieldBase(local, owner, method.DeclaringType, method)))
+            return null;
+
+        var field = resolved.Field;
+        if (owner is GenericInstanceTypeAnalysisContext
+            && field is not ConcreteGenericFieldAnalysisContext)
+            field = BindResolvedFieldLeaf(owner, resolved.Containers, field);
+        return new FieldReference(field, local, (int)memory.Addend, resolved.Containers,
+            memory.AccessSize);
+    }
+
     /// Rewrites [v + addend] unmanaged dereferences whose base register provably holds the
     /// address of a managed storage location (v = &amp;t, plus constant displacements on it).
     /// [&amp;t] is a plain `t` read; [&amp;t + k] reaches the sibling frame slot at that
@@ -911,7 +951,7 @@ public static class MetadataResolver
                      || IsOwnBackingAccessor(leaf, caller, store)));
     }
 
-    private static bool IsCompilerGeneratedBackingField(FieldAnalysisContext field) =>
+    internal static bool IsCompilerGeneratedBackingField(FieldAnalysisContext field) =>
         field.Name.StartsWith("<", System.StringComparison.Ordinal)
         && field.Name.EndsWith(">k__BackingField", System.StringComparison.Ordinal);
 

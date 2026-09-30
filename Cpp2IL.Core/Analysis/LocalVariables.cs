@@ -153,6 +153,11 @@ public static class LocalVariables
             bufferLocal.Name = "returnBuffer";
             bufferLocal.Type = method.ReturnType;
         }
+
+        // Runs here, not with the rest of type resolution: the sibling
+        // `Move(Vn, …)` lane definitions it reads are removed by the first
+        // dead-code pass, which runs before ResolveTypesAndFields.
+        VectorLanePacking.Run(method);
     }
 
     public static void RemoveUnused(MethodAnalysisContext method)
@@ -349,6 +354,7 @@ public static class LocalVariables
         // incompatible with the whole-register local they read can be split off to
         // the register's lane-0 view - the slot the scalar operation actually sees.
         SplitScalarOperandViews(method);
+        VectorLanePacking.SurrenderPackedArgs(method);
     }
 
     private static bool ResolveStackAggregateFields(MethodAnalysisContext method)
@@ -1738,6 +1744,7 @@ public static class LocalVariables
         // Same kind-splitting as in ResolveTypesAndFields, applied to the copies
         // SSA teardown and copy coalescing leave behind.
         SplitScalarOperandViews(method);
+        VectorLanePacking.SurrenderPackedArgs(method);
 
         // The `arr == null`/`arr + 32` arm pairs of `new Span(arr)` only become
         // visible after SSA teardown produces the edge copies.
@@ -2028,7 +2035,13 @@ public static class LocalVariables
         }
 
         // Move field, local: a field store types the stored value with the field's type.
-        if (destination is FieldReference storeField && source is LocalVariable storeSource)
+        // A synthesized lane-pack store is exempt: the source supplies one lane of
+        // a register-spread aggregate, so its honest type is whatever its own
+        // producer proves (often the whole vector type). Smearing the lane field's
+        // scalar type onto it would retype the register's other uses scalar and
+        // turn a spellable whole vector into a diagnosed coercion.
+        if (destination is FieldReference storeField && source is LocalVariable storeSource
+            && !VectorLanePacking.IsPackLocal(storeField.Local))
             return SetTypeRespectingBooleanClaim(storeSource, storeField.Field.FieldType, method, allDefinitions);
 
         // ArrayLength is emitted as ldlen/conv.i4, so its result is always Int32 when the
@@ -2334,7 +2347,6 @@ public static class LocalVariables
                 || destination.Register.Version < 0
                 || !IsScalarLaneType(destination.Type))
                 continue;
-
             // Negate is excluded deliberately: `fneg s8, s0` is a scalar lane op whose
             // register-view destination is honestly scalar, and its ISIL is
             // indistinguishable from a vector `fneg v0.4s`.
@@ -2357,8 +2369,8 @@ public static class LocalVariables
             // `float / VectorN`, so the left operand must be the vector.
             // `VectorN op VectorM` is legal only for N == M - different widths
             // mean a scalar lane op whose operands carry unrelated types.
-            var leftVector = VectorOperandEvidence(left);
-            var rightVector = VectorOperandEvidence(right);
+            var leftVector = VectorOperandEvidence(left, method);
+            var rightVector = VectorOperandEvidence(right, method);
             var leftIsElement = IsLaneViewOperand(left);
             var rightIsElement = IsLaneViewOperand(right);
             var provableVectorOp = instruction.OpCode switch
@@ -2387,24 +2399,114 @@ public static class LocalVariables
 
             // Every other operand position holding the old local reads this def
             // site's value, so the whole lifetime retargets to the vector local.
+            // A `Vn.Sk` destination names one lane view of the register the
+            // vector op wrote whole: scalar slots take that lane's field, and
+            // only a slot that expects the whole vector takes the local itself.
+            var laneIndex = SingleLaneIndex(destination.Register.Name);
+            var laneLeaf = laneIndex >= 0
+                ? VectorLanePacking.VectorLanes(vectorType) is { } lanes && laneIndex < lanes.Length
+                    ? new FieldReference(lanes[laneIndex], split, 0)
+                    : (IOperand?)null
+                : null;
             foreach (var other in instructions)
             for (var operandIndex = 0; operandIndex < other.Operands.Count; operandIndex++)
-                if (ReplaceLocal(other.Operands[operandIndex], destination, split) is { } rewritten)
+            {
+                var operand = other.Operands[operandIndex];
+                if (laneLeaf != null && operand is LocalVariable local
+                    && ReferenceEquals(local, destination)
+                    && !SlotExpectsVector(other, operandIndex, method))
+                {
+                    other.SetOperand(operandIndex, laneLeaf);
+                    continue;
+                }
+                if (ReplaceLocal(operand, destination, split) is { } rewritten)
                     other.SetOperand(operandIndex, rewritten);
+            }
         }
     }
 
     /// <summary>
-    /// The vector type this operand proves for a binop. Register-view locals
-    /// (`Vn`/`Vn.Sk`) are never evidence: their type is produced by the same
-    /// fill-only register-window typing whose smear this pass repairs, so a
-    /// vector-typed register view can be a scalar `fmul s` operand wearing a
-    /// sibling lifetime's type.
+    /// The `k` in a `Vn.Sk` lane-view name - the Single lane this view reads of
+    /// its register - or -1 for a whole-register name or a non-Single lane
+    /// width.
     /// </summary>
-    private static TypeAnalysisContext? VectorOperandEvidence(IOperand operand)
-        => operand is LocalVariable local && IsRegisterViewName(local.Register.Name)
-            ? null
-            : UnityVectorOperandType(operand);
+    private static int SingleLaneIndex(string? name)
+    {
+        if (name is null || !IsLaneViewName(name))
+            return -1;
+        var dot = name.IndexOf('.');
+        if (name[dot + 1] != 'S')
+            return -1;
+        var index = 0;
+        for (var i = dot + 2; i < name.Length && char.IsDigit(name[i]); i++)
+            index = index * 10 + (name[i] - '0');
+        return index;
+    }
+
+    /// <summary>
+    /// Whether an operand slot expects the whole vector value, where a
+    /// lane-viewed local retargets to the `_vec` local itself instead of one
+    /// lane leaf: a `Move` destination typed vector, a vector call argument, a
+    /// vector `ret`.
+    /// </summary>
+    private static bool SlotExpectsVector(Instruction use, int operandIndex,
+        MethodAnalysisContext method)
+    {
+        // Phi inputs name the def site's register, not a lane view of it.
+        if (use.OpCode == OpCode.Phi)
+            return true;
+        var expected = use.OpCode switch
+        {
+            OpCode.Move when operandIndex == 1 => use.Operands[0] switch
+            {
+                LocalVariable local => local.Type,
+                FieldReference field => field.Field.FieldType,
+                _ => null,
+            },
+            OpCode.Return => method.ReturnType,
+            OpCode.Call when operandIndex >= 2 =>
+                VectorLanePacking.ResolveCallee(method.AppContext, use.Operands[1])
+                    ?.Parameters.ElementAtOrDefault(operandIndex - 2)?.ParameterType,
+            OpCode.CallVoid or OpCode.IndirectCall when operandIndex >= 1 =>
+                VectorLanePacking.ResolveCallee(method.AppContext, use.Operands[0])
+                    ?.Parameters.ElementAtOrDefault(operandIndex - 1)?.ParameterType,
+            _ => null,
+        };
+        return expected?.FullName is "UnityEngine.Vector2" or "UnityEngine.Vector3"
+            or "UnityEngine.Vector4" or "UnityEngine.Quaternion";
+    }
+
+    /// <summary>
+    /// The vector type this operand proves for a binop. A register-view local's
+    /// own type is never evidence: it is produced by the same fill-only
+    /// register-window typing whose smear this pass repairs, so a vector-typed
+    /// register view can be a scalar `fmul s` operand wearing a sibling
+    /// lifetime's type. The operand it copies from is a different matter -
+    /// `fmul s0, s1, s2` where the source local was defined by a Move of a
+    /// vector-typed operand carries that operand's type as real evidence.
+    /// </summary>
+    private static TypeAnalysisContext? VectorOperandEvidence(IOperand operand,
+        MethodAnalysisContext method)
+    {
+        if (operand is not LocalVariable local || !IsRegisterViewName(local.Register.Name))
+            return UnityVectorOperandType(operand);
+        TypeAnalysisContext? evidence = null;
+        var hasMoveDef = false;
+        foreach (var definition in method.ControlFlowGraph!.Instructions)
+        {
+            if (!ReferenceEquals(definition.Destination, local))
+                continue;
+            if (definition.OpCode != OpCode.Move || definition.Operands.Count < 2)
+                return null;
+            hasMoveDef = true;
+            var sourceType = UnityVectorOperandType(definition.Operands[1]);
+            if (sourceType != null && evidence != null
+                && evidence.FullName != sourceType.FullName)
+                return null;
+            evidence ??= sourceType;
+        }
+        return hasMoveDef ? evidence : null;
+    }
 
     /// <summary>
     /// A `Vn.Sk` lane operand is produced only by a vector-element operand
@@ -2527,32 +2629,53 @@ public static class LocalVariables
             switch (instruction.OpCode)
             {
                 case OpCode.Move:
-                    SplitMoveOperandViews(instruction);
+                    SplitMoveOperandViews(method, instruction);
                     break;
                 case OpCode.Negate or OpCode.Not
                     or OpCode.Add or OpCode.Subtract or OpCode.Multiply
                     or OpCode.Divide or OpCode.Modulo
                     or OpCode.And or OpCode.Or or OpCode.Xor
                     or OpCode.ShiftLeft or OpCode.ShiftRight:
-                    SplitScalarSources(instruction);
+                    SplitScalarSources(method, instruction);
                     break;
                 case OpCode.CheckEqual or OpCode.CheckNotEqual
                     or OpCode.CheckGreater or OpCode.CheckGreaterOrEqual
                     or OpCode.CheckLess or OpCode.CheckLessOrEqual:
-                    SplitScalarComparisonSources(instruction);
+                    SplitScalarComparisonSources(method, instruction);
                     break;
             }
         }
     }
 
-    private static void SplitMoveOperandViews(Instruction instruction)
+    private static void SplitMoveOperandViews(MethodAnalysisContext method, Instruction instruction)
     {
-        if (instruction.Operands.Count < 2 || instruction.Operands[0] is not LocalVariable destination)
+        if (instruction.Operands.Count < 2)
+            return;
+
+        // A store through a scalar-typed field slot sees the same low-lane view
+        // a scalar local does, so a register-view source splits to its lane-0
+        // field here too.
+        if (instruction.Operands[0] is FieldReference { Field.FieldType: { } fieldType } destinationField
+            && IsScalarLaneType(fieldType))
+        {
+            // A lane split would let the emitter collapse the slot into a
+            // member store on a by-ref parameter (`param.x` on `out Vector3
+            // param`): a single proven lane is a legal write, but leaves the
+            // parameter's sibling members unassigned - CS0177 where control
+            // kept the unspellable-leaf diagnostic. Without per-lane
+            // definite-assignment proof for the whole destination, the
+            // destination keeps the diagnostic.
+            if (!ReceiverIsByRefParameter(destinationField.Local, method))
+                SplitScalarSources(method, instruction, fieldType);
+            return;
+        }
+
+        if (instruction.Operands[0] is not LocalVariable destination)
             return;
 
         if (IsScalarLaneType(destination.Type))
         {
-            SplitScalarSources(instruction);
+            SplitScalarSources(method, instruction);
             return;
         }
 
@@ -2566,18 +2689,63 @@ public static class LocalVariables
             instruction.SetOperand(0, new FieldReference(lane, destination, 0));
     }
 
-    private static void SplitScalarSources(Instruction instruction)
+    private static void SplitScalarSources(MethodAnalysisContext method, Instruction instruction)
     {
         if (instruction.Operands[0] is not LocalVariable destination
             || !IsScalarLaneType(destination.Type))
             return;
+        SplitScalarSources(method, instruction, destination.Type!);
+    }
 
+    // A `ref`/`out` parameter's local is byref-typed and sits in the parameter
+    // list. Before copy coalescing, stores often spell it through a per-edge
+    // alias local (`v25`) that every definition copies from the same source -
+    // the shape ByrefAliasForwarding later rewrites to the parameter.
+    private static bool ReceiverIsByRefParameter(LocalVariable local, MethodAnalysisContext method)
+    {
+        if (local.Type is not ByRefTypeAnalysisContext)
+            return false;
+        var seen = new HashSet<LocalVariable>();
+        for (var current = local; seen.Add(current);)
+        {
+            if (method.ParameterLocals.Any(p => p.Register.Number == current.Register.Number))
+                return true;
+            if (UniformByrefAliasSource(current, method) is not { } source)
+                return false;
+            current = source;
+        }
+        return false;
+    }
+
+    // The single byref local every definition of `local` copies from, when all
+    // of them are Move copies of the same source; null otherwise.
+    private static LocalVariable? UniformByrefAliasSource(LocalVariable local, MethodAnalysisContext method)
+    {
+        LocalVariable? source = null;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction.OpCode != OpCode.Move
+                || instruction.Destination is not LocalVariable destination
+                || !ReferenceEquals(destination, local))
+                continue;
+            if (instruction.Operands.Count < 2
+                || instruction.Operands[1] is not LocalVariable operand
+                || operand.Type is not ByRefTypeAnalysisContext
+                || (source != null && !ReferenceEquals(source, operand)))
+                return null;
+            source = operand;
+        }
+        return source;
+    }
+
+    private static void SplitScalarSources(MethodAnalysisContext method, Instruction instruction, TypeAnalysisContext laneType)
+    {
         for (var i = 1; i < instruction.Operands.Count; i++)
-            if (LaneOperand(instruction.Operands[i], destination.Type!) is { } lane)
+            if (LaneOperand(instruction.Operands[i], laneType, method) is { } lane)
                 instruction.SetOperand(i, lane);
     }
 
-    private static void SplitScalarComparisonSources(Instruction instruction)
+    private static void SplitScalarComparisonSources(MethodAnalysisContext method, Instruction instruction)
     {
         // A comparison's operand pair shares one stack kind, which the flag-typed
         // destination does not reveal; take it from whichever side is already scalar.
@@ -2592,21 +2760,143 @@ public static class LocalVariables
         if (laneType == null)
             return;
 
-        if (LaneOperand(right, laneType) is { } rightLane)
+        if (LaneOperand(right, laneType, method) is { } rightLane)
             instruction.SetOperand(2, rightLane);
-        if (LaneOperand(left, laneType) is { } leftLane)
+        if (LaneOperand(left, laneType, method) is { } leftLane)
             instruction.SetOperand(1, leftLane);
     }
 
-    private static IOperand? LaneOperand(IOperand operand, TypeAnalysisContext laneType)
+    private static IOperand? LaneOperand(IOperand operand, TypeAnalysisContext laneType,
+        MethodAnalysisContext method)
     {
+        // A scalar view of a 128-bit vector constant is its first element:
+        // `fneg s1, s0` with `movi v0.4s, #x` reads lane S0 = X.
+        if (operand is Vector128Literal literal)
+            return new FloatLiteral(literal.X);
+
+        // A scalar read of a resolved aggregate host (a struct field or a
+        // register-view local) sees the host's lane-0 field: `ldr s0, [vec]`
+        // reads `vec`'s first lane.
+        if (operand is FieldReference { Field.FieldType: { } fieldType } fieldRef
+            && fieldType.IsValueType && !IsScalarLaneType(fieldType)
+            && LaneZeroField(fieldType, laneType) is { } nestedLane)
+        {
+            // A read on a receiver that can only spell as raw metadata (an
+            // Il2CppClass/static-fields pointer or metadata handle)
+            // defaults at the slot; projecting a lane off it would just move
+            // the default onto the member, so the operand stays whole for the
+            // emitter's referent-level fallback. A static member's receiver is
+            // never consumed (ldsfld ignores it), so a metadata-internal holder
+            // does not veto the lane split.
+            if (!fieldRef.Field.IsStatic && !ManagedLaneReceiver(fieldRef))
+                return null;
+            // The aggregate becomes the innermost container of the nested
+            // reference, so it is the hop the emission pass spells `ldflda`
+            // on. For a compiler-generated backing field that hop only
+            // survives when the decompiler-facing rewrite can reach the
+            // getter (inside the accessor's own body it never can - the
+            // rewrite would recurse); otherwise the scalar stays as the
+            // whole-aggregate read its own diagnostic names.
+            if (MetadataResolver.IsCompilerGeneratedBackingField(fieldRef.Field)
+                && !MetadataResolver.BackingAccessorVisible(fieldRef.Field, method,
+                    store: false))
+                return null;
+            return new FieldReference(nestedLane, fieldRef.Local, fieldRef.Offset,
+                [.. fieldRef.Containers, fieldRef.Field], fieldRef.AccessSize);
+        }
+
         if (operand is not LocalVariable { Type: { } aggregateType } local
             || !aggregateType.IsValueType || IsScalarLaneType(aggregateType)
-            || LaneZeroField(aggregateType, laneType) is not { } lane)
+            || LaneZeroField(aggregateType, laneType) is not { } lane
+            || !LaneValueSpellable(local, method))
             return null;
 
         return new FieldReference(lane, local, 0);
     }
+
+    // The lane read only spells when the host local does. A local whose
+    // definitions all move in an operand the emitter cannot spell (a field
+    // read on a metadata-internal receiver, a raw pointer expression, an
+    // unmanaged load) defaults at the slot; splitting a store's source would
+    // only move the default onto the member (`referent.lane = default(T).lane`),
+    // so the whole operand is kept for the referent-level fallback control
+    // emits. A non-Move definition spells the local directly and reads fine.
+    private static bool LaneValueSpellable(LocalVariable local, MethodAnalysisContext method)
+    {
+        var seen = new HashSet<LocalVariable>();
+        var work = new Stack<LocalVariable>();
+        work.Push(local);
+        while (work.Count > 0)
+        {
+            var current = work.Pop();
+            if (!seen.Add(current))
+                continue;
+            foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            {
+                if (!ReferenceEquals(instruction.Destination, current))
+                    continue;
+                // A call whose callee cannot be invoked assigns no managed
+                // value - the lane would read a default where control keeps
+                // the whole operand (and its own named diagnostic).
+                if (instruction.OpCode is OpCode.Call or OpCode.IndirectCall
+                    && VectorLanePacking.ResolveCallee(method.AppContext,
+                        instruction.Operands[0]) is { } callee
+                    && !IlGenerator.CalleeUsableFrom(callee, method))
+                    return false;
+                if (instruction.OpCode != OpCode.Move
+                    || instruction.Operands.Count < 2)
+                    continue;
+                switch (instruction.Operands[1])
+                {
+                    case LocalVariable copy when ReferenceEquals(copy, current):
+                        break;
+                    case LocalVariable copy:
+                        work.Push(copy);
+                        break;
+                    // A field read spells only when the member path itself can be
+                    // named from this method. A static member emits ldsfld -
+                    // its receiver is unused, so a metadata-internal holder (the
+                    // Il2CppStaticFields block) does not veto it; an instance
+                    // read still needs a managed receiver and a usable member.
+                    case FieldReference field
+                        when (field.Field.IsStatic || ManagedLaneReceiver(field))
+                        && SpellableField(field, method):
+                    // Loads materialize the local either as the resolved read or
+                    // as their own named diagnostic; either way `local.lane`
+                    // reads a real declared local.
+                    case MemoryOperand or ArrayAccess or ArrayElementFieldReference
+                        or ArrayLength or AddressOf or ReferenceCast
+                        or SelectedFieldReference:
+                    // Constants, callee/type operands and literals always emit a
+                    // concrete value.
+                    case Immediate or FloatLiteral or DoubleLiteral or StringLiteral
+                        or TypeAnalysisContext or MethodAnalysisContext
+                        or Vector128Literal:
+                        break;
+                    default:
+                        return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // The emitter's own predicate, minus the emitted-token gate: analysis runs
+    // before fields gain their AsmResolver definitions, so requiring the token
+    // here would call every field unspellable.
+    private static bool SpellableField(FieldReference field, MethodAnalysisContext method)
+        => IlGenerator.FieldReferenceUsableFrom(field, method, requireToken: false);
+
+    // A field read spells only when its receiver does. Reads through metadata
+    // internals (the Il2CppClass/static-fields block or a runtime metadata
+    // handle) and through raw pointers spell as IntPtr, which no member access
+    // can name.
+    private static bool ManagedLaneReceiver(FieldReference field)
+        => field.Local?.Type is not (StaticFieldStorageTypeAnalysisContext
+            or RuntimeClassTypeAnalysisContext
+            or RuntimeMethodInfoAnalysisContext
+            or RuntimeFieldInfoAnalysisContext
+            or PointerTypeAnalysisContext);
 
     // A ldfld/stfld or instance-call receiver emits `&host` for a value-type
     // host (ldloca on a host-typed local) or a host-assignable reference

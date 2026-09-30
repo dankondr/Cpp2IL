@@ -522,11 +522,11 @@ public static class IlGenerator
                 if (storeField is { } field)
                 {
                     if (WholeValueContainerReference(field,
-                            EmittedOperandType(instruction.Operands[1], context)) is { } wholeValue
+                            EmittedOperandType(instruction.Operands[1], context), context) is { } wholeValue
                         && FieldReferenceUsableFrom(wholeValue, context, writeAccess: true))
                     {
                         if (!wholeValue.Field.IsStatic)
-                            LoadFieldReceiver(wholeValue, context, method, locals, writeLine);
+                            LoadFieldReceiver(wholeValue, context, method, locals, writeLine, forWrite: true);
                         if (LoadOperandIntoSlot(instruction.Operands[1], wholeValue.Field.FieldType,
                             context, method, locals, writeLine))
                             instructions.Add(wholeValue.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
@@ -555,7 +555,7 @@ public static class IlGenerator
                         if (FieldReferenceUsableFrom(outer, context, writeAccess: true))
                         {
                             if (!outerField.IsStatic)
-                                LoadFieldReceiver(outer, context, method, locals, writeLine);
+                                LoadFieldReceiver(outer, context, method, locals, writeLine, forWrite: true);
                             if (LoadOperandIntoSlot(instruction.Operands[1], conversion.Parameters[0].ParameterType,
                                 context, method, locals, writeLine))
                             {
@@ -586,7 +586,7 @@ public static class IlGenerator
                                 || ThisAliasLocals(context).Contains(field.Local)))
                             instructions.Add(CilOpCodes.Ldarg_0);
                         else
-                            LoadFieldReceiver(field, context, method, locals, writeLine);
+                            LoadFieldReceiver(field, context, method, locals, writeLine, forWrite: true);
                     }
 
                     if (LoadOperandIntoSlot(instruction.Operands[1], field.Field.FieldType, context, method, locals, writeLine))
@@ -1837,7 +1837,14 @@ public static class IlGenerator
                 }
                 else
                 {
-                    LoadOperand(instruction.Operands[1], method, locals, writeLine, null, context);
+                    LoadOperand(instruction.Operands[1], method, locals, writeLine,
+                        // `fneg` on a 128-bit constant reads a float lane: without a
+                        // Single contract the literal emits ldnull, which `neg`
+                        // cannot consume - the lane-0 scalar view is the honest
+                        // projection the scalarized ops get elsewhere.
+                        instruction.OpCode == OpCode.Negate && instruction.Operands[1] is Vector128Literal
+                            ? context.AppContext.SystemTypes.SystemSingleType
+                            : null, context);
                     // `not`/`neg` on `&x` really means the pointed value; the coerce
                     // dereferences an integral element or drops a lost one for zero.
                     if (unaryOperandType is ByRefTypeAnalysisContext)
@@ -4267,7 +4274,7 @@ public static class IlGenerator
                     break;
                 }
                 if (!addressedField.Field.IsStatic)
-                    LoadFieldReceiver(addressedField, callingContext, method, locals, writeLine);
+                    LoadFieldReceiver(addressedField, callingContext, method, locals, writeLine, forWrite: true);
                 instructions.Add(addressedField.Field.IsStatic ? CilOpCodes.Ldsflda : CilOpCodes.Ldflda,
                     addressedField.Field.IsStatic ? addressedField.Field.ToFieldDescriptor()
                         : FieldDescriptorFor(addressedField.Field,
@@ -4338,7 +4345,7 @@ public static class IlGenerator
                     break;
                 if (TryEmitInlinedListCount(field, callingContext, method, locals))
                     break;
-                if (WholeValueContainerReference(field, expectedType) is { } wholeValue
+                if (WholeValueContainerReference(field, expectedType, callingContext) is { } wholeValue
                     && FieldReferenceUsableFrom(wholeValue, callingContext))
                 {
                     if (wholeValue.Field.IsStatic)
@@ -4650,8 +4657,8 @@ public static class IlGenerator
         return receiverType;
     }
 
-    private static bool FieldReferenceUsableFrom(FieldReference field, MethodAnalysisContext context,
-        bool writeAccess = false)
+    internal static bool FieldReferenceUsableFrom(FieldReference field, MethodAnalysisContext context,
+        bool writeAccess = false, bool requireToken = true)
     {
         var receiverType = EmittedOperandType(field.Local, context);
         var chainHead = true;
@@ -4677,7 +4684,7 @@ public static class IlGenerator
                     || !Analysis.MetadataResolver.BackingAccessorVisible(container, context, store: false))
                     return false;
             }
-            else if (!FieldUsableFrom(container, context, writeAccess, receiverType: effectiveReceiver))
+            else if (!FieldUsableFrom(container, context, writeAccess, receiverType: effectiveReceiver, requireToken))
                 return false;
             receiverType = container.IsStatic
                 ? container.FieldType
@@ -4687,7 +4694,8 @@ public static class IlGenerator
             receiverType: field.Field.IsStatic ? null
                 : field.Containers.Count == 0
                     ? ResolvedFieldReceiverType(field.Field, field.Local, receiverType, context)
-                    : receiverType);
+                    : receiverType,
+            requireToken: requireToken);
     }
 
     // Mirrors what LoadBase actually pushes as the field receiver: `ldarg.0` when
@@ -4743,7 +4751,7 @@ public static class IlGenerator
     // instantiation, so the base signature is re-instantiated) and a plain
     // field becomes a MemberReference on the receiver (its signature keeps the
     // declaring definition's !T, instantiated by the receiver's arguments).
-    private static TypeAnalysisContext? EmittedContainerFieldType(FieldAnalysisContext container,
+    internal static TypeAnalysisContext? EmittedContainerFieldType(FieldAnalysisContext container,
         TypeAnalysisContext? resolvedReceiver)
     {
         var instance = resolvedReceiver switch
@@ -4813,7 +4821,7 @@ public static class IlGenerator
     }
 
     private static void LoadFieldReceiver(FieldReference field, MethodAnalysisContext context, MethodDefinition method,
-        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine, bool forWrite = false)
     {
         void LoadBase(FieldAnalysisContext target)
         {
@@ -4848,6 +4856,14 @@ public static class IlGenerator
         var start = 0;
         if (first.IsStatic)
         {
+            // Reached for writes only inside the declaring .cctor: a store or
+            // address consumer has no legal spelling for initonly elsewhere,
+            // and its store is refused upstream before a receiver is loaded.
+            if (!forWrite && (first.Attributes & FieldAttributes.InitOnly) != 0)
+            {
+                Analysis.InitonlyStaticFieldReceiver.PushValueChain(field, method);
+                return;
+            }
             method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldsflda, first.ToFieldDescriptor());
             receiverType = first.FieldType;
             start = 1;
@@ -4996,6 +5012,29 @@ public static class IlGenerator
             memory.AccessSize);
         return true;
     }
+
+    // Shape-only mirrors of the TryEmit* inlined-member checks: when a leaf is
+    // an enumerator `_current` or list `_size` backing an inline-able getter,
+    // the slot load must reach LoadOperand so those paths can still spell it.
+    private static bool InlinedEnumeratorCurrentCandidate(FieldReference field,
+        MethodAnalysisContext context)
+    {
+        var current = field.Field.Name == "_current" && field.Containers.Count == 0
+            ? field.Field
+            : field.Containers.FirstOrDefault();
+        return current?.Name == "_current"
+            && EmittedLocalType(field.Local, context) is GenericInstanceTypeAnalysisContext enumerator
+            && enumerator.GenericType.Methods.Any(candidate => candidate.Name == "get_Current"
+                && !candidate.IsStatic && candidate.Parameters.Count == 0);
+    }
+
+    private static bool InlinedListCountCandidate(FieldReference field,
+        MethodAnalysisContext context)
+        => field is { Field.Name: "_size", Local: LocalVariable receiver }
+            && EmittedLocalType(receiver, context) is GenericInstanceTypeAnalysisContext list
+            && list.GenericType.FullName == "System.Collections.Generic.List`1"
+            && list.GenericType.Methods.Any(candidate => candidate.Name == "get_Count"
+                && !candidate.IsStatic && candidate.Parameters.Count == 0);
 
     private static bool TryEmitInlinedListCount(FieldReference field, MethodAnalysisContext context,
         MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
@@ -7723,15 +7762,127 @@ public static class IlGenerator
             // slot - it is dropped and the default substitution is diagnosed.
             if (!EmitStackCoerce(emitted, contract, method, context, convertByRef))
             {
-                var instructions = method.CilMethodBody!.Instructions;
-                instructions.Add(CilOpCodes.Pop);
+                var body = method.CilMethodBody!.Instructions;
+                body.Add(CilOpCodes.Pop);
                 if (!TryEmitAwaiterCall(operand, emitted, contract, method, context, locals))
-                    PushDefaultOf(contract, method, instructions, context, SlotDefaultReasonFor(emitted, contract, context));
+                    PushDefaultOf(contract, method, body, context, SlotDefaultReasonFor(emitted, contract, context));
             }
             return true;
         }
+        var instructions = method.CilMethodBody!.Instructions;
+        // A leaf read past an unspellable member (`local.private.x`) defaults at
+        // every site that reaches it. Materializing the referent's default once
+        // per member path costs one named note and every lane/site reads a real
+        // ldfld off it - the whole-member read control emits once, not N.
+        if (resolved is FieldReference unspellableField
+            && contract != null
+            && TryEmitReferentMemoLoad(unspellableField, contract, context, method, locals,
+                instructions, convertByRef))
+            return true;
         if (!TryEmitAwaiterCall(operand, emitted, contract, method, context, locals))
-            PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context, SlotDefaultReasonFor(emitted, contract, context));
+            PushDefaultOf(contract, method, instructions, context, SlotDefaultReasonFor(emitted, contract, context));
+        return true;
+    }
+
+    // A field load through a member path this method cannot spell
+    // (`local.privateMember.y`) otherwise drops to a slot default at every site
+    // that reads it. The referent the binary reached - `local.privateMember` -
+    // materializes its default once per (receiver, path) instead: one slot-fill
+    // note like control's single whole-member read, then a real ldfld chain for
+    // each leaf read. Only paths where every member past the unspellable one
+    // spells qualify; an unspellable leaf itself keeps the slot-level default
+    // that names the consumer's contract.
+    private static bool TryEmitReferentMemoLoad(FieldReference field, TypeAnalysisContext contract,
+        MethodAnalysisContext context, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, CilInstructionCollection instructions,
+        bool convertByRef)
+    {
+        if (field.Local is null)
+            return false;
+        var containers = field.Containers;
+        var receiverType = EmittedOperandType(field.Local, context);
+        var chainHead = true;
+        var unspellableAt = -1;
+        for (var i = 0; i < containers.Count; i++)
+        {
+            var container = containers[i];
+            var effectiveReceiver = chainHead && !container.IsStatic
+                ? ResolvedFieldReceiverType(container, field.Local, receiverType, context)
+                : receiverType;
+            chainHead = false;
+            if (IsAutoPropertyBackingField(container)
+                || !FieldUsableFrom(container, context, receiverType: effectiveReceiver))
+            {
+                unspellableAt = i;
+                break;
+            }
+            receiverType = container.IsStatic
+                ? container.FieldType
+                : EmittedContainerFieldType(container, effectiveReceiver);
+        }
+        // The walk's referent must be a container: an unspellable leaf, or a
+        // fully spellable path, already has its own diagnostic shape.
+        if (unspellableAt < 0)
+            return false;
+        var referentType = containers[unspellableAt].FieldType;
+        if (referentType is null || !TypeTokenUsableFrom(referentType, context))
+            return false;
+        // Every member the leaf chain walks after the referent must spell with
+        // its token bound - this is emission, not an accessibility estimate.
+        var suffixReceiver = referentType;
+        foreach (var member in containers.Skip(unspellableAt + 1))
+        {
+            if (member.IsStatic || IsAutoPropertyBackingField(member)
+                || !FieldUsableFrom(member, context, receiverType: suffixReceiver))
+                return false;
+            suffixReceiver = EmittedContainerFieldType(member, suffixReceiver);
+        }
+        if (field.Field.IsStatic || IsAutoPropertyBackingField(field.Field)
+            || !FieldUsableFrom(field.Field, context, receiverType: suffixReceiver)
+            || !StackContractSatisfied(field.Field.FieldType, contract, context, convertByRef))
+            return false;
+
+        // One materialization per (referent local, member path); the name keys
+        // the locals map so later sites find the same CIL local.
+        var memoName = $"VEC_REF_{RuntimeHelpers.GetHashCode(field.Local)}_" +
+            string.Join('_', containers.Take(unspellableAt + 1).Select(member => member.Name));
+        CilLocalVariable? memo = null;
+        foreach (var pair in locals)
+            if (pair.Key.Register.Name == memoName)
+            {
+                memo = pair.Value;
+                break;
+            }
+        if (memo is null)
+        {
+            memo = new CilLocalVariable(referentType.ToTypeSignature());
+            method.CilMethodBody!.LocalVariables.Add(memo);
+            var memoLocal = new LocalVariable(memoName, new Register(null, memoName), referentType);
+            locals[memoLocal] = memo;
+            // The referent's value was never recovered: fill the memo with the
+            // same diagnosed default the whole-member read would emit once.
+            PushDefaultOf(referentType, method, instructions, context);
+            instructions.Add(CilOpCodes.Stloc, memo);
+        }
+
+        instructions.Add(referentType.IsValueType ? CilOpCodes.Ldloca : CilOpCodes.Ldloc, memo);
+        var receiver = referentType;
+        foreach (var member in containers.Skip(unspellableAt + 1))
+        {
+            instructions.Add(member.FieldType?.IsValueType == true ? CilOpCodes.Ldflda : CilOpCodes.Ldfld,
+                FieldDescriptorFor(member, receiver));
+            receiver = EmittedContainerFieldType(member, receiver) ?? member.FieldType;
+        }
+        instructions.Add(CilOpCodes.Ldfld, FieldDescriptorFor(field.Field, receiver));
+        // The leaf lands raw on the stack - apply the same coerce the resolved
+        // path would, or drop it for the diagnosed slot default when the leaf
+        // type cannot legally cross the contract.
+        if (!EmitStackCoerce(field.Field.FieldType, contract, method, context, convertByRef))
+        {
+            instructions.Add(CilOpCodes.Pop);
+            PushDefaultOf(contract, method, instructions, context,
+                SlotDefaultReason(field.Field.FieldType, contract));
+        }
         return true;
     }
 
@@ -7888,8 +8039,36 @@ public static class IlGenerator
             && NestedValueFieldForContract(container, contract) is { } nested)
             resolved = nested;
         if (resolved is FieldReference nestedField
-            && WholeValueContainerReference(nestedField, contract) is { } wholeValue)
+            && WholeValueContainerReference(nestedField, contract, context) is { } wholeValue)
             resolved = wholeValue;
+        // A field leaf the emitter cannot spell (a private member leaf, or a
+        // container whose member access is denied) still names its referent:
+        // when the referent's own type cannot satisfy the slot contract the
+        // load fails with the referent named as the operand source - `Vector3
+        // operand into a Single slot` - instead of an anonymous slot fill.
+        // The field stays resolved so LoadOperand can still spell it through
+        // its inlined-property and addressed paths; emitting the referent
+        // itself would substitute the whole object for the member the binary
+        // actually moved.
+        if (resolved is FieldReference unspellableField
+            && !FieldReferenceUsableFrom(unspellableField, context)
+            && (WholeValueContainerReference(unspellableField, contract, context) is not { } collapsed
+                || !FieldReferenceUsableFrom(collapsed, context))
+            && !InlinedEnumeratorCurrentCandidate(unspellableField, context)
+            && !InlinedListCountCandidate(unspellableField, context)
+            && unspellableField.Local is LocalVariable referent
+            && (unspellableField.Containers.LastOrDefault(link =>
+                        link.FieldType?.FullName
+                            != unspellableField.Field.FieldType.FullName)
+                    ?.FieldType
+                ?? EmittedOperandType(referent, context, contract)) is { } referentType
+            && referentType.FullName != unspellableField.Field.FieldType.FullName
+            && contract != null
+            && !StackContractSatisfied(referentType, contract, context, convertByRef))
+        {
+            emitted = referentType;
+            return false;
+        }
         // A bare type operand into a value-type slot has no honest emission except
         // runtime handles and native-int class handles, which have real token values.
         if (resolved is TypeAnalysisContext and not RuntimeMethodInfoAnalysisContext
@@ -8067,6 +8246,7 @@ public static class IlGenerator
         }
         return false;
     }
+
 
     // Frame-pointer- and stack-slot-relative stores ([x29 - N], [stack_N + K])
     // write a native frame slot the lifter never promoted to a local. Each
@@ -9209,7 +9389,7 @@ public static class IlGenerator
             && (generic.TypeGenericParameters.Any(ContainsSharedEnumMarker)
                 || generic.MethodGenericParameters.Any(ContainsSharedEnumMarker));
 
-    private static bool CalleeUsableFrom(MethodAnalysisContext method, MethodAnalysisContext context) =>
+    internal static bool CalleeUsableFrom(MethodAnalysisContext method, MethodAnalysisContext context) =>
         !CalleeUsesSharedEnumMarker(method)
         && Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(method, context);
 
@@ -10135,7 +10315,7 @@ public static class IlGenerator
     }
 
     internal static FieldReference? WholeValueContainerReference(FieldReference field,
-        TypeAnalysisContext? valueType)
+        TypeAnalysisContext? valueType, MethodAnalysisContext? context = null)
     {
         if (valueType == null || field.Containers.Count == 0 || field.Field.Offset != 0)
             return null;
@@ -10211,7 +10391,7 @@ public static class IlGenerator
                 .ToMethodDescriptor();
     }
 
-    private static IFieldDescriptor FieldDescriptorFor(FieldAnalysisContext field,
+    internal static IFieldDescriptor FieldDescriptorFor(FieldAnalysisContext field,
         TypeAnalysisContext? receiverType)
     {
         if (field is ConcreteGenericFieldAnalysisContext concrete)
@@ -10380,9 +10560,12 @@ public static class IlGenerator
         };
 
     private static bool FieldUsableFrom(FieldAnalysisContext field, MethodAnalysisContext context,
-        bool writeAccess = false, TypeAnalysisContext? receiverType = null)
+        bool writeAccess = false, TypeAnalysisContext? receiverType = null, bool requireToken = true)
     {
-        if (!CanEmitFieldToken(field))
+        // Analysis passes ask about accessibility before any field gains its
+        // emitted definition (requireToken: false); emission keeps the token
+        // gate so a member with no emitted definition still counts unspellable.
+        if (requireToken && !CanEmitFieldToken(field))
             return false;
         var attrs = field.Attributes;
         // A literal (const) field has no writable slot at all: a store to it has
@@ -10558,7 +10741,7 @@ public static class IlGenerator
                         return false;
                 }
                 else
-                    LoadFieldReceiver(field, context, method, locals, writeLine);
+                    LoadFieldReceiver(field, context, method, locals, writeLine, forWrite: true);
                 instructions.Add(CilOpCodes.Ldflda,
                     FieldDescriptorFor(field.Field, FieldReceiverType(field, context)));
                 return true;
@@ -10591,7 +10774,7 @@ public static class IlGenerator
             && nested.Offset == nested.Containers[^1].Offset
             && ThisConstructorCallPlan.SameTypeIdentity(nested.Containers[^1].FieldType, structType))
         {
-            LoadFieldReceiver(nested, context, method, locals, writeLine);
+            LoadFieldReceiver(nested, context, method, locals, writeLine, forWrite: true);
             return;
         }
         if (ReceiverEmitsStructAddress(operand, context, structType))
@@ -10880,7 +11063,7 @@ public static class IlGenerator
                         || ThisAliasLocals(context).Contains(field.Local)))
                     instructions.Add(CilOpCodes.Ldarg_0);
                 else
-                    LoadFieldReceiver(field, context, method, locals, writeLine);
+                    LoadFieldReceiver(field, context, method, locals, writeLine, forWrite: true);
                 instructions.Add(CilOpCodes.Ldloc, scratch);
                 instructions.Add(CilOpCodes.Stfld, fieldDescriptor);
                 break;
