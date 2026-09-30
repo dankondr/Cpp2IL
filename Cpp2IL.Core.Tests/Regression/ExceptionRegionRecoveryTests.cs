@@ -410,9 +410,11 @@ public class ExceptionRegionRecoveryTests
             "a failed inner finally still runs its parent; a failed first call in one finally skips the second call");
     }
 
-    [TestCase(true)]
-    [TestCase(false)]
-    public void RecognizedTypeTestProducesCatchAndLeavesToNormalMerge(bool recognizedTypeTest)
+    [TestCase(true, false)]
+    [TestCase(false, false)]
+    [TestCase(true, true)]
+    [TestCase(false, true)]
+    public void RecognizedTypeTestProducesCatchAndLeavesToNormalMerge(bool recognizedTypeTest, bool classTest)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "CatchOwner",
@@ -436,7 +438,8 @@ public class ExceptionRegionRecoveryTests
         caller.ConvertedIsil = [protectedCall, merge,
             At(0x2000, OpCode.Call, new StringLiteral("__cxa_begin_catch"), x0, x0),
             At(0x2004, OpCode.Move, exception, new MemoryOperand(x0, null, 0)),
-            At(0x2008, OpCode.Call, new StringLiteral(recognizedTypeTest ? "il2cpp_vm_object_is_inst" : "unknown_class_check"), x0, exception, exceptionType),
+            At(0x2008, OpCode.Call, new StringLiteral(recognizedTypeTest ? classTest ? "il2cpp_class_is_assignable_from" : "il2cpp_vm_object_is_inst" : "unknown_class_check"),
+                x0, classTest ? exceptionType : exception, classTest ? new MemoryOperand(exception, null, 0) : exceptionType),
             At(0x200C, OpCode.CheckEqual, condition, x0, new Immediate(0)),
             At(0x2010, OpCode.ConditionalJump, mismatch, condition),
             At(0x2014, OpCode.CallVoid, report, exception),

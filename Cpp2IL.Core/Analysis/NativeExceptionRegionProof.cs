@@ -119,16 +119,11 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
     internal sealed record CatchResult(TypeAnalysisContext Type, LocalVariable ExceptionLocal,
         List<Instruction> Handler, List<EhCallSiteInfo> Sites, HashSet<ulong> Pads, ulong MergeAddress);
 
-    // The type-check recognizer remains the existing key-function layer. In particular,
-    // an unidentified Class::IsAssignableFrom call is not a typed catch proof.
     internal List<CatchResult> FindCatches(Func<ulong, bool>? wrapperTypeProof = null)
     {
         if (code.Count == 0 || context.UnwindInfo == null) return [];
-        var typeTests = context.AppContext.GetOrCreateKeyFunctionAddresses().Pairs
-            .Where(p => p.Key == nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_is_inst) && p.Value != 0)
-            .Select(p => p.Value).ToHashSet();
-        if (!code.Any(i => i.IsCall && (i.Operands[0] is Immediate target && typeTests.Contains(target.UnsignedValue)
-                || i.Operands[0] is StringLiteral { Value: nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_is_inst) }))) return [];
+        if (!code.Any(i => i.IsCall && Helper(i.Operands[0]) is
+                nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_is_inst) or "il2cpp_class_is_assignable_from")) return [];
         var states = NormalStates();
         if (states == null) return [];
         wrapperTypeProof ??= address => KeyFunctionRecovery.IsExceptionWrapperTypeInfo(context, new Immediate(unchecked((long)address)));
@@ -155,8 +150,12 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
                 {
                     var args = instruction.Operands.Skip(instruction.OpCode == OpCode.CallVoid ? 1 : 2).Select(o => Value(o, state)).ToArray();
                     var helper = Helper(instruction.Operands[0]);
-                    if (helper == nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_is_inst) && args.Length >= 2
-                        && args[0] == Exception && ResolveCatchType(args[1]) is { } catchType)
+                    var classTest = helper == "il2cpp_class_is_assignable_from";
+                    var catchType = args.Length < 2 ? null
+                        : classTest && args[1] == "m(" + Exception + ")" ? ResolveCatchType(args[0])
+                        : helper == nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_is_inst) && args[0] == Exception
+                            ? ResolveCatchType(args[1]) : null;
+                    if (catchType != null)
                     {
                         type = catchType;
                         var mismatch = state.Copy();
@@ -168,7 +167,7 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
                             || paths.Count == 0 || paths.Any(p => p.Terminated || p.Effects.Count != 0)) { type = null; break; }
                         foreach (var path in paths) state.Pads.UnionWith(path.Pads);
                         Clobber(state);
-                        Set(instruction.Destination, Exception, state);
+                        Set(instruction.Destination, classTest ? Number(1) : Exception, state);
                         index++;
                         break;
                     }
@@ -277,10 +276,23 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
     private TypeAnalysisContext? ResolveCatchType(string? value)
     {
         var type = code.SelectMany(i => i.Operands).OfType<TypeAnalysisContext>().FirstOrDefault(t => value == "type:" + t.FullName);
-        if (type == null && value is { Length: > 4 } && value.StartsWith("m(#", StringComparison.Ordinal)
-            && value.EndsWith(')') && long.TryParse(value[3..^1], out var address)
-            && context.AppContext.LibCpp2IlContext.GetTypeGlobalByAddress(unchecked((ulong)address)) is { } metadataType)
-            type = context.AppContext.ResolveIl2CppType(metadataType);
+        if (type == null && value != null)
+        {
+            var loads = 0;
+            while (value.StartsWith("m(", StringComparison.Ordinal) && value.EndsWith(')'))
+            { loads++; value = value[2..^1]; }
+            if (loads is 1 or 2 && TryNumber(value, out var address))
+            {
+                try
+                {
+                    var pointer = unchecked((ulong)address);
+                    if (loads == 2) pointer = context.AppContext.Binary.ReadPointerAtVirtualAddress(pointer);
+                    if (context.AppContext.LibCpp2IlContext.GetTypeGlobalByAddress(pointer) is { } metadataType)
+                        type = context.AppContext.ResolveIl2CppType(metadataType);
+                }
+                catch (Exception) { return null; }
+            }
+        }
         for (var parent = type; parent != null; parent = parent.DefaultBaseType)
             if (parent == context.AppContext.SystemTypes.SystemExceptionType) return type;
         return null;
@@ -557,6 +569,8 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
         name = context.AppContext.GetOrCreateKeyFunctionAddresses().Pairs.FirstOrDefault(p => p.Value == address).Key;
         if (name == null && !binary.TryGetExportedFunctionName(address, out name))
             NewArm64KeyFunctionAddresses.TryResolveGotVeneerImportName(binary, address, out name!);
+        if (string.IsNullOrEmpty(name) && KeyFunctionRecovery.IsClassIsAssignableFrom(binary, address))
+            name = "il2cpp_class_is_assignable_from";
         helperNames[address] = string.IsNullOrEmpty(name) ? null : name;
         return helperNames[address];
     }
