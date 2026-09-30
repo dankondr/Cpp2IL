@@ -15,7 +15,7 @@ public class AccessibilityExtensionsTests
         Assert.That(AccessibilityExtensions.IsExternalRuntimeAssembly(name), Is.True);
     }
 
-    [TestCase("CastleClashers.Game")]
+    [TestCase("Game.Recovered")]
     [TestCase("Newtonsoft.Json")]
     public void RecoveredLibrariesCanBeRecoveryFriends(string name)
     {
