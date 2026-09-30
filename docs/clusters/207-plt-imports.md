@@ -37,8 +37,10 @@ only when all three elements are present: a canary check (`CheckEqual` /
 `CheckNotEqual` where one side provably is the canary — the TLS cell
 `[SYSREG + 0x28]`, a local or cell whose every def carries it — and both
 sides are shapes it can take: a local, a `[base + 0x28]` read through any
-base, or a cell proven to hold it), the `ConditionalJump` it feeds, and a
-`__stack_chk_fail` call reachable from one of its successors through empty
+base, a cell proven to hold it, or a frame cell read through a materialized
+`Move ptr, &stackslot` whose store the lift never emitted — large frames
+re-materialize the frame base per use), the `ConditionalJump` it feeds, and
+a `__stack_chk_fail` call reachable from one of its successors through empty
 connector blocks — nothing else ever calls it, so the reachable failure is
 the structural co-proof when neither side is a direct TLS read. The fold
 turns the branch into a `Jump` to the merge edge, nops the failure call
@@ -65,6 +67,7 @@ cells carrying real data are never touched.
 `CanaryGuardFoldsToMergeAndExcisesFailBlock`,
 `CanaryGuardWithLocalStoredCanaryFolds`, `SharedFailBlockFoldsEveryGuard`,
 `StoredCanaryFrameSlotFolds`, `SpilledTlsPointerCompareFoldsAndSweepsMachinery`,
+`AddressOfFrameCellCompareFolds`, `AddressOfFrameCellWithoutFailCallStays`,
 `UnprovenPointerCellStoreSurvivesTheSweep`, `UnprovenFrameSlotIsNotExcised`,
 `AnImmediateFailTargetIsMatchedThroughTheResolver`,
 `SelfCompareCanaryFoldsToFallThroughWithoutFailCall`,
