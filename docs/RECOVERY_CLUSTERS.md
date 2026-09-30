@@ -201,6 +201,7 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
   Reference mode (75 assemblies against the real reference pack): **315 → 315 errors / 38 → 38
   failing** — identical code histograms (CS0246 48 = control's; no new CS0246 — the generated-shim
   problem of the abandoned forwarder round is gone because nothing is generated). Residual keepers: the 848 gated/unproven notes above, the 179 `Unrecoverable operation` reclassifications, and the 215-site `&`→`&` consumer cluster (awaiter/builder `ref` receivers — a different coercion shape). | `Regression/AddressIntoIntPtrSlotTests.*` (7 tests) |
+|| castle-recovery#195 `game-specific-fills` (policy: hand-written `TryFill*` bodies keyed on game type/method names + the injected `CastleRecovery.Runtime` reference) | IL emission / recovery policy | Removal only — every game-keyed special case in `AsmResolverDllOutputFormatIlRecovery` is gone: `CastleRecoveryReference` (an `AssemblyReference("CastleRecovery.Runtime", 1.0.0.0)` no build provides — the phantom reference behind the 6 CS0246 `CastleRecovery` diagnostics and the 13 `ilverify:FileNotFoundException` verifier crashes), `RepairVoodooTuneMetadataReturnLocal`, and the 15 game-keyed fills (`TryFillSoftMaskGetComponent`, `TryFillSoftMaskGetISoftMask`, `TryFillFormatTime`, `TryFillInitializationGetInitData`, `TryFillInitializationSubsystem`, `TryFillMonoSingleton`, `TryFillSaveObfuscate`, `TryFillEasySaveFullPath`, `TryFillSaveExists`, `TryFillEasySaveGenericPersistence`, `TryFillSaveGenericPersistence`, `TryFillPanelGetPanel`, `TryFillPanelLifecycle`, `TryFillPanelNullPredicate`, `TryFillVoodooTuneProcess`). Every body they wrote now comes from the general lifter or keeps a named `decompiler-issue` note — nothing was replaced with a stub. Kept fills are generic and decided on declared metadata alone: `TryFillClosureSingletonConstructor` (the C# `<>c`/`<>9` display-class singleton shape, 587 methods on control) and `TryFillFieldLikeEvent` (declared add/remove accessor + same-name backing field + `Delegate.Combine`/`Remove`, 796 methods). r241 measurement (control `development@22a45563`, signing driver + ILVerify): all 23 removed-fill methods transition `semantic-recovery → lifted-unverified`; default compile **775 → 769 errors / 79 → 79 failing** (exactly the 6 CS0246s removed — the same 79 assemblies still fail on their other diagnostics); refmode **315 → 309 / 38 → 38** with the 10 game-owned per-assembly counts moved only on `CastleClashers.Core` 14 → 12 and `CastleClashers.Game` 27 → 25 (`EasySave3` 7 → 5 is not game-owned); triage `missing-assembly` **6 → 0** in both modes, every other bucket flat; codeverify `verified` 10,600 → 10,760, `compiles_unverified` 39,554 → 39,392, `incomplete` 18,167 → 18,183, `invalid_il` 406 → 393, `stub` 101,641 → 101,640, `fails_compile`/`no_body`/`missing` flat; per-method ILVerify **0 transitions of any kind** across 178,275 keyed methods; P1 game-owned (`game_owned_table.py`): `verified` **915 → 1,076** (`CastleClashers.Core` 0 → 160 — the whole assembly verifies once the phantom reference is gone; `CastleClashers.VoodooTune` 43 → 44), `compiles_unverified` 17,557 → 17,393, `incomplete` 4,973 → 4,986 (+13 — the removed fills' methods whose lifted bodies are partial: 6 `CastleClashers.Core` + 7 `CastleClashers.Game`, including the single verified → incomplete move `SoftMasking.SoftMaskable::GetComponent<T>` which is not game-owned but counts in the joined delta), `invalid_il` 10 → 1, `stub`/`fails_compile`/`no_body` flat, refmode errors 88 → 84 | `Regression/UnprovidedReferencePinningTests.*` (2 tests) |
 
 ## Summary
 
@@ -208,7 +209,7 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
 - **84 fork PRs** merged since `b5ad444b` (#1–#79, #81–#85; no #80), plus the
   castle-recovery#NN issue rows.
 - **2 are not live recovery fixes**: #26 (reverted by #27) and #85 (CI only).
-- **138 recovery-fix clusters.** **136** carry reproducing tests (tests added or
+- **139 recovery-fix clusters.** **137** carry reproducing tests (tests added or
   strengthened in the same PR): the 80 through the backfill wave (#16 + #47,
   #38, #40, #41, #57, #58), castle-recovery#74's `UnboxEmissionTests.*`,
   castle-recovery#75's `Arm64VectorLaneLiftingTests.*`,
@@ -272,7 +273,8 @@ tiny injected fixtures only — no game binaries, names, tokens or addresses.
   castle-recovery#84's `EventBackingFieldVisibilityTests.*`,
   castle-recovery#174's and castle-recovery#191's `AwaiterProvenanceTests.*`,
   castle-recovery#177's `NonzeroLiteralEmissionTests.*`, and
-  castle-recovery#176's `AddressIntoIntPtrSlotTests.*`.
+  castle-recovery#176's `AddressIntoIntPtrSlotTests.*`, and
+  castle-recovery#195's `UnprovidedReferencePinningTests.*`
 - **2 remain `none`**, both compile-only fixes: #15 (`IReadOnlySet` on
   netstandard2.0) and #20 (`AddOperands` signature fix, exercised downstream by
   `Arm64LibcMathImportTests`).
@@ -306,8 +308,10 @@ Larger open clusters deliberately not pinned:
 - `ilverify:NullReferenceException` (2,376): already fixed on `development` —
   re-verifying the assemblies rebuilt from `development` produces zero
   `NullReferenceException` verifier crashes. The residual 13
-  `ilverify:FileNotFoundException` crashes are the verifier failing to resolve
-  the injected `CastleRecovery.Runtime` helper assembly.
+  `ilverify:FileNotFoundException` crashes were the verifier failing to resolve
+  the injected `CastleRecovery.Runtime` helper assembly — castle-recovery#195
+  removes the injection, so the crashes are gone (0 per-method ILVerify status
+  transitions; the 13 call-site records no longer carry the crash evidence).
 - `ilverify:ReturnPtrToStack` (379): emits stack-valid (`ldloca`/`ret`) bodies
   with no Cpp2IL-side diagnostic to assert; smaller than the pinned stub
   cluster. Next in line if a third `ilverify` pin is wanted.
