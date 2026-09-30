@@ -6305,56 +6305,29 @@ public static class IlGenerator
     // emitted type even though the memory operand itself declares none.
     private static TypeAnalysisContext? StoreContract(IOperand destination, MethodAnalysisContext context)
     {
-        // `this` is the one local whose declared type is not what `stloc` sees:
-        // ldarg.0/stloc on a struct method's this moves a managed pointer, so the
-        // store contract is the emitted type, not the bare struct.
-        var declared = destination is LocalVariable { IsThis: true }
-            ? null
-            : DestinationType(destination);
-        // A shared-generic erased instantiation (List<object>) is not the local
-        // the emitted body declares when sharpening recovered the concrete one;
-        // the contract must agree with the declaration or the store coerces the
-        // operand into a type the slot does not accept.
-        if (declared is GenericInstanceTypeAnalysisContext declaredInstance
-            && declaredInstance.GenericArguments.Any(ContainsErasedSharedArgument)
-            && destination is LocalVariable destinationLocal
-            && EmittedLocalTypeCore(destinationLocal, context, []) is GenericInstanceTypeAnalysisContext
-                {
-                    GenericType: { } sharpenedDefinition,
-                    GenericArguments: { } sharpenedArguments
-                } sharpenedContract
-            && ThisConstructorCallPlan.SameTypeIdentity(sharpenedDefinition, declaredInstance.GenericType)
-            && !sharpenedArguments.Any(argument =>
-                ContainsUnusableSharpenedArgument(argument, context)))
-            return sharpenedContract;
-        if (declared is ByRefTypeAnalysisContext declaredByRef
-            && IsErasedSharedArgument(declaredByRef.ElementType)
-            && destination is LocalVariable byRefLocal
-            && EmittedLocalType(byRefLocal, context) is ByRefTypeAnalysisContext sharpenedByRef
-            && !IsErasedSharedArgument(sharpenedByRef.ElementType))
-            return sharpenedByRef;
-        if (declared == context.AppContext.SystemTypes.SystemObjectType
-            && destination is LocalVariable objectLocal
-            && EmittedLocalType(objectLocal, context) is { } concreteContract
-            && concreteContract != context.AppContext.SystemTypes.SystemObjectType)
-            return concreteContract;
-        // A call-defined contract only describes the slot when it agrees with the
-        // emitted local type: a rep that declares another concrete type (e.g. the
-        // `this` declaring type) still has to receive the store through that slot,
-        // so the emitted contract wins whenever they conflict.
-        if (destination is LocalVariable callLocal
-            && CallDefinedLocalType(callLocal, context, []) is { } callContract
-            && (EmittedLocalType(callLocal, context) is not { } emittedContract
-                || ThisConstructorCallPlan.SameTypeIdentity(emittedContract, callContract)
-                || emittedContract == context.AppContext.SystemTypes.SystemObjectType))
-            return callContract;
+        // StoreToOperand lowers a local destination to `stloc`, so the slot can
+        // only hold the type the .locals signature declares. Any sharper
+        // analysis type - a recovered instantiation, a call-defined type - that
+        // the declaration erased back is not a type the verifier accepts at the
+        // store; the declared slot wins.
+        if (destination is LocalVariable slotLocal)
+        {
+            var localContract = EmittableLocalType(EmittedLocalType(slotLocal, context), context);
+            // A local whose manufactured Boolean claim was vetoed falls back to
+            // an object slot: mark its contract so a scalar edge reaching it
+            // keeps the named note the Boolean-typed slot emitted.
+            return localContract.FullName == "System.Object"
+                && Analysis.LocalVariables.CarriesVetoedBooleanClaim(slotLocal, context)
+                    ? new Analysis.BooleanClaimVetoedSlotTypeAnalysisContext(localContract)
+                    : localContract;
+        }
+        var declared = DestinationType(destination);
         if (declared != null)
             return declared;
         var fallback = destination switch
         {
-            LocalVariable local => EmittedLocalType(local, context),
             MemoryOperand { Index: null, Addend: 0, Scale: 0, Base: LocalVariable { Type: not ByRefTypeAnalysisContext } baseLocal }
-                => EmittedLocalType(baseLocal, context),
+                => EmittableLocalType(EmittedLocalType(baseLocal, context), context),
             _ => null
         };
         return fallback;
@@ -7143,6 +7116,13 @@ public static class IlGenerator
             return false;
         }
 
+        // A scalar reaching a vetoed-Boolean object slot is a value the binary
+        // moved as raw bits into a pointer slot: `box` fabricates a conversion
+        // the binary never made. Only these marked slots - not any ordinary
+        // System.Object contract - keep the note the bool-typed slot emitted.
+        if (from.IsValueType && to is Analysis.BooleanClaimVetoedSlotTypeAnalysisContext)
+            return false;
+
         // Some recovered corlib contexts lose their value-type flag even though
         // their stack kind and name remain exact. A primitive entering any managed
         // reference slot still must be boxed; key this off the canonical name, not
@@ -7460,6 +7440,11 @@ public static class IlGenerator
             return true;
         if (to.FullName is "System.Single" or "System.Double")
             return from.FullName is "System.Single" or "System.Double" || fromWidth != 0;
+        // Mirrors EmitStackCoerce: a scalar reaching a vetoed-Boolean object
+        // slot has no honest conversion - `box` would fabricate one the binary
+        // never made, so the slot takes the diagnosed default instead.
+        if (from.IsValueType && to is Analysis.BooleanClaimVetoedSlotTypeAnalysisContext)
+            return false;
         if (from.IsValueType && !to.IsValueType)
             // box, plus castclass when the reference target narrows - both need
             // tokens the caller can legally name. A byref-like source cannot be
