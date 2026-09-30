@@ -40,6 +40,11 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             ["atan2f"] = ("Atan2", false, 2), ["atan2"] = ("Atan2", true, 2),
             ["powf"] = ("Pow", false, 2),     ["pow"] = ("Pow", true, 2),
             ["fmodf"] = (null, false, 2),    ["fmod"] = (null, true, 2),
+            ["coshf"] = ("Cosh", false, 1),   ["cosh"] = ("Cosh", true, 1),
+            ["sinhf"] = ("Sinh", false, 1),   ["sinh"] = ("Sinh", true, 1),
+            ["tanhf"] = ("Tanh", false, 1),   ["tanh"] = ("Tanh", true, 1),
+            ["log10f"] = ("Log10", false, 1), ["log10"] = ("Log10", true, 1),
+            ["log2f"] = ("Log2", false, 1),   ["log2"] = ("Log2", true, 1),
         };
 
     public override BaseCallingConventionResolver CallingConventionResolver => CallingConventions;

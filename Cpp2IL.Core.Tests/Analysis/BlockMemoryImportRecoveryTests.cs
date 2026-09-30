@@ -717,4 +717,124 @@ public class BlockMemoryImportRecoveryTests
             Throws.TypeOf<R.TargetInvocationException>(), "the body must throw, not silently copy");
         Assert.That(dst, Is.EqualTo(new[] { "a", "b" }), "destination must be untouched");
     }
+
+    // ---------- Import naming and scalar out-parameter imports ----------
+
+    // Any import the resolver names gets a StringLiteral target, so an unproven
+    // use stays diagnosed as `Unknown call target operand: "name"` instead of an
+    // anonymous address.
+    [Test]
+    public void ResolvedButUnhandledImportGetsNamedTarget()
+    {
+        var caller = CallerWithUnresolvedCall(out var call);
+        BlockMemoryImportRecovery.Run(caller, va => va == 0x10000 ? "qsort" : null);
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+        Assert.That(call.Operands[0], Is.TypeOf<StringLiteral>());
+        Assert.That(((StringLiteral)call.Operands[0]).Value, Is.EqualTo("qsort"));
+    }
+
+    [Test]
+    public void UnresolvedCallTargetStaysUnnamed()
+    {
+        var caller = CallerWithUnresolvedCall(out var call);
+        BlockMemoryImportRecovery.Run(caller, _ => null);
+        Assert.That(call.Operands[0], Is.TypeOf<Immediate>());
+    }
+
+    // A call already carrying a name (e.g. named by an earlier run) is still
+    // eligible for a rewrite.
+    [Test]
+    public void AlreadyNamedImportStillRewrites()
+    {
+        var caller = CallerWithUnresolvedCall(out var call);
+        call.SetOperand(0, new StringLiteral("memset"));
+        call.SetOperand(3, new Immediate(0));
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memset"), Is.True);
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.MemorySet));
+    }
+
+    // Inject a System.Math member into the fixture corlib (the test game's
+    // mscorlib is minimal and lacks Truncate/Sin/Cos). Returns the member.
+    private MethodAnalysisContext InjectMathMember(string name, TypeAnalysisContext type,
+        params TypeAnalysisContext[] paramTypes)
+    {
+        var math = _app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Math")!;
+        var member = new InjectedMethodAnalysisContext(math, name, type,
+            R.MethodAttributes.Public | R.MethodAttributes.Static, paramTypes);
+        math.Methods.Add(member);
+        return member;
+    }
+
+    // modf(x, *iptr): the managed shape is `Math.Truncate(x)` stored through the
+    // out pointer, and the result is `x - trunc(x)`.
+    [Test]
+    public void ModfRewritesToTruncateAndSubtract()
+    {
+        InjectMathMember("Truncate", _app.SystemTypes.SystemDoubleType, _app.SystemTypes.SystemDoubleType);
+        var caller = CallerWithUnresolvedCall(out var call);
+        var slot = new LocalVariable("iptr", new Register(null, "stack"), _app.SystemTypes.SystemDoubleType);
+        caller.Locals!.Add(slot);
+        call.SetOperand(2, new AddressOf(slot));
+
+        BlockMemoryImportRecovery.Run(caller, _ => "modf");
+
+        var instructions = caller.ControlFlowGraph!.Instructions;
+        var truncate = instructions.FirstOrDefault(i =>
+            i.OpCode == OpCode.Call && i.Operands[0] is MethodAnalysisContext);
+        Assert.That(truncate, Is.Not.Null, "a Math.Truncate call must be inserted");
+        Assert.That(((MethodAnalysisContext)truncate!.Operands[0]).Name, Is.EqualTo("Truncate"));
+        Assert.That(truncate.Operands[2], Is.SameAs(call.Operands[1]),
+            "Truncate's argument is the Subtract's left-hand side (x)");
+        var store = instructions.FirstOrDefault(i =>
+            i.OpCode == OpCode.Move && ReferenceEquals(i.Destination, slot));
+        Assert.That(store, Is.Not.Null, "the out pointer's store must be inserted");
+        Assert.That(store!.Operands[1], Is.SameAs(truncate.Operands[1]),
+            "the stored value is Truncate's result");
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.Subtract));
+        Assert.That(call.Operands[2], Is.SameAs(truncate.Operands[1]));
+    }
+
+    // sincos(x, *s, *c): two managed calls and two stores; the void import's
+    // own result slot drops away with the call.
+    [Test]
+    public void SincosRewritesToSinAndCos()
+    {
+        InjectMathMember("Sin", _app.SystemTypes.SystemDoubleType, _app.SystemTypes.SystemDoubleType);
+        InjectMathMember("Cos", _app.SystemTypes.SystemDoubleType, _app.SystemTypes.SystemDoubleType);
+        var caller = CallerWithUnresolvedCall(out var call);
+        var sin = new LocalVariable("s", new Register(null, "stack"), _app.SystemTypes.SystemDoubleType);
+        var cos = new LocalVariable("c", new Register(null, "stack"), _app.SystemTypes.SystemDoubleType);
+        caller.Locals!.Add(sin);
+        caller.Locals!.Add(cos);
+        call.SetOperand(2, new AddressOf(sin));
+        call.SetOperand(3, new AddressOf(cos));
+
+        BlockMemoryImportRecovery.Run(caller, _ => "sincos");
+
+        var instructions = caller.ControlFlowGraph!.Instructions;
+        var names = instructions.Where(i => i.OpCode == OpCode.Call && i.Operands[0] is MethodAnalysisContext)
+            .Select(i => ((MethodAnalysisContext)i.Operands[0]).Name).ToList();
+        Assert.That(names, Is.EqualTo(new[] { "Sin", "Cos" }));
+        Assert.That(instructions.Any(i => i.OpCode == OpCode.Move && ReferenceEquals(i.Destination, sin)), Is.True);
+        Assert.That(instructions.Any(i => i.OpCode == OpCode.Move && ReferenceEquals(i.Destination, cos)), Is.True);
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.Nop));
+    }
+
+    // An out pointer that cannot be proven - an opaque integer local here -
+    // keeps the call as a named diagnostic rather than emitting a raw store.
+    [Test]
+    public void UnprovenModfOutPointerStaysNamedCall()
+    {
+        var caller = CallerWithUnresolvedCall(out var call);
+        call.SetOperand(2, Reg("X0", _int64)); // opaque pointer value, no provenance
+
+        BlockMemoryImportRecovery.Run(caller, _ => "modf");
+
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+        Assert.That(call.Operands[0], Is.TypeOf<StringLiteral>());
+        Assert.That(((StringLiteral)call.Operands[0]).Value, Is.EqualTo("modf"));
+        Assert.That(caller.ControlFlowGraph!.Instructions.Any(i =>
+            i.OpCode == OpCode.Call && i.Operands[0] is MethodAnalysisContext), Is.False,
+            "no managed math call may be emitted when the out pointer is unproven");
+    }
 }
