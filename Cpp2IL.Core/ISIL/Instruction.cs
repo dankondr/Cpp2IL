@@ -12,6 +12,13 @@ public class Instruction : IOperand
 {
     public int Index;
 
+    /// <summary>
+    /// The address of the machine instruction this instruction was lifted from, or 0 when it
+    /// was synthesized (by the instruction set or a later analysis pass). Lets unwind data
+    /// (landing pads, call-site ranges) be mapped onto the instruction stream.
+    /// </summary>
+    public ulong NativeAddress;
+
     public OpCode OpCode
     {
         get;

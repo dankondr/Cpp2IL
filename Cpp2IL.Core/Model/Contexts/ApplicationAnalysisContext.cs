@@ -353,6 +353,19 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
         return Binary.TryMapVirtualAddressToRaw(ret, out _) ? ret : 0;
     }
 
+    /// <summary>
+    /// Returns the virtual address one past the end of the function starting at
+    /// <paramref name="functionStart"/>: the end of its unwind-table extent when the binary
+    /// provides one, else the next known function start (or 0 when neither is known).
+    /// </summary>
+    public ulong GetFunctionEnd(ulong functionStart)
+    {
+        var end = GetAddressOfNextFunctionStart(functionStart);
+        if (Binary.EhFunctions?.TryGetValue(functionStart, out var eh) == true && eh.End > functionStart)
+            end = end > functionStart ? Math.Min(end, eh.End) : eh.End;
+        return end;
+    }
+
     public BaseKeyFunctionAddresses GetOrCreateKeyFunctionAddresses()
     {
         lock (InstructionSet)
