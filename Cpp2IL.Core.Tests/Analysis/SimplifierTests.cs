@@ -130,6 +130,27 @@ public class SimplifierTests
             () => string.Join("\n", graph.Blocks.SelectMany(b => b.Instructions)));
     }
 
+    [Test]
+    public void DoesNotForwardALoadPastAWriteOfItsBase()
+    {
+        // `LDR W17, [X15], #4; ADD W0, W17, W0`: x = [p]; p = p + 4; sum = sum + x. Forwarding
+        // [p] into the add would read the next element.
+        var p = new LocalVariable("p", new Register(null, "p"));
+        var x = new LocalVariable("x", new Register(null, "x"));
+        var sum = new LocalVariable("sum", new Register(null, "sum"));
+        var add = new Instruction(2, OpCode.Add, sum, sum, x);
+        var graph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, x, new MemoryOperand(p, null, 0, 0, 4)),
+            new Instruction(1, OpCode.Add, p, p, Imm(4)),
+            add,
+            new Instruction(3, OpCode.Return, sum)
+        ]);
+
+        Simplifier.Simplify(CreateMethod(graph, p, x, sum));
+
+        Assert.That(add.Operands[2], Is.Not.InstanceOf<MemoryOperand>());
+    }
+
     private static MethodAnalysisContext CreateMethod(ISILControlFlowGraph graph, params LocalVariable[] locals)
     {
         var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));
