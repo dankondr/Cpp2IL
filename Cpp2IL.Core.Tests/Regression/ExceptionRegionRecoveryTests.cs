@@ -153,6 +153,41 @@ public class ExceptionRegionRecoveryTests
         Assert.That(new NativeExceptionRegionProof(caller).Find().Count, Is.EqualTo(proven ? 1 : 0));
     }
 
+    [TestCase(false)]
+    [TestCase(true)]
+    public void CompoundCleanupCannotReuseMemoryFactsAcrossTheFirstCall(bool reloadChangedStorage)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "CompoundWrites",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
+        MethodAnalysisContext Method(string name) => owner.InjectMethodContext(name, app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public | R.MethodAttributes.Static, []);
+        var caller = Method("M");
+        var first = Method("First");
+        var second = Method("Second");
+        var receiver = new Register(null, "X19");
+        var exception = new Register(null, "X20");
+        var storage = new StackOffset(0);
+        Instruction At(ulong address, OpCode op, params IOperand[] operands)
+            => new(0, op, operands.ToList()) { NativeAddress = address };
+        caller.ConvertedIsil = [At(0x1000, OpCode.Move, receiver, new Immediate(42)),
+            At(0x1004, OpCode.Move, storage, receiver),
+            At(0x1008, OpCode.CallVoid, Method("Work")),
+            At(0x100C, OpCode.CallVoid, first, new AddressOf(storage)),
+            At(0x1010, OpCode.CallVoid, second, receiver), At(0x1014, OpCode.Return),
+            At(0x2000, OpCode.Move, exception, new Register(null, "X0")),
+            At(0x2004, OpCode.CallVoid, first, new AddressOf(storage)),
+            At(0x2008, OpCode.CallVoid, second, reloadChangedStorage ? storage : receiver),
+            At(0x200C, OpCode.CallVoid, new StringLiteral("_Unwind_Resume"), exception)];
+        caller.UnwindInfo = new EhFunctionInfo { Start = 0x1000, Size = 0x1010 };
+        caller.UnwindInfo.CallSites.Add(new EhCallSiteInfo(0x1008, 4, 0x2000, 0)
+            { Actions = [new EhActionInfo(0, null)] });
+        EhRegionPartition.Partition(caller);
+        var proofs = new NativeExceptionRegionProof(caller).Find();
+        Assert.That(proofs.Count, Is.EqualTo(reloadChangedStorage ? 0 : 1));
+        if (!reloadChangedStorage) Assert.That(proofs[0].CleanupCalls.Count, Is.EqualTo(2));
+    }
+
     [Test]
     public void SwitchCasesLeaveFinallyAndPreserveTheDefaultPath()
     {

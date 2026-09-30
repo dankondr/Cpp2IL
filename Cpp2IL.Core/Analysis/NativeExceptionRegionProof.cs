@@ -348,28 +348,7 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
                 // Addressed native storage can be written by a call (including a hidden
                 // struct result). Initial zeroes are not facts about the returned object.
                 var callee = callees.GetValueOrDefault(instruction.NativeAddress);
-                var arguments = instruction.Operands.Skip(instruction.OpCode == OpCode.CallVoid ? 1 : 2);
-                // Boxing copies the input bytes; it never writes through the value
-                // pointer. Treating it as an unknown writer erased adjacent saved
-                // cleanup receivers even on the exceptional edge.
-                var boxesValue = Helper(instruction.Operands[0]) is nameof(BaseKeyFunctionAddresses.il2cpp_value_box)
-                    or nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_box);
-                var writes = arguments.Where(_ => !boxesValue)
-                    .Select(o => (Address: Value(o, after), Size: ArgumentStorageSize(callee, o))).ToList();
-                if (instruction.Destination is MemoryOperand result)
-                    writes.Add((Address(result, after), StorageSize(callee?.ReturnType)));
-                foreach (var (address, size) in writes)
-                {
-                    if (address?.StartsWith("f", StringComparison.Ordinal) != true) continue;
-                    var separator = address.IndexOf(':');
-                    if (separator < 0 || !long.TryParse(address[(separator + 1)..], out var start)) continue;
-                    foreach (var cell in after.Memory.Keys.ToArray())
-                        if (cell.StartsWith(address[..(separator + 1)], StringComparison.Ordinal)
-                            && long.TryParse(cell[(separator + 1)..], out var offset) && (offset >= start || after.MemoryWidths.GetValueOrDefault(cell) == 0
-                                || offset + after.MemoryWidths[cell] > start)
-                            && (size == 0 || offset < start + size))
-                            after.Memory.Remove(cell);
-                }
+                InvalidateCallStorage(instruction, after, callee);
                 // A callee may write its arguments before throwing. Use the same
                 // invalidation on the exceptional edge, before assigning a return value.
                 exceptionStates[index] = after.Copy();
@@ -404,6 +383,32 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
             }
         }
         return states;
+    }
+
+    private void InvalidateCallStorage(Instruction instruction, State state, MethodAnalysisContext? callee)
+    {
+        var arguments = instruction.Operands.Skip(instruction.OpCode == OpCode.CallVoid ? 1 : 2);
+        // Boxing copies the input bytes; it never writes through the value
+        // pointer. Treating it as an unknown writer erased adjacent saved
+        // cleanup receivers even on the exceptional edge.
+        var boxesValue = Helper(instruction.Operands[0]) is nameof(BaseKeyFunctionAddresses.il2cpp_value_box)
+            or nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_box);
+        var writes = arguments.Where(_ => !boxesValue)
+            .Select(o => (Address: Value(o, state), Size: ArgumentStorageSize(callee, o))).ToList();
+        if (instruction.Destination is MemoryOperand result)
+            writes.Add((Address(result, state), StorageSize(callee?.ReturnType)));
+        foreach (var (address, size) in writes)
+        {
+            if (address?.StartsWith("f", StringComparison.Ordinal) != true) continue;
+            var separator = address.IndexOf(':');
+            if (separator < 0 || !long.TryParse(address[(separator + 1)..], out var start)) continue;
+            foreach (var cell in state.Memory.Keys.ToArray())
+                if (cell.StartsWith(address[..(separator + 1)], StringComparison.Ordinal)
+                    && long.TryParse(cell[(separator + 1)..], out var offset) && (offset >= start || state.MemoryWidths.GetValueOrDefault(cell) == 0
+                        || offset + state.MemoryWidths[cell] > start)
+                    && (size == 0 || offset < start + size))
+                    state.Memory.Remove(cell);
+        }
     }
 
     private long ArgumentStorageSize(MethodAnalysisContext? callee, IOperand argument)
@@ -453,13 +458,17 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
             state.Pads.Add(instruction.NativeAddress);
         if (instruction.IsCall)
         {
+            var cleanupKey = CallKey(instruction, state);
+            var matchedCleanup = cleanupKey != null && cleanups.ContainsKey(cleanupKey);
+            if (matchedCleanup)
+                InvalidateCallStorage(instruction, state, instruction.Operands[0] as MethodAnalysisContext);
             ProveAuxiliaryPads(instruction, state, depth);
             var args = instruction.Operands.Skip(instruction.OpCode == OpCode.CallVoid ? 1 : 2)
                 .Select(o => Value(o, state)).ToArray();
             var helper = Helper(instruction.Operands[0]);
-            if (CallKey(instruction, state) is { } key && cleanups.ContainsKey(key))
+            if (matchedCleanup)
             {
-                state.Effects.Add(key);
+                state.Effects.Add(cleanupKey!);
                 Clobber(state);
             }
             else if (helper is "__cxa_begin_catch")
@@ -707,7 +716,7 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
                         && long.TryParse(cell[(colon + 1)..], out var offset)
                         && (width == 0 || offset < start + width)
                         && (offset >= start || state.MemoryWidths.GetValueOrDefault(cell) == 0
-                            || offset + state.MemoryWidths[cell] > start))
+                                    || offset + state.MemoryWidths[cell] > start))
                         state.Memory.Remove(cell);
             state.MemoryWidths[key] = width;
         }
