@@ -150,6 +150,76 @@ public class ExceptionRegionRecoveryTests
         Assert.That(new NativeExceptionRegionProof(caller).Find().Count, Is.EqualTo(proven ? 1 : 0));
     }
 
+    [Test]
+    public void SwitchCasesLeaveFinallyAndPreserveTheDefaultPath()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "SwitchOwner",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
+        MethodAnalysisContext Method(string name) => owner.InjectMethodContext(name, app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public | R.MethodAttributes.Static, []);
+        var caller = Method("M"); var cleanup = Method("Cleanup"); var work = Method("Work");
+        Instruction At(ulong address, OpCode op, params IOperand[] operands) => new(0, op, operands.ToList()) { NativeAddress = address };
+        var call = At(0x1000, OpCode.CallVoid, work);
+        var first = At(0x1008, OpCode.CallVoid, cleanup);
+        var second = At(0x1010, OpCode.CallVoid, cleanup);
+        var ret = At(0x1014, OpCode.Return);
+        var dispatch = At(0x1004, OpCode.ConditionalJump, second, new Register(null, "X8"));
+        var join = At(0x100C, OpCode.Jump, ret);
+        var exception = new Register(null, "X20");
+        caller.ConvertedIsil = [call, dispatch, first, join, second, ret,
+            At(0x2000, OpCode.Move, exception, new Register(null, "X0")),
+            At(0x2004, OpCode.CallVoid, cleanup),
+            At(0x2008, OpCode.CallVoid, new StringLiteral("_Unwind_Resume"), exception)];
+        caller.UnwindInfo = new EhFunctionInfo { Start = 0x1000, Size = 0x100C };
+        caller.UnwindInfo.CallSites.Add(new EhCallSiteInfo(0x1000, 4, 0x2000, 0) { Actions = [new EhActionInfo(0, null)] });
+        EhRegionPartition.Partition(caller);
+        var module = new ModuleDefinition("SwitchRegions.dll");
+        var runtimeOwner = new TypeDefinition("Tests", "SwitchOwner", AsmResolver.PE.DotNet.Metadata.Tables.TypeAttributes.Public,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(runtimeOwner);
+        MethodDefinition Definition(string name, params TypeSignature[] parameters)
+        {
+            var method = new MethodDefinition(name, AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Public
+                | AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Static,
+                MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, parameters));
+            runtimeOwner.Methods.Add(method); method.CilMethodBody = new(); return method;
+        }
+        var definition = Definition("M", module.CorLibTypeFactory.Int32);
+        var cleanupDefinition = Definition("Cleanup");
+        var workDefinition = Definition("Work");
+        workDefinition.CilMethodBody!.Instructions.Add(CilOpCodes.Ret);
+        var trace = new FieldDefinition("Trace", AsmResolver.PE.DotNet.Metadata.Tables.FieldAttributes.Public
+            | AsmResolver.PE.DotNet.Metadata.Tables.FieldAttributes.Static, module.CorLibTypeFactory.Int32);
+        runtimeOwner.Fields.Add(trace);
+        var cleanupIl = cleanupDefinition.CilMethodBody!.Instructions;
+        cleanupIl.Add(CilOpCodes.Ldsfld, trace); cleanupIl.Add(CilOpCodes.Ldc_I4_1); cleanupIl.Add(CilOpCodes.Add);
+        cleanupIl.Add(CilOpCodes.Stsfld, trace); cleanupIl.Add(CilOpCodes.Ret);
+        cleanup.PutExtraData("AsmResolverMethod", cleanupDefinition);
+        var a = new CilInstruction(CilOpCodes.Call, cleanupDefinition);
+        var b = new CilInstruction(CilOpCodes.Call, cleanupDefinition);
+        var done = new CilInstruction(CilOpCodes.Ret);
+        var selection = new CilInstruction(CilOpCodes.Switch, new ICilLabel[] { new CilInstructionLabel(a), new CilInstructionLabel(b) });
+        var map = new Dictionary<Instruction, List<CilInstruction>>
+        {
+            [call] = [new(CilOpCodes.Call, workDefinition)], [dispatch] = [new(CilOpCodes.Ldarg_0), selection],
+            [first] = [a], [join] = [new(CilOpCodes.Br, new CilInstructionLabel(done))], [second] = [b], [ret] = [done]
+        };
+        foreach (var instruction in map.Values.SelectMany(i => i)) definition.CilMethodBody!.Instructions.Add(instruction);
+        ExceptionRegionRecovery.Apply(caller, definition, map);
+        Assert.That(definition.CilMethodBody!.ExceptionHandlers, Has.Count.EqualTo(1));
+        Assert.That(caller.AnalysisWarnings, Is.Empty);
+        Assert.That(((IList<ICilLabel>)selection.Operand!).Cast<CilInstructionLabel>()
+            .All(l => l.Instruction!.OpCode == CilOpCodes.Leave), Is.True);
+        var type = Load(module).GetType("Tests.SwitchOwner")!;
+        foreach (var value in new[] { -1, 0, 1, 99 })
+        {
+            type.GetField("Trace")!.SetValue(null, 0);
+            type.GetMethod("M")!.Invoke(null, [value]);
+            Assert.That(type.GetField("Trace")!.GetValue(null), Is.EqualTo(1));
+        }
+    }
+
     [TestCase(true)]
     [TestCase(false)]
     public void HandlerLocalMustBeAssignedOnEveryIncomingPath(bool assignRight)

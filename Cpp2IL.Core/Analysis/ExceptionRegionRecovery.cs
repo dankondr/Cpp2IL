@@ -81,14 +81,12 @@ internal static class ExceptionRegionRecovery
                 }
                 if (!reachableInstructions.Add(index)) continue;
                 var instruction = unit.Code[index];
-                if (instruction.Operand is CilInstructionLabel { Instruction: { } target }
-                    && owner.TryGetValue(target, out var next))
+                foreach (var label in Targets(instruction))
                 {
+                    if (label is not CilInstructionLabel { Instruction: { } target } || !owner.TryGetValue(target, out var next)) return;
                     if (next != unit) unit.Next.Add(next);
                     else pendingInstructions.Push(unit.Code.FindIndex(i => ReferenceEquals(i, target)));
                 }
-                else if (instruction.Operand is IList<ICilLabel>)
-                    return; // switch-edge rewriting is not proven here yet
                 if (instruction.OpCode.FlowControl is not (CilFlowControl.Branch or CilFlowControl.Return or CilFlowControl.Throw))
                     pendingInstructions.Push(index + 1);
             }
@@ -297,6 +295,34 @@ internal static class ExceptionRegionRecovery
             {
                 if (removed.Contains(instruction)) continue;
                 replacements.Add(instruction);
+                if (instruction.Operand is IList<ICilLabel> targets)
+                {
+                    var rewritten = new List<ICilLabel>();
+                    var trampolines = new List<CilInstruction>();
+                    foreach (var label in targets)
+                    {
+                        var targetInstruction = ((CilInstructionLabel)label).Instruction!;
+                        var targetUnit = owner[targetInstruction];
+                        var enteredRegions = membership[targetUnit].Except(membership[unit]).OrderByDescending(r => r.Units.Count).ToList();
+                        var targetAddress = enteredRegions.Count > 0 ? enteredRegions[0].Anchor : targetInstruction;
+                        if (membership[unit].Except(membership[targetUnit]).Any())
+                        {
+                            var leave = new CilInstruction(CilOpCodes.Leave, new CilInstructionLabel(targetAddress));
+                            rewritten.Add(new CilInstructionLabel(leave));
+                            trampolines.Add(leave);
+                        }
+                        else rewritten.Add(new CilInstructionLabel(targetAddress));
+                    }
+                    instruction.Operand = rewritten.ToArray();
+                    if (trampolines.Count > 0)
+                    {
+                        var defaultPath = new CilInstruction(CilOpCodes.Nop);
+                        replacements.Add(new CilInstruction(CilOpCodes.Br, new CilInstructionLabel(defaultPath)));
+                        replacements.AddRange(trampolines);
+                        replacements.Add(defaultPath);
+                    }
+                    continue;
+                }
                 if (instruction.Operand is not CilInstructionLabel { Instruction: { } target }
                     || !owner.TryGetValue(target, out var next) || next == unit) continue;
                 var entered = membership[next].Except(membership[unit]).OrderByDescending(r => r.Units.Count).ToList();
@@ -390,6 +416,13 @@ internal static class ExceptionRegionRecovery
         }
     }
 
+    private static IEnumerable<ICilLabel> Targets(CilInstruction instruction) => instruction.Operand switch
+    {
+        ICilLabel label => [label],
+        IList<ICilLabel> labels => labels,
+        _ => []
+    };
+
     private static Dictionary<Unit, HashSet<CilLocalVariable>> AssignedOnEntry(List<Unit> units,
         Dictionary<Unit, HashSet<Unit>> dominators)
     {
@@ -430,8 +463,9 @@ internal static class ExceptionRegionRecovery
                 if (!seen.Add(index)) continue;
                 var instruction = unit.Code[index];
                 if (instruction.OpCode.Code is CilCode.Stloc or CilCode.Stloc_S && ReferenceEquals(instruction.Operand, local)) continue;
-                if (instruction.Operand is CilInstructionLabel { Instruction: { } target })
+                foreach (var label in Targets(instruction))
                 {
+                    if (label is not CilInstructionLabel { Instruction: { } target }) return false;
                     var next = unit.Code.FindIndex(i => ReferenceEquals(i, target));
                     if (next < 0) return false;
                     pending.Push(next);
