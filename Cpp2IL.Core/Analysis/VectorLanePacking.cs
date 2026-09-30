@@ -206,6 +206,13 @@ internal static class VectorLanePacking
         return true;
     }
 
+    // A pack local is identified by its synthesized register name. Its lane
+    // stores are bookkeeping for the pack, not real field stores: type
+    // propagation must not smear a lane field's scalar type back onto a
+    // whole-register source (LocalVariables.PropagateMove checks this).
+    internal static bool IsPackLocal(LocalVariable? local)
+        => local?.Register.Name is { } name && name.StartsWith("VEC_PACK_");
+
     // A lane store's slot is System.Single: an integer immediate would emit a
     // numeric reinterpretation, while FloatLiteral carries the proven value.
     private static IOperand LaneStoreSource(IOperand operand)

@@ -2033,7 +2033,13 @@ public static class LocalVariables
         }
 
         // Move field, local: a field store types the stored value with the field's type.
-        if (destination is FieldReference storeField && source is LocalVariable storeSource)
+        // A synthesized lane-pack store is exempt: the source supplies one lane of
+        // a register-spread aggregate, so its honest type is whatever its own
+        // producer proves (often the whole vector type). Smearing the lane field's
+        // scalar type onto it would retype the register's other uses scalar and
+        // turn a spellable whole vector into a diagnosed coercion.
+        if (destination is FieldReference storeField && source is LocalVariable storeSource
+            && !VectorLanePacking.IsPackLocal(storeField.Local))
             return SetTypeRespectingBooleanClaim(storeSource, storeField.Field.FieldType, method, allDefinitions);
 
         // ArrayLength is emitted as ldlen/conv.i4, so its result is always Int32 when the
