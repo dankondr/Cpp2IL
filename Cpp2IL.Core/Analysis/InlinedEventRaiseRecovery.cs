@@ -176,9 +176,11 @@ internal static class InlinedEventRaiseRecovery
         if (isil is not { Count: > 0 })
             return false;
 
+        // Only Move copies are chased; mapping every destination would let a
+        // call's return slot overwrite the copy that produced the delegate.
         var definitions = new Dictionary<LocalVariable, Instruction>();
         foreach (var instruction in isil)
-            if (instruction.Destination is LocalVariable destination)
+            if (instruction.OpCode == OpCode.Move && instruction.Destination is LocalVariable destination)
                 definitions[destination] = instruction;
 
         var invokeImplOffset = (candidate.AppContext.Binary.is32Bit ? 4 : 8) * 3;
