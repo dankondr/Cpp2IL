@@ -367,4 +367,180 @@ public class ConcreteCallTypingTests
         });
     }
 
+    [Test]
+    public void KlassHierarchyCastCheckTypesSurvivingLocal()
+    {
+        // castclass<T> lowers to a klass-hierarchy walk: [v] reads the klass,
+        // [klass+table+depth*8] the hierarchy entry, and a mismatch branch throws
+        // InvalidCastException. Reaching past that check proves the value is a T,
+        // which types the erased IEnumerator.get_Current result it consumed.
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2022Game();
+        var corlib = app.AssembliesByName["mscorlib"];
+        var getCurrent = corlib.GetTypeByFullName("System.Collections.IEnumerator")!
+            .Methods.Single(m => m.Name == "get_Current");
+        var stream = corlib.GetTypeByFullName("System.IO.Stream")!;
+        var invalidCast = corlib.GetTypeByFullName("System.InvalidCastException")!;
+        var observe = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Observe",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, [app.SystemTypes.SystemObjectType]);
+        var enumerator = new LocalVariable("enumerator", new Register(null, "X21"),
+            corlib.GetTypeByFullName("System.Collections.IEnumerator"));
+        var item = new LocalVariable("item", new Register(null, "X0"));
+        var klass = new LocalVariable("klass", new Register(null, "X8"));
+        var depth = new LocalVariable("depth", new Register(null, "W9"), app.SystemTypes.SystemInt32Type);
+        var address = new LocalVariable("address", new Register(null, "X9"));
+        var condition = new LocalVariable("condition", new Register(null, "cond"));
+        var throwInstruction = new Instruction(7, OpCode.Throw, invalidCast);
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([
+                new(0, OpCode.Call, getCurrent, item, enumerator),
+                new(1, OpCode.Move, klass, new MemoryOperand(item)),
+                new(2, OpCode.Add, address, new MemoryOperand(klass, null, 0xC8), depth),
+                new(3, OpCode.CheckNotEqual, condition, new MemoryOperand(address, null, -8), stream),
+                new(4, OpCode.ConditionalJump, throwInstruction, condition),
+                new(5, OpCode.CallVoid, observe, item),
+                new(6, OpCode.Return),
+                throwInstruction])
+        };
+
+        LocalVariables.ResolveTypesAndFields(caller);
+
+        Assert.That(IlGenerator.EmittedLocalType(item, caller), Is.EqualTo(stream));
+    }
+
+    [Test]
+    public void BooleanMergeDefinitionsEmitBoolean()
+    {
+        // A junk-merge register defined only by 0/1 literal copies across its
+        // branch arms holds a bool even though no stack contract names one.
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2022Game();
+        var flag = new LocalVariable("flag", new Register(null, "X22"));
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([
+                new(0, OpCode.Move, flag, new Immediate(0)),
+                new(1, OpCode.Move, flag, new Immediate(1)),
+                new(2, OpCode.Move, new LocalVariable("sink", new Register(null, "sink")), flag),
+                new(3, OpCode.Return)])
+        };
+
+        LocalVariables.ResolveTypesAndFields(caller);
+
+        Assert.That(IlGenerator.EmittedLocalType(flag, caller),
+            Is.EqualTo(app.SystemTypes.SystemBooleanType));
+    }
+
+    [Test]
+    public void SeededUnionSurvivesConditionalFlagUse()
+    {
+        // A copy-merge class whose only typed mate declares Boolean is provably
+        // boolean; a brtrue use adds no contrary evidence and cannot veto it.
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2022Game();
+        var flag = new LocalVariable("flag", new Register(null, "X22"));
+        var erased = new LocalVariable("erased", new Register(null, "X23"), app.SystemTypes.SystemObjectType);
+        var destination = new LocalVariable("destination", new Register(null, "X24"),
+            app.SystemTypes.SystemBooleanType);
+        var hidden = new LocalVariable("hidden", new Register(null, "hidden"));
+        var thenBlock = new Instruction(6, OpCode.Nop);
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([
+                new(0, OpCode.Move, erased, hidden),
+                new(1, OpCode.Move, flag, erased),
+                new(2, OpCode.Move, destination, flag),
+                new(3, OpCode.ConditionalJump, thenBlock, flag),
+                new(4, OpCode.Move, flag, erased),
+                new(5, OpCode.Return),
+                thenBlock])
+        };
+
+        LocalVariables.ResolveTypesAndFields(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(IlGenerator.EmittedLocalType(flag, caller),
+                Is.EqualTo(app.SystemTypes.SystemBooleanType));
+            Assert.That(IlGenerator.EmittedLocalType(erased, caller),
+                Is.EqualTo(app.SystemTypes.SystemBooleanType));
+        });
+    }
+
+    [Test]
+    public void AddressTakenLocalStaysUntypedDespiteBooleanDefinitions()
+    {
+        // A slot that is memset/memcpy'd through `&v` is raw storage; literal
+        // 0/1 defs landing in it do not make it a bool - `ldloca`/`initblk`
+        // over a Boolean local is unverifiable. Keep it untyped.
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2022Game();
+        var slot = new LocalVariable("slot", new Register(null, "X22"));
+        var pointer = new LocalVariable("pointer", new Register(null, "X8"));
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([
+                new(0, OpCode.Move, slot, new Immediate(0)),
+                new(1, OpCode.Move, pointer, new AddressOf(slot)),
+                new(2, OpCode.Move, slot, new Immediate(1)),
+                new(3, OpCode.Return)])
+        };
+
+        LocalVariables.ResolveTypesAndFields(caller);
+
+        Assert.That(IlGenerator.EmittedLocalType(slot, caller),
+            Is.EqualTo(app.SystemTypes.SystemObjectType));
+    }
+
+    [Test]
+    public void AddressTakenLocalStaysUntypedDespiteCastCheck()
+    {
+        // Same rule for the castclass proof: a `&`-taken slot is raw storage,
+        // so even a proven klass-hierarchy check cannot type it - the emission
+        // must keep the address diagnostic instead of `ldloca` over a managed
+        // local.
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2022Game();
+        var corlib = app.AssembliesByName["mscorlib"];
+        var getCurrent = corlib.GetTypeByFullName("System.Collections.IEnumerator")!
+            .Methods.Single(m => m.Name == "get_Current");
+        var stream = corlib.GetTypeByFullName("System.IO.Stream")!;
+        var invalidCast = corlib.GetTypeByFullName("System.InvalidCastException")!;
+        var observe = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Observe",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, [app.SystemTypes.SystemObjectType]);
+        var enumerator = new LocalVariable("enumerator", new Register(null, "X21"),
+            corlib.GetTypeByFullName("System.Collections.IEnumerator"));
+        var item = new LocalVariable("item", new Register(null, "X0"));
+        var klass = new LocalVariable("klass", new Register(null, "X8"));
+        var depth = new LocalVariable("depth", new Register(null, "W9"), app.SystemTypes.SystemInt32Type);
+        var address = new LocalVariable("address", new Register(null, "X9"));
+        var condition = new LocalVariable("condition", new Register(null, "cond"));
+        var pointer = new LocalVariable("pointer", new Register(null, "X10"));
+        var throwInstruction = new Instruction(7, OpCode.Throw, invalidCast);
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([
+                new(0, OpCode.Call, getCurrent, item, enumerator),
+                new(1, OpCode.Move, klass, new MemoryOperand(item)),
+                new(2, OpCode.Add, address, new MemoryOperand(klass, null, 0xC8), depth),
+                new(3, OpCode.CheckNotEqual, condition, new MemoryOperand(address, null, -8), stream),
+                new(4, OpCode.ConditionalJump, throwInstruction, condition),
+                new(5, OpCode.CallVoid, observe, item),
+                new(6, OpCode.Move, pointer, new AddressOf(item)),
+                new(7, OpCode.Return),
+                throwInstruction])
+        };
+
+        LocalVariables.ResolveTypesAndFields(caller);
+
+        Assert.That(IlGenerator.EmittedLocalType(item, caller),
+            Is.EqualTo(app.SystemTypes.SystemObjectType));
+    }
+
 }

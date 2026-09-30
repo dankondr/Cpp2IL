@@ -5773,6 +5773,12 @@ public static class IlGenerator
         // register-reuse leftover and the slot contract is the only proven type.
         if (local.Type != null && UsedOnlyAsCastSource(local, context))
             return context.AppContext.SystemTypes.SystemObjectType;
+        // The klass-hierarchy walk il2cpp emits for castclass<T> ([v] loads the
+        // klass, the mismatch branch throws InvalidCastException) proves the
+        // surviving value is a T no matter what its erased producer declared.
+        if ((local.Type == null || local.Type == context.AppContext.SystemTypes.SystemObjectType)
+            && CastCheckedLocalType(local, context) is { } castCheckedType)
+            return castCheckedType;
         // System.Object is also the lifter's fallback for a register whose real
         // numeric type was lost. Do not guess from arithmetic alone; a concrete
         // numeric mate (array length, typed field/parameter, etc.) must prove it.
@@ -5805,6 +5811,11 @@ public static class IlGenerator
             if (local.Type == context.AppContext.SystemTypes.SystemObjectType
                 && SharpenedObjectAllocationType(local, context) is { } allocatedType)
                 return allocatedType;
+            // An Object-tagged local whose definitions all produce 0/1 (check results,
+            // boolean copies) holds a bool the erased producer could not name.
+            if (local.Type == context.AppContext.SystemTypes.SystemObjectType
+                && IsBooleanEmissionLocal(local, context))
+                return context.AppContext.SystemTypes.SystemBooleanType;
             // A cast source (isinst/castclass) must verify as a managed reference and
             // no stack operation bridges native int into that operand, so a
             // handle-typed local that feeds one emits object instead of IntPtr.
@@ -5896,6 +5907,92 @@ public static class IlGenerator
         ArrayLength length => CastReferencesLocal(length.Array, local),
         _ => false,
     };
+
+    // The klass-hierarchy walk il2cpp emits for castclass<T>: [v] loads the
+    // object's klass, [klass+tabOff+depth*8] reads the hierarchy entry, and a
+    // mismatch throws InvalidCastException - the path past the check provably
+    // holds a T. Returns the proven reference type when the local was checked
+    // that way, else null.
+    private static TypeAnalysisContext? CastCheckedLocalType(LocalVariable local, MethodAnalysisContext context)
+    {
+        // `&v` is raw storage (a memset/memcpy destination); typing the slot
+        // would emit `ldloca`/`initblk` over a managed local. The `[v]` base
+        // use is the klass walk itself and must stay legal.
+        if (RawAddressLocals(context).Contains(local))
+            return null;
+        foreach (var instruction in context.ControlFlowGraph!.Instructions)
+        {
+            if (instruction is not { OpCode: OpCode.CheckNotEqual, Operands: [_, var left, var right] })
+                continue;
+            var (memory, target) = (left, right) switch
+            {
+                (MemoryOperand m, TypeAnalysisContext t) => (m, t),
+                (TypeAnalysisContext t, MemoryOperand m) => (m, t),
+                _ => (default, null)
+            };
+            if (target == null || target.IsValueType
+                || !KlassDerivedFromLocal(memory, local, context)
+                || !CheckBranchesToInvalidCast(instruction, context))
+                continue;
+            return target;
+        }
+        return null;
+    }
+
+    // Whether the memory operand's address chain is rooted at the local's own
+    // +0 read - the klass pointer - reached through the hierarchy-entry address
+    // arithmetic ([klass+tabOff] + scaled depth). Depth-capped; field reads
+    // (nonzero addend at the local hop) do not prove a type check.
+    private static bool KlassDerivedFromLocal(MemoryOperand memory, LocalVariable local, MethodAnalysisContext context)
+    {
+        var pending = new Stack<MemoryOperand>();
+        var seen = new HashSet<LocalVariable>();
+        pending.Push(memory);
+        while (pending.Count > 0)
+        {
+            var current = pending.Pop();
+            if (current.Base is not LocalVariable memBase)
+                continue;
+            if (ReferenceEquals(memBase, local))
+            {
+                if (current.Addend == 0)
+                    return true;
+                continue;
+            }
+            if (!seen.Add(memBase))
+                continue;
+            foreach (var definition in context.ControlFlowGraph!.Instructions)
+            {
+                if (!ReferenceEquals(definition.Destination, memBase))
+                    continue;
+                foreach (var operand in definition.Operands.Skip(1))
+                    if (operand is MemoryOperand defMemory)
+                        pending.Push(defMemory);
+            }
+        }
+        return false;
+    }
+
+    // Whether the comparison's nonzero branch lands on a block that just throws
+    // InvalidCastException - the mismatch exit of castclass<T>, which is what
+    // makes the surviving path a proof rather than a hint.
+    private static bool CheckBranchesToInvalidCast(Instruction check, MethodAnalysisContext context)
+    {
+        foreach (var instruction in context.ControlFlowGraph!.Instructions)
+        {
+            if (instruction is not { OpCode: OpCode.ConditionalJump,
+                    Operands: [Block branchTarget, LocalVariable branchCondition] }
+                || !ReferenceEquals(branchCondition, check.Destination))
+                continue;
+            var nonNop = branchTarget.Instructions.Where(i => i.OpCode != OpCode.Nop).ToArray();
+            if (nonNop.Length is 1 or 2
+                && nonNop[0] is { OpCode: OpCode.Throw,
+                    Operands: [TypeAnalysisContext { FullName: "System.InvalidCastException" }] }
+                && (nonNop.Length == 1 || nonNop[1].OpCode == OpCode.Return))
+                return true;
+        }
+        return false;
+    }
 
     private static bool OperandReferencesLocal(IOperand? operand, LocalVariable local) => operand switch
     {
@@ -6148,18 +6245,28 @@ public static class IlGenerator
     private static bool IsBooleanEmissionLocal(LocalVariable local, MethodAnalysisContext context,
         HashSet<LocalVariable> active)
     {
-        if (!active.Add(local))
+        if (!active.Add(local)
+            || RawAddressLocals(context).Contains(local)
+            || MemoryBaseLocals(context).Contains(local))
             return false;
         var definitions = context.ControlFlowGraph!.Instructions
             .Where(instruction => ReferenceEquals(instruction.Destination, local))
             .ToList();
-        var result = definitions.Count > 0 && definitions.All(instruction =>
+        var allBoolean = definitions.Count > 0 && definitions.All(instruction =>
             instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual
             || instruction.OpCode == OpCode.Not && IsBooleanEmissionOperand(instruction.Operands[1], context, active)
+            || instruction.OpCode is OpCode.Move or OpCode.Phi
+                && instruction.Operands.Skip(1).All(operand => IsBooleanEmissionOperand(operand, context, active))
             || instruction.OpCode is OpCode.And or OpCode.Or or OpCode.Xor
                 && instruction.Operands.Skip(1).All(operand => IsBooleanEmissionOperand(operand, context, active)));
+        // All-0 copy merges are also the null-slot idiom; a flag needs one source
+        // that can actually be a 1 - a check result, a nonzero literal, or a copy
+        // of an already-provable boolean.
+        var hasNonzeroSource = definitions.Any(instruction =>
+            instruction.OpCode is not (OpCode.Move or OpCode.Phi)
+            || instruction.Operands.Skip(1).Any(operand => operand is not Immediate { Value: 0 }));
         active.Remove(local);
-        return result;
+        return allBoolean && hasNonzeroSource;
     }
 
     private static bool IsBooleanEmissionOperand(IOperand operand, MethodAnalysisContext context,
@@ -6170,6 +6277,38 @@ public static class IlGenerator
         LocalVariable local when local.Type == null => IsBooleanEmissionLocal(local, context, active),
         _ => false,
     };
+
+    // Locals whose slot is handled as raw memory can never carry an inferred
+    // type: `&v` marks a memset/memcpy destination and `[v]` a dereferenced
+    // pointer, and emitting a managed or 1-byte type there would produce
+    // `ldloca`/`initblk` sequences the verifier rejects. Their slots stay
+    // untyped so the address emission keeps its named diagnostic. Mirror of
+    // the numeric union's hard disqualifiers.
+    private static HashSet<LocalVariable> RawAddressLocals(MethodAnalysisContext context)
+    {
+        if (context.GetExtraData<HashSet<LocalVariable>>("RawAddressLocals") is { } cached)
+            return cached;
+        var locals = new HashSet<LocalVariable>();
+        foreach (var instruction in context.ControlFlowGraph!.Instructions)
+            foreach (var operand in instruction.Operands)
+                if (operand is AddressOf { Target: LocalVariable target })
+                    locals.Add(target);
+        context.PutExtraData("RawAddressLocals", locals);
+        return locals;
+    }
+
+    private static HashSet<LocalVariable> MemoryBaseLocals(MethodAnalysisContext context)
+    {
+        if (context.GetExtraData<HashSet<LocalVariable>>("MemoryBaseLocals") is { } cached)
+            return cached;
+        var locals = new HashSet<LocalVariable>();
+        foreach (var instruction in context.ControlFlowGraph!.Instructions)
+            foreach (var operand in instruction.Operands)
+                if (operand is MemoryOperand { Base: LocalVariable memoryBase })
+                    locals.Add(memoryBase);
+        context.PutExtraData("MemoryBaseLocals", locals);
+        return locals;
+    }
 
     // Untyped locals that only ever flow through numeric operations get a numeric
     // CIL type instead of System.Object: union-find merges locals across Move/Phi/
@@ -6194,6 +6333,9 @@ public static class IlGenerator
         // Locals that must be numeric because they feed an op with no non-numeric
         // stack form (add/sub/mul/bitwise/shift — unlike ceq, which refs also take).
         var numericOpUse = new HashSet<LocalVariable>();
+        // Locals read by a brtrue-family jump - a use that proves nothing about
+        // the value kind and can still hide a reference in a seedless class.
+        var ambiguousFlagUse = new HashSet<LocalVariable>();
 
         LocalVariable Find(LocalVariable local)
         {
@@ -6381,7 +6523,10 @@ public static class IlGenerator
                 AddOperandConstraint(instruction.Operands[0], context.ReturnType);
             else if (op == OpCode.ConditionalJump && instruction.Operands.Count > 1)
                 // brtrue accepts refs and ints alike; too ambiguous to seed a type.
-                Disqualify(instruction.Operands[1]);
+                // It still cannot veto a class a typed mate already proves - only
+                // the seedless int fallback needs the doubt.
+                if (instruction.Operands[1] is LocalVariable flagLocal)
+                    ambiguousFlagUse.Add(Find(flagLocal));
             else if (op == OpCode.NewArr)
             {
                 Disqualify(instruction.Operands[0]);
@@ -6405,6 +6550,7 @@ public static class IlGenerator
         var rootDisqualified = new HashSet<LocalVariable>(disqualified.Select(Find));
 
         var rootNumericOpUse = new HashSet<LocalVariable>(numericOpUse.Select(Find));
+        var rootAmbiguousFlagUse = new HashSet<LocalVariable>(ambiguousFlagUse.Select(Find));
         var systemTypes = context.AppContext.SystemTypes;
 
         var result = new Dictionary<LocalVariable, TypeAnalysisContext>();
@@ -6415,7 +6561,7 @@ public static class IlGenerator
             if (rootDisqualified.Contains(root))
                 continue;
             var hasTypes = rootConstraints.TryGetValue(root, out var types) && types.Count > 0;
-            if (!hasTypes && !rootNumericOpUse.Contains(root))
+            if (!hasTypes && (!rootNumericOpUse.Contains(root) || rootAmbiguousFlagUse.Contains(root)))
                 continue;
             var picked = hasTypes
                 ? types!.FirstOrDefault(t => t.FullName == "System.Double")
