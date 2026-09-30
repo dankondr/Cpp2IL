@@ -13,7 +13,8 @@ namespace Cpp2IL.Core.Analysis;
 // Compares native cleanup effects before SSA changes register/stack identities. A match
 // includes the call arguments, not just the shared native target. The normal copy is
 // subsequently emitted with its already-resolved managed signature and locals.
-internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
+internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
+    Func<ulong, List<Instruction>?>? closureBody = null)
 {
     internal sealed record Result(List<List<ulong>> CleanupCalls, List<EhCallSiteInfo> Sites, HashSet<ulong> Pads);
     private const string Exception = "exception", Wrapper = "exception-wrapper";
@@ -36,10 +37,11 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
         internal HashSet<ulong> Pads = [];
         internal List<List<string>> AuxiliaryEffects = [];
         internal bool Terminated;
+        internal bool Returned;
         internal State Copy() => new()
         {
             Frame = Frame, Sp = Sp, Registers = new(Registers), Memory = new(Memory), MemoryWidths = new(MemoryWidths),
-            StorageOrigins = new(StorageOrigins), Effects = new(Effects), Pads = new(Pads), AuxiliaryEffects = new(AuxiliaryEffects), Terminated = Terminated
+            StorageOrigins = new(StorageOrigins), Effects = new(Effects), Pads = new(Pads), AuxiliaryEffects = new(AuxiliaryEffects), Terminated = Terminated, Returned = Returned
         };
     }
 
@@ -99,7 +101,7 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
                 if (!WalkHandler(code, entry, state, [], paths, 0)) { walked = false; break; }
             }
             if (!walked || paths.Count == 0
-                || paths.Any(p => p.Terminated || p.Effects.Count == 0 || p.Effects.Distinct().Count() != p.Effects.Count
+                || paths.Any(p => p.Terminated || p.Returned || p.Effects.Count == 0 || p.Effects.Distinct().Count() != p.Effects.Count
                     || !p.Effects.SequenceEqual(paths[0].Effects)
                     || p.AuxiliaryEffects.Any(e => !e.SequenceEqual(p.Effects))))
                 continue;
@@ -171,12 +173,20 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
                         handlerSteps = 4096;
                         var paths = new List<State>();
                         if (index + 1 >= code.Count || !WalkHandler(code, index + 1, mismatch, [], paths, 0)
-                            || paths.Count == 0 || paths.Any(p => p.Terminated || p.Effects.Count != 0)) { type = null; break; }
+                            || paths.Count == 0 || paths.Any(p => p.Terminated || p.Returned || p.Effects.Count != 0)) { type = null; break; }
                         foreach (var path in paths) state.Pads.UnionWith(path.Pads);
                         Clobber(state);
                         Set(instruction.Destination, classTest ? Number(1) : Exception, state);
                         index++;
                         break;
+                    }
+                    if (helper == nameof(BaseKeyFunctionAddresses.il2cpp_codegen_initialize_runtime_metadata_inline))
+                    {
+                        var value = Load(args.FirstOrDefault(), state);
+                        Clobber(state);
+                        Set(instruction.Destination, value, state);
+                        index++;
+                        continue;
                     }
                     if (helper != "__cxa_begin_catch" || args.FirstOrDefault() != Exception) break;
                     Clobber(state);
@@ -206,7 +216,14 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
                 }
                 if (instruction.IsCall)
                 {
-                    if (Helper(instruction.Operands[0]) == "__cxa_end_catch")
+                    if (Helper(instruction.Operands[0]) == nameof(BaseKeyFunctionAddresses.il2cpp_codegen_initialize_runtime_metadata_inline))
+                    {
+                        var argument = instruction.Operands.Skip(instruction.OpCode == OpCode.CallVoid ? 1 : 2).FirstOrDefault();
+                        var value = argument == null ? null : Load(Value(argument, state), state);
+                        Clobber(state);
+                        Set(instruction.Destination, value, state);
+                    }
+                    else if (Helper(instruction.Operands[0]) == "__cxa_end_catch")
                     { endedCatch = true; Clobber(state); }
                     else
                     {
@@ -214,6 +231,7 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
                         if (callee == null && instruction.Operands[0] is Immediate address
                             && context.AppContext.MethodsByAddress.TryGetValue(address.UnsignedValue, out var methods) && methods.Count == 1)
                             callee = methods[0];
+                        callee ??= CatchCallee(instruction, state);
                         if (callee == null || !callee.IsVoid || callee.Name == ".ctor") break;
                         var count = callee.Parameters.Count + (callee.IsStatic ? 0 : 1);
                         var arguments = instruction.Operands.Skip(instruction.OpCode == OpCode.CallVoid ? 1 : 2).Take(count)
@@ -221,8 +239,18 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
                         if (arguments.Length != count || arguments.Any(a => a == null)) break;
                         handler.Add(new Instruction(handler.Count, OpCode.CallVoid, new List<IOperand> { callee }.Concat(arguments!).ToList()!)
                             { NativeAddress = instruction.NativeAddress });
+                        InvalidateCallStorage(instruction, state, callee);
                         Clobber(state);
                     }
+                }
+                else if (instruction is { OpCode: OpCode.Move, Destination: MemoryOperand memory }
+                    && (instruction.NativeStoreWidthBytes ?? memory.AccessSize) is > 0 and var width
+                    && ThisField(Address(memory, state), width) is { } field)
+                {
+                    var value = CatchArgument(instruction.Operands[1], state, exceptionLocal);
+                    if (value == null) break;
+                    handler.Add(new Instruction(handler.Count, OpCode.Move, [field, value]) { NativeAddress = instruction.NativeAddress });
+                    Transfer(instruction, state);
                 }
                 else if (!TransferScaffolding(instruction, state, false)) break;
                 var next = Successors(code, index, state).ToList();
@@ -234,13 +262,20 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
             if (merge < 0 || !endedCatch || !VoidEpilogue(merge, out var mergeAddress)) continue;
             var existing = result.FirstOrDefault(r => r.Type == type && r.MergeAddress == mergeAddress
                 && r.Handler.Count == handler.Count && r.Handler.Zip(handler).All(p =>
-                    p.First.Operands[0] == p.Second.Operands[0] && p.First.Operands.Skip(1).Select(o => o.ToString())
-                        .SequenceEqual(p.Second.Operands.Skip(1).Select(o => o.ToString()))));
+                    p.First.OpCode == p.Second.OpCode && p.First.Operands.Select(HandlerOperandKey)
+                        .SequenceEqual(p.Second.Operands.Select(HandlerOperandKey))));
             if (existing != null) { existing.Sites.Add(site); existing.Pads.UnionWith(state.Pads); }
             else result.Add(new(type, exceptionLocal, handler, [site], state.Pads, mergeAddress));
         }
         return result;
     }
+
+    private static string? HandlerOperandKey(IOperand operand) => operand switch
+    {
+        MethodAnalysisContext method => method.FullNameWithSignature,
+        FieldReference field => $"{field.Offset}:{field}",
+        _ => operand.ToString()
+    };
 
     private static bool TransferScaffolding(Instruction instruction, State state, bool allowWrapperStore)
     {
@@ -250,7 +285,9 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
             or OpCode.CheckLessOrEqual or OpCode.CheckGreaterOrEqual or OpCode.And or OpCode.Or or OpCode.Xor
             or OpCode.ShiftLeft or OpCode.ShiftRight)) return false;
         if (instruction.IsAssignment && instruction.OpCode != OpCode.Move && instruction.Destination is not Register) return false;
-        if (instruction.Destination is MemoryOperand memory
+        // Instruction.Destination omits absolute-address stores as constants.
+        // They are still effects and must not disappear from the unwind proof.
+        if (instruction.OpCode == OpCode.Move && instruction.Operands[0] is MemoryOperand memory
             && !(allowWrapperStore && Address(memory, state) == Wrapper)
             && Address(memory, state)?.StartsWith("f", StringComparison.Ordinal) != true) return false;
         Transfer(instruction, state);
@@ -284,7 +321,63 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
         if (value == Exception) return exceptionLocal;
         if (TryNumber(value, out var number)) return new Immediate(number);
         if (operand is StringLiteral literal) return literal;
+        if (context.ParameterOperands.FirstOrDefault() is Register parameter && !context.IsStatic)
+        {
+            if (value == "argument:" + parameter.Name) return context.ParameterLocals.FirstOrDefault(l => l.IsThis);
+            if (ThisField(value, 0) is { } field && field.Field.FieldType.IsValueType) return new AddressOf(field);
+        }
         return null;
+    }
+
+    private FieldReference? ThisField(string? address, int width)
+    {
+        if (context.IsStatic || context.DeclaringType == null || context.ParameterOperands.FirstOrDefault() is not Register parameter
+            || context.ParameterLocals.FirstOrDefault(l => l.IsThis) is not { } self) return null;
+        var root = "argument:" + parameter.Name;
+        var offset = 0L;
+        if (address != root && (address == null || !address.StartsWith("(" + root + "+", StringComparison.Ordinal)
+                || !address.EndsWith(')') || !long.TryParse(address[(root.Length + 2)..^1], out offset))) return null;
+        if (width == 0 && offset >= 0 && offset <= int.MaxValue
+            && MetadataResolver.FindInstanceFieldAtOffset(context.DeclaringType, offset) is { } whole)
+            return new FieldReference(whole, self, (int)offset);
+        if (offset < 0 || offset > int.MaxValue || MetadataResolver.FindInstanceFieldPathAtOffset(context.DeclaringType, offset, width) is not { } path)
+            return null;
+        if (width != 0 && StorageSize(path.Field.FieldType) != width) return null;
+        return new FieldReference(path.Field, self, (int)offset, path.Containers, width);
+    }
+
+    private MethodAnalysisContext? CatchCallee(Instruction instruction, State state)
+    {
+        // Shared generic bodies can lack an address-map entry. As in
+        // ResolveCallsViaMethodInfo, require metadata in the exact hidden slot.
+        var arguments = instruction.Operands.Skip(instruction.OpCode == OpCode.CallVoid ? 1 : 2).ToArray();
+        for (var n = 0; n < arguments.Length; n++)
+        {
+            if (MetadataAddress(Value(arguments[n], state)) is not { } address) continue;
+            try
+            {
+                var usage = context.AppContext.LibCpp2IlContext.GetMethodGlobalByAddress(address);
+                if (usage?.Type is not (MetadataUsageType.MethodDef or MetadataUsageType.MethodRef)) continue;
+                var method = context.AppContext.ResolveContextForMethod(usage);
+                if (method == null || method == context || !method.IsVoid || method.IsStatic || n != method.Parameters.Count + 1
+                    || ThisField(Value(arguments[0], state), 0) is not { } receiver
+                    || receiver.Field.FieldType.FullName != method.DeclaringType?.FullName) continue;
+                return method;
+            }
+            catch (Exception) { }
+        }
+        return null;
+    }
+
+    private ulong? MetadataAddress(string? value)
+    {
+        if (value == null) return null;
+        var loads = 0;
+        while (value.StartsWith("m(", StringComparison.Ordinal) && value.EndsWith(')'))
+        { loads++; value = value[2..^1]; }
+        if (loads is < 1 or > 2 || !TryNumber(value, out var address)) return null;
+        try { return loads == 2 ? context.AppContext.Binary.ReadPointerAtVirtualAddress(unchecked((ulong)address)) : unchecked((ulong)address); }
+        catch (Exception) { return null; }
     }
 
     private TypeAnalysisContext? ResolveCatchType(string? value)
@@ -516,12 +609,25 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
                 var child = state.Copy();
                 child.Frame = depth + 1;
                 child.Sp = 0;
+                foreach (var cell in child.Memory.Keys.Where(k => k.StartsWith($"f{child.Frame}:", StringComparison.Ordinal)).ToArray())
+                { child.Memory.Remove(cell); child.MemoryWidths.Remove(cell); child.StorageOrigins.Remove(cell); }
                 var exits = new List<State>();
                 if (!WalkHandler(nested, 0, child, [], exits, depth + 1)) return false;
-                // This path must propagate the original exception, not return to arbitrary
-                // unrecognised native code. Returning closures remain unproven.
-                completed.AddRange(exits);
-                return exits.Count > 0;
+                if (exits.Count == 0) return false;
+                foreach (var exit in exits)
+                {
+                    if (!exit.Returned) { completed.Add(exit); continue; }
+                    // Returning from a cleanup closure is not an unwind exit. Continue
+                    // its caller with the proven writes/effects and the caller's frame.
+                    exit.Returned = false;
+                    exit.Frame = state.Frame;
+                    exit.Sp = state.Sp;
+                    Clobber(exit);
+                    var next = Successors(body, index, exit).ToList();
+                    if (next.Count == 0 || !next.All(n => WalkHandler(body, n, exit.Copy(), new(visited), completed, depth)))
+                        return false;
+                }
+                return true;
             }
             else
             {
@@ -534,7 +640,12 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
             return true;
         }
         else if (instruction.OpCode == OpCode.Return)
-            return false;
+        {
+            if (depth == 0 || state.Sp != 0 || instruction.Operands.Count != 0) return false;
+            state.Returned = true;
+            completed.Add(state);
+            return true;
+        }
         else if (!TransferScaffolding(instruction, state, true)) return false;
         var successors = Successors(body, index, state).ToList();
         return successors.Count > 0 && successors.All(next =>
@@ -561,7 +672,7 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
             if (!WalkHandler(code, entry, auxiliary, [], paths, depth + 1) || paths.Count == 0) continue;
             var terminateGuard = site.Actions.All(a => a.Filter > 0 && a.TypeInfo == 0)
                 && paths.All(p => p.Terminated && p.Effects.Count == 0);
-            if (!terminateGuard && paths.Any(p => p.Terminated || p.Effects.Count == 0)) continue;
+            if (!terminateGuard && paths.Any(p => p.Terminated || p.Returned || p.Effects.Count == 0)) continue;
             foreach (var path in paths)
             {
                 state.Pads.UnionWith(path.Pads);
@@ -573,6 +684,7 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
 
     private List<Instruction>? NativeBody(ulong address)
     {
+        if (closureBody != null) return closureBody(address);
         if (nativeBodies.TryGetValue(address, out var existing)) return existing;
         try
         {
@@ -674,8 +786,13 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
 
     private static string? Address(MemoryOperand memory, State state)
     {
-        if (memory.Index != null) return null;
-        return Plus(memory.Base == null ? Number(0) : Value(memory.Base, state), memory.Addend);
+        var offset = memory.Addend;
+        if (memory.Index != null)
+        {
+            if (!TryNumber(Value(memory.Index, state), out var index)) return null;
+            offset = unchecked(offset + index * memory.Scale);
+        }
+        return Plus(memory.Base == null ? Number(0) : Value(memory.Base, state), offset);
     }
 
     private static string? Load(string? address, State state)

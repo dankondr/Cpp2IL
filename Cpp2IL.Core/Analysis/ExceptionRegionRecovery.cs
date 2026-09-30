@@ -227,7 +227,11 @@ internal static class ExceptionRegionRecovery
             pending.Push(entry);
             while (pending.TryPop(out var unit))
             {
-                if (unit == merge || !protectedUnits.Add(unit)) continue;
+                // A normal SetResult/return can lie beyond the native try. Leave to
+                // that existing unit without adding its call to the protected range.
+                if (unit == merge || unit.Code.Any(i => i.OpCode.Code == CilCode.Ret)
+                    || NativeCall(unit) && !proof.Sites.Any(s => unit.Source!.NativeAddress >= s.Start && unit.Source.NativeAddress < s.End)
+                    || !protectedUnits.Add(unit)) continue;
                 foreach (var next in unit.Next) pending.Push(next);
             }
             if (!seeds.All(protectedUnits.Contains)

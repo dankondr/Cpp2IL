@@ -454,7 +454,8 @@ public class ExceptionRegionRecoveryTests
     [TestCase(false, true, false, false)]
     [TestCase(true, true, true, false)]
     [TestCase(true, true, true, true)]
-    public void RecognizedTypeTestProducesCatchAndLeavesToNormalMerge(bool recognizedTypeTest, bool classTest, bool multipleCalls, bool returningHandler)
+    [TestCase(true, true, false, false, true)]
+    public void RecognizedTypeTestProducesCatchAndLeavesToNormalMerge(bool recognizedTypeTest, bool classTest, bool multipleCalls, bool returningHandler, bool normalTail = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "CatchOwner",
@@ -486,7 +487,7 @@ public class ExceptionRegionRecoveryTests
             At(0x2014, OpCode.CallVoid, report, exception),
             At(0x2018, OpCode.CallVoid, new StringLiteral("__cxa_end_catch")),
             returningHandler ? At(0x201C, OpCode.Return) : At(0x201C, OpCode.Jump, merge), mismatch];
-        if (multipleCalls) caller.ConvertedIsil.Insert(1, secondCall);
+        if (multipleCalls || normalTail) caller.ConvertedIsil.Insert(1, secondCall);
         caller.UnwindInfo = new EhFunctionInfo { Start = 0x1000, Size = 0x1030 };
         caller.UnwindInfo.CallSites.Add(new EhCallSiteInfo(0x1000, multipleCalls ? 8UL : 4UL, 0x2000, 1)
             { Actions = [new EhActionInfo(1, 0xABC)] });
@@ -521,7 +522,7 @@ public class ExceptionRegionRecoveryTests
         {
             [protectedCall] = [new(CilOpCodes.Call, workDefinition)], [merge] = [new(CilOpCodes.Ret)]
         };
-        if (multipleCalls)
+        if (multipleCalls || normalTail)
         {
             map.Remove(merge);
             map[secondCall] = [new(CilOpCodes.Call, workDefinition)];
@@ -534,6 +535,14 @@ public class ExceptionRegionRecoveryTests
         });
         var clause = definition.CilMethodBody.ExceptionHandlers.Single();
         Assert.That(clause.HandlerType, Is.EqualTo(CilExceptionHandlerType.Exception));
+        if (normalTail)
+        {
+            var instructions = definition.CilMethodBody.Instructions.ToList();
+            var tail = instructions.FindIndex(i => ReferenceEquals(i, map[secondCall][0]));
+            var start = instructions.IndexOf(((CilInstructionLabel)clause.TryStart!).Instruction!);
+            var end = instructions.IndexOf(((CilInstructionLabel)clause.TryEnd!).Instruction!);
+            Assert.That(tail < start || tail >= end, Is.True, "An uncovered SetResult must stay outside the try.");
+        }
         Assert.That(clause.ExceptionType!.FullName, Is.EqualTo(catchTypeDefinition.FullName));
         var handlerStart = definition.CilMethodBody.Instructions.ToList().FindIndex(i => ReferenceEquals(i, ((CilInstructionLabel)clause.HandlerStart!).Instruction));
         var emitted = definition.CilMethodBody.Instructions.Skip(handlerStart).Take(4).ToList();
@@ -563,9 +572,163 @@ public class ExceptionRegionRecoveryTests
         reportDefinition.CilMethodBody.Instructions.Add(CilOpCodes.Ldarg_0);
         reportDefinition.CilMethodBody.Instructions.Add(CilOpCodes.Stsfld, captured);
         reportDefinition.CilMethodBody.Instructions.Add(CilOpCodes.Ret);
+        // Exercise the real emitter too: the catch's defining stloc is outside
+        // the normal ISIL graph and must still define the exception argument.
+        SyntheticFixture.SeedCorLibTypes(app, module, app.SystemTypes.SystemVoidType,
+            app.SystemTypes.SystemStringType, app.SystemTypes.SystemObjectType);
+        work.PutExtraData("AsmResolverMethod", workDefinition);
+        report.PutExtraData("AsmResolverMethod", reportDefinition);
+        caller.ControlFlowGraph = new Cpp2IL.Core.Graphs.ISILControlFlowGraph(
+            multipleCalls || normalTail ? [protectedCall, secondCall, merge] : [protectedCall, merge]);
+        caller.Locals = [];
+        IlGenerator.GenerateIl(caller, definition, proofs);
+        Assert.That(definition.CilMethodBody.ExceptionHandlers.Count, Is.EqualTo(1));
+        Assert.That(definition.CilMethodBody.Instructions.Any(i => i.Operand is string text
+            && text.Contains("Undefined local caughtException")), Is.False);
         var runtimeType = Load(module).GetType("Tests.CatchOwner")!;
         Assert.DoesNotThrow(() => runtimeType.GetMethod("M")!.Invoke(null, null));
         Assert.That(runtimeType.GetField("Captured")!.GetValue(null)!.GetType().FullName, Is.EqualTo("Tests.SpecificException"));
+    }
+
+    [TestCase(4, false, true)]
+    [TestCase(8, false, false)]
+    [TestCase(4, true, false)]
+    public void CatchPreservesStateStoreAndBuilderReceiver(int storeWidth, bool lostReceiver, bool expected)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "StateMachine",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var builder = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Builder",
+            app.AllTypes.Single(t => t.FullName == "System.ValueType"), R.TypeAttributes.Public | R.TypeAttributes.SequentialLayout);
+        var stateField = owner.InjectFieldContext("State", app.SystemTypes.SystemInt32Type, R.FieldAttributes.Public);
+        stateField.Offset = 16;
+        var builderField = owner.InjectFieldContext("Builder", builder, R.FieldAttributes.Public);
+        builderField.Offset = 24;
+        var setException = builder.InjectMethodContext("SetException", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public, [app.SystemTypes.SystemExceptionType]);
+        var caller = owner.InjectMethodContext("MoveNext", app.SystemTypes.SystemVoidType, R.MethodAttributes.Public, []);
+        var work = owner.InjectMethodContext("Work", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public | R.MethodAttributes.Static, []);
+        var x0 = new Register(null, "X0");
+        var self = new Register(null, lostReceiver ? "X9" : "X19");
+        var exception = new Register(null, "X20");
+        var condition = new Register(null, "condition");
+        caller.ParameterOperands = [x0];
+        caller.ParameterLocals = [new LocalVariable("this", x0, owner) { IsThis = true }];
+        Instruction At(ulong address, OpCode op, params IOperand[] operands)
+            => new(0, op, operands.ToList()) { NativeAddress = address };
+        var merge = At(0x1010, OpCode.Return);
+        var mismatch = At(0x2030, OpCode.CallVoid, new StringLiteral("il2cpp_raise_exception"), exception);
+        var store = At(0x2014, OpCode.Move, new MemoryOperand(self, null, 16), new Immediate(-2));
+        store.NativeStoreWidthBytes = storeWidth;
+        caller.ConvertedIsil = [At(0x1000, OpCode.Move, self, x0), At(0x1004, OpCode.CallVoid, work), merge,
+            At(0x2000, OpCode.Call, new StringLiteral("__cxa_begin_catch"), x0, x0),
+            At(0x2004, OpCode.Move, exception, new MemoryOperand(x0)),
+            At(0x2008, OpCode.Call, new StringLiteral("il2cpp_class_is_assignable_from"), x0,
+                app.SystemTypes.SystemExceptionType, new MemoryOperand(exception)),
+            At(0x200C, OpCode.CheckEqual, condition, x0, new Immediate(0)),
+            At(0x2010, OpCode.ConditionalJump, mismatch, condition), store,
+            At(0x2018, OpCode.Add, x0, self, new Immediate(24)),
+            At(0x201C, OpCode.CallVoid, setException, x0, exception),
+            At(0x2020, OpCode.CallVoid, new StringLiteral("__cxa_end_catch")),
+            At(0x2024, OpCode.Jump, merge), mismatch];
+        caller.UnwindInfo = new EhFunctionInfo { Start = 0x1000, Size = 0x1040 };
+        caller.UnwindInfo.CallSites.Add(new EhCallSiteInfo(0x1004, 4, 0x2000, 1) { Actions = [new EhActionInfo(1, 0xABC)] });
+        EhRegionPartition.Partition(caller);
+        var proofs = new NativeExceptionRegionProof(caller).FindCatches(a => a == 0xABC);
+        Assert.That(proofs.Count, Is.EqualTo(expected ? 1 : 0));
+        if (!expected) return;
+        var handler = proofs.Single().Handler;
+        Assert.That(handler.Count, Is.EqualTo(2));
+        Assert.That(((FieldReference)handler[0].Operands[0]).Field, Is.SameAs(stateField));
+        Assert.That(((Immediate)handler[0].Operands[1]).Value, Is.EqualTo(-2));
+        Assert.That(((FieldReference)((AddressOf)handler[1].Operands[1]).Target).Field, Is.SameAs(builderField));
+        Assert.That(handler[1].Operands[2], Is.SameAs(proofs[0].ExceptionLocal));
+    }
+
+    [TestCase(false, false, false, true)]
+    [TestCase(true, false, false, false)]
+    [TestCase(false, true, false, false)]
+    [TestCase(false, false, true, false)]
+    public void ReturningCleanupClosureMustContinueToOriginalUnwind(bool differentArgument, bool extraStore,
+        bool returnsInsteadOfUnwinding, bool expected)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "ClosureOwner",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
+        MethodAnalysisContext Method(string name) => owner.InjectMethodContext(name, app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public | R.MethodAttributes.Static, []);
+        var caller = Method("Caller");
+        var work = Method("Work");
+        var cleanup = Method("Dispose");
+        var x0 = new Register(null, "X0");
+        var exception = new Register(null, "X20");
+        var receiver = new StackOffset(8);
+        Instruction At(ulong address, OpCode op, params IOperand[] operands)
+            => new(0, op, operands.ToList()) { NativeAddress = address };
+        caller.ConvertedIsil = [At(0x1000, OpCode.Move, receiver, new Immediate(42)),
+            At(0x1004, OpCode.CallVoid, work), At(0x1008, OpCode.CallVoid, cleanup, new Immediate(42)),
+            At(0x100C, OpCode.Return), At(0x2000, OpCode.Move, exception, x0),
+            At(0x2004, OpCode.Move, x0, new AddressOf(receiver)),
+            At(0x2008, OpCode.CallVoid, new Immediate(0x3000), x0),
+            returnsInsteadOfUnwinding ? At(0x200C, OpCode.Return)
+                : At(0x200C, OpCode.CallVoid, new StringLiteral("_Unwind_Resume"), exception)];
+        var closure = new List<Instruction> {
+            At(0x3000, OpCode.ShiftStack, new Immediate(-16)),
+            At(0x3004, OpCode.Move, new StackOffset(0), exception),
+            At(0x3008, OpCode.Move, x0, differentArgument ? new Immediate(43) : new MemoryOperand(x0)),
+            At(0x300C, OpCode.CallVoid, cleanup, x0),
+            At(0x3010, OpCode.Move, exception, new StackOffset(0)),
+            At(0x3014, OpCode.ShiftStack, new Immediate(16)), At(0x3018, OpCode.Return) };
+        if (extraStore) closure.Insert(3, At(0x300A, OpCode.Move, new MemoryOperand(addend: 0x9000), new Immediate(1)));
+        caller.UnwindInfo = new EhFunctionInfo { Start = 0x1000, Size = 0x1010 };
+        caller.UnwindInfo.CallSites.Add(new EhCallSiteInfo(0x1004, 4, 0x2000, 0) { Actions = [new EhActionInfo(0, null)] });
+        EhRegionPartition.Partition(caller);
+        var proofs = new NativeExceptionRegionProof(caller, address => address == 0x3000 ? closure : null).Find();
+        Assert.That(proofs.Count, Is.EqualTo(expected ? 1 : 0));
+        if (expected) Assert.That(proofs[0].CleanupCalls.Single(), Is.EqualTo(new[] { 0x1008UL }));
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void SharedCatchGroupsCompareTheFullCalleeSignature(bool differentOverload)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Overloads",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var attributes = R.MethodAttributes.Public | R.MethodAttributes.Static;
+        var caller = owner.InjectMethodContext("M", app.SystemTypes.SystemVoidType, attributes, []);
+        var work = owner.InjectMethodContext("Work", app.SystemTypes.SystemVoidType, attributes, []);
+        var report = owner.InjectMethodContext("Report", app.SystemTypes.SystemVoidType, attributes,
+            [app.SystemTypes.SystemExceptionType, app.SystemTypes.SystemInt32Type]);
+        var other = differentOverload ? owner.InjectMethodContext("Report", app.SystemTypes.SystemVoidType, attributes,
+            [app.SystemTypes.SystemExceptionType, app.SystemTypes.SystemInt64Type]) : report;
+        Instruction At(ulong address, OpCode op, params IOperand[] operands)
+            => new(0, op, operands.ToList()) { NativeAddress = address };
+        var ret = At(0x1008, OpCode.Return);
+        caller.ConvertedIsil = [At(0x1000, OpCode.CallVoid, work), At(0x1004, OpCode.CallVoid, work), ret];
+        caller.UnwindInfo = new EhFunctionInfo { Start = 0x1000, Size = 0x2040 };
+        foreach (var (pad, start, target) in new[] { (0x2000UL, 0x1000UL, report), (0x3000UL, 0x1004UL, other) })
+        {
+            var x0 = new Register(null, "X0");
+            var exception = new Register(null, "X19");
+            var condition = new Register(null, "condition");
+            var mismatch = At(pad + 32, OpCode.CallVoid, new StringLiteral("il2cpp_raise_exception"), exception);
+            caller.ConvertedIsil.AddRange([
+                At(pad, OpCode.Call, new StringLiteral("__cxa_begin_catch"), x0, x0),
+                At(pad + 4, OpCode.Move, exception, new MemoryOperand(x0)),
+                At(pad + 8, OpCode.Call, new StringLiteral("il2cpp_class_is_assignable_from"), x0,
+                    app.SystemTypes.SystemExceptionType, new MemoryOperand(exception)),
+                At(pad + 12, OpCode.CheckEqual, condition, x0, new Immediate(0)),
+                At(pad + 16, OpCode.ConditionalJump, mismatch, condition),
+                At(pad + 20, OpCode.CallVoid, target, exception, new Immediate(1)),
+                At(pad + 24, OpCode.CallVoid, new StringLiteral("__cxa_end_catch")),
+                At(pad + 28, OpCode.Jump, ret), mismatch]);
+            caller.UnwindInfo.CallSites.Add(new EhCallSiteInfo(start, 4, pad, 1) { Actions = [new EhActionInfo(1, 0xABC)] });
+        }
+        EhRegionPartition.Partition(caller);
+        Assert.That(new NativeExceptionRegionProof(caller).FindCatches(a => a == 0xABC).Count,
+            Is.EqualTo(differentOverload ? 2 : 1));
     }
 
     private static R.Assembly Load(ModuleDefinition module)

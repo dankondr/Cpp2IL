@@ -38,6 +38,10 @@ public static class IlGenerator
     }
 
     public static void GenerateIl(MethodAnalysisContext context, MethodDefinition definition)
+        => GenerateIl(context, definition, null);
+
+    internal static void GenerateIl(MethodAnalysisContext context, MethodDefinition definition,
+        List<Analysis.NativeExceptionRegionProof.CatchResult>? provenCatches)
     {
         var assembly = context.DeclaringType!.DeclaringAssembly;
         var module = definition.DeclaringModule!;
@@ -153,7 +157,7 @@ public static class IlGenerator
         // store typed and width-mismatched loads keep the load diagnostic.
         RewriteFrameSlotLoads(context, frameSlotLocals);
 
-        var catchProofs = new Analysis.NativeExceptionRegionProof(context).FindCatches();
+        var catchProofs = provenCatches ?? new Analysis.NativeExceptionRegionProof(context).FindCatches();
         foreach (var proof in catchProofs) context.Locals.Add(proof.ExceptionLocal);
 
         // Map ISIL locals to IL. The declared type joins the method body's locals
@@ -332,11 +336,14 @@ public static class IlGenerator
         {
             var start = body.Instructions.Count;
             body.Instructions.Add(CilOpCodes.Stloc, locals[proof.ExceptionLocal]);
+            // The CLI supplies this value on handler entry; its defining stloc
+            // is emitted here rather than in the normal-path ISIL graph.
+            DefinedLocalRegisters(context).Add(proof.ExceptionLocal.Register);
             foreach (var instruction in proof.Handler)
                 GenerateInstructions(instruction, context, definition, locals, writeLine, constructorPairs, thisConstructorCalls, frameSlotLocals);
             var handler = body.Instructions.Skip(start).ToList();
             while (body.Instructions.Count > start) body.Instructions.RemoveAt(start);
-            if (handler.Count(i => i.OpCode.FlowControl == CilFlowControl.Call) == proof.Handler.Count
+            if (handler.Count(i => i.OpCode.FlowControl == CilFlowControl.Call) == proof.Handler.Count(i => i.IsCall)
                 && !handler.Any(i => i.Operand is string diagnostic && diagnostic.Length > 0
                     || i.OpCode.FlowControl is CilFlowControl.Branch or CilFlowControl.ConditionalBranch
                         or CilFlowControl.Return or CilFlowControl.Throw))
