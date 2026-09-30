@@ -470,4 +470,38 @@ public class AccessWidthTests
             Assert.That(caller.ControlFlowGraph!.Instructions.Any(i => i.OpCode == OpCode.ShiftRight), Is.True);
         });
     }
+
+    [Test]
+    public void CopyOfAWholeStructIntoItsFirstFieldAddressIsAnAssignment()
+    {
+        // Holder { Pair2 pair @0x10 }, Pair2 { int a @0; int b @4 }: `memcpy(&local.a, &holder.pair, 8)`
+        // copies a whole Pair2 - upstream canonicalizes `&local` to its first field.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var pair = InjectStruct(app, "Pair2");
+        var a = InjectField("a", app.SystemTypes.SystemInt32Type, pair, 0);
+        InjectField("b", app.SystemTypes.SystemInt32Type, pair, 4);
+        var holder = InjectClass(app, "Holder");
+        var pairField = InjectField("pair", pair, holder, 0x10);
+        var module = new ModuleDefinition("Width.dll");
+        Seed(module, app, pair, holder);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemObjectType);
+
+        var owner = Local("holder", holder);
+        var copy = Local("copy", pair);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.MemoryCopy, new AddressOf(new FieldReference(a, copy, 0)),
+                new AddressOf(new FieldReference(pairField, owner, 0x10)), new Immediate(8)),
+            new(1, OpCode.Return)], [owner, copy]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Cpblk), Is.False, () => Dump(method));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stobj), Is.True, () => Dump(method));
+        });
+    }
 }

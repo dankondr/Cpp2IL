@@ -9760,10 +9760,20 @@ public static class IlGenerator
         IOperand content, IOperand count, MethodAnalysisContext context, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
     {
+        // `&local.first` of a struct local is `&local` when that makes the two sides one type:
+        // value-type field addresses are canonicalized to the first field upstream.
+        if (instruction.OpCode is OpCode.MemoryCopy or OpCode.MemoryMove)
+        {
+            destination = WholeStorage(destination, BlockCopyPointee(content, context));
+            content = WholeStorage(content, BlockCopyPointee(destination, context));
+        }
         if (count is not Immediate { Value: > 0 } byteCount
             || BlockCopyPointee(destination, context) is not { IsValueType: true } pointee
-            || pointee is GenericInstanceTypeAnalysisContext or GenericParameterTypeAnalysisContext
-            || pointee.Definition?.Size is not { } pointeeSize
+            || pointee is GenericParameterTypeAnalysisContext
+            || (pointee is not GenericInstanceTypeAnalysisContext && pointee.Definition?.Size is { } metadataSize
+                ? metadataSize
+                : TypeSizes.LaidOutSize(pointee, context.AppContext.Binary.PointerSizeBytes) is > 0 and var laidOut
+                    ? laidOut : (long?)null) is not { } pointeeSize
             || byteCount.Value != pointeeSize
             || !TypeTokenUsableFrom(pointee, context))
             return false;
@@ -9787,6 +9797,14 @@ public static class IlGenerator
                 return false;
         }
     }
+
+    private static IOperand WholeStorage(IOperand operand, TypeAnalysisContext? other)
+        => other != null
+           && operand is AddressOf { Target: FieldReference { Offset: 0, Containers.Count: 0, Field.IsStatic: false,
+               Local: { Type: { IsValueType: true } whole } local } }
+           && ThisConstructorCallPlan.SameTypeIdentity(whole, other)
+            ? new AddressOf(local)
+            : operand;
 
     // The element type a block-op address provably holds when it emits `&T`:
     // only a managed pointer carries a referent the type system can name - a
