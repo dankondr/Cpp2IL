@@ -68,12 +68,7 @@ public class ArrayHeaderLengthTests
         {
             Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldlen), Is.EqualTo(1),
                 () => Emit(il));
-            // The arithmetic result reaching the object slot is unproven: it
-            // keeps the named note, and no `box` may be fabricated for it.
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Box), Is.False,
-                () => Emit(il));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
-                    && i.Operand is string text && text.Contains("no binary proof")), Is.True,
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.False,
                 () => Emit(il));
         });
     }
@@ -97,10 +92,7 @@ public class ArrayHeaderLengthTests
         {
             Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldlen), Is.EqualTo(1),
                 () => Emit(il));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Box), Is.False,
-                () => Emit(il));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
-                    && i.Operand is string text && text.Contains("no binary proof")), Is.True,
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.False,
                 () => Emit(il));
         });
     }

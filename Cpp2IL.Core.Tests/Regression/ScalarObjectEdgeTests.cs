@@ -227,4 +227,88 @@ public class ScalarObjectEdgeTests
                 () => string.Join("\n", il.Select(i => i.ToString())));
         });
     }
+
+    [Test]
+    public void LifterTypedObjectSlotWithScalarDefinitionsRetypesToTheScalar()
+    {
+        // Object is the lifter's fallback tag on a register whose real type
+        // analysis lost. When the register's own definitions all prove the
+        // same scalar, the slot is declared as that scalar: the store needs
+        // no edge, no `box` and no note at all.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var slot = Local("v", app.SystemTypes.SystemObjectType);
+        var flagA = Local("a", app.SystemTypes.SystemInt32Type);
+        var flagB = Local("b", app.SystemTypes.SystemInt32Type);
+        var module = new ModuleDefinition("RetypedSlot.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemObjectType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, flagA, new Immediate(1)),
+            new(1, OpCode.Move, flagB, new Immediate(2)),
+            new(2, OpCode.CheckLess, slot, flagA, flagB),
+            new(3, OpCode.Return)], [slot, flagA, flagB]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(method.CilMethodBody.LocalVariables.Any(local =>
+                    local.VariableType?.ToString()?.Contains("Int32") == true), Is.True,
+                () => "the slot is declared as the proven Int32:\n"
+                    + string.Join("\n", method.CilMethodBody.LocalVariables.Select(l => l.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Box), Is.False,
+                () => "no edge remains to fabricate a box for:\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.False,
+                () => "no edge remains to note either:\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Throw), Is.False);
+        });
+    }
+
+    [Test]
+    public void MixedLifetimeObjectSlotKeepsNoteAndBoxWithoutThrow()
+    {
+        // One register carries both lifetimes: a definition from an unprovable
+        // object local and a literal store. It cannot be retyped to one honest
+        // slot, so it keeps System.Object - but throwing the scalar store
+        // would leave the later lifetime reading an unassigned local. The
+        // unproven edge keeps the named note plus the prior `box` emission,
+        // and the path is not stopped.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var slot = Local("v", app.SystemTypes.SystemObjectType);
+        var objLocal = Local("o", app.SystemTypes.SystemObjectType);
+        var module = new ModuleDefinition("MixedSlot.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemObjectType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, slot, objLocal),
+            new(1, OpCode.Move, slot, new Immediate(5)),
+            new(2, OpCode.Return)], [slot, objLocal]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(method.CilMethodBody.LocalVariables.Any(local =>
+                    local.VariableType?.ToString()?.Contains("Object") == true), Is.True,
+                () => "the mixed-lifetime slot keeps System.Object:\n"
+                    + string.Join("\n", method.CilMethodBody.LocalVariables.Select(l => l.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Box), Is.True,
+                () => "the lifter-typed contract keeps the prior box emission:\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("no binary proof")), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Throw), Is.False,
+                () => "the store must not stop the path - the register is shared:\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
+        });
+    }
 }

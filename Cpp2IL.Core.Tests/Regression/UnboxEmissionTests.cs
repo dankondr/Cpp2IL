@@ -29,11 +29,11 @@ public class UnboxEmissionTests
         SeedCorLibTypes(app, module, valueType, app.SystemTypes.SystemObjectType,
             app.SystemTypes.SystemVoidType);
         var (caller, method) = ForeignCaller(app, module, [
-            new(-1, OpCode.Move, boxed, new Immediate(0)),
             new(0, OpCode.Call, new StringLiteral("il2cpp_vm_object_unbox"),
                 unboxedPointer, boxed, valueType),
             new(1, OpCode.Move, value, new MemoryOperand(unboxedPointer)),
             new(2, OpCode.Return, value)], [boxed, unboxedPointer, value]);
+        caller.ParameterLocals = [boxed];
 
         KeyFunctionRecovery.Run(caller);
         IlGenerator.GenerateIl(caller, method);

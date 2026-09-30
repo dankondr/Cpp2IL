@@ -5584,6 +5584,12 @@ public static class IlGenerator
             if (local.Type == context.AppContext.SystemTypes.SystemObjectType
                 && SharpenedObjectAllocationType(local, context) is { } allocatedType)
                 return allocatedType;
+            // Object is also the lifter's fallback tag for a register whose
+            // real type analysis lost: when the register's own definitions all
+            // prove the same scalar, the slot is that scalar, not an object.
+            if (local.Type == context.AppContext.SystemTypes.SystemObjectType
+                && Analysis.ScalarObjectEdgeAnalysis.ProvenScalarSlotType(local, context) is { } provenScalar)
+                return provenScalar;
             // A cast source (isinst/castclass) must verify as a managed reference and
             // no stack operation bridges native int into that operand, so a
             // handle-typed local that feeds one emits object instead of IntPtr.
@@ -5616,6 +5622,10 @@ public static class IlGenerator
                 : context.AppContext.SystemTypes.SystemIntPtrType;
         if (NumericLocalTypes(context).TryGetValue(local, out var numericType) && CanEmitTypeToken(numericType))
             return numericType;
+        // An untyped register whose definitions all prove the same scalar was
+        // never an object either: the slot takes the proven type.
+        if (Analysis.ScalarObjectEdgeAnalysis.ProvenScalarSlotType(local, context) is { } provenUntypedScalar)
+            return provenUntypedScalar;
         return context.AppContext.SystemTypes.SystemObjectType;
     }
 
@@ -6324,13 +6334,14 @@ public static class IlGenerator
         if (destination is LocalVariable slotLocal)
         {
             var localContract = EmittableLocalType(EmittedLocalType(slotLocal, context), context);
+            if (localContract.FullName != "System.Object")
+                return localContract;
             // A local whose manufactured Boolean claim was vetoed falls back to
             // an object slot: mark its contract so a scalar edge reaching it
             // keeps the named note the Boolean-typed slot emitted.
-            return localContract.FullName == "System.Object"
-                && Analysis.LocalVariables.CarriesVetoedBooleanClaim(slotLocal, context)
-                    ? new Analysis.BooleanClaimVetoedSlotTypeAnalysisContext(localContract)
-                    : localContract;
+            if (Analysis.LocalVariables.CarriesVetoedBooleanClaim(slotLocal, context))
+                return new Analysis.BooleanClaimVetoedSlotTypeAnalysisContext(localContract);
+            return LifterObjectContract(slotLocal, localContract, context);
         }
         var declared = DestinationType(destination);
         if (declared != null)
@@ -6338,11 +6349,24 @@ public static class IlGenerator
         var fallback = destination switch
         {
             MemoryOperand { Index: null, Addend: 0, Scale: 0, Base: LocalVariable { Type: not ByRefTypeAnalysisContext } baseLocal }
-                => EmittableLocalType(EmittedLocalType(baseLocal, context), context),
+                => LifterObjectContract(baseLocal,
+                    EmittableLocalType(EmittedLocalType(baseLocal, context), context), context),
             _ => null
         };
         return fallback;
     }
+
+    // An object contract that comes only from the slot's own analysis tag -
+    // not a parameter, this, return or method-info slot - is lifter-chosen:
+    // mark it so an unproven scalar edge into it keeps the prior emission
+    // plus the named note instead of stopping the method.
+    private static TypeAnalysisContext LifterObjectContract(LocalVariable local,
+        TypeAnalysisContext contract, MethodAnalysisContext context) =>
+        contract.FullName == "System.Object"
+            && local is { IsThis: false, IsReturn: false, IsMethodInfo: false }
+            && AnalysisParameterForLocal(local, context) == null
+            ? new Analysis.LifterTypedObjectSlotTypeAnalysisContext(contract)
+            : contract;
 
     // The interface instantiation a produced instance satisfies: its
     // definition's interface list still mentions the definition's parameters,
@@ -6626,7 +6650,7 @@ public static class IlGenerator
 
     // Runtime handle wrappers (klass/method/field/rgctx handles) lower to a raw
     // pointer-sized value at emission even though their contexts are not value types.
-    private static bool IsNativeHandleType(TypeAnalysisContext type) =>
+    internal static bool IsNativeHandleType(TypeAnalysisContext type) =>
         type is RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext
             or RuntimeFieldInfoAnalysisContext or StaticFieldStorageTypeAnalysisContext
             or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext;
@@ -6654,19 +6678,24 @@ public static class IlGenerator
     // injected (synthetic fixtures).
     private static void EmitDecompilerNote(MethodDefinition method, MethodAnalysisContext? context, string detail)
     {
+        var instructions = method.CilMethodBody!.Instructions;
+        instructions.Add(CilOpCodes.Ldstr, Diagnostic(detail));
+        instructions.Add(CilOpCodes.Call, ResolveNoteTarget(method, context));
+    }
+
+    // The sink a decompiler-issue note calls: the game's own NoteDecompilerIssue
+    // helper when the assembly has one, else Console.WriteLine.
+    private static IMethodDescriptor ResolveNoteTarget(MethodDefinition method, MethodAnalysisContext? context)
+    {
         var module = method.DeclaringModule!;
         var noteIssue = context?.DeclaringType?.DeclaringAssembly
             .GetTypeByFullName($"{HelpersNamespace}.{HelpersTypeName}")
             ?.Methods.FirstOrDefault(candidate => candidate.Name == NoteIssueMethodName);
-        var writeLine = noteIssue != null
-            ? noteIssue.ToMethodDescriptor()
-            : module.CorLibTypeFactory.CorLibScope
+        return noteIssue?.ToMethodDescriptor()
+            ?? module.CorLibTypeFactory.CorLibScope
                 .CreateTypeReference("System", "Console")
                 .CreateMemberReference("WriteLine",
                     MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.String]));
-        var instructions = method.CilMethodBody!.Instructions;
-        instructions.Add(CilOpCodes.Ldstr, Diagnostic(detail));
-        instructions.Add(CilOpCodes.Call, writeLine);
     }
 
     // A constructor body's first C# statement can only be the constructor
@@ -6983,36 +7012,27 @@ public static class IlGenerator
             or "System.UInt16" or "System.UInt32" or "System.UInt64" or "System.UIntPtr"
         || type is { IsEnumType: true, DefaultEnumUnderlyingType: { } underlying } && IsUnsignedType(underlying);
 
-    // Resolves the diagnostic target an honest-failure emission writes to: the
-    // injected Cpp2ILHelpers.NoteDecompilerIssue when it exists in the emitting
-    // assembly, Console.WriteLine otherwise.
-    private static IMethodDescriptor NoteIssueMethod(MethodAnalysisContext? context, MethodDefinition method)
+    // An unproven scalar->object edge (castle-recovery#189): a conversion the
+    // binary never performed gets the named decompiler-issue note. A slot whose
+    // object contract was declared metadata ends the path - the note then the
+    // honest stop - but an object contract that is only the lifter's own tag on
+    // a register must not stop the path: the register can be shared across
+    // lifetimes, and a thrown store would leave a later lifetime reading an
+    // unassigned local. The marked contract keeps the prior `box` emission so
+    // the slot stays assigned, still carrying the note. Returns true when the
+    // caller's ordinary `box` emission must not run.
+    private static bool EmitUnprovenScalarObjectEdge(TypeAnalysisContext from, TypeAnalysisContext to,
+        MethodDefinition method, MethodAnalysisContext? context)
     {
-        var module = method.DeclaringModule!;
-        var factory = module.CorLibTypeFactory;
-        var noteIssueContext = context?.DeclaringType?.DeclaringAssembly
-            .GetTypeByFullName($"{HelpersNamespace}.{HelpersTypeName}")
-            ?.Methods.FirstOrDefault(m => m.Name == NoteIssueMethodName);
-        return noteIssueContext?.ToMethodDescriptor()
-            ?? factory.CorLibScope.CreateTypeReference("System", "Console")
-                .CreateMemberReference("WriteLine",
-                    MethodSignature.CreateStatic(factory.Void, [factory.String]));
-    }
-
-    // A scalar reaching a System.Object slot earns `box` only when the operand's
-    // definitions prove the binary allocated one (castle-recovery#189); every
-    // other edge is a conversion the binary never performed - a named
-    // decompiler-issue note and an honest stop instead of a fabricated box.
-    // Returns true when the caller's ordinary `box` emission may proceed.
-    private static bool ObjectBoxEdgeIsProven(MethodDefinition method, MethodAnalysisContext? context,
-        IOperand? operand, TypeAnalysisContext from, bool operationProvesBox = false)
-    {
-        if (operationProvesBox
-            || (context != null && Analysis.ScalarObjectEdgeAnalysis.OperandProvesBox(operand, context)))
-            return true;
-        EmitUnrecoverableOperation(method, NoteIssueMethod(context, method),
-            $"Unproven scalar->object edge: a {from.FullName} value reaching System.Object has no binary proof of a reference or a box");
-        return false;
+        var detail =
+            $"Unproven scalar->object edge: a {from.FullName} value reaching System.Object has no binary proof of a reference or a box";
+        if (to is Analysis.LifterTypedObjectSlotTypeAnalysisContext)
+        {
+            EmitDecompilerNote(method, context, detail);
+            return false;
+        }
+        EmitUnrecoverableOperation(method, ResolveNoteTarget(method, context), detail);
+        return true;
     }
 
     // Emits the conversion needed to make a value of `from` acceptable where `to` is
@@ -7192,7 +7212,8 @@ public static class IlGenerator
             && to is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext))
         {
             if (Analysis.ScalarObjectEdgeAnalysis.IsScalarObjectEdge(from, to)
-                && !ObjectBoxEdgeIsProven(method, context, operand, from, operationProvesBox))
+                && !Analysis.ScalarObjectEdgeAnalysis.ObjectBoxEdgeProven(operand, context, operationProvesBox)
+                && EmitUnprovenScalarObjectEdge(from, to, method, context))
                 return true;
             instructions.Add(CilOpCodes.Box, primitive.ToTypeDefOrRef());
             if (to.FullName == "System.Object" || !CanEmitTypeToken(to))
@@ -7217,7 +7238,8 @@ public static class IlGenerator
             if (!TypeTokenUsableFrom(from, context))
                 return false;
             if (Analysis.ScalarObjectEdgeAnalysis.IsScalarObjectEdge(from, to)
-                && !ObjectBoxEdgeIsProven(method, context, operand, from, operationProvesBox))
+                && !Analysis.ScalarObjectEdgeAnalysis.ObjectBoxEdgeProven(operand, context, operationProvesBox)
+                && EmitUnprovenScalarObjectEdge(from, to, method, context))
                 return true;
             instructions.Add(CilOpCodes.Box, from.ToTypeSignature().ToTypeDefOrRef());
             // box yields a `from` reference; an interface/other-ref destination still
@@ -8871,7 +8893,7 @@ public static class IlGenerator
     // True when ToTypeSignature can produce a usable operand for box/unbox/castclass.
     // Reduced test fixtures may not carry the AsmResolver metadata the real pipeline
     // always has, in which case the coercion is skipped rather than fatal.
-    private static bool CanEmitTypeToken(TypeAnalysisContext? type) => type switch
+    internal static bool CanEmitTypeToken(TypeAnalysisContext? type) => type switch
     {
         null => false,
         GenericInstanceTypeAnalysisContext generic => CanEmitTypeToken(generic.GenericType)
