@@ -4265,8 +4265,15 @@ public static class IlGenerator
                 LoadLocal(referenceCast.Value, method, locals, callingContext);
                 // A cast to the value's own type verifies without the opcode.
                 if (!ThisConstructorCallPlan.SameTypeIdentity(castValueType, castTarget))
+                {
+                    // isinst/castclass take an object reference: a value of a generic
+                    // parameter type is boxed first, as the C# compiler emits it (for a
+                    // reference-type argument the box is the reference itself).
+                    if (castValueType is GenericParameterTypeAnalysisContext && CanEmitTypeToken(castValueType))
+                        instructions.Add(CilOpCodes.Box, castValueType.ToTypeSignature().ToTypeDefOrRef());
                     instructions.Add(referenceCast.NullOnFailure ? CilOpCodes.Isinst : CilOpCodes.Castclass,
                         castTarget.ToTypeSignature().ToTypeDefOrRef());
+                }
                 break;
             case ArrayLength arrayLength:
                 LoadArrayBase(arrayLength.Array, method, locals, callingContext);
