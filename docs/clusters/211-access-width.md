@@ -33,6 +33,15 @@ Rules, in `MetadataResolver.ResolveFieldOffsets`:
   the second float, not an integer shift of a `Vector2`. The part is split only
   when it is exactly one field: `long >> 32` stays arithmetic.
 
+- A load through a merge of cell addresses is a merge of the cell values
+  (`LoadThroughMergedAddresses`, right after `RecoverObjectFieldAddresses`, still in
+  SSA). `x = c ? &a.f : &b.g; use(*x)` is what clang leaves of
+  `use(c ? a.f : b.g)`: each edge reads its field where it took the address, and a
+  phi of the values replaces the load. A string literal slot already stands for its
+  string. All cells have one type, every use of the merged address is that load, it
+  sits in the join block with no call or store before it, and each incoming edge is
+  the only exit of its block.
+
 Float and vector stores keep `AccessSize` 0 on the memory operand, a convention
 other passes read. Their real width is `Instruction.NativeStoreWidthBytes`.
 

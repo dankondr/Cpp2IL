@@ -506,6 +506,97 @@ public static class MetadataResolver
         }
     }
 
+    // `x = c ? &a.f : &b.g; use(*x)` is `use(c ? a.f : b.g)`: native code merges the
+    // addresses of two cells and loads once after the join. When every input of the
+    // merge is a cell of one type (a field, or a string literal slot, which already
+    // stands for its value), the load moves to the end of each incoming edge and a
+    // merge of the values replaces it. Each edge reads its cell where the address was
+    // taken, so the join must not write memory before the load.
+    internal static void LoadThroughMergedAddresses(MethodAnalysisContext method)
+    {
+        var graph = method.ControlFlowGraph!;
+        var definitions = graph.Instructions
+            .Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!)
+            .Where(g => g.Count() == 1)
+            .ToDictionary(g => g.Key, g => g.Single());
+        var created = 0;
+        foreach (var block in graph.Blocks.ToList())
+        foreach (var phi in block.Instructions.Where(i => i.OpCode == OpCode.Phi).ToList())
+        {
+            if (phi.Operands[0] is not LocalVariable address
+                || phi.Operands.Count - 1 != block.Predecessors.Count
+                || block.Predecessors.Any(p => p.Successors.Count != 1)
+                || phi.Operands.Skip(1).Select(Cell).ToList() is not { } cells
+                || cells.Any(c => c == null)
+                || cells.Select(c => c!.Value.Type.FullName).Distinct().Count() != 1)
+                continue;
+
+            var loads = new List<(Instruction User, int Index)>();
+            var otherUse = false;
+            foreach (var user in graph.Instructions)
+            for (var i = 0; i < user.Operands.Count; i++)
+            {
+                if (user.Operands[i] is MemoryOperand { Base: LocalVariable b, Index: null, Scale: 0, Addend: 0 }
+                    && ReferenceEquals(b, address) && !(user.OpCode == OpCode.Move && i == 0))
+                    loads.Add((user, i));
+                else if (!ReferenceEquals(user, phi) && Mentions(user.Operands[i], address))
+                    otherUse = true;
+            }
+            if (otherUse || loads.Count == 0
+                || loads.Any(l => !block.Instructions.Contains(l.User)
+                                  || block.Instructions.TakeWhile(i => !ReferenceEquals(i, l.User)).Any(MayWriteMemory)))
+                continue;
+
+            var type = cells[0]!.Value.Type;
+            var values = new List<IOperand> { new LocalVariable($"merged{created}", new Register(null, $"MERGED{created++}"), type) };
+            method.Locals.Add((LocalVariable)values[0]);
+            for (var k = 0; k < cells.Count; k++)
+            {
+                if (cells[k]!.Value.Field is not { } field)
+                {
+                    values.Add(phi.Operands[1 + k]);
+                    continue;
+                }
+                var value = new LocalVariable($"merged{created}", new Register(null, $"MERGED{created++}"), type);
+                method.Locals.Add(value);
+                SsaForm.InsertBeforeTerminator(block.Predecessors[k], [new Instruction(-1, OpCode.Move, value,
+                    new FieldReference(field.Field, field.Local, field.Offset, field.Containers, field.AccessSize))]);
+                values.Add(value);
+            }
+            block.Instructions.Insert(block.Instructions.IndexOf(phi) + 1, new Instruction(-1, OpCode.Phi, values));
+            foreach (var (user, index) in loads)
+                user.SetOperand(index, values[0]);
+        }
+
+        (FieldReference? Field, TypeAnalysisContext Type)? Cell(IOperand operand) => operand switch
+        {
+            AddressOf { Target: FieldReference field } => (field, field.Field.FieldType),
+            LocalVariable slot when definitions.TryGetValue(slot, out var definition)
+                && definition is { OpCode: OpCode.Move, Operands: [_, StringLiteral] }
+                => (null, method.AppContext.SystemTypes.SystemStringType),
+            _ => null,
+        };
+
+        static bool Mentions(IOperand operand, LocalVariable local) => operand switch
+        {
+            MemoryOperand memory => ReferenceEquals(memory.Base, local) || ReferenceEquals(memory.Index, local),
+            AddressOf { Target: { } target } => Mentions(target, local),
+            _ => ReferencesLocal(operand, local),
+        };
+
+        static bool MayWriteMemory(Instruction instruction) => instruction.OpCode switch
+        {
+            OpCode.Nop or OpCode.Phi or OpCode.Jump or OpCode.ConditionalJump => false,
+            OpCode.Move or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
+                or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not
+                or OpCode.Negate or OpCode.SignExtend32 or OpCode.CheckEqual or OpCode.CheckNotEqual
+                or OpCode.CheckGreater or OpCode.CheckLess or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual
+                => instruction.Operands is not [LocalVariable, ..],
+            _ => true,
+        };
+    }
+
     // The zero stores that directly follow `first` in its block and continue its byte
     // range through the same base.
     private static List<Instruction> AdjacentZeroStores(MethodAnalysisContext method, Instruction first,
