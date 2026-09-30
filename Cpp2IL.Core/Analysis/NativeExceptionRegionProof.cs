@@ -197,6 +197,13 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
             {
                 if (states.ContainsKey(index)) { merge = index; break; }
                 var instruction = code[index];
+                if (endedCatch && context.IsVoid && instruction.OpCode == OpCode.Return && instruction.Operands.Count == 0)
+                {
+                    // A separate void return has no live value to merge. Reuse a
+                    // reachable normal return as the leave destination outside EH.
+                    merge = states.Keys.FirstOrDefault(i => code[i].OpCode == OpCode.Return && code[i].Operands.Count == 0, -1);
+                    break;
+                }
                 if (instruction.IsCall)
                 {
                     if (Helper(instruction.Operands[0]) == "__cxa_end_catch")

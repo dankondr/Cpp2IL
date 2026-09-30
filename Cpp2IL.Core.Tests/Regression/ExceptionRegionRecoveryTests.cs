@@ -413,12 +413,13 @@ public class ExceptionRegionRecoveryTests
             "a failed inner finally still runs its parent; a failed first call in one finally skips the second call");
     }
 
-    [TestCase(true, false, false)]
-    [TestCase(false, false, false)]
-    [TestCase(true, true, false)]
-    [TestCase(false, true, false)]
-    [TestCase(true, true, true)]
-    public void RecognizedTypeTestProducesCatchAndLeavesToNormalMerge(bool recognizedTypeTest, bool classTest, bool multipleCalls)
+    [TestCase(true, false, false, false)]
+    [TestCase(false, false, false, false)]
+    [TestCase(true, true, false, false)]
+    [TestCase(false, true, false, false)]
+    [TestCase(true, true, true, false)]
+    [TestCase(true, true, true, true)]
+    public void RecognizedTypeTestProducesCatchAndLeavesToNormalMerge(bool recognizedTypeTest, bool classTest, bool multipleCalls, bool returningHandler)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "CatchOwner",
@@ -449,7 +450,7 @@ public class ExceptionRegionRecoveryTests
             At(0x2010, OpCode.ConditionalJump, mismatch, condition),
             At(0x2014, OpCode.CallVoid, report, exception),
             At(0x2018, OpCode.CallVoid, new StringLiteral("__cxa_end_catch")),
-            At(0x201C, OpCode.Jump, merge), mismatch];
+            returningHandler ? At(0x201C, OpCode.Return) : At(0x201C, OpCode.Jump, merge), mismatch];
         if (multipleCalls) caller.ConvertedIsil.Insert(1, secondCall);
         caller.UnwindInfo = new EhFunctionInfo { Start = 0x1000, Size = 0x1030 };
         caller.UnwindInfo.CallSites.Add(new EhCallSiteInfo(0x1000, multipleCalls ? 8UL : 4UL, 0x2000, 1)
