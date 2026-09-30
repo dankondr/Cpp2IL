@@ -196,6 +196,19 @@ public static class BlockMemoryImportRecovery
         return true;
     }
 
+    // Whether the instruction is the unresolved-import call this pass rewrites:
+    // a Call carrying a raw immediate target that resolves to a memcpy/memset/
+    // memmove GOT veneer, with the raw ABI operand layout still intact.
+    // Matches TryRewriteCall's shape gate exactly, so callers checking for
+    // block-op participation see precisely the calls this pass could rewrite.
+    internal static bool IsBlockMemoryImportCall(MethodAnalysisContext method, Instruction call)
+        => call.OpCode == OpCode.Call
+            && call.Operands.Count >= 5
+            && call.Operands[0] is Immediate target
+            && method.AppContext.Binary is { } binary
+            && ResolveImportName(binary, target.UnsignedValue)
+                is "memcpy" or "memset" or "memmove";
+
     /// <summary>
     /// Whether the operand can be loaded as a pointer-shaped stack value (&, *, native
     /// int, an integral address literal, or a concrete managed reference - conv.u on an

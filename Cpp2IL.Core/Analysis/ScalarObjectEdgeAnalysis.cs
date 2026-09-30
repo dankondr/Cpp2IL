@@ -168,7 +168,8 @@ public static class ScalarObjectEdgeAnalysis
         // so a local whose reads are not all dominated by a definition would
         // emit a read of an unassigned local. Keeping it object keeps those
         // sites on the prior path with their note.
-        return found && EveryReadHasDominatingDefinition(local, context) ? proven : null;
+        return found && !ParticipatesInBlockMemory(local, context)
+            && EveryReadHasDominatingDefinition(local, context) ? proven : null;
     }
 
     // True when every read of `local` - through any operand nesting - is
@@ -190,8 +191,9 @@ public static class ScalarObjectEdgeAnalysis
         if (context.DominatorInfo == null)
             context.PutExtraData("ScalarSlotDominators", dominators);
         var accesses = LocalAccessMap(context);
-        foreach (var (readBlock, readIndex, isDef) in accesses.TryGetValue(local, out var positions)
-                     ? positions : [])
+        if (!accesses.TryGetValue(local, out var positions) || positions == null)
+            return true;
+        foreach (var (readBlock, readIndex, isDef, _) in positions)
         {
             if (isDef)
                 continue;
@@ -206,31 +208,52 @@ public static class ScalarObjectEdgeAnalysis
         return true;
     }
 
+    // cpblk/initblk and the conv.u a Buffer.MemoryCopy argument puts on a `&`
+    // operand are not ILVerify-legal IL: a retyped slot satisfying the
+    // block-op operand proofs would turn a formerly noted import call into
+    // invalid IL. A local whose value or address a block memory op consumes
+    // keeps System.Object, so the proofs fail and the call keeps its
+    // unresolved diagnostic. (Spelling the write verifiably is the
+    // unmanaged-memory seam tracked separately.)
+    private static bool ParticipatesInBlockMemory(LocalVariable local,
+        MethodAnalysisContext context)
+        => LocalAccessMap(context).TryGetValue(local, out var positions)
+            && positions.Any(position => position.blockTouched);
+
     // Every def and read position for every local in the method, collected in
     // one pass: a def is a bare-local destination or an &local call operand
     // (the callee can write the cell); a read is a local reachable through
     // any operand nesting except those. Positions are (block, instruction
-    // index within the block).
-    private static Dictionary<LocalVariable, List<(Graphs.Block block, int index, bool isDef)>>
+    // index within the block) plus a flag for block memory operations.
+    private static Dictionary<LocalVariable, List<(Graphs.Block block, int index, bool isDef,
+            bool blockTouched)>>
         LocalAccessMap(MethodAnalysisContext context)
     {
-        var cached = context.GetExtraData<Dictionary<LocalVariable, List<(Graphs.Block, int, bool)>>>(
-            "ScalarSlotAccesses");
+        var cached = context.GetExtraData<Dictionary<LocalVariable, List<(Graphs.Block, int, bool,
+            bool)>>>("ScalarSlotAccesses");
         if (cached != null)
             return cached;
-        var map = new Dictionary<LocalVariable, List<(Graphs.Block, int, bool)>>();
-        void Record(LocalVariable local, Graphs.Block block, int index, bool isDef)
+        var map = new Dictionary<LocalVariable, List<(Graphs.Block, int, bool, bool)>>();
+        void Record(LocalVariable local, Graphs.Block block, int index, bool isDef,
+            bool blockTouched)
         {
             if (!map.TryGetValue(local, out var positions))
                 map[local] = positions = [];
-            positions.Add((block, index, isDef));
+            positions.Add((block, index, isDef, blockTouched));
         }
         foreach (var block in context.ControlFlowGraph!.Blocks)
             for (var index = 0; index < block.Instructions.Count; index++)
             {
                 var instruction = block.Instructions[index];
+                // Rewritten block ops and the unresolved import calls that
+                // become them consume raw memory through the operand: a
+                // proven-scalar retype must not make their operand proofs
+                // pass, so every local they touch is marked.
+                var blockTouched = instruction.OpCode
+                    is OpCode.MemoryCopy or OpCode.MemorySet or OpCode.MemoryMove
+                    || BlockMemoryImportRecovery.IsBlockMemoryImportCall(context, instruction);
                 if (instruction.Destination is LocalVariable destination)
-                    Record(destination, block, index, isDef: true);
+                    Record(destination, block, index, isDef: true, blockTouched);
                 var isCall = instruction.OpCode is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall;
                 // A bare-local destination position is written, not read -
                 // matched by index because a self-referencing operation passes
@@ -248,13 +271,13 @@ public static class ScalarObjectEdgeAnalysis
                         // &local handed to a call can be written through the
                         // callee: a def, not a read.
                         foreach (var addressed in LocalVariables.OperandLocals(operand))
-                            Record(addressed, block, index, isDef: true);
+                            Record(addressed, block, index, isDef: true, blockTouched);
                         continue;
                     }
                     if (operandIndex == destinationIndex)
                         continue;
                     foreach (var readLocal in LocalVariables.OperandLocals(operand))
-                        Record(readLocal, block, index, isDef: false);
+                        Record(readLocal, block, index, isDef: false, blockTouched);
                 }
             }
         context.PutExtraData("ScalarSlotAccesses", map);

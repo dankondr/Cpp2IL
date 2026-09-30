@@ -349,4 +349,42 @@ public class ScalarObjectEdgeTests
                     + string.Join("\n", il.Select(i => i.ToString())));
         });
     }
+
+    [Test]
+    public void BlockMemoryDestinationObjectSlotKeepsObjectNotInitblk()
+    {
+        // A block memory op lowers to initblk/cpblk - IL the verifier rejects
+        // outright. Retyping the destination slot to the proven scalar would
+        // let the op's operand proofs pass and emit that invalid IL where the
+        // object slot keeps the op on its named unrecoverable diagnostic.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var slot = Local("v", app.SystemTypes.SystemObjectType);
+        var module = new ModuleDefinition("BlockSlot.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemObjectType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, slot, new Immediate(5)),
+            new(1, OpCode.MemorySet, new AddressOf(slot), new Immediate(0), new Immediate(208)),
+            new(2, OpCode.Return)], [slot]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(method.CilMethodBody.LocalVariables.Any(local =>
+                    local.VariableType?.ToString()?.Contains("Object") == true), Is.True,
+                () => "a block-op operand keeps System.Object:\n"
+                    + string.Join("\n", method.CilMethodBody.LocalVariables.Select(l => l.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Initblk), Is.False,
+                () => "the block op must not emit unverifiable IL:\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                    && i.Operand is string text && text.Contains("Unproven block memory operand")), Is.True,
+                () => "the op keeps its named diagnostic:\n"
+                    + string.Join("\n", il.Select(i => i.ToString())));
+        });
+    }
 }
