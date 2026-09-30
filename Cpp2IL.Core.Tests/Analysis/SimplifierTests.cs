@@ -151,6 +151,27 @@ public class SimplifierTests
         Assert.That(add.Operands[2], Is.Not.InstanceOf<MemoryOperand>());
     }
 
+    [Test]
+    public void DoesNotForwardAFieldReadPastAStoreToMemory()
+    {
+        // x = owner.value; owner.value = 5; return x: the read is the value before the store.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new LocalVariable("owner", new Register(null, "owner"));
+        var x = new LocalVariable("x", new Register(null, "x"));
+        var field = new InjectedFieldAnalysisContext("value", app.SystemTypes.SystemInt32Type,
+            System.Reflection.FieldAttributes.Public, app.SystemTypes.SystemObjectType);
+        var ret = new Instruction(2, OpCode.Return, x);
+        var graph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, x, new FieldReference(field, owner, 16)),
+            new Instruction(1, OpCode.Move, new FieldReference(field, owner, 16), Imm(5)),
+            ret
+        ]);
+
+        Simplifier.Simplify(CreateMethod(graph, owner, x));
+
+        Assert.That(ret.Operands[0], Is.SameAs(x));
+    }
+
     private static MethodAnalysisContext CreateMethod(ISILControlFlowGraph graph, params LocalVariable[] locals)
     {
         var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));

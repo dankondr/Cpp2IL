@@ -159,6 +159,14 @@ public static class Simplifier
             return changed;
         }
 
+        private static bool MayWriteMemory(Instruction instruction) => instruction.OpCode switch
+        {
+            OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall or OpCode.Newobj or OpCode.MemoryCopy
+                or OpCode.MemorySet or OpCode.MemoryMove or OpCode.Interrupt or OpCode.NotImplemented => true,
+            OpCode.Move => instruction.Operands.Count > 0 && instruction.Operands[0] is not LocalVariable,
+            _ => false,
+        };
+
         private bool MustPreserveFieldSnapshot(Block block, int startIndex, LocalVariable value,
             LocalVariable? receiver)
         {
@@ -289,6 +297,10 @@ public static class Simplifier
             // and a join that merges another definition of one of them ends it too.
             var replacementLocals = LocalVariables.OperandLocals(replacement).ToHashSet();
             stopAtJoins |= replacementLocals.Any(read => definitionCounts.TryGetValue(read, out var count) && count > 1);
+            // A value read from memory is only that value until something may write memory:
+            // `x = o.f; o.f = 5; return x` must not become `return o.f`.
+            var readsMemory = replacement is FieldReference or SelectedFieldReference or MemoryOperand
+                or ArrayAccess or ArrayElementFieldReference;
 
             var visited = new HashSet<Block>();
             var remaining = new Stack<(Block, int)>(_graph.Blocks.Count);
@@ -315,7 +327,8 @@ public static class Simplifier
                         return;
 
                     // The instruction still reads the old value; what follows it does not.
-                    pathEnds = instruction.Destination is LocalVariable written && replacementLocals.Contains(written);
+                    pathEnds = instruction.Destination is LocalVariable written && replacementLocals.Contains(written)
+                               || readsMemory && MayWriteMemory(instruction);
 
                     // Replace operands
                     for (var j = 0; j < instruction.Operands.Count; j++)
