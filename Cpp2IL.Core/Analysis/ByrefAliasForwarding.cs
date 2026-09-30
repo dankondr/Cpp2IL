@@ -260,7 +260,7 @@ internal static class ByrefAliasForwarding
                     roots[i] = (bind, pointee);
                     break;
                 case LocalVariable source
-                    when !candidates.Contains(source) && !ReferenceEquals(source, local):
+                    when !ReferenceEquals(source, local):
                     roots[i] = (source, source);
                     break;
                 case { } other when IsForwardableRoot(other)
@@ -323,6 +323,8 @@ internal static class ByrefAliasForwarding
             for (var i = 0; i < block.Instructions.Count; i++)
             {
                 var instruction = block.Instructions[i];
+                if (instruction.OpCode == OpCode.Nop)
+                    continue; // an earlier pass in the fixpoint retired it - it is no longer a use
                 if (defSet.Contains(instruction))
                 {
                     // A def's own source may still read the local (&local or a
