@@ -219,44 +219,57 @@ internal static class VectorLanePacking
         if (method.ControlFlowGraph is not { } graph)
             return;
 
-        var packs = new Dictionary<LocalVariable, (List<Instruction> Stores,
-            HashSet<LocalVariable> VectorSources)>();
+        var packs = new Dictionary<LocalVariable, List<Instruction>>();
         foreach (var instruction in graph.Instructions)
         {
             if (instruction.OpCode != OpCode.Move
                 || instruction.Operands is not
-                    [FieldReference { Containers.Count: 0 } store, var source]
+                    [FieldReference { Containers.Count: 0 } store, _]
                 || !IsPackLocal(store.Local))
                 continue;
-            if (!packs.TryGetValue(store.Local, out var entry))
-            {
-                entry = (new List<Instruction>(), new HashSet<LocalVariable>());
-                packs[store.Local] = entry;
-            }
-            entry.Stores.Add(instruction);
-            // The donor is a `_vec` split local - either directly, or behind
-            // the lane view SplitScalarOperandViews writes onto the source
-            // (`v81_vec.x`). Any other scalar source just fills its lane.
-            var donor = source switch
-            {
-                LocalVariable local when IsVecSplitLocal(local) => local,
-                FieldReference { Containers.Count: 0, Local: { } host } when IsVecSplitLocal(host)
-                    => host,
-                _ => null,
-            };
-            if (donor != null)
-                entry.VectorSources.Add(donor);
+            if (!packs.TryGetValue(store.Local, out var stores))
+                packs[store.Local] = stores = new List<Instruction>();
+            stores.Add(instruction);
         }
 
         var removed = new List<Instruction>();
         var deadPacks = new List<LocalVariable>();
-        foreach (var (pack, (stores, vectorSources)) in packs)
+        foreach (var (pack, stores) in packs)
         {
-            // One `_vec` donor means the pack stood in for that register's
-            // whole-vector form; zero keeps the pack, two or more is ambiguous.
-            if (vectorSources.Count != 1)
+            // The pack can only collapse onto one whole value: every lane
+            // store must read that donor's matching lane (`pack.x = donor.x`),
+            // and the lanes written must cover the donor's whole lane set. A
+            // mixed source set means the pack is a real assembly and stays.
+            IOperand? donor = null;
+            object? donorKey = null;
+            var covered = new HashSet<string>();
+            var ambiguous = false;
+            foreach (var store in stores)
+            {
+                var (key, operand) = PackStoreDonor(store);
+                if (key is null || operand is null
+                    || (donor is not null && !key.Equals(donorKey)))
+                {
+                    ambiguous = true;
+                    break;
+                }
+                donor ??= operand;
+                donorKey ??= key;
+                covered.Add(((FieldReference)store.Operands[0]).Field.Name);
+            }
+            if (ambiguous || donor is null)
                 continue;
-            var donor = vectorSources.First();
+            var donorType = donor switch
+            {
+                LocalVariable local => local.Type,
+                FieldReference field => field.Field.FieldType,
+                _ => null,
+            };
+            var donorLanes = donorType is null ? null : VectorLanes(donorType);
+            if (donorLanes is null || covered.Count != donorLanes.Length
+                || donorLanes.Any(lane => !covered.Contains(lane.Name)))
+                continue;
+
             var rewrote = false;
             foreach (var consumer in graph.Instructions)
                 for (var i = 0; i < consumer.Operands.Count; i++)
@@ -276,6 +289,53 @@ internal static class VectorLanePacking
         foreach (var block in graph.Blocks)
             block.Instructions.RemoveAll(dead.Contains);
         method.Locals.RemoveAll(deadSet.Contains);
+    }
+
+    /// <summary>
+    /// The whole value a lane store <c>pack.lane = source.lane</c> reads when
+    /// the source is that whole value: a `_vec` split local (directly or
+    /// behind the lane view SplitScalarOperandViews writes), or the field
+    /// chain the lane came off of (`this.F.x` donates `this.F`). The key
+    /// identifies the donor so every store must name the same one.
+    /// </summary>
+    private static (object? Key, IOperand? Value) PackStoreDonor(Instruction store)
+    {
+        if (store.Operands is not [FieldReference { } destination, var source]
+            || destination.Containers.Count != 0)
+            return (null, null);
+        var laneName = destination.Field.Name;
+        return source switch
+        {
+            // `pack.lane = donor` directly, or `pack.lane = donor.lane` where
+            // donor is a `_vec` split local.
+            LocalVariable local when IsVecSplitLocal(local)
+                => (local, local),
+            FieldReference { Containers.Count: 0, Field: { } leaf, Local: { } host }
+                when IsVecSplitLocal(host) && leaf.Name == laneName
+                => (host, host),
+            // `pack.lane = L.a.b.lane` donates `L.a.b` - the field chain up
+            // to the container whose member was read, when that member is
+            // itself a lane-packable vector.
+            FieldReference { Containers.Count: >= 1, Field: { } leaf }
+                when leaf.Name == laneName
+                => FieldChainDonor(source as FieldReference),
+            _ => (null, null),
+        };
+    }
+
+    private static (object? Key, IOperand? Value) FieldChainDonor(FieldReference? source)
+    {
+        if (source is null || source.Containers.Count == 0)
+            return (null, null);
+        var parent = source.Containers[source.Containers.Count - 1];
+        if (VectorLanes(parent.FieldType) is null)
+            return (null, null);
+        var donor = new FieldReference(parent, source.Local, 0,
+            source.Containers.Count == 1
+                ? []
+                : source.Containers.Take(source.Containers.Count - 1).ToList(),
+            source.AccessSize);
+        return ((source.Local, parent, source.Containers.Count), donor);
     }
 
     // The whole-register local `SplitVectorBinopDefSites` creates for a vector
