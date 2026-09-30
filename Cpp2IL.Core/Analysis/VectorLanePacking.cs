@@ -306,10 +306,9 @@ internal static class VectorLanePacking
         var laneName = destination.Field.Name;
         return source switch
         {
-            // `pack.lane = donor` directly, or `pack.lane = donor.lane` where
-            // donor is a `_vec` split local.
-            LocalVariable local when IsVecSplitLocal(local)
-                => (local, local),
+            // `pack.lane = donor.lane` where donor is a `_vec` split local. A
+            // whole-local source is not lane evidence - a vector local read
+            // as a scalar takes lane x regardless of the lane being stored.
             FieldReference { Containers.Count: 0, Field: { } leaf, Local: { } host }
                 when IsVecSplitLocal(host) && leaf.Name == laneName
                 => (host, host),
