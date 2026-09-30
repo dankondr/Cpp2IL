@@ -354,6 +354,7 @@ public static class LocalVariables
         // incompatible with the whole-register local they read can be split off to
         // the register's lane-0 view - the slot the scalar operation actually sees.
         SplitScalarOperandViews(method);
+        VectorLanePacking.SurrenderPackedArgs(method);
     }
 
     private static bool ResolveStackAggregateFields(MethodAnalysisContext method)
@@ -1743,6 +1744,7 @@ public static class LocalVariables
         // Same kind-splitting as in ResolveTypesAndFields, applied to the copies
         // SSA teardown and copy coalescing leave behind.
         SplitScalarOperandViews(method);
+        VectorLanePacking.SurrenderPackedArgs(method);
 
         // The `arr == null`/`arr + 32` arm pairs of `new Span(arr)` only become
         // visible after SSA teardown produces the edge copies.
@@ -2345,7 +2347,6 @@ public static class LocalVariables
                 || destination.Register.Version < 0
                 || !IsScalarLaneType(destination.Type))
                 continue;
-
             // Negate is excluded deliberately: `fneg s8, s0` is a scalar lane op whose
             // register-view destination is honestly scalar, and its ISIL is
             // indistinguishable from a vector `fneg v0.4s`.
@@ -2368,8 +2369,8 @@ public static class LocalVariables
             // `float / VectorN`, so the left operand must be the vector.
             // `VectorN op VectorM` is legal only for N == M - different widths
             // mean a scalar lane op whose operands carry unrelated types.
-            var leftVector = VectorOperandEvidence(left);
-            var rightVector = VectorOperandEvidence(right);
+            var leftVector = VectorOperandEvidence(left, method);
+            var rightVector = VectorOperandEvidence(right, method);
             var leftIsElement = IsLaneViewOperand(left);
             var rightIsElement = IsLaneViewOperand(right);
             var provableVectorOp = instruction.OpCode switch
@@ -2406,16 +2407,36 @@ public static class LocalVariables
     }
 
     /// <summary>
-    /// The vector type this operand proves for a binop. Register-view locals
-    /// (`Vn`/`Vn.Sk`) are never evidence: their type is produced by the same
-    /// fill-only register-window typing whose smear this pass repairs, so a
-    /// vector-typed register view can be a scalar `fmul s` operand wearing a
-    /// sibling lifetime's type.
+    /// The vector type this operand proves for a binop. A register-view local's
+    /// own type is never evidence: it is produced by the same fill-only
+    /// register-window typing whose smear this pass repairs, so a vector-typed
+    /// register view can be a scalar `fmul s` operand wearing a sibling
+    /// lifetime's type. The operand it copies from is a different matter -
+    /// `fmul s0, s1, s2` where the source local was defined by a Move of a
+    /// vector-typed operand carries that operand's type as real evidence.
     /// </summary>
-    private static TypeAnalysisContext? VectorOperandEvidence(IOperand operand)
-        => operand is LocalVariable local && IsRegisterViewName(local.Register.Name)
-            ? null
-            : UnityVectorOperandType(operand);
+    private static TypeAnalysisContext? VectorOperandEvidence(IOperand operand,
+        MethodAnalysisContext method)
+    {
+        if (operand is not LocalVariable local || !IsRegisterViewName(local.Register.Name))
+            return UnityVectorOperandType(operand);
+        TypeAnalysisContext? evidence = null;
+        var hasMoveDef = false;
+        foreach (var definition in method.ControlFlowGraph!.Instructions)
+        {
+            if (!ReferenceEquals(definition.Destination, local))
+                continue;
+            if (definition.OpCode != OpCode.Move || definition.Operands.Count < 2)
+                return null;
+            hasMoveDef = true;
+            var sourceType = UnityVectorOperandType(definition.Operands[1]);
+            if (sourceType != null && evidence != null
+                && evidence.FullName != sourceType.FullName)
+                return null;
+            evidence ??= sourceType;
+        }
+        return hasMoveDef ? evidence : null;
+    }
 
     /// <summary>
     /// A `Vn.Sk` lane operand is produced only by a vector-element operand
@@ -2694,8 +2715,10 @@ public static class LocalVariables
             // Il2CppClass/static-fields pointer or metadata handle)
             // defaults at the slot; projecting a lane off it would just move
             // the default onto the member, so the operand stays whole for the
-            // emitter's referent-level fallback.
-            if (!ManagedLaneReceiver(fieldRef))
+            // emitter's referent-level fallback. A static member's receiver is
+            // never consumed (ldsfld ignores it), so a metadata-internal holder
+            // does not veto the lane split.
+            if (!fieldRef.Field.IsStatic && !ManagedLaneReceiver(fieldRef))
                 return null;
             // The aggregate becomes the innermost container of the nested
             // reference, so it is the hop the emission pass spells `ldflda`
@@ -2740,8 +2763,17 @@ public static class LocalVariables
                 continue;
             foreach (var instruction in method.ControlFlowGraph!.Instructions)
             {
-                if (!ReferenceEquals(instruction.Destination, current)
-                    || instruction.OpCode != OpCode.Move
+                if (!ReferenceEquals(instruction.Destination, current))
+                    continue;
+                // A call whose callee cannot be invoked assigns no managed
+                // value - the lane would read a default where control keeps
+                // the whole operand (and its own named diagnostic).
+                if (instruction.OpCode is OpCode.Call or OpCode.IndirectCall
+                    && VectorLanePacking.ResolveCallee(method.AppContext,
+                        instruction.Operands[0]) is { } callee
+                    && !IlGenerator.CalleeUsableFrom(callee, method))
+                    return false;
+                if (instruction.OpCode != OpCode.Move
                     || instruction.Operands.Count < 2)
                     continue;
                 switch (instruction.Operands[1])

@@ -7535,13 +7535,116 @@ public static class IlGenerator
             // slot - it is dropped and the default substitution is diagnosed.
             if (!EmitStackCoerce(emitted, contract, method, context, convertByRef))
             {
-                var instructions = method.CilMethodBody!.Instructions;
-                instructions.Add(CilOpCodes.Pop);
-                PushDefaultOf(contract, method, instructions, context, SlotDefaultReason(emitted, contract));
+                var body = method.CilMethodBody!.Instructions;
+                body.Add(CilOpCodes.Pop);
+                PushDefaultOf(contract, method, body, context, SlotDefaultReason(emitted, contract));
             }
             return true;
         }
-        PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context, SlotDefaultReason(emitted, contract));
+        var instructions = method.CilMethodBody!.Instructions;
+        // A leaf read past an unspellable member (`local.private.x`) defaults at
+        // every site that reaches it. Materializing the referent's default once
+        // per member path costs one named note and every lane/site reads a real
+        // ldfld off it - the whole-member read control emits once, not N.
+        if (resolved is FieldReference unspellableField
+            && contract != null
+            && TryEmitReferentMemoLoad(unspellableField, contract, context, method, locals,
+                instructions, convertByRef))
+            return true;
+        PushDefaultOf(contract, method, instructions, context, SlotDefaultReason(emitted, contract));
+        return true;
+    }
+
+    // A field load through a member path this method cannot spell
+    // (`local.privateMember.y`) otherwise drops to a slot default at every site
+    // that reads it. The referent the binary reached - `local.privateMember` -
+    // materializes its default once per (receiver, path) instead: one slot-fill
+    // note like control's single whole-member read, then a real ldfld chain for
+    // each leaf read. Only paths where every member past the unspellable one
+    // spells qualify; an unspellable leaf itself keeps the slot-level default
+    // that names the consumer's contract.
+    private static bool TryEmitReferentMemoLoad(FieldReference field, TypeAnalysisContext contract,
+        MethodAnalysisContext context, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, CilInstructionCollection instructions,
+        bool convertByRef)
+    {
+        if (field.Local is null)
+            return false;
+        var containers = field.Containers;
+        var receiverType = EmittedOperandType(field.Local, context);
+        var chainHead = true;
+        var unspellableAt = -1;
+        for (var i = 0; i < containers.Count; i++)
+        {
+            var container = containers[i];
+            var effectiveReceiver = chainHead && !container.IsStatic
+                ? ResolvedFieldReceiverType(container, field.Local, receiverType, context)
+                : receiverType;
+            chainHead = false;
+            if (IsAutoPropertyBackingField(container)
+                || !FieldUsableFrom(container, context, receiverType: effectiveReceiver))
+            {
+                unspellableAt = i;
+                break;
+            }
+            receiverType = container.IsStatic
+                ? container.FieldType
+                : EmittedContainerFieldType(container, effectiveReceiver);
+        }
+        // The walk's referent must be a container: an unspellable leaf, or a
+        // fully spellable path, already has its own diagnostic shape.
+        if (unspellableAt < 0)
+            return false;
+        var referentType = containers[unspellableAt].FieldType;
+        if (referentType is null || !TypeTokenUsableFrom(referentType, context))
+            return false;
+        // Every member the leaf chain walks after the referent must spell with
+        // its token bound - this is emission, not an accessibility estimate.
+        var suffixReceiver = referentType;
+        foreach (var member in containers.Skip(unspellableAt + 1))
+        {
+            if (member.IsStatic || IsAutoPropertyBackingField(member)
+                || !FieldUsableFrom(member, context, receiverType: suffixReceiver))
+                return false;
+            suffixReceiver = EmittedContainerFieldType(member, suffixReceiver);
+        }
+        if (field.Field.IsStatic || IsAutoPropertyBackingField(field.Field)
+            || !FieldUsableFrom(field.Field, context, receiverType: suffixReceiver)
+            || !StackContractSatisfied(field.Field.FieldType, contract, context, convertByRef))
+            return false;
+
+        // One materialization per (referent local, member path); the name keys
+        // the locals map so later sites find the same CIL local.
+        var memoName = $"VEC_REF_{RuntimeHelpers.GetHashCode(field.Local)}_" +
+            string.Join('_', containers.Take(unspellableAt + 1).Select(member => member.Name));
+        CilLocalVariable? memo = null;
+        foreach (var pair in locals)
+            if (pair.Key.Register.Name == memoName)
+            {
+                memo = pair.Value;
+                break;
+            }
+        if (memo is null)
+        {
+            memo = new CilLocalVariable(referentType.ToTypeSignature());
+            method.CilMethodBody!.LocalVariables.Add(memo);
+            var memoLocal = new LocalVariable(memoName, new Register(null, memoName), referentType);
+            locals[memoLocal] = memo;
+            // The referent's value was never recovered: fill the memo with the
+            // same diagnosed default the whole-member read would emit once.
+            PushDefaultOf(referentType, method, instructions, context);
+            instructions.Add(CilOpCodes.Stloc, memo);
+        }
+
+        instructions.Add(referentType.IsValueType ? CilOpCodes.Ldloca : CilOpCodes.Ldloc, memo);
+        var receiver = referentType;
+        foreach (var member in containers.Skip(unspellableAt + 1))
+        {
+            instructions.Add(member.FieldType?.IsValueType == true ? CilOpCodes.Ldflda : CilOpCodes.Ldfld,
+                FieldDescriptorFor(member, receiver));
+            receiver = EmittedContainerFieldType(member, receiver) ?? member.FieldType;
+        }
+        instructions.Add(CilOpCodes.Ldfld, FieldDescriptorFor(field.Field, receiver));
         return true;
     }
 
@@ -8907,7 +9010,7 @@ public static class IlGenerator
             && (generic.TypeGenericParameters.Any(ContainsSharedEnumMarker)
                 || generic.MethodGenericParameters.Any(ContainsSharedEnumMarker));
 
-    private static bool CalleeUsableFrom(MethodAnalysisContext method, MethodAnalysisContext context) =>
+    internal static bool CalleeUsableFrom(MethodAnalysisContext method, MethodAnalysisContext context) =>
         !CalleeUsesSharedEnumMarker(method)
         && Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(method, context);
 

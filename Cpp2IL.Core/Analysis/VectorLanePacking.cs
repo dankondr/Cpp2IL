@@ -206,6 +206,83 @@ internal static class VectorLanePacking
         return true;
     }
 
+    /// <summary>
+    /// Pack stores were written against the scalar lane lifetimes visible at
+    /// lifting time. Later splitting can retarget a lane store's source to a
+    /// whole-vector `_vec` local - that register's `v.4s` form is the call's
+    /// vector argument itself, and the pack was only standing in for it. Hand
+    /// the consumed operand slots back to the vector local and drop the pack.
+    /// Called after the kind-splitting passes (LocalVariables).
+    /// </summary>
+    internal static void SurrenderPackedArgs(MethodAnalysisContext method)
+    {
+        if (method.ControlFlowGraph is not { } graph)
+            return;
+
+        var packs = new Dictionary<LocalVariable, (List<Instruction> Stores,
+            HashSet<LocalVariable> VectorSources)>();
+        foreach (var instruction in graph.Instructions)
+        {
+            if (instruction.OpCode != OpCode.Move
+                || instruction.Operands is not
+                    [FieldReference { Containers.Count: 0 } store, var source]
+                || !IsPackLocal(store.Local))
+                continue;
+            if (!packs.TryGetValue(store.Local, out var entry))
+            {
+                entry = (new List<Instruction>(), new HashSet<LocalVariable>());
+                packs[store.Local] = entry;
+            }
+            entry.Stores.Add(instruction);
+            // The donor is a `_vec` split local - either directly, or behind
+            // the lane view SplitScalarOperandViews writes onto the source
+            // (`v81_vec.x`). Any other scalar source just fills its lane.
+            var donor = source switch
+            {
+                LocalVariable local when IsVecSplitLocal(local) => local,
+                FieldReference { Containers.Count: 0, Local: { } host } when IsVecSplitLocal(host)
+                    => host,
+                _ => null,
+            };
+            if (donor != null)
+                entry.VectorSources.Add(donor);
+        }
+
+        var removed = new List<Instruction>();
+        var deadPacks = new List<LocalVariable>();
+        foreach (var (pack, (stores, vectorSources)) in packs)
+        {
+            // One `_vec` donor means the pack stood in for that register's
+            // whole-vector form; zero keeps the pack, two or more is ambiguous.
+            if (vectorSources.Count != 1)
+                continue;
+            var donor = vectorSources.First();
+            var rewrote = false;
+            foreach (var consumer in graph.Instructions)
+                for (var i = 0; i < consumer.Operands.Count; i++)
+                    if (ReferenceEquals(consumer.Operands[i], pack))
+                    {
+                        consumer.SetOperand(i, donor);
+                        rewrote = true;
+                    }
+            if (!rewrote)
+                continue;
+            removed.AddRange(stores);
+            deadPacks.Add(pack);
+        }
+
+        var dead = new HashSet<Instruction>(removed);
+        var deadSet = deadPacks.ToHashSet();
+        foreach (var block in graph.Blocks)
+            block.Instructions.RemoveAll(dead.Contains);
+        method.Locals.RemoveAll(deadSet.Contains);
+    }
+
+    // The whole-register local `SplitVectorBinopDefSites` creates for a vector
+    // binop's def site - identified by its synthesized `VEC_` register name.
+    private static bool IsVecSplitLocal(LocalVariable local)
+        => local.Register.Name is { } name && name.StartsWith("VEC_") && !IsPackLocal(local);
+
     // A pack local is identified by its synthesized register name. Its lane
     // stores are bookkeeping for the pack, not real field stores: type
     // propagation must not smear a lane field's scalar type back onto a
@@ -535,7 +612,7 @@ internal static class VectorLanePacking
         return null;
     }
 
-    private static MethodAnalysisContext? ResolveCallee(ApplicationAnalysisContext app,
+    internal static MethodAnalysisContext? ResolveCallee(ApplicationAnalysisContext app,
         IOperand target)
     {
         switch (target)
