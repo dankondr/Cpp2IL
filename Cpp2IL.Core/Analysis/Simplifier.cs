@@ -488,6 +488,7 @@ public static class Simplifier
             remaining.Push((startBlock, startIndex));
 
             usedByMemory = false;
+            var reassigned = false;
 
             while (remaining.Count > 0)
             {
@@ -576,6 +577,19 @@ public static class Simplifier
                             }
                         }
                     }
+
+                    // Reassigned before any read: this path no longer carries the value.
+                    if (instruction.Destination is LocalVariable redefined && redefined == local)
+                    {
+                        reassigned = true;
+                        break;
+                    }
+                }
+
+                if (reassigned)
+                {
+                    reassigned = false;
+                    continue;
                 }
 
                 // Process successors

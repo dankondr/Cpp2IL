@@ -102,6 +102,34 @@ public class SimplifierTests
             () => string.Join("\n", graph.Blocks.SelectMany(b => b.Instructions)));
     }
 
+    [Test]
+    public void DropsALoopCopyThatTheNextIterationOverwritesFirst()
+    {
+        // loop { a = Next(y); Consume(a); q = a + 4; a = q; }: the copy at the bottom is
+        // overwritten at the top before anything reads it, so it is dead.
+        var a = new LocalVariable("a", new Register(null, "a"));
+        var q = new LocalVariable("q", new Register(null, "q"));
+        var y = new LocalVariable("y", new Register(null, "y"));
+        var c = new LocalVariable("c", new Register(null, "c"));
+        var top = new Instruction(1, OpCode.Call, Str("Next"), a, y);
+        var copy = new Instruction(4, OpCode.Move, a, q);
+        var graph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.CallVoid, Str("Enter"), y),
+            top,
+            new Instruction(2, OpCode.CallVoid, Str("Consume"), a),
+            new Instruction(3, OpCode.Add, q, a, Imm(4)),
+            copy,
+            new Instruction(5, OpCode.Call, Str("More"), c),
+            new Instruction(6, OpCode.ConditionalJump, top, c),
+            new Instruction(7, OpCode.Return)
+        ]);
+
+        Simplifier.Simplify(CreateMethod(graph, a, q, y, c));
+
+        Assert.That(graph.Blocks.SelectMany(b => b.Instructions).Contains(copy), Is.False,
+            () => string.Join("\n", graph.Blocks.SelectMany(b => b.Instructions)));
+    }
+
     private static MethodAnalysisContext CreateMethod(ISILControlFlowGraph graph, params LocalVariable[] locals)
     {
         var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));
