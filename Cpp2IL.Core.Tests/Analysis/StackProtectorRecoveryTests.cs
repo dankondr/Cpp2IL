@@ -195,6 +195,94 @@ public class StackProtectorRecoveryTests
         Assert.That(failCall.OpCode, Is.EqualTo(OpCode.Nop));
     }
 
+    // The widest real compare shape: the fresh side reads the canary through
+    // a spilled thread pointer - `[ptr + 0x28]` where `ptr` was loaded from a
+    // frame cell that only ever holds SYSREG - against the stored-canary
+    // frame slot. The dead edge's `__stack_chk_fail` is the co-proof, and the
+    // sweep then nops the whole machinery: the compare, the reload chain, the
+    // canary store, the thread-pointer store and the SYSREG move.
+    [Test]
+    public void SpilledTlsPointerCompareFoldsAndSweepsMachinery()
+    {
+        var caller = Caller();
+        var sysLocal = new LocalVariable("v_sys", new Register(null, "SYSREG"), _int64);
+        var tls = Reg("X23", _int64, 1);
+        var ptr = Reg("X8", _int64, 59);
+        var frame = Reg("X29", _int64, 1);
+        var cond = Reg("TEMPCOND", _app.SystemTypes.SystemBooleanType, 20);
+
+        var moveTls = new Instruction(0, OpCode.Move, tls, sysLocal);
+        var storeCanary = new Instruction(1, OpCode.Move, new MemoryOperand(frame, null, -8),
+            new MemoryOperand(tls, null, 0x28));
+        var loadPtr = new Instruction(2, OpCode.Move, ptr, new MemoryOperand(frame, null, -40));
+        var storePtr = new Instruction(3, OpCode.Move, new MemoryOperand(frame, null, -40), tls);
+        var check = new Instruction(4, OpCode.CheckNotEqual, cond,
+            new MemoryOperand(ptr, null, 0x28), new MemoryOperand(frame, null, -8));
+        var failCall = new Instruction(6, OpCode.Call, new StringLiteral("__stack_chk_fail"),
+            Reg("X0", version: 2));
+        var branch = new Instruction(5, OpCode.ConditionalJump, failCall, cond);
+        var mergeReturn = new Instruction(7, OpCode.Return, Reg("X0", version: 3));
+        var failReturn = new Instruction(8, OpCode.Return);
+
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            moveTls, storeCanary, loadPtr, storePtr, check, branch, mergeReturn, failCall,
+            failReturn,
+        ]);
+        caller.Locals = [sysLocal, tls, ptr, frame, cond];
+
+        StackProtectorRecovery.Run(caller);
+
+        Assert.That(branch.OpCode, Is.EqualTo(OpCode.Jump));
+        Assert.That(failCall.OpCode, Is.EqualTo(OpCode.Nop));
+        foreach (var machinery in new[] { moveTls, storeCanary, loadPtr, storePtr, check })
+            Assert.That(machinery.OpCode, Is.EqualTo(OpCode.Nop),
+                $"protector machinery instruction {machinery.Index} must be swept");
+    }
+
+    // When the cell feeding the compare's `[x + 0x28]` side also carries real
+    // data the guard still folds - the stored-canary side and the reachable
+    // __stack_chk_fail prove the protector - but the unproven store is real
+    // frame traffic and survives the sweep.
+    [Test]
+    public void UnprovenPointerCellStoreSurvivesTheSweep()
+    {
+        var caller = Caller();
+        var sysLocal = new LocalVariable("v_sys", new Register(null, "SYSREG"), _int64);
+        var tls = Reg("X23", _int64, 1);
+        var ptr = Reg("X8", _int64, 59);
+        var frame = Reg("X29", _int64, 1);
+        var other = Reg("X10", _int64, 70);
+        var cond = Reg("TEMPCOND", _app.SystemTypes.SystemBooleanType, 20);
+
+        var moveTls = new Instruction(0, OpCode.Move, tls, sysLocal);
+        var storeCanary = new Instruction(1, OpCode.Move, new MemoryOperand(frame, null, -8),
+            new MemoryOperand(tls, null, 0x28));
+        var loadPtr = new Instruction(2, OpCode.Move, ptr, new MemoryOperand(frame, null, -40));
+        var realStore = new Instruction(3, OpCode.Move, new MemoryOperand(frame, null, -40), other);
+        var check = new Instruction(4, OpCode.CheckNotEqual, cond,
+            new MemoryOperand(ptr, null, 0x28), new MemoryOperand(frame, null, -8));
+        var failCall = new Instruction(6, OpCode.Call, new StringLiteral("__stack_chk_fail"),
+            Reg("X0", version: 2));
+        var branch = new Instruction(5, OpCode.ConditionalJump, failCall, cond);
+        var mergeReturn = new Instruction(7, OpCode.Return, Reg("X0", version: 3));
+        var failReturn = new Instruction(8, OpCode.Return);
+
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            moveTls, storeCanary, loadPtr, realStore, check, branch, mergeReturn, failCall,
+            failReturn,
+        ]);
+        caller.Locals = [sysLocal, tls, ptr, frame, other, cond];
+
+        StackProtectorRecovery.Run(caller);
+
+        Assert.That(branch.OpCode, Is.EqualTo(OpCode.Jump));
+        Assert.That(failCall.OpCode, Is.EqualTo(OpCode.Nop));
+        Assert.That(check.OpCode, Is.EqualTo(OpCode.Nop));
+        Assert.That(storeCanary.OpCode, Is.EqualTo(OpCode.Nop));
+        Assert.That(realStore.OpCode, Is.EqualTo(OpCode.Move),
+            "a store carrying real data is not protector machinery");
+    }
+
     // A frame slot whose writes are not all canary stores is not proven: the
     // compare stays real code even beside a `__stack_chk_fail` call.
     [Test]

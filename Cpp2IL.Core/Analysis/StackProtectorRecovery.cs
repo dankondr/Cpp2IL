@@ -16,14 +16,16 @@ namespace Cpp2IL.Core.Analysis;
 /// to `__stack_chk_fail` on mismatch. None of it has program meaning.
 ///
 /// A guard is folded only when all three elements are present: a canary check
-/// (`CheckEqual`/`CheckNotEqual` with the TLS cell `[SYSREG + 0x28]` as one
-/// side), the conditional branch it feeds, and a `__stack_chk_fail` call - a
-/// call whose target names that import, either lifted with a "name" literal or
-/// resolved through its PLT/GOT-veneer relocation. When any element is missing
-/// nothing is touched and the call keeps its diagnostic - unless the compare's
-/// two sides are the same operand, in which case the check is a constant and
-/// the guard folds to its live edge on that proof alone (the failure call has
-/// already gone for these).
+/// (`CheckEqual`/`CheckNotEqual` where one side provably is the canary - the
+/// TLS cell `[SYSREG + 0x28]`, a local or cell every def of which carries it -
+/// and both sides are shapes it can take), the conditional branch it feeds,
+/// and a `__stack_chk_fail` call - a call whose target names that import,
+/// either lifted with a "name" literal or resolved through its
+/// PLT/GOT-veneer relocation. When any element is missing nothing is touched
+/// and the call keeps its diagnostic - unless the compare's two sides are the
+/// same operand, in which case the check is a constant and the guard folds to
+/// its live edge on that proof alone (the failure call has already gone for
+/// these).
 ///
 /// Folding replaces the guard's `ConditionalJump` with a `Jump` to the other
 /// successor and nops the `__stack_chk_fail` call. Blocks made unreachable by
@@ -63,6 +65,125 @@ public static class StackProtectorRecovery
             call.OpCode = OpCode.Nop;
             call.SetOperands();
         }
+
+        SweepDeadCanary(cfg);
+    }
+
+    // Once the guards fold, the protector's machinery is dead: the compare, the
+    // reloads feeding it, the prologue stores to the canary cell and the cell
+    // holding the spilled thread pointer. Left in place they emit unmanaged
+    // TLS reads and undefined-SYSREG diagnostics for values that have no
+    // program meaning, so they are nopped here: a pure def (Move/Not/compare)
+    // whose result no instruction reads, and a store to a cell proven to hold
+    // only protector values once nothing reads it back. Stores to cells that
+    // carry real data are never touched.
+    private static void SweepDeadCanary(ISILControlFlowGraph cfg)
+    {
+        // Cells are proven before the sweep: the proofs read the stores, and a
+        // nopped store must not flip a cell's proof mid-fixpoint.
+        var deadCells = new HashSet<MemoryOperand>();
+        foreach (var instruction in cfg.Instructions)
+        {
+            if (instruction.OpCode == OpCode.Move
+                && instruction.Operands.Count > 1
+                && instruction.Operands[0] is MemoryOperand cell
+                && (IsStoredCanaryCell(cell, cfg) || IsTlsPointerCell(cell, cfg)))
+                deadCells.Add(cell);
+        }
+
+        var deadLocals = new HashSet<LocalVariable>();
+        for (var round = 0; round < 16; round++)
+        {
+            var usedLocals = new HashSet<LocalVariable>();
+            var readCells = new HashSet<MemoryOperand>();
+            var instructions = cfg.Instructions;
+            foreach (var instruction in instructions)
+            {
+                if (instruction.OpCode == OpCode.Nop)
+                    continue;
+                foreach (var source in instruction.Sources)
+                    CollectSourceUse(source, usedLocals, readCells);
+                if (instruction.Destination is MemoryOperand destinationCell)
+                    CollectLocalUse(destinationCell, usedLocals);
+            }
+
+            var changed = false;
+            foreach (var instruction in instructions)
+            {
+                if (instruction.OpCode is not (OpCode.Move or OpCode.CheckEqual
+                        or OpCode.CheckNotEqual or OpCode.Not)
+                    || instruction.Destination is not { } destination
+                    || !TouchesProtector(instruction, deadCells, deadLocals, cfg))
+                    continue;
+                var dead = destination switch
+                {
+                    LocalVariable local => !usedLocals.Contains(local),
+                    MemoryOperand cell => deadCells.Contains(cell) && !readCells.Contains(cell),
+                    _ => false,
+                };
+                if (!dead)
+                    continue;
+                if (destination is LocalVariable deadLocal)
+                    deadLocals.Add(deadLocal);
+                instruction.OpCode = OpCode.Nop;
+                instruction.SetOperands();
+                changed = true;
+            }
+            if (!changed)
+                return;
+        }
+    }
+
+    // Only instructions on the protector's def-chain may be swept: an operand
+    // naming a proven protector cell, a TLS canary read, a SYSREG root, or a
+    // local already swept. Anything else - a dead load of real data, a store
+    // to a mixed-use cell - keeps its instructions and its diagnostics.
+    private static bool TouchesProtector(Instruction instruction, HashSet<MemoryOperand> deadCells,
+        HashSet<LocalVariable> deadLocals, ISILControlFlowGraph cfg)
+    {
+        foreach (var operand in instruction.Operands)
+        {
+            switch (operand)
+            {
+                case MemoryOperand { Index: null, Addend: TlsStackGuardOffset,
+                        Base: LocalVariable canaryBase }
+                    when deadLocals.Contains(canaryBase) || IsSysregProvenanced(canaryBase, cfg):
+                case MemoryOperand cell when deadCells.Contains(cell):
+                case Register { Name: "SYSREG" }:
+                    return true;
+                case MemoryOperand mem
+                    when (mem.Base is LocalVariable b && deadLocals.Contains(b))
+                        || (mem.Index is LocalVariable i && deadLocals.Contains(i)):
+                    return true;
+                case LocalVariable local
+                    when deadLocals.Contains(local) || IsSysregProvenanced(local, cfg):
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    private static void CollectSourceUse(IOperand operand, HashSet<LocalVariable> locals,
+        HashSet<MemoryOperand> cells)
+    {
+        if (operand is MemoryOperand cell)
+            cells.Add(cell);
+        CollectLocalUse(operand, locals);
+    }
+
+    private static void CollectLocalUse(IOperand operand, HashSet<LocalVariable> locals)
+    {
+        switch (operand)
+        {
+            case LocalVariable local:
+                locals.Add(local);
+                break;
+            case MemoryOperand { Base: LocalVariable baseLocal }:
+                locals.Add(baseLocal);
+                break;
+        }
+        if (operand is MemoryOperand { Index: LocalVariable indexLocal })
+            locals.Add(indexLocal);
     }
 
     // A TwoWay block whose branch condition is the canary check and one of whose
@@ -290,10 +411,23 @@ public static class StackProtectorRecovery
             return false;
         var left = check.Operands[1];
         var right = check.Operands[2];
-        return (IsTlsCanaryRead(left, cfg) || IsTlsCanaryRead(right, cfg))
+        return (IsCanaryProven(left, cfg) || IsCanaryProven(right, cfg))
             && IsCanaryOperand(left, cfg)
             && IsCanaryOperand(right, cfg);
     }
+
+    // A side provably part of the protector: the fresh TLS read, a local whose
+    // every def carries it, or a cell whose every store writes it. When one
+    // side proves the canary and the other is a shape it could take, the
+    // compare feeding a reachable __stack_chk_fail is the protector - nothing
+    // else ever calls it.
+    private static bool IsCanaryProven(IOperand operand, ISILControlFlowGraph cfg) =>
+        operand switch
+        {
+            LocalVariable local => IsCanaryValue(local, cfg),
+            MemoryOperand mem => IsTlsCanaryRead(mem, cfg) || IsStoredCanaryCell(mem, cfg),
+            _ => false,
+        };
 
     // One side of a canary check: the fresh TLS read, a plain local (the fail
     // call's presence is what proves it the stored canary), a `+0x28` read
@@ -323,6 +457,33 @@ public static class StackProtectorRecovery
                      && dest.Equals(cell)))
         {
             if (!IsCanaryValue(def.Operands[1], cfg))
+                return false;
+            saw = true;
+        }
+        return saw;
+    }
+
+    // A cell holding the spilled thread pointer: every write carries a
+    // SYSREG-provenanced value - the `mrs xN, tpidr_el0` result, possibly
+    // through spilled locals - so reads `[cell] + 0x28` are TLS canary reads
+    // one level removed.
+    private static bool IsTlsPointerCell(MemoryOperand cell, ISILControlFlowGraph cfg)
+    {
+        if (cell.Index != null)
+            return false;
+        var saw = false;
+        foreach (var def in cfg.Instructions.Where(i => i.OpCode == OpCode.Move
+                     && i.Operands.Count > 1
+                     && i.Operands[0] is MemoryOperand dest
+                     && dest.Equals(cell)))
+        {
+            var proven = def.Operands[1] switch
+            {
+                Register { Name: "SYSREG" } => true,
+                LocalVariable source => IsSysregProvenanced(source, cfg),
+                _ => false,
+            };
+            if (!proven)
                 return false;
             saw = true;
         }
