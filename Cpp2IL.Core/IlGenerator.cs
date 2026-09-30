@@ -52,6 +52,12 @@ public static class IlGenerator
                 .CreateTypeReference("System", "Console")
                 .CreateMemberReference("WriteLine", MethodSignature.CreateStatic(factory.Void, [factory.String]));
 
+        // Un-inline proven inlined event raises (E?.Invoke() in foreign bodies)
+        // while branch operands are still blocks, so the guard can be folded
+        // back into the raiser call and the private backing field loses its
+        // foreign reference.
+        Analysis.InlinedEventRaiseRecovery.Run(context);
+
         // Change branch targets to instructions
         foreach (var instruction in context.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))
         {
