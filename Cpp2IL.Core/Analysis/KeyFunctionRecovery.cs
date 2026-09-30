@@ -24,7 +24,7 @@ public static class KeyFunctionRecovery
         {
             var export = binary.GetVirtualAddressOfExportedFunctionByName("il2cpp_class_is_assignable_from");
             return MatchClassIsAssignableFrom(export, target, address => BitConverter.ToUInt32(
-                binary.GetRawBinaryContent().Slice((int)binary.MapVirtualAddressToRaw(address), 4)));
+                binary.GetRawBinaryContent().Slice((int)binary.MapVirtualAddressToRaw(address), 4).ToArray(), 0));
         }
         catch (Exception) { return false; }
     }

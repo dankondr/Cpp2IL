@@ -201,7 +201,7 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context)
                 {
                     // A separate void return has no live value to merge. Reuse a
                     // reachable normal return as the leave destination outside EH.
-                    merge = states.Keys.FirstOrDefault(i => code[i].OpCode == OpCode.Return && code[i].Operands.Count == 0, -1);
+                    merge = states.Keys.Where(i => code[i].OpCode == OpCode.Return && code[i].Operands.Count == 0).DefaultIfEmpty(-1).First();
                     break;
                 }
                 if (instruction.IsCall)
