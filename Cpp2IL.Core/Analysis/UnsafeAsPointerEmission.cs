@@ -1,0 +1,416 @@
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using AsmResolver.DotNet;
+using AsmResolver.DotNet.Code.Cil;
+using AsmResolver.PE.DotNet.Cil;
+using Cpp2IL.Core.Extensions;
+using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils.AsmResolver;
+using ISIL = Cpp2IL.Core.ISIL;
+
+namespace Cpp2IL.Core.Analysis;
+
+/// <summary>
+/// Emission of <c>System.Runtime.CompilerServices.Unsafe.AsPointer&lt;T&gt;</c>
+/// for a <c>&amp;T</c> operand landing in a native-int slot (the pinned-address
+/// idiom). <c>conv.*</c> and every binary op reject a managed pointer outright
+/// (ECMA III.1.5), so <c>Unsafe.AsPointer</c> is the only verifiable spelling
+/// of the raw address: it returns <c>void*</c>, which the verifier reads as
+/// native unsigned int and which therefore satisfies a
+/// <c>System.IntPtr</c>/<c>System.UIntPtr</c> or <c>void*</c> slot with no
+/// further conversion - exactly the value the binary moved.
+/// </summary>
+internal static class UnsafeAsPointerEmission
+{
+    // The helper lookup is per application and needed once per coercion site;
+    // body emission runs parallel per assembly, so cache it under a lock-safe
+    // map keyed on the context.
+    private static readonly ConcurrentDictionary<ApplicationAnalysisContext, MethodAnalysisContext?> AsPointerCache = new();
+
+    private const string UnsafeFullName = "System.Runtime.CompilerServices.Unsafe";
+
+    /// <summary>
+    /// Whether <c>call void* Unsafe.AsPointer&lt;element&gt;(!!0&amp;)</c> can
+    /// stand in for a <c>&amp;element</c> operand: the element must be a lawful
+    /// generic argument that the emitting method can name, some emitted corlib
+    /// assembly must actually carry the helper, the calling method must render
+    /// in an unsafe-capable context, and the helper's type name must resolve
+    /// unambiguously for the caller, and the helper must be accessible to it
+    /// as declared - the emitted reference never widens the helper. Anything
+    /// less is an unproven site and keeps its diagnosed default.
+    /// </summary>
+    internal static bool Satisfiable(TypeAnalysisContext? element, MethodAnalysisContext? context) =>
+        UsableGenericArgument(element, context)
+        && ResolveAsPointer(element!.AppContext) is { } helper
+        && !HostLacksUnsafeContext(context)
+        && !UnsafeAmbiguousFor(context)
+        && UnsafeAccessibleFor(helper, context);
+
+    /// <summary>
+    /// Why an otherwise-proven site keeps its diagnosed default, or null when
+    /// the ordinary "no legal conversion" text already names the shape. Only
+    /// meaningful when <see cref="Satisfiable"/> is false; also null when the
+    /// slot is not one <see cref="ServesSlot"/> would ever take, since the
+    /// helper spelling was never on the table there.
+    /// </summary>
+    internal static string? BlockedReason(ByRefTypeAnalysisContext from, TypeAnalysisContext? to,
+        MethodAnalysisContext? context)
+    {
+        if (!ServesSlot(to)
+            || from.ElementType is not { } element
+            || !UsableGenericArgument(element, context)
+            || ResolveAsPointer(element.AppContext) is not { } helper)
+            return null;
+        if (HostLacksUnsafeContext(context))
+            return "the Unsafe.AsPointer<T> spelling is withheld because the host is a compiler-generated state-machine MoveNext, which decompiles without an unsafe context";
+        if (UnsafeAmbiguousFor(context))
+            return "the Unsafe.AsPointer<T> spelling is withheld because the calling assembly resolves more than one System.Runtime.CompilerServices.Unsafe type";
+        if (!UnsafeAccessibleFor(helper, context))
+            return "the Unsafe.AsPointer<T> spelling is withheld because the helper's declaring type is not accessible to the calling assembly as emitted, and the recovery does not widen accessibility";
+        return null;
+    }
+
+    // A `MoveNext` on a compiler-generated state machine (`<X>d__N`, iterator
+    // or async) renders through ilspy's generated-code path, which never emits
+    // an `unsafe` modifier - a `void*` call inside it would not compile, so
+    // the site is unproven there regardless of the slot's contract.
+    private static bool HostLacksUnsafeContext(MethodAnalysisContext? context) =>
+        context is { Name: "MoveNext", DeclaringType: { } stateMachine }
+        && (stateMachine.IsCompilerGeneratedBasedOnCustomAttributes
+            || stateMachine.Name is { } name
+            && name.StartsWith('<')
+            && (name.Contains(">d__") || name.Contains(">c__Iterator")));
+
+    // CS0433 territory: the type name `System.Runtime.CompilerServices.Unsafe`
+    // exists in the real BCL and in the vendored NuGet assembly, and a caller
+    // whose compilation can see more than one such type resolves the
+    // unqualified name ambiguously - no C# spelling of ours picks between
+    // them, so the site is unproven there. What the compile sees is the
+    // caller's emitted reference set - the assemblies its members actually
+    // bind, not the metadata-declared list: an emitted module drops a declared
+    // reference nothing uses, so a declared-but-unused Unsafe never reaches
+    // the csproj. `ReferencedAssemblies` rebuilds that used set from the
+    // caller's decoded instructions and member signatures; the decode is the
+    // same pure call analysis performs, safe while bodies emit in parallel.
+    private static readonly ConcurrentDictionary<AssemblyAnalysisContext, HashSet<AssemblyAnalysisContext>>
+        ReferencedAssemblies = new();
+
+    private static bool UnsafeAmbiguousFor(MethodAnalysisContext? context) =>
+        context?.CustomAttributeAssembly is { } caller
+        && (UnsafeDeclaredFor(caller) || UnsafeUsedBy(caller) > 1);
+
+    // The emitted call names the helper verbatim, so the caller must see the
+    // helper's declaring type at its declared accessibility: this game's corlib
+    // declares Unsafe internal and the emitted reference carries no widening,
+    // so only a caller inside the helper's accessibility scope (its own
+    // assembly, or a friend the emitted internals grants reach) can spell it.
+    // The same predicate ordinary callee accessibility checks use.
+    private static bool UnsafeAccessibleFor(MethodAnalysisContext helper, MethodAnalysisContext? context) =>
+        context?.DeclaringType is { } caller
+        && helper.DeclaringType is { } owner
+        && owner.IsAccessibleTo(caller);
+
+    // The emitted module's AssemblyRef table sits inside the caller's declared
+    // references (plus the caller itself): any second Unsafe-declaring assembly
+    // in that set can end up as a -r on the csproj, making the unqualified
+    // helper name ambiguous for the compiler. Globals bound by ldtoken are one
+    // such binding that only this declared-refs signal sees - raw ISIL carries
+    // the pointer, not the type.
+    private static bool UnsafeDeclaredFor(AssemblyAnalysisContext caller)
+    {
+        if (caller.Definition is not { } callerDef)
+            return false;
+        var count = 0;
+        foreach (var reference in callerDef.ReferencedAssemblies.Append(callerDef))
+        {
+            if (caller.AppContext.ResolveContextForAssembly(reference) is { } assembly
+                && assembly.GetTypeByFullName(UnsafeFullName) != null)
+                count++;
+        }
+        return count > 1;
+    }
+
+    // The usage scan covers what declared refs cannot express: a caller whose
+    // emitted code binds an Unsafe-declaring assembly it never declared (e.g.
+    // through a generic instantiation resolved to a concrete context).
+    private static int UnsafeUsedBy(AssemblyAnalysisContext caller)
+        => UnsafeCountFor(caller);
+
+    private static int UnsafeCountFor(AssemblyAnalysisContext caller)
+    {
+        var referenced = ReferencedAssemblies.GetOrAdd(caller, CollectReferenced);
+        var count = 0;
+        var mscorlibHasUnsafe = false;
+        foreach (var candidate in caller.AppContext.AssembliesByName.Values)
+        {
+            if (candidate.GetTypeByFullName(UnsafeFullName) == null)
+                continue;
+            if (candidate.Name == "mscorlib")
+                mscorlibHasUnsafe = true;
+            if (candidate == caller || referenced.Contains(candidate))
+                count++;
+        }
+        // Reference-mode compilation swaps the emitted mscorlib for the real
+        // BCL, which always carries a public Unsafe: a caller that binds a
+        // second copy anywhere would spell the unqualified name ambiguously
+        // there even when the recovered mscorlib does not declare the type.
+        if (!mscorlibHasUnsafe)
+            count++;
+        return count;
+    }
+
+    private static HashSet<AssemblyAnalysisContext> CollectReferenced(AssemblyAnalysisContext caller)
+    {
+        var referenced = new HashSet<AssemblyAnalysisContext>();
+        void Mark(AssemblyAnalysisContext? assembly)
+        {
+            if (assembly != null)
+                referenced.Add(assembly);
+        }
+        void MarkType(TypeAnalysisContext? type)
+        {
+            switch (type)
+            {
+                case null:
+                    return;
+                case WrappedTypeAnalysisContext wrapped:
+                    MarkType(wrapped.ElementType);
+                    return;
+                case GenericInstanceTypeAnalysisContext generic:
+                    foreach (var argument in generic.GenericArguments)
+                        MarkType(argument);
+                    return;
+                default:
+                    Mark(type.DeclaringAssembly);
+                    return;
+            }
+        }
+        void MarkOperand(ISIL.IOperand? operand)
+        {
+            switch (operand)
+            {
+                case null:
+                    return;
+                case MethodAnalysisContext method:
+                    Mark(method.CustomAttributeAssembly);
+                    MarkType(method.DeclaringType);
+                    if (method is ConcreteGenericMethodAnalysisContext concrete)
+                    {
+                        foreach (var argument in concrete.TypeGenericParameters)
+                            MarkType(argument);
+                        foreach (var argument in concrete.MethodGenericParameters)
+                            MarkType(argument);
+                    }
+                    return;
+                case RuntimeClassTypeAnalysisContext runtimeType:
+                    MarkType(runtimeType.RepresentedType);
+                    return;
+                case RuntimeMethodInfoAnalysisContext runtimeMethod:
+                    Mark(runtimeMethod.RepresentedMethod.CustomAttributeAssembly);
+                    MarkType(runtimeMethod.RepresentedMethod.DeclaringType);
+                    return;
+                case RuntimeFieldInfoAnalysisContext runtimeField:
+                    Mark(runtimeField.RepresentedField.CustomAttributeAssembly);
+                    MarkType(runtimeField.RepresentedField.FieldType);
+                    return;
+                case TypeAnalysisContext type:
+                    MarkType(type);
+                    return;
+                case FieldAnalysisContext field:
+                    Mark(field.CustomAttributeAssembly);
+                    MarkType(field.FieldType);
+                    return;
+                case ISIL.FieldReference reference:
+                    MarkOperand(reference.Local);
+                    Mark(reference.Field.CustomAttributeAssembly);
+                    MarkType(reference.Field.FieldType);
+                    foreach (var container in reference.Containers)
+                    {
+                        Mark(container.CustomAttributeAssembly);
+                        MarkType(container.FieldType);
+                    }
+                    return;
+                case ISIL.SelectedFieldReference selector:
+                    MarkOperand(selector.Selector);
+                    foreach (var (_, field) in selector.Choices)
+                        MarkOperand(field);
+                    return;
+                case ISIL.ArrayElementFieldReference element:
+                    MarkOperand(element.Array);
+                    MarkOperand(element.Index);
+                    Mark(element.Field.CustomAttributeAssembly);
+                    return;
+                case ISIL.AddressOf address:
+                    MarkOperand(address.Target);
+                    return;
+                case ISIL.MemoryOperand memory:
+                    MarkOperand(memory.Base);
+                    MarkOperand(memory.Index);
+                    return;
+                case ISIL.ReferenceCast cast:
+                    MarkOperand(cast.Value);
+                    MarkType(cast.Type);
+                    return;
+                case ISIL.ArrayAccess access:
+                    MarkOperand(access.Array);
+                    MarkOperand(access.Index);
+                    return;
+                case ISIL.ArrayLength length:
+                    MarkOperand(length.Array);
+                    return;
+                case ISIL.LocalVariable local:
+                    MarkType(local.Type);
+                    return;
+                case ISIL.Instruction instruction:
+                    foreach (var inner in instruction.Operands)
+                        MarkOperand(inner);
+                    return;
+            }
+        }
+
+        foreach (var type in caller.Types)
+        {
+            MarkType(type);
+            foreach (var field in type.Fields)
+            {
+                Mark(field.CustomAttributeAssembly);
+                MarkType(field.FieldType);
+            }
+            foreach (var method in type.Methods)
+            {
+                MarkType(method.ReturnType);
+                foreach (var parameter in method.Parameters)
+                    MarkType(parameter.ParameterType);
+                foreach (var operand in method.ParameterOperands)
+                    MarkOperand(operand);
+                if (method.Definition == null)
+                    continue;
+                ulong pointer;
+                try
+                {
+                    pointer = method.UnderlyingPointer;
+                }
+                catch
+                {
+                    continue;
+                }
+                if (pointer == 0)
+                    continue;
+                List<ISIL.Instruction> isil;
+                try
+                {
+                    // RawBytes is only populated by Analyze(); a method too
+                    // large to analyze emits no recovered body and so cannot
+                    // bind any assembly reference either.
+                    method.EnsureRawBytes();
+                    if (MethodAnalysisContext.MaxMethodSizeBytes != -1
+                        && method.RawBytes.Length > MethodAnalysisContext.MaxMethodSizeBytes)
+                        continue;
+                    isil = caller.AppContext.InstructionSet.GetIsilFromMethod(method);
+                }
+                catch
+                {
+                    // A method that will not decode cannot prove its own
+                    // reference set; count every Unsafe-declaring assembly as
+                    // visible so the site stays on its diagnosed default.
+                    foreach (var candidate in caller.AppContext.AssembliesByName.Values)
+                    {
+                        if (candidate.GetTypeByFullName(UnsafeFullName) != null)
+                            Mark(candidate);
+                    }
+                    return referenced;
+                }
+                foreach (var instruction in isil)
+                {
+                    foreach (var operand in instruction.Operands)
+                        MarkOperand(operand);
+                }
+            }
+        }
+        return referenced;
+    }
+
+    /// <summary>
+    /// Emits <c>call void* Unsafe.AsPointer&lt;element&gt;(!!0&amp;)</c> over
+    /// the operand already on the stack, leaving <c>void*</c>. Returns false
+    /// when the site is unproven (see <see cref="Satisfiable"/>); the caller
+    /// then drops the operand and emits the diagnosed default.
+    /// </summary>
+    internal static bool TryEmit(ByRefTypeAnalysisContext from, MethodAnalysisContext? context,
+        CilInstructionCollection instructions)
+    {
+        // The generic argument is the address's element type verbatim: the
+        // stack carries `&element`, and `!!0&` unifies with it only when
+        // `!!0 == element` - unwrapping an `X[]` element to `X` would leave a
+        // `&X` callee requirement under a `&X[]` value.
+        var element = from.ElementType;
+        if (!Satisfiable(element, context))
+            return false;
+        var helper = ResolveAsPointer(element!.AppContext)!;
+        // No accessibility widening: the helper is emitted exactly as
+        // declared, and Satisfiable already refused every caller outside its
+        // scope. (The descriptor path also freezes external-runtime members
+        // like the corlib helper against widening on its own.)
+        instructions.Add(CilOpCodes.Call,
+            helper.MakeGenericInstanceMethod(element).ToMethodDescriptor());
+        return true;
+    }
+
+    // `void*` slots take the helper's own return type, so they are served too;
+    // a typed unmanaged pointer slot is not (void* -> T* has no verifiable
+    // conversion), and the native-int result is what IntPtr/UIntPtr want.
+    internal static bool ServesSlot(TypeAnalysisContext? contract) =>
+        contract is { FullName: "System.IntPtr" or "System.UIntPtr" }
+            or PointerTypeAnalysisContext { ElementType.FullName: "System.Void" };
+
+    // A generic argument must be a closed-ish, non-pointer, non-byref,
+    // non-ref-struct type: pointers and byrefs are illegal arguments, ref
+    // structs cannot be generic arguments at all, and the synthetic marker /
+    // rgctx contexts name no real type (they only pretend a token exists).
+    // Generic parameters are lawful arguments - the instantiation keeps them
+    // verbatim - and so are wrapped forms like `X[]`: `!!0 == X[]` is what the
+    // `&X[]` stack unifies with. The caller must be able to name the argument
+    // (same visibility gate every token-bearing emission uses).
+    private static bool UsableGenericArgument(TypeAnalysisContext? element, MethodAnalysisContext? context) =>
+        element switch
+        {
+            null => false,
+            ByRefTypeAnalysisContext or PointerTypeAnalysisContext => false,
+            RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext
+                or RuntimeFieldInfoAnalysisContext or StaticFieldStorageTypeAnalysisContext
+                or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext
+                or SentinelTypeAnalysisContext or BoxedTypeAnalysisContext => false,
+            GenericParameterTypeAnalysisContext => true,
+            _ => !(element.IsValueType && IlGenerator.IsByRefLike(element))
+                 && IlGenerator.TypeTokenUsableFrom(element, context),
+        };
+
+    // Finds the corlib copy of `static void* Unsafe::AsPointer<T>(ref T)` among
+    // the emitted assemblies: a static single-parameter generic whose only
+    // parameter is a byref and whose return is an unmanaged pointer, carrying
+    // an emitted definition. Corlib-named assemblies are preferred so a facade
+    // copy (e.g. the Unsafe reference assembly) never wins the bind.
+    private static MethodAnalysisContext? ResolveAsPointer(ApplicationAnalysisContext appContext) =>
+        AsPointerCache.GetOrAdd(appContext, ScanForAsPointer);
+
+    private static MethodAnalysisContext? ScanForAsPointer(ApplicationAnalysisContext appContext)
+    {
+        foreach (var corlibFirst in appContext.AssembliesByName.Values.OrderBy(a =>
+                     a.Name is "mscorlib" or "netstandard" or "System.Private.CoreLib" ? 0 : 1))
+        {
+            if (corlibFirst.GetTypeByFullName("System.Runtime.CompilerServices.Unsafe") is not { } unsafeType)
+                continue;
+            var candidate = unsafeType.Methods.FirstOrDefault(method =>
+                method is { IsStatic: true, Name: "AsPointer" }
+                && method.GenericParameters.Count == 1
+                && method.Parameters.Count == 1
+                && method.Parameters[0].ParameterType is ByRefTypeAnalysisContext
+                && method.ReturnType is PointerTypeAnalysisContext
+                && method.GetExtraData<MethodDefinition>("AsmResolverMethod") != null);
+            if (candidate != null)
+                return candidate;
+        }
+        return null;
+    }
+}
