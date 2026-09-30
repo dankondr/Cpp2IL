@@ -522,7 +522,7 @@ public static class IlGenerator
                 if (storeField is { } field)
                 {
                     if (WholeValueContainerReference(field,
-                            EmittedOperandType(instruction.Operands[1], context)) is { } wholeValue
+                            EmittedOperandType(instruction.Operands[1], context), context) is { } wholeValue
                         && FieldReferenceUsableFrom(wholeValue, context, writeAccess: true))
                     {
                         if (!wholeValue.Field.IsStatic)
@@ -4256,7 +4256,7 @@ public static class IlGenerator
                     break;
                 if (TryEmitInlinedListCount(field, callingContext, method, locals))
                     break;
-                if (WholeValueContainerReference(field, expectedType) is { } wholeValue
+                if (WholeValueContainerReference(field, expectedType, callingContext) is { } wholeValue
                     && FieldReferenceUsableFrom(wholeValue, callingContext))
                 {
                     if (wholeValue.Field.IsStatic)
@@ -4922,6 +4922,29 @@ public static class IlGenerator
             memory.AccessSize);
         return true;
     }
+
+    // Shape-only mirrors of the TryEmit* inlined-member checks: when a leaf is
+    // an enumerator `_current` or list `_size` backing an inline-able getter,
+    // the slot load must reach LoadOperand so those paths can still spell it.
+    private static bool InlinedEnumeratorCurrentCandidate(FieldReference field,
+        MethodAnalysisContext context)
+    {
+        var current = field.Field.Name == "_current" && field.Containers.Count == 0
+            ? field.Field
+            : field.Containers.FirstOrDefault();
+        return current?.Name == "_current"
+            && EmittedLocalType(field.Local, context) is GenericInstanceTypeAnalysisContext enumerator
+            && enumerator.GenericType.Methods.Any(candidate => candidate.Name == "get_Current"
+                && !candidate.IsStatic && candidate.Parameters.Count == 0);
+    }
+
+    private static bool InlinedListCountCandidate(FieldReference field,
+        MethodAnalysisContext context)
+        => field is { Field.Name: "_size", Local: LocalVariable receiver }
+            && EmittedLocalType(receiver, context) is GenericInstanceTypeAnalysisContext list
+            && list.GenericType.FullName == "System.Collections.Generic.List`1"
+            && list.GenericType.Methods.Any(candidate => candidate.Name == "get_Count"
+                && !candidate.IsStatic && candidate.Parameters.Count == 0);
 
     private static bool TryEmitInlinedListCount(FieldReference field, MethodAnalysisContext context,
         MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
@@ -7242,8 +7265,36 @@ public static class IlGenerator
             && NestedValueFieldForContract(container, contract) is { } nested)
             resolved = nested;
         if (resolved is FieldReference nestedField
-            && WholeValueContainerReference(nestedField, contract) is { } wholeValue)
+            && WholeValueContainerReference(nestedField, contract, context) is { } wholeValue)
             resolved = wholeValue;
+        // A field leaf the emitter cannot spell (a private member leaf, or a
+        // container whose member access is denied) still names its referent:
+        // when the referent's own type cannot satisfy the slot contract the
+        // load fails with the referent named as the operand source - `Vector3
+        // operand into a Single slot` - instead of an anonymous slot fill.
+        // The field stays resolved so LoadOperand can still spell it through
+        // its inlined-property and addressed paths; emitting the referent
+        // itself would substitute the whole object for the member the binary
+        // actually moved.
+        if (resolved is FieldReference unspellableField
+            && !FieldReferenceUsableFrom(unspellableField, context)
+            && (WholeValueContainerReference(unspellableField, contract, context) is not { } collapsed
+                || !FieldReferenceUsableFrom(collapsed, context))
+            && !InlinedEnumeratorCurrentCandidate(unspellableField, context)
+            && !InlinedListCountCandidate(unspellableField, context)
+            && unspellableField.Local is LocalVariable referent
+            && (unspellableField.Containers.LastOrDefault(link =>
+                        link.FieldType?.FullName
+                            != unspellableField.Field.FieldType.FullName)
+                    ?.FieldType
+                ?? EmittedOperandType(referent, context, contract)) is { } referentType
+            && referentType.FullName != unspellableField.Field.FieldType.FullName
+            && contract != null
+            && !StackContractSatisfied(referentType, contract, context, convertByRef))
+        {
+            emitted = referentType;
+            return false;
+        }
         // A bare type operand into a value-type slot has no honest emission except
         // runtime handles and native-int class handles, which have real token values.
         if (resolved is TypeAnalysisContext and not RuntimeMethodInfoAnalysisContext
@@ -7421,6 +7472,7 @@ public static class IlGenerator
         }
         return false;
     }
+
 
     // Frame-pointer- and stack-slot-relative stores ([x29 - N], [stack_N + K])
     // write a native frame slot the lifter never promoted to a local. Each
@@ -9217,7 +9269,7 @@ public static class IlGenerator
     }
 
     internal static FieldReference? WholeValueContainerReference(FieldReference field,
-        TypeAnalysisContext? valueType)
+        TypeAnalysisContext? valueType, MethodAnalysisContext? context = null)
     {
         if (valueType == null || field.Containers.Count == 0 || field.Field.Offset != 0)
             return null;

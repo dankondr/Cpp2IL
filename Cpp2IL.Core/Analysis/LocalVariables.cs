@@ -2558,10 +2558,18 @@ public static class LocalVariables
         // A store through a scalar-typed field slot sees the same low-lane view
         // a scalar local does, so a register-view source splits to its lane-0
         // field here too.
-        if (instruction.Operands[0] is FieldReference { Field.FieldType: { } fieldType }
+        if (instruction.Operands[0] is FieldReference { Field.FieldType: { } fieldType } destinationField
             && IsScalarLaneType(fieldType))
         {
-            SplitScalarSources(method, instruction, fieldType);
+            // A lane split would let the emitter collapse the slot into a
+            // member store on a by-ref parameter (`param.x` on `out Vector3
+            // param`): a single proven lane is a legal write, but leaves the
+            // parameter's sibling members unassigned - CS0177 where control
+            // kept the unspellable-leaf diagnostic. Without per-lane
+            // definite-assignment proof for the whole destination, the
+            // destination keeps the diagnostic.
+            if (!ReceiverIsByRefParameter(destinationField.Local, method))
+                SplitScalarSources(method, instruction, fieldType);
             return;
         }
 
@@ -2590,6 +2598,47 @@ public static class LocalVariables
             || !IsScalarLaneType(destination.Type))
             return;
         SplitScalarSources(method, instruction, destination.Type!);
+    }
+
+    // A `ref`/`out` parameter's local is byref-typed and sits in the parameter
+    // list. Before copy coalescing, stores often spell it through a per-edge
+    // alias local (`v25`) that every definition copies from the same source -
+    // the shape ByrefAliasForwarding later rewrites to the parameter.
+    private static bool ReceiverIsByRefParameter(LocalVariable local, MethodAnalysisContext method)
+    {
+        if (local.Type is not ByRefTypeAnalysisContext)
+            return false;
+        var seen = new HashSet<LocalVariable>();
+        for (var current = local; seen.Add(current);)
+        {
+            if (method.ParameterLocals.Any(p => p.Register.Number == current.Register.Number))
+                return true;
+            if (UniformByrefAliasSource(current, method) is not { } source)
+                return false;
+            current = source;
+        }
+        return false;
+    }
+
+    // The single byref local every definition of `local` copies from, when all
+    // of them are Move copies of the same source; null otherwise.
+    private static LocalVariable? UniformByrefAliasSource(LocalVariable local, MethodAnalysisContext method)
+    {
+        LocalVariable? source = null;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction.OpCode != OpCode.Move
+                || instruction.Destination is not LocalVariable destination
+                || !ReferenceEquals(destination, local))
+                continue;
+            if (instruction.Operands.Count < 2
+                || instruction.Operands[1] is not LocalVariable operand
+                || operand.Type is not ByRefTypeAnalysisContext
+                || (source != null && !ReferenceEquals(source, operand)))
+                return null;
+            source = operand;
+        }
+        return source;
     }
 
     private static void SplitScalarSources(MethodAnalysisContext method, Instruction instruction, TypeAnalysisContext laneType)
@@ -2635,6 +2684,13 @@ public static class LocalVariables
             && fieldType.IsValueType && !IsScalarLaneType(fieldType)
             && LaneZeroField(fieldType, laneType) is { } nestedLane)
         {
+            // A read on a receiver that can only spell as raw metadata (an
+            // Il2CppClass/static-fields pointer or metadata handle)
+            // defaults at the slot; projecting a lane off it would just move
+            // the default onto the member, so the operand stays whole for the
+            // emitter's referent-level fallback.
+            if (!ManagedLaneReceiver(fieldRef))
+                return null;
             // The aggregate becomes the innermost container of the nested
             // reference, so it is the hop the emission pass spells `ldflda`
             // on. For a compiler-generated backing field that hop only
@@ -2652,11 +2708,64 @@ public static class LocalVariables
 
         if (operand is not LocalVariable { Type: { } aggregateType } local
             || !aggregateType.IsValueType || IsScalarLaneType(aggregateType)
-            || LaneZeroField(aggregateType, laneType) is not { } lane)
+            || LaneZeroField(aggregateType, laneType) is not { } lane
+            || !LaneValueSpellable(local, method))
             return null;
 
         return new FieldReference(lane, local, 0);
     }
+
+    // The lane read only spells when the host local does. A local whose
+    // definitions all move in an operand the emitter cannot spell (a field
+    // read on a metadata-internal receiver, a raw pointer expression, an
+    // unmanaged load) defaults at the slot; splitting a store's source would
+    // only move the default onto the member (`referent.lane = default(T).lane`),
+    // so the whole operand is kept for the referent-level fallback control
+    // emits. A non-Move definition spells the local directly and reads fine.
+    private static bool LaneValueSpellable(LocalVariable local, MethodAnalysisContext method)
+    {
+        var seen = new HashSet<LocalVariable>();
+        var work = new Stack<LocalVariable>();
+        work.Push(local);
+        while (work.Count > 0)
+        {
+            var current = work.Pop();
+            if (!seen.Add(current))
+                continue;
+            foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            {
+                if (!ReferenceEquals(instruction.Destination, current)
+                    || instruction.OpCode != OpCode.Move
+                    || instruction.Operands.Count < 2)
+                    continue;
+                switch (instruction.Operands[1])
+                {
+                    case LocalVariable copy when ReferenceEquals(copy, current):
+                        break;
+                    case LocalVariable copy:
+                        work.Push(copy);
+                        break;
+                    case FieldReference field when ManagedLaneReceiver(field):
+                    case Vector128Literal:
+                        break;
+                    default:
+                        return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // A field read spells only when its receiver does. Reads through metadata
+    // internals (the Il2CppClass/static-fields block or a runtime metadata
+    // handle) and through raw pointers spell as IntPtr, which no member access
+    // can name.
+    private static bool ManagedLaneReceiver(FieldReference field)
+        => field.Local?.Type is not (StaticFieldStorageTypeAnalysisContext
+            or RuntimeClassTypeAnalysisContext
+            or RuntimeMethodInfoAnalysisContext
+            or RuntimeFieldInfoAnalysisContext
+            or PointerTypeAnalysisContext);
 
     // A ldfld/stfld or instance-call receiver emits `&host` for a value-type
     // host (ldloca on a host-typed local) or a host-assignable reference

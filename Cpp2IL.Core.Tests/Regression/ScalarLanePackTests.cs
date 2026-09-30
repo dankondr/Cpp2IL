@@ -176,4 +176,125 @@ public class ScalarLanePackTests
                 () => string.Join("\n", il.Select(i => i.ToString())));
         });
     }
+
+    [Test]
+    public void OutParameterLaneStoreKeepsDiagnostic()
+    {
+        // `str s0, [result.x]` writes only lane x of an `out Vector3` referent.
+        // Splitting the vector source to lane x would let the emitter collapse
+        // the unspellable leaf into a partial member write `result.x = vec.x` -
+        // legal C# only when every lane of `result` ends up assigned, otherwise
+        // CS0177 control never emitted. The destination stays unproven and keeps
+        // control's `Inaccessible field store` diagnostic.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = Vector3(app);
+        var module = new ModuleDefinition("LanePack.dll");
+        SeedCorLibTypes(app, module, vector, app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemSingleType, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemVoidType);
+        Echo(app, module, vector);
+        var fields = vector.Fields.OfType<InjectedFieldAnalysisContext>().ToList();
+        var mValue = new InjectedFieldAnalysisContext("m_value",
+            app.SystemTypes.SystemSingleType, R.FieldAttributes.Private,
+            app.SystemTypes.SystemSingleType, 0);
+        var outLocal = new LocalVariable("result", new Register(0, "X0"),
+            new ByRefTypeAnalysisContext(vector));
+        var vectorLocal = new LocalVariable("vec", new Register(8, "X8"), vector);
+
+        var callerType = new InjectedTypeAnalysisContext(app.AssembliesByName["UnityEngine.CoreModule"],
+            "Tests", "OutStore", app.SystemTypes.SystemObjectType,
+            R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var caller = callerType.InjectMethodContext("Run", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public | R.MethodAttributes.Static,
+            new ByRefTypeAnalysisContext(vector));
+        caller.Parameters[0].Attributes = R.ParameterAttributes.Out;
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move,
+                new FieldReference(mValue, outLocal, 0, [fields[0]]), vectorLocal),
+            new Instruction(1, OpCode.Return)]);
+        caller.Locals = [outLocal, vectorLocal];
+        caller.ParameterOperands = [new Register(0, "X0")];
+        caller.AnalysisWarnings = [];
+        caller.DominatorInfo = new DominatorInfo(caller.ControlFlowGraph);
+
+        var type = new TypeDefinition("Tests", "OutStore", TypeAttributes.Public | TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);
+        var vectorSig = vector.GetExtraData<TypeDefinition>("AsmResolverType")!.ToTypeSignature();
+        var method = new MethodDefinition("Run",
+            MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.HideBySig,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void,
+                [vectorSig.MakeByReferenceType()]));
+        type.Methods.Add(method);
+
+        LocalVariables.CreateAll(caller);
+        // CreateAll rebuilds ParameterLocals from registers the CFG reaches; in
+        // a real method the out parameter's local is named back into it.
+        caller.ParameterLocals = [outLocal];
+        LocalVariables.ResolveTypesAndFields(caller);
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr && i.Operand is string text
+                    && text.Contains("Inaccessible field store")), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Throw), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stfld
+                    && (i.Operand as IFieldDescriptor)?.Name?.ToString() == "x"), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+        });
+    }
+
+    [Test]
+    public void UnspellableLaneLeafKeepsNamedConversion()
+    {
+        // `fmov s5, v.x` where the `x` member leaf cannot be spelled (a private
+        // storage member under a likewise private container): the Single slot
+        // still gets its default, but the note names the operand conversion -
+        // "No legal conversion from UnityEngine.Vector3 operand to
+        // System.Single slot" - instead of an anonymous slot fill.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = Vector3(app);
+        var module = new ModuleDefinition("LanePack.dll");
+        SeedCorLibTypes(app, module, vector, app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemSingleType, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemVoidType);
+        Echo(app, module, vector);
+        var container = new InjectedFieldAnalysisContext("x",
+            app.SystemTypes.SystemSingleType, R.FieldAttributes.Private, vector, 0);
+        var mValue = new InjectedFieldAnalysisContext("m_value",
+            app.SystemTypes.SystemSingleType, R.FieldAttributes.Private,
+            app.SystemTypes.SystemSingleType, 0);
+        var vecLocal = new LocalVariable("vec", new Register(0, "X8"), vector);
+        var dstLocal = new LocalVariable("dst", new Register(0, "V0"),
+            app.SystemTypes.SystemSingleType);
+
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, dstLocal, new FieldReference(mValue, vecLocal, 0, [container])),
+            new(1, OpCode.Return)], [vecLocal, dstLocal]);
+        caller.DominatorInfo = new DominatorInfo(caller.ControlFlowGraph!);
+
+        LocalVariables.CreateAll(caller);
+        LocalVariables.ResolveTypesAndFields(caller);
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr && i.Operand is string text
+                    && text.Contains("No legal conversion from UnityEngine.Vector3 operand"
+                        + " to System.Single slot")), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr && i.Operand is string text
+                    && text.Contains("Operand slot of type System.Single filled")), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+        });
+    }
 }
