@@ -154,6 +154,30 @@ public class IntegerArithmeticTypeTests
     }
 
     [Test]
+    public void IntegerResultTypesItsUntypedDivisor()
+    {
+        // count = 0; count = count + 1; quotient (Int32) = total (Int32) / count: the counter
+        // meets only immediates and this division, which fixes it to Int32.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, []);
+        var count = new LocalVariable("count", new Register(null, "count"));
+        var total = new LocalVariable("total", new Register(null, "total")) { Type = app.SystemTypes.SystemInt32Type };
+        var quotient = new LocalVariable("quotient", new Register(null, "quotient")) { Type = app.SystemTypes.SystemInt32Type };
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, count, new Immediate(0)),
+            new(1, OpCode.Add, count, count, new Immediate(1)),
+            new(2, OpCode.Divide, quotient, total, count),
+            new(3, OpCode.Return, quotient)]);
+        method.Locals = [count, total, quotient];
+        method.ParameterLocals = [];
+
+        LocalVariables.ResolveLateGeneratedTypes(method);
+
+        Assert.That(count.Type, Is.SameAs(app.SystemTypes.SystemInt32Type));
+    }
+
+    [Test]
     public void LateArithmeticRecoveryPreservesInt32LoopCounter()
     {
         var app = Cpp2IlApi.CurrentAppContext!;

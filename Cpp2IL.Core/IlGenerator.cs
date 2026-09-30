@@ -394,6 +394,24 @@ public static class IlGenerator
     private static string Diagnostic(string message) 
         => message.Length <= 250 ? message : message[..250] + "…";
 
+    // A load off a class pointer that matches no recovered idiom still gets its field named in the
+    // diagnostic, so the string names `initialized` or `vtable slot n` rather than a raw offset.
+    private static string ClassStructureReadName(MemoryOperand memory, MethodAnalysisContext? callingContext)
+    {
+        if (callingContext == null
+            || memory is not { Index: null, Scale: 0, Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext } }
+            || memory.Addend is < 0 or > uint.MaxValue)
+            return "";
+
+        var metadataVersion = callingContext.AppContext.MetadataVersion;
+        var is32Bit = callingContext.AppContext.Binary.is32Bit;
+        if (Il2CppClassUsefulOffsets.TryGetField((uint)memory.Addend, metadataVersion, is32Bit, out var field, out var name))
+            return $" ({name})";
+        return Il2CppClassUsefulOffsets.GetVTableSlot(memory.Addend, metadataVersion, is32Bit) is { } slot
+            ? $" (vtable slot {slot})"
+            : "";
+    }
+
     // Replaces a call the verifier could never resolve with the standard diagnostic stub:
     // note the unnameable callee, then throw. The ISIL operands are never loaded, so the
     // stack stays balanced and the destination (if any) keeps its default.
@@ -4433,12 +4451,13 @@ public static class IlGenerator
                     });
                     break;
                 }
-                instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand));
+                var readName = ClassStructureReadName(memory, callingContext);
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand + readName));
                 instructions.Add(CilOpCodes.Call, writeLine);
                 var exceptionCtor = module.CorLibTypeFactory.CorLibScope
                     .CreateTypeReference("System", "Exception")
                     .CreateMemberReference(".ctor", MethodSignature.CreateInstance(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.String]));
-                instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand));
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand + readName));
                 instructions.Add(CilOpCodes.Newobj, exceptionCtor);
                 instructions.Add(CilOpCodes.Throw);
                 return false;
@@ -9912,10 +9931,22 @@ public static class IlGenerator
         IOperand content, IOperand count, MethodAnalysisContext context, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
     {
+        // `&local.first` of a struct local is `&local` when that makes the two sides one type:
+        // value-type field addresses are canonicalized to the first field upstream.
+        if (instruction.OpCode is OpCode.MemoryCopy or OpCode.MemoryMove)
+        {
+            destination = WholeStorage(destination, BlockCopyPointee(content, context));
+            content = WholeStorage(content, BlockCopyPointee(destination, context));
+        }
+        // A fill that covers the whole struct local clears the local, not its first field.
+        else if (count is Immediate { Value: > 0 } fillCount
+                 && destination is AddressOf { Target: FieldReference { Local.Type: { IsValueType: true } filled } }
+                 && ManagedSize(filled, context) == fillCount.Value)
+            destination = WholeStorage(destination, filled);
         if (count is not Immediate { Value: > 0 } byteCount
             || BlockCopyPointee(destination, context) is not { IsValueType: true } pointee
-            || pointee is GenericInstanceTypeAnalysisContext or GenericParameterTypeAnalysisContext
-            || pointee.Definition?.Size is not { } pointeeSize
+            || pointee is GenericParameterTypeAnalysisContext
+            || ManagedSize(pointee, context) is not { } pointeeSize
             || byteCount.Value != pointeeSize
             || !TypeTokenUsableFrom(pointee, context))
             return false;
@@ -9939,6 +9970,24 @@ public static class IlGenerator
                 return false;
         }
     }
+
+    // The managed size (instance size less the object header), not the marshaled native size,
+    // which is -1 for a struct holding references. A generic instance has no metadata size.
+    private static long? ManagedSize(TypeAnalysisContext type, MethodAnalysisContext context)
+    {
+        var pointerSize = context.AppContext.Binary.PointerSizeBytes;
+        if (type is not GenericInstanceTypeAnalysisContext && TypeSizes.UnboxedSize(type, pointerSize) is > 0 and var exact)
+            return exact;
+        return TypeSizes.LaidOutSize(type, pointerSize) is > 0 and var laidOut ? laidOut : null;
+    }
+
+    private static IOperand WholeStorage(IOperand operand, TypeAnalysisContext? other)
+        => other != null
+           && operand is AddressOf { Target: FieldReference { Offset: 0, Containers.Count: 0, Field.IsStatic: false,
+               Local: { Type: { IsValueType: true } whole } local } }
+           && ThisConstructorCallPlan.SameTypeIdentity(whole, other)
+            ? new AddressOf(local)
+            : operand;
 
     // The element type a block-op address provably holds when it emits `&T`:
     // only a managed pointer carries a referent the type system can name - a

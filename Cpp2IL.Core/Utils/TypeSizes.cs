@@ -65,4 +65,49 @@ public static class TypeSizes
         active.Remove(type);
         return total;
     }
+
+    // sizeof(T) of a value type as il2cpp lays it out: C struct rules, each field at its
+    // natural alignment, the whole padded to the widest one. Metadata carries the exact size of
+    // a closed type; a generic instance has none, so its fields (with the arguments bound) are
+    // laid out here. 0 when any field's size is unknown.
+    public static long LaidOutSize(TypeAnalysisContext type, int pointerSize) => Layout(type, pointerSize, []).Size;
+
+    private static (long Size, long Alignment) Layout(TypeAnalysisContext type, int pointerSize,
+        HashSet<TypeAnalysisContext> active)
+    {
+        if (!type.IsValueType)
+            return (pointerSize, pointerSize);
+        var primitive = MinimumUnboxedSize(type, pointerSize) is var minimum && type.FullName switch
+        {
+            "System.Boolean" or "System.Byte" or "System.SByte" or "System.Char" or "System.Int16" or "System.UInt16"
+                or "System.Int32" or "System.UInt32" or "System.Single" or "System.Int64" or "System.UInt64"
+                or "System.Double" or "System.IntPtr" or "System.UIntPtr" => true,
+            _ => false,
+        };
+        if (primitive)
+            return (minimum, minimum);
+        if (!active.Add(type))
+            return (0, 1);
+
+        var fields = type is GenericInstanceTypeAnalysisContext instance
+            ? instance.GenericType.Fields.Select(field => (FieldAnalysisContext)new ConcreteGenericFieldAnalysisContext(field, instance))
+            : type.Fields;
+        long offset = 0, alignment = 1;
+        foreach (var field in fields.Where(field => !field.IsStatic))
+        {
+            var (size, fieldAlignment) = Layout(field.FieldType, pointerSize, active);
+            if (size == 0)
+            {
+                active.Remove(type);
+                return (0, 1);
+            }
+            offset = (offset + fieldAlignment - 1) / fieldAlignment * fieldAlignment + size;
+            alignment = System.Math.Max(alignment, fieldAlignment);
+        }
+        active.Remove(type);
+        var laidOut = offset == 0 ? 1 : (offset + alignment - 1) / alignment * alignment;
+        // A closed type's metadata size is authoritative; the layout only fills in its alignment.
+        return (type is GenericInstanceTypeAnalysisContext ? laidOut : UnboxedSize(type, pointerSize) is > 0 and var exact ? exact : laidOut,
+            alignment);
+    }
 }

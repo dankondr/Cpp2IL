@@ -654,7 +654,7 @@ public class SsaForm
     /// Inserts <paramref name="moves"/> at the end of <paramref name="block"/>, but before any
     /// trailing control-flow instruction, so the copies execute on the outgoing edge.
     /// </summary>
-    private static void InsertBeforeTerminator(Block block, List<Instruction> moves)
+    internal static void InsertBeforeTerminator(Block block, List<Instruction> moves)
     {
         if (moves.Count == 0)
             return;

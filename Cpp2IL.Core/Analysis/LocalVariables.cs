@@ -332,6 +332,7 @@ public static class LocalVariables
             changed |= MetadataResolver.ResolveVirtualCalls(method);
             changed |= PropagateFromCallParameters(method, allowCanonicalCallTypes);
             changed |= AggregateResultLanes.Run(method);
+            changed |= MetadataResolver.LoadThroughMergedAddresses(method);
             changed |= MetadataResolver.ResolveFieldOffsets(method);
             changed |= ResolveSharpenedFieldOwners(method);
             changed |= RgctxResolver.Run(method);
@@ -1886,6 +1887,23 @@ public static class LocalVariables
                 destination.Type = binopVectorType;
                 return true;
             }
+        }
+
+        // `Int32 = Int32 op x`: an integer result whose other operand has that same type fixes an
+        // untyped operand to it (the native op ran at that width). This is what types a loop
+        // counter that only ever meets immediates and a typed division.
+        if (instruction.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
+            && IntegerResultType(destination, method) is { } resultType)
+        {
+            var typed = false;
+            if (left is LocalVariable { Type: null } untypedLeft && !ReferenceEquals(untypedLeft, destination)
+                && (IntegerResultType(right, method) ?? IntegerImmediateType(right, method)) == resultType)
+                typed |= SetTypeIfUnknown(untypedLeft, resultType);
+            if (right is LocalVariable { Type: null } untypedRight && !ReferenceEquals(untypedRight, destination)
+                && (IntegerResultType(left, method) ?? IntegerImmediateType(left, method)) == resultType)
+                typed |= SetTypeIfUnknown(untypedRight, resultType);
+            if (typed)
+                return true;
         }
 
         if (destination.Type != null)

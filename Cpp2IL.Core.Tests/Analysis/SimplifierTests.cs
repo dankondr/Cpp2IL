@@ -69,6 +69,109 @@ public class SimplifierTests
         Assert.That(add.Operands[1], Is.InstanceOf<FieldReference>());
     }
 
+    [Test]
+    public void KeepsTheCopyThatCarriesAPointerIntoTheNextIteration()
+    {
+        // for (; i < n; i++) { x = *p; p += 4; }: lowered out of SSA, the step is `q = p + 4;
+        // p = q` at the bottom of the loop, and `[p]` at its top reads that copy on the next
+        // iteration. Dropping it would read the first element every time.
+        var p = new LocalVariable("p", new Register(null, "p"));
+        var q = new LocalVariable("q", new Register(null, "q"));
+        var x = new LocalVariable("x", new Register(null, "x"));
+        var i = new LocalVariable("i", new Register(null, "i"));
+        var n = new LocalVariable("n", new Register(null, "n"));
+        var c = new LocalVariable("c", new Register(null, "c"));
+        var top = new Instruction(2, OpCode.Move, x, new MemoryOperand(p, null, 0, 0, 4));
+        var step = new Instruction(4, OpCode.Move, p, q);
+        var graph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, i, Imm(0)),
+            new Instruction(1, OpCode.CallVoid, Str("Consume"), p),
+            top,
+            new Instruction(3, OpCode.Add, q, p, Imm(4)),
+            step,
+            new Instruction(5, OpCode.Add, i, i, Imm(1)),
+            new Instruction(6, OpCode.CheckLess, c, i, n),
+            new Instruction(7, OpCode.ConditionalJump, top, c),
+            new Instruction(8, OpCode.Return, x)
+        ]);
+
+        Simplifier.Simplify(CreateMethod(graph, p, q, x, i, n, c));
+
+        Assert.That(graph.Blocks.SelectMany(b => b.Instructions)
+            .Count(instruction => ReferenceEquals(instruction.Destination, p)), Is.EqualTo(1),
+            () => string.Join("\n", graph.Blocks.SelectMany(b => b.Instructions)));
+    }
+
+    [Test]
+    public void DropsALoopCopyThatTheNextIterationOverwritesFirst()
+    {
+        // loop { a = Next(y); Consume(a); q = a + 4; a = q; }: the copy at the bottom is
+        // overwritten at the top before anything reads it, so it is dead.
+        var a = new LocalVariable("a", new Register(null, "a"));
+        var q = new LocalVariable("q", new Register(null, "q"));
+        var y = new LocalVariable("y", new Register(null, "y"));
+        var c = new LocalVariable("c", new Register(null, "c"));
+        var top = new Instruction(1, OpCode.Call, Str("Next"), a, y);
+        var copy = new Instruction(4, OpCode.Move, a, q);
+        var graph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.CallVoid, Str("Enter"), y),
+            top,
+            new Instruction(2, OpCode.CallVoid, Str("Consume"), a),
+            new Instruction(3, OpCode.Add, q, a, Imm(4)),
+            copy,
+            new Instruction(5, OpCode.Call, Str("More"), c),
+            new Instruction(6, OpCode.ConditionalJump, top, c),
+            new Instruction(7, OpCode.Return)
+        ]);
+
+        Simplifier.Simplify(CreateMethod(graph, a, q, y, c));
+
+        Assert.That(graph.Blocks.SelectMany(b => b.Instructions).Contains(copy), Is.False,
+            () => string.Join("\n", graph.Blocks.SelectMany(b => b.Instructions)));
+    }
+
+    [Test]
+    public void DoesNotForwardALoadPastAWriteOfItsBase()
+    {
+        // `LDR W17, [X15], #4; ADD W0, W17, W0`: x = [p]; p = p + 4; sum = sum + x. Forwarding
+        // [p] into the add would read the next element.
+        var p = new LocalVariable("p", new Register(null, "p"));
+        var x = new LocalVariable("x", new Register(null, "x"));
+        var sum = new LocalVariable("sum", new Register(null, "sum"));
+        var add = new Instruction(2, OpCode.Add, sum, sum, x);
+        var graph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, x, new MemoryOperand(p, null, 0, 0, 4)),
+            new Instruction(1, OpCode.Add, p, p, Imm(4)),
+            add,
+            new Instruction(3, OpCode.Return, sum)
+        ]);
+
+        Simplifier.Simplify(CreateMethod(graph, p, x, sum));
+
+        Assert.That(add.Operands[2], Is.Not.InstanceOf<MemoryOperand>());
+    }
+
+    [Test]
+    public void DoesNotForwardAFieldReadPastAStoreToMemory()
+    {
+        // x = owner.value; owner.value = 5; return x: the read is the value before the store.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new LocalVariable("owner", new Register(null, "owner"));
+        var x = new LocalVariable("x", new Register(null, "x"));
+        var field = new InjectedFieldAnalysisContext("value", app.SystemTypes.SystemInt32Type,
+            System.Reflection.FieldAttributes.Public, app.SystemTypes.SystemObjectType);
+        var ret = new Instruction(2, OpCode.Return, x);
+        var graph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, x, new FieldReference(field, owner, 16)),
+            new Instruction(1, OpCode.Move, new FieldReference(field, owner, 16), Imm(5)),
+            ret
+        ]);
+
+        Simplifier.Simplify(CreateMethod(graph, owner, x));
+
+        Assert.That(ret.Operands[0], Is.SameAs(x));
+    }
+
     private static MethodAnalysisContext CreateMethod(ISILControlFlowGraph graph, params LocalVariable[] locals)
     {
         var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));

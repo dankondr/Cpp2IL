@@ -26,30 +26,10 @@ public static class InterfaceDispatchRecovery
         if (changed)
             (definitions, homeBlock) = BuildMaps(cfg);
 
+        var index = new DefUseIndex(cfg);
         var lookups = new List<Match>();
 
-        foreach (var block in cfg.Blocks.ToList())
-        {
-            foreach (var instruction in block.Instructions.ToList())
-            {
-                if (instruction.OpCode is not (OpCode.IndirectCall or OpCode.IndirectJump))
-                    continue;
-
-                if (MatchDispatch(method, instruction, definitions, homeBlock) is { } match)
-                {
-                    RewriteDispatch(method, instruction, block, match, definitions);
-                    lookups.Add(match);
-                    changed = true;
-                    continue;
-                }
-
-                if (MatchVirtualDispatch(method, instruction, definitions, homeBlock) is { } virtualMatch)
-                {
-                    RewriteVirtualDispatch(method, instruction, block, virtualMatch, definitions);
-                    changed = true;
-                }
-            }
-        }
+        MatchAndRewrite(method, cfg, index, definitions, homeBlock, lookups, ref changed);
 
         if (changed)
         {
@@ -61,23 +41,69 @@ public static class InterfaceDispatchRecovery
             DeadCodeEliminator.Run(method);
         }
 
-        return lookups.Count == 0 ? null : () =>
+        // Class-pointer types (Il2CppClass<K>) are seeded after this pass runs, so idioms that
+        // match on the interface/type operand may only become recognizable later - retry the
+        // matchers in the deferred finish step before giving up on a lookup.
+        return () =>
         {
-            TrimResolvedCallArgumentsUsingLookups(cfg, lookups, definitions);
+            var (lateDefinitions, lateHomeBlock) = BuildMaps(cfg);
+            var lateIndex = new DefUseIndex(cfg);
+            var lateChanged = false;
+            MatchAndRewrite(method, cfg, lateIndex, lateDefinitions, lateHomeBlock, lookups, ref lateChanged);
+            if (lateChanged)
+            {
+                DeadCodeEliminator.Run(method);
+                foreach (var lookup in lookups)
+                    TryExciseLookup(cfg, lookup, lateDefinitions, lateHomeBlock);
+                DeadCodeEliminator.Run(method);
+            }
+
+            TrimResolvedCallArgumentsUsingLookups(cfg, lookups, lateDefinitions);
             DeadCodeEliminator.Run(method);
 
             foreach (var lookup in lookups)
-                TryExciseLookup(cfg, lookup, definitions, homeBlock);
+                TryExciseLookup(cfg, lookup, lateDefinitions, lateHomeBlock);
 
             DeadCodeEliminator.Run(method);
         };
     }
 
+    private static void MatchAndRewrite(MethodAnalysisContext method, ISILControlFlowGraph cfg,
+        DefUseIndex index, Dictionary<LocalVariable, Instruction> definitions,
+        Dictionary<Instruction, Block> homeBlock, List<Match> lookups, ref bool changed)
+    {
+        foreach (var block in cfg.Blocks.ToList())
+        {
+            foreach (var instruction in block.Instructions.ToList())
+            {
+                if (instruction.OpCode is not (OpCode.IndirectCall or OpCode.IndirectJump))
+                    continue;
+
+                if (MatchDispatch(method, instruction, index, definitions, homeBlock) is { } match)
+                {
+                    RewriteDispatch(method, instruction, block, match, definitions);
+                    lookups.Add(match);
+                    changed = true;
+                    continue;
+                }
+
+                if (MatchVirtualDispatch(method, instruction, definitions, homeBlock) is { } virtualMatch)
+                {
+                    RewriteVirtualDispatch(method, instruction, block, virtualMatch, definitions);
+                    changed = true;
+                    continue;
+                }
+
+                if (instruction.OpCode == OpCode.IndirectJump
+                    && TryRewriteMergedTailDispatch(method, instruction, index, definitions, homeBlock))
+                    changed = true;
+            }
+        }
+    }
+
     private static void TrimResolvedCallArgumentsUsingLookups(ISILControlFlowGraph cfg,
         List<Match> lookups, Dictionary<LocalVariable, Instruction> definitions)
     {
-        var invokeDataPhis = lookups.Select(lookup => lookup.InvokeDataPhi).ToHashSet();
-
         foreach (var call in cfg.Instructions)
         {
             if (!call.IsCall || call.Operands[0] is not MethodAnalysisContext called)
@@ -90,8 +116,7 @@ public static class InterfaceDispatchRecovery
                 if (call.Operands[i] is not LocalVariable argument
                     || ChaseCopies(definitions, argument) is not
                         { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: LocalVariable invokeData }] }
-                    || ChaseCopies(definitions, invokeData) is not { } phi
-                    || !invokeDataPhis.Contains(phi))
+                    || !lookups.Any(lookup => lookup.IsMergeOperand(definitions, invokeData)))
                     continue;
 
                 call.RemoveOperandAt(i);
@@ -122,22 +147,40 @@ public static class InterfaceDispatchRecovery
     private const long VTableOffset32 = 0xC0;
     private const int InvokeDataShift = 4; // sizeof(VirtualInvokeData) == 16
 
+    // The VirtualInvokeData pointer arriving at the dispatch: an explicit phi (whose source defs
+    // are MergeDefs), or an implicit phi - several defs of the same local reaching the use on
+    // different edges after SSA removal.
     private record struct Match(
         MethodAnalysisContext Resolved,
-        Instruction InvokeDataPhi,
+        Instruction? InvokeDataPhi,
         Block Merge,
         Instruction SlowCall,
         LocalVariable KlassLocal,
         Instruction? GenericVirtualHelper = null,
         RuntimeMethodInfoAnalysisContext? ConcreteMethodInfo = null,
-        int? OutParamBuffer = null);
+        int? OutParamBuffer = null,
+        HashSet<Instruction>? MergeDefs = null)
+    {
+        // An operand's def-chain leads to the merged invokeData pointer when it ends at the phi
+        // itself or at one of its per-edge sources.
+        public bool IsMergeOperand(Dictionary<LocalVariable, Instruction> definitions, IOperand operand)
+        {
+            if (operand is not LocalVariable local
+                || ChaseCopies(definitions, local) is not { } definition)
+                return false;
+            return ReferenceEquals(definition, InvokeDataPhi)
+                || MergeDefs != null && MergeDefs.Contains(definition);
+        }
+    }
 
     private record struct GenericVirtualTarget(
         MemoryOperand TargetLoad,
         Instruction Helper,
         RuntimeMethodInfoAnalysisContext MethodInfo);
 
-    private static Match? MatchDispatch(MethodAnalysisContext method, Instruction dispatch, Dictionary<LocalVariable, Instruction> definitions, Dictionary<Instruction, Block> homeBlock)
+    private static Match? MatchDispatch(MethodAnalysisContext method, Instruction dispatch,
+        DefUseIndex index, Dictionary<LocalVariable, Instruction> definitions,
+        Dictionary<Instruction, Block> homeBlock)
     {
         // the call target loads VirtualInvokeData::methodPtr, separately or folded in
         var rawTargetLoad = dispatch.Operands[0] switch
@@ -151,29 +194,48 @@ public static class InterfaceDispatchRecovery
             : null;
         var targetLoad = genericTarget?.TargetLoad ?? rawTargetLoad;
 
-        if (targetLoad is not { Index: null, Scale: 0, Addend: 0, Base: LocalVariable invokeData }
-            || ChaseCopies(definitions, invokeData) is not { OpCode: OpCode.Phi, Operands: [_, LocalVariable first, LocalVariable second] } phi)
-            return MatchOutParamDispatch(method, dispatch, definitions, homeBlock);
+        if (targetLoad is not { Index: null, Scale: 0, Addend: 0, Base: LocalVariable invokeData })
+            return MatchOutParamDispatch(method, dispatch, definitions, homeBlock, index);
 
-        return MatchLookupPhi(method, phi, first, second, genericTarget?.MethodInfo,
-            genericTarget?.Helper, null, definitions, homeBlock);
+        // The invokeData pointer may reach the dispatch through an explicit phi or, after SSA
+        // removal, through several defs of the same local on different predecessor edges.
+        Instruction? phi = null;
+        List<Instruction> mergeDefs;
+        if (ChaseCopies(definitions, invokeData) is
+            { OpCode: OpCode.Phi, Operands: [_, LocalVariable first, LocalVariable second] } found)
+        {
+            phi = found;
+            mergeDefs = [found];
+            if (ChaseCopies(definitions, first) is { } firstDef)
+                mergeDefs.Add(firstDef);
+            if (ChaseCopies(definitions, second) is { } secondDef)
+                mergeDefs.Add(secondDef);
+        }
+        else if (index.MergeSources(invokeData, dispatch) is { } sources
+                 && sources.Select(source => source.Def).ToList() is { Count: >= 2 } defs)
+        {
+            mergeDefs = defs;
+        }
+        else
+            return MatchOutParamDispatch(method, dispatch, definitions, homeBlock, index);
+
+        return MatchLookupPhi(method, phi, mergeDefs, genericTarget?.MethodInfo,
+            genericTarget?.Helper, null, definitions, homeBlock, dispatch, index);
     }
 
-    // Everything after the invokeData phi: one side must be the unresolved slow-path call, the
+    // Everything after the invokeData merge: one side must be the unresolved slow-path call, the
     // other the vtable entry chain. With genericMethodInfo the resolved method comes from the
     // concrete RuntimeMethod* argument; otherwise the constant slot indexes the interface.
-    private static Match? MatchLookupPhi(MethodAnalysisContext method, Instruction phi,
-        LocalVariable first, LocalVariable second,
+    private static Match? MatchLookupPhi(MethodAnalysisContext method, Instruction? phi,
+        List<Instruction> mergeDefs,
         RuntimeMethodInfoAnalysisContext? genericMethodInfo, Instruction? genericHelper,
         int? outParamBuffer,
-        Dictionary<LocalVariable, Instruction> definitions, Dictionary<Instruction, Block> homeBlock)
+        Dictionary<LocalVariable, Instruction> definitions, Dictionary<Instruction, Block> homeBlock,
+        Instruction dispatch, DefUseIndex index)
     {
-        var firstDefinition = ChaseCopies(definitions, first);
-        var secondDefinition = ChaseCopies(definitions, second);
-        var slowCall = firstDefinition is { OpCode: OpCode.Call }
-            ? firstDefinition
-            : secondDefinition is { OpCode: OpCode.Call } ? secondDefinition : null;
-        var vtableEntry = ReferenceEquals(slowCall, firstDefinition) ? secondDefinition : firstDefinition;
+        var slowCall = mergeDefs.FirstOrDefault(def => def.OpCode == OpCode.Call);
+        var vtableEntry = mergeDefs.FirstOrDefault(def =>
+            !ReferenceEquals(def, slowCall) && !ReferenceEquals(def, phi));
 
         // slow path is GetInterfaceInvokeDataFromVTableSlowPath(obj, interface, slot), never resolved
         if (slowCall is not { Operands: [Immediate, _, _, var interfaceOperand, var slotOperand, ..] })
@@ -218,7 +280,7 @@ public static class InterfaceDispatchRecovery
             if (!slotProven
                 || !SameDeclaringType(declaringInterface, generic.RepresentedMethod.DeclaringType)
                 || MatchVTableEntryChain(definitions, vtableEntry,
-                    slotImmediate is { } immediate ? immediate : slotOperand) is not { } genericKlass)
+                    slotImmediate is { } immediate ? immediate : slotOperand, index) is not { } genericKlass)
                 return null;
 
             resolved = generic.RepresentedMethod;
@@ -231,7 +293,7 @@ public static class InterfaceDispatchRecovery
 
             var slot = (int)concreteSlot.Value;
             // fast path computes klass + vtableOffset + ((entryOffset + slot) << 4) (the +slot folds away for slot 0)
-            if (MatchVTableEntryChain(definitions, vtableEntry, slot) is not { } concreteKlass
+            if (MatchVTableEntryChain(definitions, vtableEntry, new Immediate(slot), index) is not { } concreteKlass
                 || ResolveInterfaceSlot(declaringInterface, slot) is not { } concreteMethod)
                 return null;
 
@@ -239,11 +301,12 @@ public static class InterfaceDispatchRecovery
             klassLocal = concreteKlass;
         }
 
-        if (!homeBlock.TryGetValue(phi, out var merge))
+        if (!homeBlock.TryGetValue(phi ?? dispatch, out var merge))
             return null;
 
         return new Match(resolved, phi, merge, slowCall, klassLocal,
-            genericHelper, genericMethodInfo, outParamBuffer);
+            genericHelper, genericMethodInfo, outParamBuffer,
+            MergeDefs: mergeDefs.ToHashSet());
     }
 
     private static GenericVirtualTarget? MatchGenericVirtualTarget(MethodAnalysisContext method,
@@ -284,7 +347,8 @@ public static class InterfaceDispatchRecovery
     // caller stack slot, so the target load is stack[n] (or [bufferPointer] where
     // bufferPointer = &stack[n]) - never the invokeData phi the pointer form needs.
     private static Match? MatchOutParamDispatch(MethodAnalysisContext method, Instruction dispatch,
-        Dictionary<LocalVariable, Instruction> definitions, Dictionary<Instruction, Block> homeBlock)
+        Dictionary<LocalVariable, Instruction> definitions, Dictionary<Instruction, Block> homeBlock,
+        DefUseIndex index)
     {
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
         if (dispatch.Operands.Count == 0)
@@ -338,8 +402,14 @@ public static class InterfaceDispatchRecovery
                 { OpCode: OpCode.Phi, Operands: [_, LocalVariable first, LocalVariable second] } phi)
                 continue;
 
-            var matched = MatchLookupPhi(method, phi, first, second, methodInfo, candidate,
-                slotIndex, definitions, homeBlock);
+            var mergeDefs = new List<Instruction> { phi };
+            if (ChaseCopies(definitions, first) is { } firstDef)
+                mergeDefs.Add(firstDef);
+            if (ChaseCopies(definitions, second) is { } secondDef)
+                mergeDefs.Add(secondDef);
+
+            var matched = MatchLookupPhi(method, phi, mergeDefs, methodInfo, candidate,
+                slotIndex, definitions, homeBlock, dispatch, index);
             if (matched == null)
                 continue;
 
@@ -451,8 +521,33 @@ public static class InterfaceDispatchRecovery
     // klass = [receiver] leaf, exactly one `<< sizeof(VirtualInvokeData)` leaf, and immediates
     // summing to vtableOffset, or to vtableOffset + slot*16 when the slot provably folded there.
     private static LocalVariable? MatchVTableEntryChain(Dictionary<LocalVariable, Instruction> definitions,
-        Instruction? vtableEntry, IOperand slotOperand)
+        Instruction? vtableEntry, IOperand slotOperand, DefUseIndex? index = null)
     {
+        // Def of `local` live at `use`: reaching-def aware so the same register-versioned name can
+        // hold the chain on one edge while an unrelated def dominates elsewhere.
+        Instruction? ResolveDef(LocalVariable local, Instruction? use)
+        {
+            if (index == null || use == null)
+                return ChaseCopies(definitions, local);
+
+            var visited = new HashSet<LocalVariable>();
+            var current = local;
+            var at = use;
+            while (visited.Add(current))
+            {
+                if (index.ReachingDef(current, at) is not { } definition)
+                    return null;
+                if (definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
+                {
+                    current = source;
+                    at = definition;
+                    continue;
+                }
+                return definition;
+            }
+            return null;
+        }
+
         // the byte size the slot contributes when it folds into a constant addend
         long? slotBytes = slotOperand switch
         {
@@ -466,18 +561,19 @@ public static class InterfaceDispatchRecovery
         var constant = 0L;
         LocalVariable? klassCandidate = null;
         LocalVariable? indexOperand = null;
+        Instruction? indexUse = null;
         var leaves = 0;
-        var pending = new Stack<IOperand>();
+        var pending = new Stack<(IOperand Operand, Instruction Use)>();
 
         if (vtableEntry is { OpCode: OpCode.Add, Operands: [_, var first, var second] })
         {
-            pending.Push(first);
-            pending.Push(second);
+            pending.Push((first, vtableEntry));
+            pending.Push((second, vtableEntry));
         }
 
         while (pending.Count > 0 && leaves < 8)
         {
-            var operand = pending.Pop();
+            var (operand, use) = pending.Pop();
             if (operand is Immediate immediate)
             {
                 constant += immediate.Value;
@@ -488,15 +584,17 @@ public static class InterfaceDispatchRecovery
                 return null;
             leaves++;
 
-            switch (ChaseCopies(definitions, local))
+            var definition = ResolveDef(local, use);
+            switch (definition)
             {
                 case { OpCode: OpCode.Add, Operands: [_, var addLeft, var addRight] }:
-                    pending.Push(addLeft);
-                    pending.Push(addRight);
+                    pending.Push((addLeft, definition));
+                    pending.Push((addRight, definition));
                     continue;
-                case { OpCode: OpCode.ShiftLeft, Operands: [_, LocalVariable index, Immediate { Value: InvokeDataShift }] }
+                case { OpCode: OpCode.ShiftLeft, Operands: [_, LocalVariable indexLocal, Immediate { Value: InvokeDataShift }] }
                     when indexOperand == null:
-                    indexOperand = index;
+                    indexOperand = indexLocal;
+                    indexUse = definition;
                     continue;
                 case { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable }] }
                     when klassCandidate == null:
@@ -515,9 +613,9 @@ public static class InterfaceDispatchRecovery
         if (folded && constant != VTableOffset + slotBytes)
             return null;
 
-        var entryOffset = ChaseCopies(definitions, indexOperand);
+        var entryOffset = ResolveDef(indexOperand, indexUse);
         if (entryOffset is { OpCode: OpCode.SignExtend32, Operands: [_, LocalVariable unextended] })
-            entryOffset = ChaseCopies(definitions, unextended);
+            entryOffset = ResolveDef(unextended, entryOffset);
 
         IOperand? entryOffsetSource = null;
         if (entryOffset is { OpCode: OpCode.Add, Operands: [_, var beforeSlot, var slotAddend] })
@@ -540,6 +638,8 @@ public static class InterfaceDispatchRecovery
         var entryOffsetLoad = entryOffsetSource switch
         {
             MemoryOperand memory => memory,
+            LocalVariable local when ResolveDef(local, entryOffset) is
+                { OpCode: OpCode.Move, Operands: [_, MemoryOperand memory] } => memory,
             LocalVariable local when ChaseCopies(definitions, local) is
                 { OpCode: OpCode.Move, Operands: [_, MemoryOperand memory] } => memory,
             _ => default(MemoryOperand?),
@@ -643,7 +743,7 @@ public static class InterfaceDispatchRecovery
         {
             if (dispatch.Operands[i] is not LocalVariable argument
                 || ChaseCopies(definitions, argument) is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable loadBase } load] }
-                || !ReferenceEquals(ChaseCopies(definitions, loadBase), match.InvokeDataPhi))
+                || !match.IsMergeOperand(definitions, loadBase))
                 continue;
 
             if (load.Addend == 8 && assembly != null)
@@ -1008,6 +1108,217 @@ public static class InterfaceDispatchRecovery
 
             block.AddInstruction(new Instruction(-1, OpCode.Return, returnOperands));
             block.CalculateBlockType();
+        }
+    }
+
+    // ===== merged tail-call dispatch =====
+
+    // `return a.VirtualX(...);` / `return b.VirtualY(...);` emitted as one shared `BR` in a merge
+    // block, fed by a phi (or, after SSA removal, several defs of the same local) of different
+    // vtable loads - one `[klass_i + vtableOffset + 16*slot_i]` per predecessor edge. Distribute
+    // the jump: each edge keeps its own slot's resolved call, cloned into its own block.
+    private static bool TryRewriteMergedTailDispatch(MethodAnalysisContext method, Instruction dispatch,
+        DefUseIndex index, Dictionary<LocalVariable, Instruction> definitions,
+        Dictionary<Instruction, Block> homeBlock)
+    {
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        var vtableOffset = pointerSize == 8 ? VTableOffset : VTableOffset32;
+        var invokeDataSize = 2L * pointerSize;
+
+        if (dispatch.Operands.Count < 2 || dispatch.Operands[0] is not LocalVariable target
+            || !homeBlock.TryGetValue(dispatch, out var merge)
+            || merge.Instructions[^1] != dispatch)
+            return false;
+
+        // Every predecessor edge must supply the target as its own [klass_i + vtable + 16*slot]
+        // load - a single reaching def means the target isn't a per-edge value at all.
+        if (index.MergeSources(target, dispatch) is not { } sources
+            || sources.Count < 2 || sources.Count != merge.Predecessors.Count)
+            return false;
+
+        var calls = new List<(Block Edge, Instruction TargetDef, MethodAnalysisContext Resolved,
+            LocalVariable Receiver, List<IOperand> Args, LocalVariable? ResultLocal)>();
+        foreach (var (edge, targetDef) in sources)
+        {
+            if (targetDef is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand
+                    { Index: null, Scale: 0, Base: LocalVariable klassLocal, Addend: var addend }] })
+                return false;
+
+            var relative = addend - vtableOffset;
+            if (relative < 0 || relative % invokeDataSize != 0)
+                return false;
+            var slot = (int)(relative / invokeDataSize);
+
+            // klass_i must be a straight [receiver] load on this edge
+            if (index.ReachingDefOnEdge(klassLocal, edge) is not
+                { OpCode: OpCode.Move, Operands: [_, MemoryOperand
+                    { Index: null, Scale: 0, Addend: 0, Base: LocalVariable receiver }] })
+                return false;
+
+            var candidates = new HashSet<TypeAnalysisContext>();
+            if (!CollectReceiverTypes(method, definitions, receiver, candidates) || candidates.Count == 0)
+                return false;
+
+            MethodAnalysisContext? root = null;
+            foreach (var candidate in candidates)
+            {
+                var implementation = ResolveVTableSlot(method.AppContext, candidate, slot);
+                var candidateRoot = implementation is { IsStatic: false } ? RootVirtualDeclaration(implementation) : null;
+                if (candidateRoot is not { IsVirtual: true })
+                    return false;
+                if (root == null)
+                    root = candidateRoot;
+                else if (!ReferenceEquals(MethodIdentity(root), MethodIdentity(candidateRoot)))
+                    return false;
+            }
+
+            if (root == null
+                || InstantiateRoot(method, root, candidates) is not { IsStatic: false } resolved
+                || resolved.GenericParameters.Count > 0
+                || resolved is ConcreteGenericMethodAnalysisContext concrete
+                    && concrete.MethodGenericParameters.Any(p => p is GenericParameterTypeAnalysisContext)
+                || method.IsVoid != resolved.IsVoid
+                || (!method.IsVoid && method.ReturnType.FullName != resolved.ReturnType.FullName))
+                return false;
+
+            // Map the jump's argument registers onto this edge's values: phi'd operands take the
+            // edge input, [klass_i + addend + ptrSize] is the hidden MethodInfo, a stale
+            // [klass_i + addend] is the methodPtr slot itself.
+            var edgeIndex = sources.IndexOf((edge, targetDef));
+            var declaringAssembly = resolved.DeclaringType?.DeclaringAssembly ?? method.DeclaringType?.DeclaringAssembly;
+            var args = new List<IOperand>();
+            var receiverFound = false;
+            for (var i = 2; i < dispatch.Operands.Count; i++)
+            {
+                var edgeValue = EdgeValue(dispatch.Operands[i], edgeIndex, edge);
+
+                if (edgeValue is MemoryOperand
+                        { Index: null, Scale: 0, Base: LocalVariable loadBase, Addend: var argAddend }
+                    && ReferenceEquals(loadBase, klassLocal))
+                {
+                    if (argAddend == addend + pointerSize && declaringAssembly != null)
+                        args.Add(new RuntimeMethodInfoAnalysisContext(resolved, declaringAssembly));
+                    else if (argAddend == addend)
+                        args.Add(new Immediate(0));
+                    else
+                        return false;
+                    continue;
+                }
+
+                if (edgeValue is LocalVariable candidate)
+                {
+                    if (SameEdgeValue(index, edge, candidate, receiver))
+                    {
+                        args.Add(receiver);
+                        receiverFound = true;
+                    }
+                    else
+                        args.Add(candidate);
+                    continue;
+                }
+
+                args.Add(edgeValue ?? dispatch.Operands[i]);
+            }
+
+            if (!receiverFound)
+                return false;
+
+            LocalVariable? resultLocal = null;
+            if (!resolved.IsVoid)
+            {
+                var callingConventions = resolved.AppContext.InstructionSet.CallingConventionResolver;
+                resultLocal = new LocalVariable("mergedTailCallResult",
+                    callingConventions?.ReturnRegister(resolved) ?? new Register(null, "rax"),
+                    resolved.ReturnType);
+            }
+
+            calls.Add((edge, targetDef, resolved, receiver, args, resultLocal));
+        }
+
+        // All edges resolve: rewrite each predecessor's `Jump merge` into its own call + return.
+        var cfg = method.ControlFlowGraph!;
+        for (var i = 0; i < calls.Count; i++)
+        {
+            var (edge, _, resolved, _, args, resultLocal) = calls[i];
+
+            var operands = new List<IOperand> { resolved };
+            if (resultLocal != null)
+                operands.Add(resultLocal);
+            operands.AddRange(args);
+
+            Instruction call;
+            if (edge.Instructions[^1] is { OpCode: OpCode.Jump } jump)
+            {
+                jump.OpCode = resolved.IsVoid ? OpCode.CallVoid : OpCode.Call;
+                jump.SetOperands(operands);
+                call = jump;
+            }
+            else
+            {
+                call = new Instruction(-1, resolved.IsVoid ? OpCode.CallVoid : OpCode.Call, operands);
+                edge.AddInstruction(call);
+            }
+            call.IsVirtualDispatch = true;
+            resolved.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(call, resolved);
+
+            var returnOperands = !method.IsVoid && !resolved.IsVoid && resultLocal != null
+                ? new List<IOperand> { resultLocal }
+                : [];
+            edge.AddInstruction(new Instruction(-1, OpCode.Return, returnOperands));
+            edge.CalculateBlockType();
+        }
+
+        // The merge's predecessors now return; unlink the merge entirely.
+        foreach (var predecessor in merge.Predecessors.ToList())
+            predecessor.Successors.Remove(merge);
+        foreach (var successor in merge.Successors)
+            successor.Predecessors.Remove(merge);
+        merge.Predecessors.Clear();
+        merge.Successors.Clear();
+        cfg.Blocks.Remove(merge);
+        return true;
+
+        // The value `operand` carries on `edge`: the phi input when the operand's reaching def is
+        // a merge phi, else the operand itself.
+        IOperand? EdgeValue(IOperand operand, int edgeIndex, Block edge)
+        {
+            if (operand is not LocalVariable local)
+                return operand;
+            if (index.ReachingDef(local, dispatch) is { OpCode: OpCode.Phi } phi)
+                return edgeIndex + 1 < phi.Operands.Count ? phi.Operands[edgeIndex + 1] : null;
+            if (index.DefinitionsOf(local).Count > 1)
+                return index.ReachingDefOnEdge(local, edge) is
+                    { OpCode: OpCode.Move, Operands: [_, var source] } ? source : local;
+            return local;
+        }
+    }
+
+    // Two locals carry the same value on an edge when copy-chasing both lands on one def or one
+    // undeffed local.
+    private static bool SameEdgeValue(DefUseIndex index, Block edge, LocalVariable left,
+        LocalVariable right)
+    {
+        if (ReferenceEquals(left, right))
+            return true;
+        return TerminalDef(index, edge, left) is { } leftDef
+            && ReferenceEquals(leftDef, TerminalDef(index, edge, right));
+
+        static object? TerminalDef(DefUseIndex index, Block edge, LocalVariable local)
+        {
+            var visited = new HashSet<LocalVariable>();
+            var current = local;
+            while (visited.Add(current))
+            {
+                if (index.ReachingDefOnEdge(current, edge) is not { } definition)
+                    return current;
+                if (definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
+                {
+                    current = source;
+                    continue;
+                }
+                return definition;
+            }
+            return null;
         }
     }
 

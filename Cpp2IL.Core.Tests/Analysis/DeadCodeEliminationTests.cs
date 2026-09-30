@@ -33,6 +33,35 @@ public class DeadCodeEliminationTests
     }
 
     [Test]
+    public void RemovesCopiesThatOnlyFeedEachOtherAroundALoop()
+    {
+        // loop { a = [slot]; b = a; ...; a = b; }: out of SSA the copies read each other, so
+        // each has a use, but nothing with an effect ever reads either.
+        var a = new LocalVariable("a", new Register(null, "a"));
+        var b = new LocalVariable("b", new Register(null, "b"));
+        var slot = new LocalVariable("slot", new Register(null, "slot"));
+        var c = new LocalVariable("c", new Register(null, "c"));
+        var top = new Instruction(1, OpCode.Move, a, new MemoryOperand(slot, null, 0, 0, 8));
+        var graph = new ISILControlFlowGraph(new List<Instruction>
+        {
+            new(0, OpCode.Move, slot, Imm(0x1000)),
+            top,
+            new(2, OpCode.Move, b, a),
+            new(3, OpCode.Move, a, b),
+            new(4, OpCode.CheckLess, c, slot, Imm(8)),
+            new(5, OpCode.ConditionalJump, top, c),
+            new(6, OpCode.Return),
+        });
+
+        DeadCodeEliminator.Run(graph);
+
+        var live = Live(graph);
+        Assert.That(live.Any(i => ReferenceEquals(i.Destination, a) || ReferenceEquals(i.Destination, b)), Is.False,
+            () => string.Join("\n", live));
+        Assert.That(live.Any(i => i.OpCode == OpCode.ConditionalJump), Is.True);
+    }
+
+    [Test]
     public void RemovesDeadChainToFixpoint()
     {
         // x = 5; temp = x - 1; flag = temp < 0; return x
