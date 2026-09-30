@@ -4614,8 +4614,8 @@ public static class IlGenerator
         return receiverType;
     }
 
-    private static bool FieldReferenceUsableFrom(FieldReference field, MethodAnalysisContext context,
-        bool writeAccess = false)
+    internal static bool FieldReferenceUsableFrom(FieldReference field, MethodAnalysisContext context,
+        bool writeAccess = false, bool requireToken = true)
     {
         var receiverType = EmittedOperandType(field.Local, context);
         var chainHead = true;
@@ -4641,7 +4641,7 @@ public static class IlGenerator
                     || !Analysis.MetadataResolver.BackingAccessorVisible(container, context, store: false))
                     return false;
             }
-            else if (!FieldUsableFrom(container, context, writeAccess, receiverType: effectiveReceiver))
+            else if (!FieldUsableFrom(container, context, writeAccess, receiverType: effectiveReceiver, requireToken))
                 return false;
             receiverType = container.IsStatic
                 ? container.FieldType
@@ -4651,7 +4651,8 @@ public static class IlGenerator
             receiverType: field.Field.IsStatic ? null
                 : field.Containers.Count == 0
                     ? ResolvedFieldReceiverType(field.Field, field.Local, receiverType, context)
-                    : receiverType);
+                    : receiverType,
+            requireToken: requireToken);
     }
 
     // Mirrors what LoadBase actually pushes as the field receiver: `ldarg.0` when
@@ -10077,9 +10078,12 @@ public static class IlGenerator
         };
 
     private static bool FieldUsableFrom(FieldAnalysisContext field, MethodAnalysisContext context,
-        bool writeAccess = false, TypeAnalysisContext? receiverType = null)
+        bool writeAccess = false, TypeAnalysisContext? receiverType = null, bool requireToken = true)
     {
-        if (!CanEmitFieldToken(field))
+        // Analysis passes ask about accessibility before any field gains its
+        // emitted definition (requireToken: false); emission keeps the token
+        // gate so a member with no emitted definition still counts unspellable.
+        if (requireToken && !CanEmitFieldToken(field))
             return false;
         var attrs = field.Attributes;
         // A literal (const) field has no writable slot at all: a store to it has

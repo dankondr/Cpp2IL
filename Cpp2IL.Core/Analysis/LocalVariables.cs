@@ -2751,8 +2751,25 @@ public static class LocalVariables
                     case LocalVariable copy:
                         work.Push(copy);
                         break;
-                    case FieldReference field when ManagedLaneReceiver(field):
-                    case Vector128Literal:
+                    // A field read spells only when the member path itself can be
+                    // named from this method. A static member emits ldsfld -
+                    // its receiver is unused, so a metadata-internal holder (the
+                    // Il2CppStaticFields block) does not veto it; an instance
+                    // read still needs a managed receiver and a usable member.
+                    case FieldReference field
+                        when (field.Field.IsStatic || ManagedLaneReceiver(field))
+                        && SpellableField(field, method):
+                    // Loads materialize the local either as the resolved read or
+                    // as their own named diagnostic; either way `local.lane`
+                    // reads a real declared local.
+                    case MemoryOperand or ArrayAccess or ArrayElementFieldReference
+                        or ArrayLength or AddressOf or ReferenceCast
+                        or SelectedFieldReference:
+                    // Constants, callee/type operands and literals always emit a
+                    // concrete value.
+                    case Immediate or FloatLiteral or DoubleLiteral or StringLiteral
+                        or TypeAnalysisContext or MethodAnalysisContext
+                        or Vector128Literal:
                         break;
                     default:
                         return false;
@@ -2761,6 +2778,12 @@ public static class LocalVariables
         }
         return true;
     }
+
+    // The emitter's own predicate, minus the emitted-token gate: analysis runs
+    // before fields gain their AsmResolver definitions, so requiring the token
+    // here would call every field unspellable.
+    private static bool SpellableField(FieldReference field, MethodAnalysisContext method)
+        => IlGenerator.FieldReferenceUsableFrom(field, method, requireToken: false);
 
     // A field read spells only when its receiver does. Reads through metadata
     // internals (the Il2CppClass/static-fields block or a runtime metadata
