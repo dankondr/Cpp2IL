@@ -9785,10 +9785,22 @@ public static class IlGenerator
         IOperand content, IOperand count, MethodAnalysisContext context, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
     {
+        // `&local.first` of a struct local is `&local` when that makes the two sides one type:
+        // value-type field addresses are canonicalized to the first field upstream.
+        if (instruction.OpCode is OpCode.MemoryCopy or OpCode.MemoryMove)
+        {
+            destination = WholeStorage(destination, BlockCopyPointee(content, context));
+            content = WholeStorage(content, BlockCopyPointee(destination, context));
+        }
+        // A fill that covers the whole struct local clears the local, not its first field.
+        else if (count is Immediate { Value: > 0 } fillCount
+                 && destination is AddressOf { Target: FieldReference { Local.Type: { IsValueType: true } filled } }
+                 && ManagedSize(filled, context) == fillCount.Value)
+            destination = WholeStorage(destination, filled);
         if (count is not Immediate { Value: > 0 } byteCount
             || BlockCopyPointee(destination, context) is not { IsValueType: true } pointee
-            || pointee is GenericInstanceTypeAnalysisContext or GenericParameterTypeAnalysisContext
-            || pointee.Definition?.Size is not { } pointeeSize
+            || pointee is GenericParameterTypeAnalysisContext
+            || ManagedSize(pointee, context) is not { } pointeeSize
             || byteCount.Value != pointeeSize
             || !TypeTokenUsableFrom(pointee, context))
             return false;
@@ -9812,6 +9824,24 @@ public static class IlGenerator
                 return false;
         }
     }
+
+    // The managed size (instance size less the object header), not the marshaled native size,
+    // which is -1 for a struct holding references. A generic instance has no metadata size.
+    private static long? ManagedSize(TypeAnalysisContext type, MethodAnalysisContext context)
+    {
+        var pointerSize = context.AppContext.Binary.PointerSizeBytes;
+        if (type is not GenericInstanceTypeAnalysisContext && TypeSizes.UnboxedSize(type, pointerSize) is > 0 and var exact)
+            return exact;
+        return TypeSizes.LaidOutSize(type, pointerSize) is > 0 and var laidOut ? laidOut : null;
+    }
+
+    private static IOperand WholeStorage(IOperand operand, TypeAnalysisContext? other)
+        => other != null
+           && operand is AddressOf { Target: FieldReference { Offset: 0, Containers.Count: 0, Field.IsStatic: false,
+               Local: { Type: { IsValueType: true } whole } local } }
+           && ThisConstructorCallPlan.SameTypeIdentity(whole, other)
+            ? new AddressOf(local)
+            : operand;
 
     // The element type a block-op address provably holds when it emits `&T`:
     // only a managed pointer carries a referent the type system can name - a
