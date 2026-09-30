@@ -7149,6 +7149,15 @@ public static class IlGenerator
             ? $"Ref struct cannot cross the value/reference boundary: dropped {from?.FullName ?? "unknown"} operand for {contract?.FullName ?? "unknown"} slot"
             : $"No legal conversion from {from?.FullName ?? "unavailable"} operand to {contract?.FullName ?? "unknown"} slot; substituting a synthetic default value.";
 
+    // Same text, with the withheld proven spelling named when a `&` operand's
+    // `Unsafe.AsPointer<T>` bridge exists but is gated off at this site.
+    private static string SlotDefaultReasonFor(TypeAnalysisContext? from, TypeAnalysisContext? contract,
+        MethodAnalysisContext? context)
+        => from is ByRefTypeAnalysisContext byRefOperand
+            && Analysis.UnsafeAsPointerEmission.BlockedReason(byRefOperand, contract, context) is { } blocked
+            ? $"No legal conversion from {from.FullName} operand to {contract?.FullName ?? "unknown"} slot; {blocked}; substituting a synthetic default value."
+            : SlotDefaultReason(from, contract);
+
     // Native width of the type's evaluation-stack representation: 4 for anything
     // narrowing to i32, 8 for 64-bit primitives, -1 for native-int/pointer/byref
     // values and 0 for non-integral stack kinds.
@@ -7257,17 +7266,22 @@ public static class IlGenerator
             fromWidth = -1;
         }
 
-        // `&T` into a native-int or unmanaged-pointer slot is the pinned-address
-        // idiom, but no verifiable IL converts `&` to `*`/nint - conv.* reject
-        // managed pointers outright (ECMA III.1.5 keeps the conversion
-        // unverifiable). The honest emission drops the address and defaults
-        // the slot - the same placeholder an unresolvable operand gets -
-        // instead of fabricating a value-as-pointer or leaving a raw `&`.
-        if (from is ByRefTypeAnalysisContext
+        // `&T` into a native-int or `void*` slot is the pinned-address idiom.
+        // conv.* reject managed pointers outright (ECMA III.1.5 keeps the
+        // conversion unverifiable), but `Unsafe.AsPointer<T>` is the verifiable
+        // spelling: it returns the address as `void*`, a native int to the
+        // verifier, carrying exactly the value the binary moved. A `T*` slot
+        // cannot accept `void*`, and an unproven site - no corlib helper or an
+        // element that cannot be a generic argument - keeps the diagnosed
+        // default rather than a fabricated value-as-pointer or a raw `&`.
+        if (from is ByRefTypeAnalysisContext byRefOperand
             && to is PointerTypeAnalysisContext or { FullName: "System.IntPtr" or "System.UIntPtr" })
         {
+            if (Analysis.UnsafeAsPointerEmission.ServesSlot(to)
+                && Analysis.UnsafeAsPointerEmission.TryEmit(byRefOperand, context, instructions))
+                return true;
             instructions.Add(CilOpCodes.Pop);
-            PushDefaultOf(to, method, instructions, context, SlotDefaultReason(from, to));
+            PushDefaultOf(to, method, instructions, context, SlotDefaultReasonFor(from, to, context));
             return true;
         }
 
@@ -7625,17 +7639,24 @@ public static class IlGenerator
         // immediately throws away (e.g. ldloca on a & local, which no C#
         // spelling renders - ilspy prints it as `ref ref x`).
         if (to is PointerTypeAnalysisContext)
-            return from is not ByRefTypeAnalysisContext && fromWidth != 0;
+            return from is not ByRefTypeAnalysisContext && fromWidth != 0
+                || from is ByRefTypeAnalysisContext byRefIntoVoid
+                    && Analysis.UnsafeAsPointerEmission.ServesSlot(to)
+                    && Analysis.UnsafeAsPointerEmission.Satisfiable(byRefIntoVoid.ElementType, context);
 
         if (from is ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
         {
             // An unmanaged pointer already is a native int; the opt-in convertByRef
             // conv.i or the target's own width rules apply. A managed pointer can
             // only reach a non-& slot through dereference, so the mirror is the
-            // element's own satisfiability.
+            // element's own satisfiability - except a native-int slot, which the
+            // & operand reaches through Unsafe.AsPointer<T> when that helper is
+            // available for the element (mirrors EmitStackCoerce).
             if (from is PointerTypeAnalysisContext)
                 return toWidth != 0;
             var element = ((ByRefTypeAnalysisContext)from).ElementType;
+            if (to.FullName is "System.IntPtr" or "System.UIntPtr")
+                return Analysis.UnsafeAsPointerEmission.Satisfiable(element, context);
             return element is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
                 && (!element.IsValueType || TypeTokenUsableFrom(element, context))
                 && StackContractSatisfied(element, to, context, convertByRef);
@@ -7704,11 +7725,11 @@ public static class IlGenerator
             {
                 var instructions = method.CilMethodBody!.Instructions;
                 instructions.Add(CilOpCodes.Pop);
-                PushDefaultOf(contract, method, instructions, context, SlotDefaultReason(emitted, contract));
+                PushDefaultOf(contract, method, instructions, context, SlotDefaultReasonFor(emitted, contract, context));
             }
             return true;
         }
-        PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context, SlotDefaultReason(emitted, contract));
+        PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context, SlotDefaultReasonFor(emitted, contract, context));
         return true;
     }
 
@@ -9029,7 +9050,7 @@ public static class IlGenerator
     // over corlib-internal marker types (List<System.Int32Enum>) that produce a token the
     // verifier rejects, so every token-bearing op routes through here instead of
     // CanEmitTypeToken alone.
-    private static bool TypeTokenUsableFrom(TypeAnalysisContext? type, MethodAnalysisContext? context) =>
+    internal static bool TypeTokenUsableFrom(TypeAnalysisContext? type, MethodAnalysisContext? context) =>
         type != null
             && !ContainsSharedEnumMarker(type)
             && CanEmitTypeToken(type)
