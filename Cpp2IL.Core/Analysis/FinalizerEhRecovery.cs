@@ -116,9 +116,13 @@ public static class FinalizerEhRecovery
 
         // The landing pad is lifted but unreachable: nothing managed jumps into it, so a second
         // call to the identical base Finalize there is the duplicated finally body. With no pad
-        // there is no region evidence and emitting one would be a guess.
-        var padCallsBase = context.ConvertedIsil != null && context.ConvertedIsil.Any(i =>
-            !live.Contains(i) && i.IsCall && i.Operands.Count > 0 && CalleeIs(context, i, baseFinalize));
+        // there is no region evidence and emitting one would be a guess. When the unwind tables
+        // were read, the pad's code sits in the method's landing-pad regions instead of the
+        // unreachable tail of the stream.
+        bool IsBaseCall(Instruction i) => i.IsCall && i.Operands.Count > 0 && CalleeIs(context, i, baseFinalize);
+        var padCallsBase =
+            (context.ConvertedIsil != null && context.ConvertedIsil.Any(i => !live.Contains(i) && IsBaseCall(i)))
+            || context.LandingPadRegions.Any(region => region.Instructions.Any(IsBaseCall));
         if (!padCallsBase)
         {
             context.AddWarning(

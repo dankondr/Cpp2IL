@@ -24,6 +24,24 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
 
     private long _globalOffset;
 
+    private IReadOnlyDictionary<ulong, EhFunctionInfo>? _ehFunctions;
+    private bool _ehFunctionsComputed;
+
+    /// <inheritdoc />
+    public override IReadOnlyDictionary<ulong, EhFunctionInfo>? EhFunctions
+    {
+        get
+        {
+            if (!_ehFunctionsComputed)
+            {
+                _ehFunctions = ElfEhTables.Read(GetRawBinaryContent(), _elfSectionHeaderEntries, is32Bit);
+                _ehFunctionsComputed = true;
+            }
+
+            return _ehFunctions;
+        }
+    }
+
     /// <summary>Reads a relocated, pointer-aligned slot protected by GNU RELRO.</summary>
     public ulong? ReadReadOnlyRelocatedPointer(ulong address)
     {

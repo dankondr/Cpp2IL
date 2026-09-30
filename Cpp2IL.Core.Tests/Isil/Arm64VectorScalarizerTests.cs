@@ -207,6 +207,23 @@ public class Arm64VectorScalarizerTests
     }
 
     [Test]
+    public void HighLaneOfAReloadedRegisterIsShiftedAgain()
+    {
+        // Two 8-byte copies through d0, each a pair of 4-byte fields. The second
+        // store's high lane is the high half of the second value: reusing the first
+        // store's shifted temporary would copy the first value's lane without a word.
+        var il = Lift(
+            0xfd402520, // ldr d0, [x9, #0x48]
+            0xfc024260, // stur d0, [x19, #0x24]
+            0xfd402500, // ldr d0, [x8, #0x48]
+            0xfd001a60); // str d0, [x19, #0x30]
+
+        var shifts = il.Where(i => i.OpCode == OpCode.ShiftRight && i.Operands[2] is Immediate { Value: 32 }).ToList();
+        Assert.That(shifts, Has.Count.EqualTo(2), () => string.Join("\n", il));
+        Assert.That(((Register)shifts[0].Operands[0]).Name, Is.Not.EqualTo(((Register)shifts[1].Operands[0]).Name));
+    }
+
+    [Test]
     public void StackVectorLoadProvesLanes()
     {
         // A stack-addressed q-load materializes the same window locals through

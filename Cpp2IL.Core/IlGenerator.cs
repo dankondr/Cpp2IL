@@ -589,7 +589,19 @@ public static class IlGenerator
                             LoadFieldReceiver(field, context, method, locals, writeLine, forWrite: true);
                     }
 
-                    if (LoadOperandIntoSlot(instruction.Operands[1], field.Field.FieldType, context, method, locals, writeLine))
+                    // A literal zero proves one register's bytes, but the store's recorded
+                    // width can prove more: a 16-byte vector store, or adjacent zero stores
+                    // the resolver merged. When it covers the whole value-type field the
+                    // store is default(T).
+                    var zeroesWholeField = IsZeroConstant(instruction.Operands[1])
+                        && field.Field.FieldType is { IsValueType: true } zeroed
+                        && SlotTakesZeroLiteralDefault(zeroed) && TypeTokenUsableFrom(zeroed, context)
+                        && TypeSizes.MinimumUnboxedSize(zeroed, context.AppContext.Binary.PointerSizeBytes)
+                            is > 0 and var zeroedSize && field.AccessSize >= zeroedSize;
+                    if (zeroesWholeField)
+                        PushDefaultValue(field.Field.FieldType, method, instructions, context);
+                    if (zeroesWholeField
+                        || LoadOperandIntoSlot(instruction.Operands[1], field.Field.FieldType, context, method, locals, writeLine))
                         instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld,
                             field.Field.IsStatic ? field.Field.ToFieldDescriptor()
                                 : FieldDescriptorFor(field.Field, FieldReceiverType(field, context)));
@@ -8201,7 +8213,7 @@ public static class IlGenerator
             candidates.Add(flat);
         foreach (var found in candidates)
         {
-            if (found.Containers.Count == 0 && !FieldStoreWidthMatches(memory, found.Field, context))
+            if (found.Containers.Count == 0 && !FieldStoreWidthMatches(memory, source, found.Field, context))
                 continue;
             // A nested store spells `receiver.c1...cN.leaf = v`: the first
             // ldflda reads `receiver.c1`, so the receiver itself must already
@@ -9094,11 +9106,20 @@ public static class IlGenerator
     // 16-byte vector spills, so they match only fields of exactly that size;
     // a narrower target would be clobbered and a wider one only partly
     // written.
-    private static bool FieldStoreWidthMatches(MemoryOperand memory, FieldAnalysisContext field,
+    private static bool FieldStoreWidthMatches(MemoryOperand memory, IOperand source, FieldAnalysisContext field,
         MethodAnalysisContext context)
     {
         var size = TypeSizes.MinimumUnboxedSize(field.FieldType, context.AppContext.Binary.PointerSizeBytes);
-        return memory.AccessSize == 0 ? size == 16 : size == memory.AccessSize;
+        if (memory.AccessSize != 0)
+            return size == memory.AccessSize;
+        // A width-0 store is float-family (str s/d/q): the register it came from is the
+        // width, and a scalar source says which one - `str s0` writes a float field whole.
+        return size == 16 || EmittedOperandType(source, context)?.FullName switch
+        {
+            "System.Single" => size == 4 && field.FieldType.FullName == "System.Single",
+            "System.Double" => size == 8 && field.FieldType.FullName == "System.Double",
+            _ => false,
+        };
     }
 
     private static FieldReference? NestedValueFieldForContract(FieldReference field,

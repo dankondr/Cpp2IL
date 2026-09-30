@@ -12,6 +12,13 @@ public class Instruction : IOperand
 {
     public int Index;
 
+    /// <summary>
+    /// The address of the machine instruction this instruction was lifted from, or 0 when it
+    /// was synthesized (by the instruction set or a later analysis pass). Lets unwind data
+    /// (landing pads, call-site ranges) be mapped onto the instruction stream.
+    /// </summary>
+    public ulong NativeAddress;
+
     public OpCode OpCode
     {
         get;
@@ -29,8 +36,10 @@ public class Instruction : IOperand
 
     public OperandList Operands => new(_operands);
 
-    // Exists to clear the return register after a CallVoid, basically.
-    public Register? ImplicitDefinition;
+    // Registers a call or similar instruction defines besides its destination: the
+    // clobbered return register of a CallVoid, or the further registers an aggregate
+    // result spans (a Vector3's V1/V2 lanes, a 16-byte struct's X1).
+    public List<Register> ImplicitDefinitions = [];
 
     // The target was read from a runtime vtable; a direct call to a virtual
     // method (for example base.M()) must not acquire this flag.
@@ -53,6 +62,11 @@ public class Instruction : IOperand
     // normalization erases MemoryOperand/StackOffset, but aggregate-return recovery
     // still needs the width to distinguish a whole struct from one of its fields.
     public int? NativeMemoryAccessSize;
+
+    // Bytes a store writes, from the register it stores. Float and vector stores keep
+    // AccessSize 0 on their memory operand (a convention other passes read); this is
+    // their real width.
+    public int? NativeStoreWidthBytes;
 
     public bool IsFallThrough =>
         OpCode switch

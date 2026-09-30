@@ -22,16 +22,16 @@ namespace Cpp2IL.Core.Tests.Regression;
 // them to the first overlapped member would substitute a different value.
 public class NestedFieldPathLoadTests
 {
-    private static InjectedTypeAnalysisContext InjectStruct(ApplicationAnalysisContext app, string name)
+    internal static InjectedTypeAnalysisContext InjectStruct(ApplicationAnalysisContext app, string name)
         => new(app.AssembliesByName["mscorlib"], "Tests", name,
             app.SystemTypes.SystemValueTypeType,
             R.TypeAttributes.Public | R.TypeAttributes.Sealed | R.TypeAttributes.SequentialLayout);
 
-    private static InjectedTypeAnalysisContext InjectClass(ApplicationAnalysisContext app, string name)
+    internal static InjectedTypeAnalysisContext InjectClass(ApplicationAnalysisContext app, string name)
         => new(app.AssembliesByName["mscorlib"], "Tests", name,
             app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
 
-    private static InjectedFieldAnalysisContext InjectField(string name, TypeAnalysisContext type,
+    internal static InjectedFieldAnalysisContext InjectField(string name, TypeAnalysisContext type,
         TypeAnalysisContext declaring, int offset)
     {
         var field = new InjectedFieldAnalysisContext(name, type, R.FieldAttributes.Public,
@@ -79,7 +79,7 @@ public class NestedFieldPathLoadTests
         return (type, first, second);
     }
 
-    private static void Seed(ModuleDefinition module, ApplicationAnalysisContext app,
+    internal static void Seed(ModuleDefinition module, ApplicationAnalysisContext app,
         params TypeAnalysisContext[] types)
     {
         var definitions = new Dictionary<TypeAnalysisContext, TypeDefinition>();
@@ -118,14 +118,14 @@ public class NestedFieldPathLoadTests
         }
     }
 
-    private static LocalVariable Local(string name, TypeAnalysisContext? type = null)
+    internal static LocalVariable Local(string name, TypeAnalysisContext? type = null)
         => new(name, new Register(null, name), type);
 
     private static bool EmitsUnmanagedLoadDiagnostic(MethodDefinition method)
         => method.CilMethodBody!.Instructions.Any(i => i.OpCode == CilOpCodes.Ldstr
             && i.Operand is string text && text.Contains("Unmanaged memory load"));
 
-    private static string Dump(MethodDefinition method)
+    internal static string Dump(MethodDefinition method)
         => string.Join("\n", method.CilMethodBody!.Instructions.Select(i => i.ToString()));
 
     [Test]

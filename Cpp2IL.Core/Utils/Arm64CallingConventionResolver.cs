@@ -29,13 +29,58 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
         if (!returnType.IsValueType || IsFloatingPoint(returnType))
             return false;
 
-        var size = TypeSizes.UnboxedSize(returnType, PtrSize);
-        if (size == 0)
-            size = TypeSizes.MinimumUnboxedSize(returnType, PtrSize);
+        var size = StructSize(returnType);
         if (size == 0)
             return false; // unknown size (e.g. generic), assume a register return
 
         return size > 16;
+    }
+
+    private static long StructSize(TypeAnalysisContext type)
+    {
+        var size = TypeSizes.UnboxedSize(type, PtrSize);
+        if (size == 0)
+            size = TypeSizes.MinimumUnboxedSize(type, PtrSize);
+        return size;
+    }
+
+    // integer args in X0-X7, fp args in V0-V7 (independent counters). A homogeneous
+    // float aggregate of n floats takes one V register per lane; any other value
+    // type of 9-16 bytes takes an integer register pair; wider composites go on the
+    // stack.
+    public override IReadOnlyList<AggregateLane> ExtraLanes(TypeAnalysisContext type, Register firstLane)
+    {
+        var firstIndex = FirstRegisterIndex(firstLane, FloatRegisters);
+        if (firstIndex >= 0
+            && TryGetHomogeneousFloatAggregate(type, [], out var elementType, out var count)
+            && count > 1
+            && firstIndex + count <= FloatRegisters.Length)
+        {
+            var lanes = new List<AggregateLane>(count - 1);
+            var width = (int)StructSize(elementType!);
+            for (var i = 1; i < count; i++)
+                lanes.Add(new AggregateLane(new Register(null, FloatRegisters[firstIndex + i]), i * width, width));
+            return lanes;
+        }
+
+        firstIndex = FirstRegisterIndex(firstLane, IntegerRegisters);
+        if (firstIndex >= 0
+            && firstIndex < IntegerRegisters.Length - 1
+            && !IsFloatingPoint(type)
+            && type.IsValueType
+            && StructSize(type) is > 8 and <= 16)
+            return [new AggregateLane(new Register(null, IntegerRegisters[firstIndex + 1]), 8,
+                (int)StructSize(type) - 8)];
+
+        return [];
+    }
+
+    private static int FirstRegisterIndex(Register register, string[] registers)
+    {
+        for (var i = 0; i < registers.Length; i++)
+            if (registers[i] == register.Name)
+                return i;
+        return -1;
     }
 
     protected override (string[] Integer, string[] Float) RawRegisters(ApplicationAnalysisContext app)
@@ -65,14 +110,27 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
 
                 floating = FloatRegisters.Length;
             }
-            else if (integer < IntegerRegisters.Length)
+            else
             {
-                args.Add(new Register(null, IntegerRegisters[integer++]));
-                return;
+                var integerRegisterCount = par == null ? 1 : IntegerRegisterCount(par.ParameterType);
+                if (integerRegisterCount > 0 && integer + integerRegisterCount <= IntegerRegisters.Length)
+                {
+                    args.Add(new Register(null, IntegerRegisters[integer]));
+                    integer += integerRegisterCount;
+                    return;
+                }
+
+                // A composite that does not fit the remaining registers spills whole to
+                // the stack and the register file is done (AAPCS C.3); a >16 byte one
+                // is passed on the stack without consuming registers at all.
+                if (integerRegisterCount > 0)
+                    integer = IntegerRegisters.Length;
             }
 
             args.Add(new StackOffset(stack));
-            stack += PtrSize;
+            stack += par != null && par.ParameterType.IsValueType
+                ? (int)((System.Math.Max(StructSize(par.ParameterType), 1) + 7) & ~7L)
+                : PtrSize;
         }
 
         if (!ctx.IsStatic)
@@ -88,6 +146,20 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
 
     private static int FloatingRegisterCount(TypeAnalysisContext type)
         => TryGetHomogeneousFloatAggregate(type, [], out _, out var count) ? count : 0;
+
+    // 0 = too wide for registers at all (stack), 1 = one register, 2 = a pair.
+    private static int IntegerRegisterCount(TypeAnalysisContext type)
+    {
+        if (!type.IsValueType || IsFloatingPoint(type))
+            return 1;
+
+        return StructSize(type) switch
+        {
+            > 8 and <= 16 => 2,
+            > 16 => 0,
+            _ => 1,
+        };
+    }
 
     private static bool TryGetHomogeneousFloatAggregate(TypeAnalysisContext type,
         HashSet<TypeAnalysisContext> active, out TypeAnalysisContext? elementType, out int count)

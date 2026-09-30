@@ -14,7 +14,8 @@ public static class NewArm64Utils
         
         if (managed)
         {
-            var startOfNext = appContext.GetAddressOfNextFunctionStart(virtAddress);
+            //The unwind-table extent wins where present; the next known function start bounds it.
+            var startOfNext = appContext.GetFunctionEnd(virtAddress);
 
             //We have to fall through to default behavior for the last method because we cannot accurately pinpoint its end
             if (startOfNext > 0)

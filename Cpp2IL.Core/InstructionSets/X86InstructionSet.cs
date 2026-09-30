@@ -645,7 +645,8 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                             call = Add(instruction.IP, ISIL.OpCode.Call, Imm(target), CallingConventions.ReturnRegister(possibleMethods[0]));
 
                         call.AddOperands(CallingConventions.ResolveForManaged(possibleMethods[0]));
-                        call.ImplicitDefinition = ReturnRegisterClobberedBy(possibleMethods[0]);
+                        if (ReturnRegisterClobberedBy(possibleMethods[0]) is { } clobbered)
+                            call.ImplicitDefinitions.Add(clobbered);
                     }
                     else
                     {
@@ -675,7 +676,8 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                             call = Add(instruction.IP, ISIL.OpCode.Call, Imm(target), CallingConventions.ReturnRegister(ctx));
 
                         call.AddOperands(CallingConventions.ResolveForManaged(ctx));
-                        call.ImplicitDefinition = ReturnRegisterClobberedBy(ctx);
+                        if (ReturnRegisterClobberedBy(ctx) is { } clobbered)
+                            call.ImplicitDefinitions.Add(clobbered);
                     }
                 }
                 else

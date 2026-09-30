@@ -86,8 +86,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
         if (context is not ConcreteGenericMethodAnalysisContext)
         {
-            //Managed method or attr gen => grab raw byte range between a and b
-            var startOfNextFunction = context.AppContext.GetAddressOfNextFunctionStart(context.UnderlyingPointer);
+            //Managed method or attr gen => grab raw byte range to the method's end (unwind-table extent when present)
+            var startOfNextFunction = context.AppContext.GetFunctionEnd(context.UnderlyingPointer);
             var count = (int)(startOfNextFunction - context.UnderlyingPointer);
 
             if (startOfNextFunction > 0)
@@ -204,10 +204,11 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         {
             var index = instructions[^1].Index + 1;
 
-            if (context.IsVoid)
-                instructions.Add(new Instruction(index, OpCode.Return));
-            else
-                instructions.Add(new Instruction(index, OpCode.Return, CallingConventions.ReturnRegister(context)));
+            var ret = context.IsVoid
+                ? new Instruction(index, OpCode.Return)
+                : new Instruction(index, OpCode.Return, CallingConventions.ReturnRegister(context));
+            CallingConventions.AttachReturnLanes(ret, context);
+            instructions.Add(ret);
         }
 
         // fix branches
@@ -244,7 +245,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         Instruction Add(ulong address, OpCode opCode, params List<IOperand> operands)
         {
             addresses.Add(address);
-            var newInstruction = new Instruction(instructions.Count, opCode, operands);
+            var newInstruction = new Instruction(instructions.Count, opCode, operands) { NativeAddress = address };
             instructions.Add(newInstruction);
             return newInstruction;
         }
@@ -298,6 +299,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                             ? new MemoryOperand(CallingConventions.HiddenReturnBufferRegister(ctx))
                             : CallingConventions.ReturnRegister(ctx));
 
+                // A multi-register result occupies its further lanes immediately: SSA
+                // sees them defined here, so the reads of V1..V3/X1 that store them
+                // away get the call's version instead of the method-entry value.
+                if (!ctx.IsVoid && !CallingConventions.ReturnsViaHiddenBuffer(ctx))
+                    foreach (var lane in CallingConventions.ExtraLanes(ctx.ReturnType,
+                                 CallingConventions.ReturnRegister(ctx)))
+                        call.ImplicitDefinitions.Add(lane.Register);
+
                 call.AddOperands(CallingConventions.ResolveForManaged(ctx));
             }
             else if (!TryEmitScalarMathImport(target))
@@ -310,10 +319,13 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
         void AddReturn()
         {
-            if (context.IsVoid)
-                Add(address, OpCode.Return);
-            else
-                Add(address, OpCode.Return, CallingConventions.ReturnRegister(context));
+            // A multi-register result leaves the callee in its lanes: the Return
+            // reads V1../X1 as operands (the mirror of the call's implicit lane
+            // definitions) so AggregateResultLanes can rebuild the aggregate.
+            var ret = context.IsVoid
+                ? Add(address, OpCode.Return)
+                : Add(address, OpCode.Return, CallingConventions.ReturnRegister(context));
+            CallingConventions.AttachReturnLanes(ret, context);
         }
 
         // for pre/post indexed accesses, apply the base register update on the correct side of the access
@@ -980,8 +992,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     }
                 };
                 EmitWriteback(beforeAccess: true);
-                Add(address, OpCode.Move, MemOperand(accessSize: storeSize), ConvertOperand(instruction, 0))
-                    .NativeMemoryAccessSize = storeSize;
+                var store = Add(address, OpCode.Move, MemOperand(accessSize: storeSize), ConvertOperand(instruction, 0));
+                store.NativeMemoryAccessSize = storeSize;
+                store.NativeStoreWidthBytes = storeSize != 0 ? storeSize : RegisterWidthBytes(instruction.Op0Reg);
                 EmitWriteback(beforeAccess: false);
                 break;
             }
@@ -1004,10 +1017,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     {
                         var storeSize = instruction.Op0Reg is >= Arm64Register.X0 and <= Arm64Register.X31
                             or >= Arm64Register.W0 and <= Arm64Register.W31 ? pairSize : 0;
-                        Add(address, OpCode.Move, MemOperand(accessSize: storeSize), ConvertOperand(instruction, 0))
-                            .NativeMemoryAccessSize = storeSize;
-                        Add(address, OpCode.Move, MemOperand(pairSize, storeSize), ConvertOperand(instruction, 1))
-                            .NativeMemoryAccessSize = storeSize;
+                        var first = Add(address, OpCode.Move, MemOperand(accessSize: storeSize), ConvertOperand(instruction, 0));
+                        first.NativeMemoryAccessSize = storeSize;
+                        first.NativeStoreWidthBytes = pairSize;
+                        var second = Add(address, OpCode.Move, MemOperand(pairSize, storeSize), ConvertOperand(instruction, 1));
+                        second.NativeMemoryAccessSize = storeSize;
+                        second.NativeStoreWidthBytes = pairSize;
                     }
                     else
                     {
