@@ -1943,6 +1943,19 @@ public static class MetadataResolver
     {
         var changed = false;
 
+        // A lea and the call it's passed to are still separate operands while this runs: a
+        // byref receiver reaches the call as a plain register holding `Move ptr, &local`.
+        // Index those defs so the receiver operand can be read as the address it carries.
+        Dictionary<LocalVariable, IOperand>? addressesOf = null;
+        if (specializeReceivers)
+        {
+            addressesOf = [];
+            foreach (var instruction in method.ControlFlowGraph!.Instructions)
+                if (instruction is { OpCode: OpCode.Move,
+                        Operands: [LocalVariable pointer, AddressOf address] })
+                    addressesOf.TryAdd(pointer, address);
+        }
+
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             if (!instruction.IsCall)
@@ -1951,7 +1964,7 @@ public static class MetadataResolver
             // A concrete receiver proves the declaring instantiation even when no MethodInfo
             // survived. Resolve this before the shared signature can type the call operands.
             if (specializeReceivers && instruction.Operands[0] is MethodAnalysisContext resolved
-                && InstantiateForReceiver(instruction, resolved) is { } instantiated)
+                && InstantiateForReceiver(instruction, resolved, addressesOf) is { } instantiated)
             {
                 instruction.SetOperand(0, instantiated);
                 instantiated.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, instantiated);
@@ -2027,7 +2040,8 @@ public static class MetadataResolver
         return changed;
     }
 
-    private static MethodAnalysisContext? InstantiateForReceiver(Instruction call, MethodAnalysisContext callee)
+    private static MethodAnalysisContext? InstantiateForReceiver(Instruction call, MethodAnalysisContext callee,
+        IReadOnlyDictionary<LocalVariable, IOperand>? addressesOf)
     {
         var firstArg = call.OpCode == OpCode.CallVoid ? 1 : 2;
         if (callee.IsStatic || firstArg >= call.Operands.Count || ErasedGenericArgumentCount(callee) == 0)
@@ -2038,7 +2052,15 @@ public static class MetadataResolver
         if (ReferenceEquals(GetMethodInfoArgument(call)?.RepresentedMethod, callee))
             return null;
 
-        var receiver = OperandEmittedType(call.Operands[firstArg]);
+        // A value-type receiver arrives as a plain pointer register before the lea folds
+        // into the operand. Read the register's `Move ptr, &x` def: the address it carries
+        // is the operand's emitted type, where the register's own type says nothing.
+        var receiverOperand = call.Operands[firstArg];
+        if (receiverOperand is LocalVariable pointer
+            && addressesOf != null && addressesOf.TryGetValue(pointer, out var address))
+            receiverOperand = address;
+
+        var receiver = OperandEmittedType(receiverOperand);
         if (receiver is ByRefTypeAnalysisContext byRef)
             receiver = byRef.ElementType;
         var definition = BaseMethodOf(callee);

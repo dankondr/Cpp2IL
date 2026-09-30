@@ -251,6 +251,79 @@ public class ConcreteCallTypingTests
         });
     }
 
+    [TestCase("MoveNext")]
+    [TestCase("Dispose")]
+    public void PointerRegisterReceiverProvesInstantiation(string name)
+    {
+        // A byref receiver reaches the call as an untyped register holding `Move ptr, &local`
+        // until the lea folds into the operand late in analysis. The pointee's concrete type is
+        // the instantiation proof, not the pointer register's (missing) type.
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2022Game();
+        var list = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var enumerator = list.NestedTypes.Single(t => t.Name!.Contains("Enumerator"));
+        var definition = enumerator.Methods.Single(m => m.Name == name);
+        var canonical = new ConcreteGenericMethodAnalysisContext(definition, [app.SystemTypes.SystemObjectType], []);
+        var instance = new GenericInstanceTypeAnalysisContext(enumerator, [app.SystemTypes.SystemStringType]);
+        var cell = new LocalVariable("cell", new Register(null, "cell"), instance);
+        var pointer = new LocalVariable("pointer", new Register(null, "pointer"));
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var call = name == "MoveNext"
+            ? new Instruction(1, OpCode.Call, canonical, result, pointer)
+            : new Instruction(1, OpCode.CallVoid, canonical, pointer);
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([
+                new(0, OpCode.Move, pointer, new AddressOf(cell)), call, new(2, OpCode.Return)])
+        };
+
+        LocalVariables.ResolveTypesAndFields(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(((MethodAnalysisContext)call.Operands[0]).DeclaringType!.FullName,
+                Is.EqualTo(instance.FullName));
+            if (name == "MoveNext")
+                Assert.That(result.Type, Is.SameAs(app.SystemTypes.SystemBooleanType));
+        });
+    }
+
+    [Test]
+    public void FieldAddressedReceiverProvesInstantiation()
+    {
+        // Same pointer-register shape, but the lea carries `&local.field` - the field's
+        // declared instantiation is the proof.
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2022Game();
+        var list = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var definition = list.Methods.Single(m => m.Name == "get_Item");
+        var canonical = new ConcreteGenericMethodAnalysisContext(definition, [app.SystemTypes.SystemObjectType], []);
+        var instance = new GenericInstanceTypeAnalysisContext(list, [app.SystemTypes.SystemStringType]);
+        var field = new InjectedFieldAnalysisContext("items", instance, FieldAttributes.Public, list, 16);
+        var owner = new LocalVariable("owner", new Register(null, "owner"), instance);
+        var pointer = new LocalVariable("pointer", new Register(null, "pointer"));
+        var value = new LocalVariable("value", new Register(null, "value"));
+        var call = new Instruction(1, OpCode.Call, canonical, value, pointer, new Immediate(0));
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([
+                new(0, OpCode.Move, pointer,
+                    new AddressOf(new FieldReference(field, owner, 16))),
+                call, new(2, OpCode.Return)])
+        };
+
+        LocalVariables.ResolveTypesAndFields(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(((MethodAnalysisContext)call.Operands[0]).DeclaringType!.FullName,
+                Is.EqualTo(instance.FullName));
+            Assert.That(value.Type, Is.SameAs(app.SystemTypes.SystemStringType));
+        });
+    }
+
     [Test]
     public void ConcreteHiddenReturnAlsoRewritesBufferUses()
     {
