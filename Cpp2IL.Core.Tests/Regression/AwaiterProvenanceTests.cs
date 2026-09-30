@@ -224,7 +224,7 @@ public class AwaiterProvenanceTests
             Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Initobj),
                 Is.True, () => string.Join("\n", il));
             Assert.That(il.Any(instruction =>
-                    instruction.Operand?.ToString()?.Contains("NoteDecompilerIssue") == true),
+                    instruction.Operand?.ToString()?.Contains("covers one register") == true),
                 Is.True, () => string.Join("\n", il));
         });
     }
