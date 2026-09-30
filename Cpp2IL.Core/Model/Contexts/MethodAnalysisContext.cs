@@ -663,7 +663,6 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Runtime class targets become available only after type resolution.
         KeyFunctionRecovery.Run(this);
         ArrayRecovery.RecoverObjectFieldAddresses(this);
-        MetadataResolver.LoadThroughMergedAddresses(this);
 
         // Needs the MethodInfo* receivers typed, so runs after resolution unlike the class-init guards
         MetadataInitGuardRemover.RunRgctx(this);

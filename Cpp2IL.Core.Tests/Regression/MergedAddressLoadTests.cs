@@ -17,7 +17,7 @@ public class MergedAddressLoadTests
 {
     private sealed record Shape(MethodAnalysisContext Caller, Block Join, Instruction Load, LocalVariable Holder);
 
-    // Holder { string name @0x10; string other @0x18; int count @0x20 }, then
+    // Holder { string name @0x10; string other @0x18; int count @0x20; Point2 start @0x28; Point2 end @0x30 }, then
     //   0: if (cond) goto 3   1: slot = "zeros"   2: goto 4   3: nop   4: [join] dst = [p]; return dst
     // with p = phi(left on the 1-2 edge, right on the 3 edge).
     private static Shape Build(string left, string right, bool callBeforeLoad = false)
@@ -29,10 +29,15 @@ public class MergedAddressLoadTests
         InjectField("name", app.SystemTypes.SystemStringType, type, 0x10);
         InjectField("other", app.SystemTypes.SystemStringType, type, 0x18);
         InjectField("count", app.SystemTypes.SystemInt32Type, type, 0x20);
+        var point = InjectStruct(app, "Point2");
+        InjectField("x", app.SystemTypes.SystemSingleType, point, 0);
+        InjectField("y", app.SystemTypes.SystemSingleType, point, 4);
+        InjectField("start", point, type, 0x28);
+        InjectField("end", point, type, 0x30);
         var module = new ModuleDefinition("Merged.dll");
-        Seed(module, app, type);
+        Seed(module, app, type, point);
         SeedCorLibTypes(app, module, app.SystemTypes.SystemStringType, app.SystemTypes.SystemInt32Type,
-            app.SystemTypes.SystemObjectType);
+            app.SystemTypes.SystemSingleType, app.SystemTypes.SystemObjectType);
 
         var holder = Local("holder", type);
         var slot = Local("slot");
@@ -54,9 +59,20 @@ public class MergedAddressLoadTests
         instructions.AddRange([load, new(5, OpCode.Return, dst)]);
         var (caller, _) = ForeignCaller(app, module, instructions, [holder, slot, address, dst, cond]);
 
-        IOperand Cell(string name) => name == "slot"
-            ? slot
-            : new AddressOf(new FieldReference(type.Fields.Single(f => f.Name == name), holder, type.Fields.Single(f => f.Name == name).Offset));
+        // "name" is `&holder.name`; "+name" is `holder + offset`, the form the type and
+        // field fixpoint sees before object field addresses are recovered.
+        IOperand Cell(string name)
+        {
+            if (name == "slot")
+                return slot;
+            var field = type.Fields.Single(f => f.Name == name.TrimStart('+'));
+            if (!name.StartsWith('+'))
+                return new AddressOf(new FieldReference(field, holder, field.Offset));
+            var sum = Local($"sum_{field.Name}");
+            caller.ControlFlowGraph!.Blocks.First().Instructions.Insert(0,
+                new Instruction(-3, OpCode.Add, sum, holder, new Immediate(field.Offset)));
+            return sum;
+        }
         var join = caller.ControlFlowGraph!.Blocks.Single(b => b.Instructions.Contains(joinStart));
         join.Instructions.Insert(0, new Instruction(-1, OpCode.Phi,
             [address, .. join.Predecessors.Select(p => Cell(p.Instructions.Any(i => i.Index == 2) ? left : right))]));
@@ -88,6 +104,16 @@ public class MergedAddressLoadTests
     }
 
     [Test]
+    public void MergedObjectPlusOffsetIsAMergeOfTheFields()
+    {
+        var shape = Build("+name", "+other");
+
+        MetadataResolver.LoadThroughMergedAddresses(shape.Caller);
+
+        Assert.That(MergedValues(shape), Is.EquivalentTo(new[] { "name", "other" }));
+    }
+
+    [Test]
     public void StringLiteralSlotMergesAsItsValue()
     {
         // `return c ? "zeros" : holder.name`: the slot local already stands for the string.
@@ -105,6 +131,17 @@ public class MergedAddressLoadTests
     {
         // The call may write either field after its address was taken.
         var shape = Build("name", "other", callBeforeLoad: true);
+
+        MetadataResolver.LoadThroughMergedAddresses(shape.Caller);
+
+        Assert.That(shape.Load.Operands[1], Is.InstanceOf<MemoryOperand>());
+    }
+
+    [Test]
+    public void StructCellsKeepTheLoad()
+    {
+        // Eight bytes at `&start` are start.x and start.y, not a Point2 value.
+        var shape = Build("start", "end");
 
         MetadataResolver.LoadThroughMergedAddresses(shape.Caller);
 

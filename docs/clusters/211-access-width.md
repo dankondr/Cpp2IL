@@ -34,11 +34,12 @@ Rules, in `MetadataResolver.ResolveFieldOffsets`:
   when it is exactly one field: `long >> 32` stays arithmetic.
 
 - A load through a merge of cell addresses is a merge of the cell values
-  (`LoadThroughMergedAddresses`, right after `RecoverObjectFieldAddresses`, still in
-  SSA). `x = c ? &a.f : &b.g; use(*x)` is what clang leaves of
+  (`LoadThroughMergedAddresses`, in the type and field fixpoint, so the merged value's
+  own fields resolve next). `x = c ? &a.f : &b.g; use(*x)` is what clang leaves of
   `use(c ? a.f : b.g)`: each edge reads its field where it took the address, and a
   phi of the values replaces the load. A string literal slot already stands for its
-  string. All cells have one type, every use of the merged address is that load, it
+  string. All cells have one type, a reference or a primitive as wide as the load (a
+  load at a struct cell reads only part of it), every use of the merged address is that load, it
   sits in the join block with no call or store before it, and each incoming edge is
   the only exit of its block.
 
