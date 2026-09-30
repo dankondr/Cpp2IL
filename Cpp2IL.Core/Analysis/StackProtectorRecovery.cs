@@ -431,17 +431,47 @@ public static class StackProtectorRecovery
 
     // One side of a canary check: the fresh TLS read, a plain local (the fail
     // call's presence is what proves it the stored canary), a `+0x28` read
-    // through any (possibly spilled) TLS base, or a memory cell proven to hold
+    // through any (possibly spilled) TLS base, a memory cell proven to hold
     // the stored canary - the frame slot the prologue wrote with
-    // `Move [frame+off], [SYSREG+0x28]`.
+    // `Move [frame+off], [SYSREG+0x28]` - or a frame cell read through a
+    // materialized address-of pointer whose store the lift did not emit.
     private static bool IsCanaryOperand(IOperand operand, ISILControlFlowGraph cfg) =>
         operand switch
         {
             LocalVariable => true,
             MemoryOperand { Index: null, Addend: TlsStackGuardOffset } => true,
-            MemoryOperand mem => IsStoredCanaryCell(mem, cfg),
+            MemoryOperand mem => IsStoredCanaryCell(mem, cfg) || IsFrameCanaryCell(mem, cfg),
             _ => false,
         };
+
+    // A `[ptr + off]` load through a pointer materialized as `Move ptr,
+    // &stackslot` - or directly through `&stackslot` - reads a frame cell even
+    // when the canary store itself is absent: large frames re-materialize the
+    // frame base per use and the lifter may not have emitted the prologue
+    // store. The compiler only ever compares the TLS canary against its own
+    // stored copy, so next to a proven canary side the frame cell is that copy.
+    private static bool IsFrameCanaryCell(MemoryOperand cell, ISILControlFlowGraph cfg)
+    {
+        if (cell.Index != null)
+            return false;
+        if (cell.Base is AddressOf addressOf)
+            return IsStackSlot(addressOf.Target);
+        if (cell.Base is not LocalVariable pointer)
+            return false;
+        var saw = false;
+        foreach (var def in cfg.Instructions.Where(i => ReferenceEquals(i.Destination, pointer)))
+        {
+            if (def.OpCode != OpCode.Move || def.Operands.Count < 2
+                || def.Operands[1] is not AddressOf source
+                || !IsStackSlot(source.Target))
+                return false;
+            saw = true;
+        }
+        return saw;
+    }
+
+    private static bool IsStackSlot(IOperand operand) =>
+        operand is LocalVariable { Register.Name: { } name } && name.StartsWith("stack_");
 
     // A memory cell is the stored canary when every write to it carries the
     // TLS canary value - the prologue's `Move [cell], [SYSREG+0x28]`, possibly

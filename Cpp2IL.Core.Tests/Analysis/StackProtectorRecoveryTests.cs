@@ -459,6 +459,78 @@ public class StackProtectorRecoveryTests
         Assert.That(branch.OpCode, Is.EqualTo(OpCode.ConditionalJump));
     }
 
+    // The large-frame shape: the compare reads the canary's frame slot through
+    // a pointer materialized as `Move ptr, &stackslot`, and no store to that
+    // cell was lifted. The proven [SYSREG+0x28] side and the reachable
+    // __stack_chk_fail still prove the protector, so the guard folds.
+    [Test]
+    public void AddressOfFrameCellCompareFolds()
+    {
+        var caller = Caller();
+        var sysLocal = new LocalVariable("v_sys", new Register(null, "SYSREG"), _int64);
+        var tls = Reg("X23", _int64, 1);
+        var frameSlot = new LocalVariable("v48", new Register(null, "stack_-80A0"), _int64);
+        var ptr = Reg("X9", _int64, 147);
+        var cond = Reg("TEMPCOND", _app.SystemTypes.SystemBooleanType, 20);
+
+        var failCall = new Instruction(5, OpCode.Call, new StringLiteral("__stack_chk_fail"),
+            Reg("X0", version: 2));
+        var failReturn = new Instruction(6, OpCode.Return);
+        var mergeReturn = new Instruction(4, OpCode.Return, Reg("X0", version: 3));
+        var branch = new Instruction(3, OpCode.ConditionalJump, failCall, cond);
+
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, tls, sysLocal),
+            new Instruction(1, OpCode.Move, ptr, new AddressOf(frameSlot)),
+            new Instruction(2, OpCode.CheckNotEqual, cond,
+                new MemoryOperand(tls, null, 0x28), new MemoryOperand(ptr, null, 0x7FF8)),
+            branch,
+            mergeReturn,
+            failCall,
+            failReturn,
+        ]);
+        caller.Locals = [sysLocal, tls, frameSlot, ptr, cond];
+
+        StackProtectorRecovery.Run(caller);
+
+        Assert.That(branch.OpCode, Is.EqualTo(OpCode.Jump));
+        Assert.That(failCall.OpCode, Is.EqualTo(OpCode.Nop));
+    }
+
+    // The same frame-cell compare with no failure call anywhere: without the
+    // co-proof the frame slot is not proven the canary and the guard stays.
+    [Test]
+    public void AddressOfFrameCellWithoutFailCallStays()
+    {
+        var caller = Caller();
+        var sysLocal = new LocalVariable("v_sys", new Register(null, "SYSREG"), _int64);
+        var tls = Reg("X23", _int64, 1);
+        var frameSlot = new LocalVariable("v48", new Register(null, "stack_-80A0"), _int64);
+        var ptr = Reg("X9", _int64, 147);
+        var cond = Reg("TEMPCOND", _app.SystemTypes.SystemBooleanType, 20);
+
+        var realCall = new Instruction(5, OpCode.Call, new StringLiteral("puts"),
+            Reg("X0", version: 2));
+        var mergeReturn = new Instruction(4, OpCode.Return, Reg("X0", version: 3));
+        var branch = new Instruction(3, OpCode.ConditionalJump, realCall, cond);
+
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, tls, sysLocal),
+            new Instruction(1, OpCode.Move, ptr, new AddressOf(frameSlot)),
+            new Instruction(2, OpCode.CheckNotEqual, cond,
+                new MemoryOperand(tls, null, 0x28), new MemoryOperand(ptr, null, 0x7FF8)),
+            branch,
+            mergeReturn,
+            realCall,
+            new Instruction(6, OpCode.Return),
+        ]);
+        caller.Locals = [sysLocal, tls, frameSlot, ptr, cond];
+
+        StackProtectorRecovery.Run(caller);
+
+        Assert.That(branch.OpCode, Is.EqualTo(OpCode.ConditionalJump));
+    }
+
     // A canary-looking compare whose +0x28 bases are not TLS-provenanced is not
     // the stack-guard read: the guard stays.
     [Test]
