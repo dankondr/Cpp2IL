@@ -7725,12 +7725,155 @@ public static class IlGenerator
             {
                 var instructions = method.CilMethodBody!.Instructions;
                 instructions.Add(CilOpCodes.Pop);
-                PushDefaultOf(contract, method, instructions, context, SlotDefaultReasonFor(emitted, contract, context));
+                if (!TryEmitAwaiterCall(operand, emitted, contract, method, context, locals))
+                    PushDefaultOf(contract, method, instructions, context, SlotDefaultReasonFor(emitted, contract, context));
             }
             return true;
         }
-        PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context, SlotDefaultReasonFor(emitted, contract, context));
+        if (!TryEmitAwaiterCall(operand, emitted, contract, method, context, locals))
+            PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context, SlotDefaultReasonFor(emitted, contract, context));
         return true;
+    }
+
+    // A value-typed source can only reach an awaiter-typed slot through the
+    // conversion the source-level await wrote: the awaitable's awaiter-producing
+    // call - T.GetAwaiter(), or DisposeAsync() for an `await using` disposable
+    // whose returned awaiter performs the switch. IL2CPP inlines that trivial
+    // wrapper - the binary moves the awaitable's bits into the awaiter slot -
+    // so where the operand's type declares a usable producer returning exactly
+    // the slot type, emitting the real call reproduces the conversion the
+    // binary made instead of standing a default in for it.
+    private static bool TryEmitAwaiterCall(IOperand operand, TypeAnalysisContext? emitted,
+        TypeAnalysisContext? contract, MethodDefinition method, MethodAnalysisContext context,
+        Dictionary<LocalVariable, CilLocalVariable> locals)
+    {
+        if (contract is not { IsValueType: true } or ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+            || emitted is not { IsValueType: true } or ByRefTypeAnalysisContext or PointerTypeAnalysisContext
+            || ThisConstructorCallPlan.SameTypeIdentity(emitted, contract))
+            return false;
+        // Awaiter types sit nested inside the awaitable that produces them
+        // (UniTask.Awaiter, ReturnToSynchronizationContext.Awaiter). Requiring
+        // that pairing keeps this to the proven conversion - a parameterless
+        // method on an unrelated type could do real work, which a bit move
+        // never implies.
+        if (contract.DeclaringType is not { } contractDeclaring
+            || !ThisConstructorCallPlan.SameTypeIdentity(contractDeclaring, emitted))
+            return false;
+        if (operand is not LocalVariable local || !locals.TryGetValue(local, out var cilLocal))
+            return false;
+
+        var definition = (emitted as GenericInstanceTypeAnalysisContext)?.GenericType ?? emitted;
+        foreach (var candidate in definition.Methods)
+        {
+            if (candidate is not { IsStatic: false, Name: "GetAwaiter" or "DisposeAsync" } || candidate.Parameters.Count != 0)
+                continue;
+            var getAwaiter = emitted is GenericInstanceTypeAnalysisContext instance
+                ? new ConcreteGenericMethodAnalysisContext(candidate, instance.GenericArguments, [])
+                : candidate;
+            if (!ThisConstructorCallPlan.SameTypeIdentity(getAwaiter.ReturnType, contract)
+                || !CalleeUsableFrom(getAwaiter, context)
+                || !ProducerBodyIsBitCopy(candidate, getAwaiter, context))
+                continue;
+            var instructions = method.CilMethodBody!.Instructions;
+            instructions.Add(CilOpCodes.Ldloca, cilLocal);
+            instructions.Add(CilOpCodes.Call, getAwaiter.ToMethodDescriptor());
+            return true;
+        }
+        return false;
+    }
+
+    // The conversion above is only proven when the producer's own lifted body
+    // is the copy the binary made: no call, allocation or branch, and every
+    // write building the returned awaiter out of the receiver's fields - never
+    // into the receiver itself, which would be a side effect a bit move does
+    // not reproduce.
+    private static bool ProducerBodyIsBitCopy(MethodAnalysisContext candidate,
+        MethodAnalysisContext producer, MethodAnalysisContext context)
+    {
+        var body = producer;
+        if (producer is ConcreteGenericMethodAnalysisContext { MethodRef: null } concrete
+            && context.AppContext.ConcreteGenericMethodsByRef.Values.FirstOrDefault(variant =>
+                variant.BaseMethodContext == candidate
+                && variant.MethodGenericParameters.Count == 0
+                && variant.TypeGenericParameters.Count == concrete.TypeGenericParameters.Count
+                && variant.TypeGenericParameters.Zip(concrete.TypeGenericParameters).All(pair =>
+                    ThisConstructorCallPlan.SameTypeIdentity(pair.First, pair.Second))) is { } variant)
+            body = variant;
+        if (body.ConvertedIsil == null && body.UnderlyingPointer != 0)
+            body.Analyze();
+        var isil = body.ConvertedIsil;
+        if (isil is not { Count: > 0 })
+            return false;
+        var definitions = new Dictionary<IOperand, List<IOperand>>();
+        foreach (var instruction in isil)
+        {
+            if (instruction.Operands.Count < 2 || definitions.ContainsKey(instruction.Operands[0]))
+                continue;
+            definitions[instruction.Operands[0]] = instruction.Operands.Skip(1).ToList();
+        }
+        foreach (var instruction in isil)
+        {
+            switch (instruction.OpCode)
+            {
+                case OpCode.Move or OpCode.MemoryCopy or OpCode.MemoryMove or OpCode.MemorySet:
+                    if (instruction.Operands.Count == 0 || WriteRootsInReceiver(instruction.Operands[0], definitions))
+                        return false;
+                    break;
+                case OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
+                    or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And or OpCode.Or or OpCode.Xor
+                    or OpCode.Not or OpCode.Negate or OpCode.VectorMin or OpCode.VectorMax
+                    or OpCode.SignExtend32 or OpCode.Nop or OpCode.Return:
+                    break;
+                default:
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    // A write destination proves a receiver mutation only when its base address
+    // resolves back to `this`: field or memory destinations rooted in the
+    // receiver are side effects; roots in parameters, locals or the return
+    // buffer are the copy the await wrote.
+    private static bool WriteRootsInReceiver(IOperand destination,
+        Dictionary<IOperand, List<IOperand>> definitions)
+    {
+        return destination switch
+        {
+            FieldReference field => RootedInReceiver(field.Local, definitions, 0),
+            MemoryOperand memory => (memory.Base != null && RootedInReceiver(memory.Base, definitions, 0))
+                || (memory.Index != null && RootedInReceiver(memory.Index, definitions, 0)),
+            _ => false,
+        };
+    }
+
+    private static bool RootedInReceiver(IOperand operand,
+        Dictionary<IOperand, List<IOperand>> definitions, int depth)
+    {
+        if (depth > 12)
+            return true;
+        switch (operand)
+        {
+            case FieldReference field:
+                return RootedInReceiver(field.Local, definitions, depth + 1);
+            case MemoryOperand memory:
+                return (memory.Base != null && RootedInReceiver(memory.Base, definitions, depth + 1))
+                    || (memory.Index != null && RootedInReceiver(memory.Index, definitions, depth + 1));
+            case AddressOf address:
+                return RootedInReceiver(address.Target, definitions, depth + 1);
+            case LocalVariable local:
+                if (local.IsThis || local.Name == "this")
+                    return true;
+                if (definitions.TryGetValue(local, out var sources))
+                    return sources.Any(source => RootedInReceiver(source, definitions, depth + 1));
+                return false;
+            case Register register:
+                if (definitions.TryGetValue(register, out var registerSources))
+                    return registerSources.Any(source => RootedInReceiver(source, definitions, depth + 1));
+                return false;
+            default:
+                return false;
+        }
     }
 
     // Resolves the operand form a slot load emits and whether its emitted type
