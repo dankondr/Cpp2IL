@@ -337,6 +337,108 @@ public class PackedRegisterFieldTests
     }
 
     [Test]
+    public void AwaiterChainRestampedAfterEarlyPassStaysDiagnosed()
+    {
+        // An awaiter register local looks like `Awaiter` while the in-SSA pass
+        // runs and `object` once a later inference settles the slot: a
+        // `slot.task.source` read projected on the early view emits
+        // `ldloc;unbox;ldflda`, which does not verify. The read stays a
+        // diagnosed integer op.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var inner = InjectStruct(app, "InnerTask");
+        InjectField("source", app.SystemTypes.SystemObjectType, inner, 0);
+        var outer = InjectStruct(app, "AwaiterShell");
+        var task = InjectField("task", inner, outer, 0);
+        var module = new ModuleDefinition("Packed.dll");
+        Seed(module, app, inner, outer);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemBooleanType, app.SystemTypes.SystemVoidType);
+
+        var slot = new LocalVariable("slot", new Register(null, "X8"), outer);
+        var result = Local("result", app.SystemTypes.SystemBooleanType);
+        var check = new Instruction(0, OpCode.CheckEqual, result,
+            new FieldReference(task, slot, 0), new Immediate(0));
+        var (caller, method) = ForeignCaller(app, module,
+            [check, new Instruction(1, OpCode.Return)], [slot, result]);
+
+        LocalVariables.ResolveTypesAndFields(caller);
+        // The restamp a later pass performs on the same local.
+        slot.Type = app.SystemTypes.SystemObjectType;
+        IlGenerator.GenerateIl(caller, method);
+
+        Assert.That(check.Operands[1], Is.TypeOf<FieldReference>()
+                .And.Matches((FieldReference? reference) => reference is { Field.Name: "task" }),
+            "a container hop taken on the early emitted type emits `unbox;ldflda` - stays");
+        Assert.That(method.CilMethodBody!.Instructions.Any(i => i.OpCode == CilOpCodes.Ldflda),
+            Is.False, () => "no readonly-& field address may reach the emitted body:\n" + Dump(method));
+    }
+
+    [Test]
+    public void AwaiterChainOnStructSlotProjectsInFinalPass()
+    {
+        // The same chain on a root whose emitted slot stays the struct projects
+        // at the final pass - `ldloca`/`ldflda` verifies there.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var inner = InjectStruct(app, "InnerTask");
+        InjectField("source", app.SystemTypes.SystemObjectType, inner, 0);
+        var outer = InjectStruct(app, "AwaiterShell");
+        var task = InjectField("task", inner, outer, 0);
+        var module = new ModuleDefinition("Packed.dll");
+        Seed(module, app, inner, outer);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemBooleanType, app.SystemTypes.SystemVoidType);
+
+        var slot = new LocalVariable("slot", new Register(null, "X8"), outer);
+        var result = Local("result", app.SystemTypes.SystemBooleanType);
+        var check = new Instruction(0, OpCode.CheckEqual, result,
+            new FieldReference(task, slot, 0), new Immediate(0));
+        var (caller, method) = ForeignCaller(app, module,
+            [check, new Instruction(1, OpCode.Return)], [slot, result]);
+
+        LocalVariables.ResolveTypesAndFields(caller);
+        PackedRegisterFields.Run(caller, finalPass: true);
+
+        Assert.That(check.Operands[1], Is.TypeOf<FieldReference>()
+                .And.Matches((FieldReference? reference) =>
+                    reference is { Field.Name: "source", Containers.Count: 1 }),
+            "a settled struct slot keeps the recovered read");
+
+        IlGenerator.GenerateIl(caller, method);
+        Assert.That(method.CilMethodBody!.Instructions.Any(i => i.OpCode == CilOpCodes.Ldflda),
+            Is.True, () => "the writable-address hop reaches the emitted body:\n" + Dump(method));
+    }
+
+    [Test]
+    public void PointerLocalMethodKeepsReadsDiagnosed()
+    {
+        // `ldloc` on an unmanaged-pointer local is not a verifiable type. A
+        // rewrite here would remove the diagnostic that keeps such code dead,
+        // so every rewrite in the method is declined.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var nullableInt = NullableOf(app, app.SystemTypes.SystemInt32Type);
+        var module = new ModuleDefinition("Packed.dll");
+        Seed(module, app, nullableInt.GenericType);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemBooleanType, app.SystemTypes.SystemVoidType);
+
+        var packed = new LocalVariable("packed", new Register(null, "X0"), nullableInt);
+        var pointer = new LocalVariable("pointer", new Register(null, "X9"),
+            new PointerTypeAnalysisContext(app.SystemTypes.SystemInt32Type));
+        var flag = Local("flag", app.SystemTypes.SystemBooleanType);
+        var mask = new Instruction(0, OpCode.And, flag, packed, new Immediate(0xFF));
+        var (caller, method) = ForeignCaller(app, module,
+            [mask, new Instruction(1, OpCode.Move, pointer, new Immediate(0)),
+                new Instruction(2, OpCode.Return)],
+            [packed, pointer, flag]);
+        caller.ParameterLocals = [packed];
+
+        LocalVariables.ResolveTypesAndFields(caller);
+
+        Assert.That(mask.OpCode, Is.EqualTo(OpCode.And),
+            "a method reading a pointer-typed local declines packed rewrites");
+    }
+
+    [Test]
     public void PartialByteMaskStaysDiagnosed()
     {
         // `ands x8, x0, #0x0F00000000` selects four bits of `value` - a bit

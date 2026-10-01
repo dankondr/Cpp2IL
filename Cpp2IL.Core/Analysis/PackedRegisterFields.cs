@@ -49,13 +49,41 @@ internal static class PackedRegisterFields
         GreaterOrEqual,
     }
 
-    public static bool Run(MethodAnalysisContext method)
+    public static bool Run(MethodAnalysisContext method, bool finalPass = false)
     {
         var graph = method.ControlFlowGraph;
         if (graph == null)
             return false;
 
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+
+        // `ldloc` on a local whose emitted slot is an unmanaged pointer is not a
+        // verifiable type. Every rewrite here replaces an op that would emit as
+        // unrecoverable (a diagnostic, and usually a thrown block) with real code,
+        // so in a method that reads a pointer-typed local a rewrite can expose
+        // dead pointer code to the verifier. Those reads stay diagnosed instead.
+        // The pointer sources below mirror the paths IlGenerator.EmittedLocalType
+        // takes to a PointerTypeAnalysisContext slot - a declared pointer type on
+        // the local or parameter, or a pointer-returning call - so this stays a
+        // single pass over the instructions rather than a per-local CFG scan.
+        var operandLocals = new HashSet<LocalVariable>();
+        var pointerSlotLocals = new HashSet<LocalVariable>();
+        foreach (var instruction in graph.Instructions)
+        {
+            foreach (var operand in instruction.Operands)
+                operandLocals.UnionWith(LocalVariables.OperandLocals(operand));
+            if (instruction is { OpCode: OpCode.Call, Destination: LocalVariable callResult,
+                    Operands: [MethodAnalysisContext { ReturnType: PointerTypeAnalysisContext }, ..] })
+                pointerSlotLocals.Add(callResult);
+        }
+        for (var index = 0; index < method.Parameters.Count && index < method.ParameterLocals.Count; index++)
+            if (method.Parameters[index].ParameterType is PointerTypeAnalysisContext)
+                pointerSlotLocals.Add(method.ParameterLocals[index]);
+        foreach (var local in operandLocals)
+            if (local.Type is PointerTypeAnalysisContext)
+                pointerSlotLocals.Add(local);
+        if (operandLocals.Overlaps(pointerSlotLocals))
+            return false;
 
         // The flag-pair fold follows a temporary to its definition, which is only
         // meaningful while the local has exactly one. SSA guarantees that; after
@@ -77,9 +105,9 @@ internal static class PackedRegisterFields
         var changed = false;
         foreach (var instruction in graph.Instructions)
         {
-            changed |= RewriteSelectingOperation(method, instruction, pointerSize);
+            changed |= RewriteSelectingOperation(method, instruction, pointerSize, finalPass);
             changed |= RewritePackedComparison(method, instruction, definitions,
-                foldedSources, pointerSize);
+                foldedSources, pointerSize, finalPass);
         }
 
         // A subtraction whose only consumers were rewritten flag checks carries no
@@ -111,7 +139,7 @@ internal static class PackedRegisterFields
     }
 
     private static bool RewriteSelectingOperation(MethodAnalysisContext method,
-        Instruction instruction, int pointerSize)
+        Instruction instruction, int pointerSize, bool finalPass)
     {
         var operandWidth = instruction.NativeIntegerWidthBits == 32 ? 4 : 8;
         switch (instruction.OpCode)
@@ -122,19 +150,21 @@ internal static class PackedRegisterFields
                 if (instruction.NativeReadWidthBits is { } readBits
                     && readBits > 0 && readBits % 8 == 0)
                     return TryWholeRead(method, instruction, 0, readBits / 8, pointerSize,
-                        instruction.NativeReadSignExtend == true ? LeafKind.Signed : LeafKind.Unsigned);
+                        instruction.NativeReadSignExtend == true ? LeafKind.Signed : LeafKind.Unsigned,
+                        finalPass);
                 // A move into an integer-typed local is the W-register truncation of
                 // the packed struct: the destination type is the read contract.
                 if (instruction.Destination is LocalVariable { Type: { } destinationType }
                     && IlGenerator.IntegralStackWidth(destinationType) is var stackWidth
                     && stackWidth is 4 or 8)
                     return TryWholeRead(method, instruction, 0, stackWidth, pointerSize,
-                        LeafKind.Whole);
+                        LeafKind.Whole, finalPass);
                 return false;
 
             case OpCode.SignExtend32:
                 return instruction.Operands.Count == 2
-                    && TryWholeRead(method, instruction, 0, 4, pointerSize, LeafKind.Signed);
+                    && TryWholeRead(method, instruction, 0, 4, pointerSize, LeafKind.Signed,
+                        finalPass);
 
             case OpCode.ShiftRight:
                 // `P >> n` keeps bytes [n/8, packedSize) of the source register:
@@ -158,7 +188,7 @@ internal static class PackedRegisterFields
                         return true;
                     }
                     if (TryWholeRead(method, instruction, (int)(bits / 8),
-                            shiftedSize - (int)(bits / 8), pointerSize, LeafKind.Whole))
+                            shiftedSize - (int)(bits / 8), pointerSize, LeafKind.Whole, finalPass))
                         return true;
                 }
                 goto default;
@@ -225,7 +255,7 @@ internal static class PackedRegisterFields
                                 (int)maskedLeafWidth, method, pointerSize,
                                 MaskLeafKind(bitOffset, maskedLeafWidth,
                                     destinationWidth,
-                                    LeafBitWidth(maskedLeafType, pointerSize)))
+                                    LeafBitWidth(maskedLeafType, pointerSize)), finalPass)
                                 is var (field, _))
                     {
                         var destination = instruction.Destination!;
@@ -258,7 +288,7 @@ internal static class PackedRegisterFields
                                 is var lowLeafWidth
                         && lowLeafWidth == lowFieldSize
                         && ProjectOperand(maskOperand, masked, 0, (int)lowLeafWidth,
-                                method, pointerSize, LeafKind.Integral)
+                                method, pointerSize, LeafKind.Integral, finalPass)
                             is var (lowLeaf, _))
                     {
                         instruction.SetOperand(ReferenceEquals(maskOperand, instruction.Operands[1]) ? 1 : 2, lowLeaf);
@@ -277,7 +307,8 @@ internal static class PackedRegisterFields
                 goto default;
 
             default:
-                return RewriteIntegerOperands(method, instruction, operandWidth, pointerSize);
+                return RewriteIntegerOperands(method, instruction, operandWidth, pointerSize,
+                    finalPass);
         }
     }
 
@@ -286,7 +317,7 @@ internal static class PackedRegisterFields
     // operand whose whole read range is one field is replaced by that field; the
     // opcode stays and the emitted op is `field op rhs`.
     private static bool RewriteIntegerOperands(MethodAnalysisContext method,
-        Instruction instruction, int operandWidth, int pointerSize)
+        Instruction instruction, int operandWidth, int pointerSize, bool finalPass)
     {
         var changed = false;
         for (var index = 1; index < instruction.Operands.Count; index++)
@@ -294,7 +325,7 @@ internal static class PackedRegisterFields
             if (OperandReadRange(instruction, index, operandWidth) is not { } range
                 || PackedOperandType(instruction.Operands[index], pointerSize) is not { } type
                 || ProjectOperand(instruction.Operands[index], type, range.Offset, range.Width,
-                    method, pointerSize, LeafKind.Integral) is not var (field, _))
+                    method, pointerSize, LeafKind.Integral, finalPass) is not var (field, _))
                 continue;
             instruction.SetOperand(index, field);
             changed = true;
@@ -329,12 +360,12 @@ internal static class PackedRegisterFields
     // `P >>`/`P &`/`ext(P)` rewrites collapse the whole instruction into a read of
     // the one field the byte range selects: `Move destination, field`.
     private static bool TryWholeRead(MethodAnalysisContext method, Instruction instruction,
-        int offset, int width, int pointerSize, LeafKind leafKind)
+        int offset, int width, int pointerSize, LeafKind leafKind, bool finalPass)
     {
         var operand = instruction.Operands[1];
         if (PackedOperandType(operand, pointerSize) is not { } type)
             return false;
-        if (ProjectOperand(operand, type, offset, width, method, pointerSize, leafKind)
+        if (ProjectOperand(operand, type, offset, width, method, pointerSize, leafKind, finalPass)
                 is not var (field, leafType))
             return false;
 
@@ -356,7 +387,7 @@ internal static class PackedRegisterFields
 
     private static bool RewritePackedComparison(MethodAnalysisContext method,
         Instruction instruction, IReadOnlyDictionary<LocalVariable, Instruction> definitions,
-        HashSet<Instruction> foldedSources, int pointerSize)
+        HashSet<Instruction> foldedSources, int pointerSize, bool finalPass)
     {
         var relation = instruction.OpCode switch
         {
@@ -385,7 +416,7 @@ internal static class PackedRegisterFields
                     : (null, 0L, false);
             if (operand != null
                 && TryPackedCompare(method, instruction, operand,
-                    Swap(relation.Value, swapped), constant, pointerSize))
+                    Swap(relation.Value, swapped), constant, pointerSize, finalPass))
             {
                 foldedSources.Add(definition);
                 return true;
@@ -395,11 +426,11 @@ internal static class PackedRegisterFields
 
         if (instruction.Operands[2] is Immediate { Value: var bound }
             && TryPackedCompare(method, instruction, instruction.Operands[1], relation.Value,
-                bound, pointerSize))
+                bound, pointerSize, finalPass))
             return true;
         if (instruction.Operands[1] is Immediate { Value: var flipped }
             && TryPackedCompare(method, instruction, instruction.Operands[2],
-                Swap(relation.Value, true), flipped, pointerSize))
+                Swap(relation.Value, true), flipped, pointerSize, finalPass))
             return true;
         return false;
     }
@@ -415,7 +446,7 @@ internal static class PackedRegisterFields
         } : relation;
 
     private static bool TryPackedCompare(MethodAnalysisContext method, Instruction instruction,
-        IOperand packedOperand, Comparison relation, long constant, int pointerSize)
+        IOperand packedOperand, Comparison relation, long constant, int pointerSize, bool finalPass)
     {
         if (PackedOperandType(packedOperand, pointerSize) is not { } type)
             return false;
@@ -425,9 +456,9 @@ internal static class PackedRegisterFields
 
         if (relation is Comparison.Equal or Comparison.NotEqual)
             return TryPackedEquality(method, instruction, packedOperand, type, packedSize,
-                relation == Comparison.NotEqual, constant, pointerSize);
+                relation == Comparison.NotEqual, constant, pointerSize, finalPass);
         return TryPackedOrder(method, instruction, packedOperand, type, packedSize,
-            relation, constant, pointerSize);
+            relation, constant, pointerSize, finalPass);
     }
 
     // `packed R k` for an ordering. Under 8 bytes the packed value is always
@@ -436,7 +467,7 @@ internal static class PackedRegisterFields
     // `packed <= bound` is `hi == 0 && lo <= bound`, and `hi` must name one field.
     private static bool TryPackedOrder(MethodAnalysisContext method, Instruction instruction,
         IOperand packedOperand, TypeAnalysisContext type, int packedSize,
-        Comparison relation, long constant, int pointerSize)
+        Comparison relation, long constant, int pointerSize, bool finalPass)
     {
         if (packedSize >= 8 || instruction.Destination is not { } destination)
             return false;
@@ -476,7 +507,7 @@ internal static class PackedRegisterFields
             || TypeSizes.MinimumUnboxedSize(highLeafType, pointerSize) is var highLeafWidth
                 && highLeafWidth <= 0
             || ProjectOperand(packedOperand, type, (int)highOffset, (int)highLeafWidth,
-                    method, pointerSize, LeafKind.Any) is not var (high, _))
+                    method, pointerSize, LeafKind.Any, finalPass) is not var (high, _))
             return false;
 
         instruction.OpCode = negate ? OpCode.CheckNotEqual : OpCode.CheckEqual;
@@ -516,7 +547,7 @@ internal static class PackedRegisterFields
     // can never hold fold to a constant; a one-field struct compares the field.
     private static bool TryPackedEquality(MethodAnalysisContext method, Instruction instruction,
         IOperand packedOperand, TypeAnalysisContext type, int packedSize,
-        bool negate, long constant, int pointerSize)
+        bool negate, long constant, int pointerSize, bool finalPass)
     {
         var destination = instruction.Destination;
         if (destination == null)
@@ -531,7 +562,7 @@ internal static class PackedRegisterFields
         }
 
         if (ProjectOperand(packedOperand, type, 0, packedSize, method, pointerSize,
-                LeafKind.Any) is not var (single, _))
+                LeafKind.Any, finalPass) is not var (single, _))
             return false;
         instruction.OpCode = negate ? OpCode.CheckNotEqual : OpCode.CheckEqual;
         instruction.SetOperands(destination, single, new Immediate(constant));
@@ -552,7 +583,7 @@ internal static class PackedRegisterFields
     // whatever `T` was instantiated to - and comes back beside the reference.
     private static (FieldReference Field, TypeAnalysisContext LeafType)? ProjectOperand(
         IOperand operand, TypeAnalysisContext type, int offset, int width,
-        MethodAnalysisContext method, int pointerSize, LeafKind leafKind)
+        MethodAnalysisContext method, int pointerSize, LeafKind leafKind, bool finalPass)
     {
         if (width <= 0)
             return null;
@@ -561,7 +592,7 @@ internal static class PackedRegisterFields
         {
             // The whole read range is one leaf - the usual case.
             return ProjectLeaf(operand, type, offset, width, exactLeaf, containers,
-                method, pointerSize, leafKind);
+                method, pointerSize, leafKind, finalPass);
         }
 
         // A read wider than one leaf still spells it when every other byte in
@@ -579,7 +610,7 @@ internal static class PackedRegisterFields
             && IsUnsignedLeaf(paddedType)
             && LeafAdmissible(paddedType, leafKind))
             return ProjectLeaf(operand, type, (int)paddedOffset, (int)paddedWidth, paddedLeaf,
-                null, method, pointerSize, leafKind);
+                null, method, pointerSize, leafKind, finalPass);
 
         return null;
     }
@@ -587,7 +618,7 @@ internal static class PackedRegisterFields
     private static (FieldReference Field, TypeAnalysisContext LeafType)? ProjectLeaf(
         IOperand operand, TypeAnalysisContext type, int offset, int width,
         FieldAnalysisContext leaf, IReadOnlyList<FieldAnalysisContext>? containers,
-        MethodAnalysisContext method, int pointerSize, LeafKind leafKind)
+        MethodAnalysisContext method, int pointerSize, LeafKind leafKind, bool finalPass)
     {
         if (ResolvedFieldType(type, containers, leaf) is not { } leafType)
             return null;
@@ -605,8 +636,28 @@ internal static class PackedRegisterFields
                     .Concat(containers ?? []).ToList(), width),
             _ => null,
         };
-        if (projected == null
-            || MetadataResolver.MemberPathUnspellable((projected.Field, projected.Containers),
+        if (projected == null)
+            return null;
+        if (projected.Containers.Count > 0
+            && projected.Containers[0].DeclaringType is { IsValueType: true } containerOwner)
+        {
+            // A container hop emits `ldflda` on the root local: that verifies
+            // only when the slot emits an address of the container's declaring
+            // struct - `ldloca`/`ldarga`/`&` receivers. An object-emitting local
+            // yields a readonly unbox result instead, and `ldflda` on it does
+            // not verify. During the in-SSA invocation a register local's Type
+            // is still a register-reuse guess later passes restamp, so the hop
+            // waits for the final pass where the emitted type is settled.
+            if (!finalPass)
+                return null;
+            var receiver = IlGenerator.EmittedLocalType(projected.Local, method)
+                is ByRefTypeAnalysisContext byRef ? byRef.ElementType
+                : IlGenerator.EmittedLocalType(projected.Local, method);
+            if (receiver is not { IsValueType: true }
+                || !SameStruct(receiver, containerOwner))
+                return null;
+        }
+        if (MetadataResolver.MemberPathUnspellable((projected.Field, projected.Containers),
                 method, store: false, addressed: false))
             return null;
         return (projected, leafType);
@@ -701,8 +752,19 @@ internal static class PackedRegisterFields
             _ => false,
         };
 
+    // Structural type identity, mirroring IlGenerator.SameTypeIdentity: context
+    // objects for the same metadata type need not be reference-equal.
+    private static bool SameStruct(TypeAnalysisContext? a, TypeAnalysisContext? b)
+        => a != null && b != null
+            && (ReferenceEquals(a, b) || a.FullName == b.FullName
+                || a is GenericInstanceTypeAnalysisContext left
+                    && b is GenericInstanceTypeAnalysisContext right
+                    && SameStruct(left.GenericType, right.GenericType)
+                    && left.GenericArguments.Count == right.GenericArguments.Count
+                    && left.GenericArguments.Zip(right.GenericArguments, SameStruct).All(z => z));
+
     private static bool LeafAdmissible(TypeAnalysisContext leafType, LeafKind leafKind)
-        => leafKind switch
+        => leafType is not PointerTypeAnalysisContext && leafKind switch
         {
             LeafKind.Any => IlGenerator.IntegralStackWidth(leafType) != 0 || !leafType.IsValueType,
             LeafKind.Integral => IlGenerator.IntegralStackWidth(leafType) != 0,
