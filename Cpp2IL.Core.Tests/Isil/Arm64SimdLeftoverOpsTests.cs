@@ -283,28 +283,27 @@ public class Arm64SimdLeftoverOpsTests
     [Test]
     public void FaddpOnOpaqueWholeRegisterCarrierStaysDiagnostic()
     {
-        // a post-indexed d-load has no lane provenance: FADDP S0, V0.2S would
-        // need the high lane via a bit-shift of the register local — refused:
-        // the register may carry a managed Vector2/aggregate.
+        // ldr d0 loads a whole-register local; FADDP S0, V0.2S would need the
+        // high lane via a bit-shift of that local — refused: the register may
+        // carry a managed Vector2/aggregate, not an integer lane carrier.
         var il = Lift(
-            0xFC408400, // ldr d0, [x0], #8
-            0x7E30D800, // faddp s0, v0.2s
+            0xFD400000, // ldr d0, [x0]
+            0x7E30D840, // faddp s0, v0.2s
             0xD65F03C0);
         Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.True);
     }
 
     [Test]
-    public void ScalarCompareOnDoubleLoadFolds()
+    public void ScalarCompareOnWideCarrierStaysDiagnostic()
     {
-        // ldr d0 materializes the low float field as an element local — an
-        // honest 32-bit carrier — so a scalar compare over it folds
+        // ldr d0 gives V0 64-bit provenance — its local may hold a managed
+        // aggregate, so a scalar compare over it stays one honest diagnostic
         var il = Lift(
             0xFD400000, // ldr d0, [x0]
             0x7EA1E403, // fcmgt s3, s0, s1
             0xD65F03C0);
-        Assert.That(il.Any(i => i.OpCode == OpCode.CheckGreater), Is.True);
-        Assert.That(il.Any(i => i.OpCode == OpCode.Negate), Is.True);
-        Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        Assert.That(il.Count(i => i.OpCode == OpCode.NotImplemented), Is.EqualTo(1));
+        Assert.That(il.Any(i => i.OpCode is OpCode.CheckGreater or OpCode.Negate), Is.False);
     }
 
     [Test]
@@ -321,18 +320,18 @@ public class Arm64SimdLeftoverOpsTests
     }
 
     [Test]
-    public void BitSelectOnDoubleLoadFolds()
+    public void BitSelectOnWideCarrierStaysDiagnostic()
     {
-        // the select operand's lanes are element locals of the D load — the
-        // per-lane selects read real lane locals, not a managed aggregate
+        // the select operand is a D-write local — folding would read a managed
+        // aggregate through an integer op and materialize reinterpret loads
         var il = Lift(
-            0xFD400000, // ldr d0, [x0] — v0 is the select input
+            0xFD400000, // ldr d0, [x0] — v0 is the wide-carrier input
             0x0E040C21, // dup v1.2s, w1
             0x0E040C42, // dup v2.2s, w2
             0x2EA21C01, // bit v1.8b, v0.8b, v2.8b
             0xD65F03C0);
-        Assert.That(il.Any(i => i.OpCode == OpCode.And), Is.True);
-        Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        Assert.That(il.Count(i => i.OpCode == OpCode.NotImplemented), Is.EqualTo(1));
+        Assert.That(il.Any(i => i.OpCode is OpCode.And or OpCode.Not), Is.False);
     }
 
     [Test]
@@ -342,9 +341,8 @@ public class Arm64SimdLeftoverOpsTests
         // honest diagnostic for lane ops plus unknown windows, so nothing but
         // the diagnostic may be emitted
         var il = Lift(
-            0x3cc01400, // ldr v0, [x0], #1 — post-indexed: no lane provenance
             0x0E040C42, // dup v2.2s, w2 — the only proven input
-            0x2EA21C01, // bit v1.8b, v0.8b, v2.8b — v0 unproven
+            0x2EA21C01, // bit v1.8b, v0.8b, v2.8b — v0/v1 unproven
             0xD65F03C0);
         Assert.That(il.Count(i => i.OpCode == OpCode.NotImplemented), Is.EqualTo(1));
         Assert.That(il.Any(i => i.OpCode is OpCode.And or OpCode.Not or OpCode.ShiftRight), Is.False,
@@ -356,7 +354,6 @@ public class Arm64SimdLeftoverOpsTests
     {
         var il = Lift(
             0x0E040C42, // dup v2.2s, w2 — proven
-            0x3cc01403, // ldr v3, [x0], #1 — post-indexed: no lane provenance
             0x2EA3E446, // fcmgt v6.2s, v2.2s, v3.2s — v3 unproven
             0xD65F03C0);
         Assert.That(il.Count(i => i.OpCode == OpCode.NotImplemented), Is.EqualTo(1));
@@ -368,13 +365,11 @@ public class Arm64SimdLeftoverOpsTests
     {
         foreach (var word in new uint[]
         {
-            0x5EF8C812, // fcmgt h18, h0, #0.0 — fp16 scalar compare
+            0x5EF8C812, // fcmgt h0, h0, h18 — fp16 scalar compare
+            0x7E30D840, // faddp s0, v0.2s with no proven lanes
+            0x2E611C02, // bsl v2.8b, v0.8b, v1.8b with fully opaque inputs
         })
             Assert.That(Lift(word).Any(i => i.OpCode == OpCode.NotImplemented), Is.True, $"0x{word:X8}");
-        // a post-indexed load is the one input shape with no lane provenance —
-        // pairwise and bit-select folds stay diagnostic on it
-        Assert.That(Lift(0xFC408400, 0x7E30D800).Any(i => i.OpCode == OpCode.NotImplemented), Is.True);
-        Assert.That(Lift(0x3cc01400, 0x2E611C02).Any(i => i.OpCode == OpCode.NotImplemented), Is.True);
     }
 
     [Test]

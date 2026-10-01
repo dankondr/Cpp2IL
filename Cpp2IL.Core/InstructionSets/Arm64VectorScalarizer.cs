@@ -79,27 +79,14 @@ internal sealed class Arm64VectorScalarizer
     private readonly Dictionary<string, Register> _shiftTemps = new();
     private readonly HashSet<ulong> _mergeTargets = new();
     private readonly HashSet<string> _claimedDests = new();
+
+    /// A lane-copy origin: SyncScalarView and scalar FMOV moves leave the
+    /// register local holding a lane of another operand — record which operand,
+    /// so a paired store of two lanes can name the one value they came from.
+    /// Entries keyed by register name (vector and element registers alike).
+    private readonly Dictionary<string, IOperand> _copySource = new();
     private int _tempCounter;
     private bool _clearProvenanceNext;
-
-    /// <summary>
-    /// No control-flow boundary has been crossed yet, so the lanes a register
-    /// was entered with are still live: an unwritten register's low window
-    /// reads as the register local itself, higher windows as the entry
-    /// element locals. Merges keep it — every edge carries the same entry
-    /// value; clearing events (code that is not this path, or an instruction
-    /// with no identifiable destination) drop it, and calls restrict it per
-    /// register via <see cref="_entryMask"/>.
-    /// </summary>
-    private bool _entryValid = true;
-    /// Per-register mask of which 32-bit windows still carry the entry value;
-    /// a call invalidates V0-V7 and V16-V31 outright but only the high half of
-    /// callee-saved V8-V15. Absent = all windows valid while _entryValid holds.
-    private readonly Dictionary<string, int> _entryMask = new();
-
-    private int EntryMask(string name) => _entryMask.TryGetValue(name, out var mask) ? mask : 0xF;
-
-    private bool CanSeed(string name) => _entryValid && EntryMask(name) != 0;
 
     /// <summary>
     /// AAPCS64: a call clobbers V0-V7 and V16-V31, and the upper halves of
@@ -123,8 +110,6 @@ internal sealed class Arm64VectorScalarizer
         }
         foreach (var name in dropped)
             _vectors.Remove(name);
-        for (var v = 0; v < 32; v++)
-            _entryMask["V" + v] = v is >= 8 and <= 15 ? 0b0011 : 0;
     }
 
     /// <summary>Branch instruction addresses that target each merge point.</summary>
@@ -233,10 +218,9 @@ internal sealed class Arm64VectorScalarizer
         _mergeFallThrough.Clear();
         _edgeExit.Clear();
         _claimedDests.Clear();
+        _copySource.Clear();
         _tempCounter = 0;
         _clearProvenanceNext = false;
-        _entryValid = true;
-        _entryMask.Clear();
         _prevAddress = 0;
 
         foreach (var insn in instructions)
@@ -281,7 +265,7 @@ internal sealed class Arm64VectorScalarizer
         // instruction may have redefined that register, the temporary holds the high
         // half of the old value. It is only reused within one instruction.
         _shiftTemps.Clear();
-        _add = add;
+        InstallEmitter(add);
         // merge-edge materializations are stamped with the predecessor's
         // address so a branch's target lookup never lands on them
         _address = _prevAddress;
@@ -289,7 +273,6 @@ internal sealed class Arm64VectorScalarizer
         {
             _vectors.Clear();
             _clearProvenanceNext = false;
-            _entryValid = false;
         }
         if (_mergeTargets.Contains(insn.Address))
             MergeLanesAt(insn.Address);
@@ -324,19 +307,25 @@ internal sealed class Arm64VectorScalarizer
     /// On a control-flow edge every proven window is materialized into its
     /// canonical element register: after this, a merge can name the window
     /// identically no matter which edge produced it, and SSA merges the element
-    /// registers like any scalar.
+    /// registers like any scalar. Windows are materialized top-down: writing
+    /// window 0 into the register local would clobber the old register value
+    /// that higher windows' shifts still need.
     /// </summary>
     private void CanonicalizeLanes()
     {
         foreach (var (name, state) in _vectors)
-            for (var slot = 0; slot < 4; slot++)
+            for (var slot = 3; slot >= 0; slot--)
             {
                 if (state.Slots[slot] is not { } slice || IsCanonical(name, slot, slice))
                     continue;
                 if (SlotOperand(state, slot) is { } value)
                 {
-                    _add(_address, OpCode.Move, [CanonicalSlot(name, slot), value])
-                        .NativeIntegerWidthBits = 32;
+                    var canonicalMove = _add(_address, OpCode.Move, [CanonicalSlot(name, slot), value]);
+                    // the move forwards a lane of unknown managed type:
+                    // NativeFloatWriteBits records the write width without
+                    // seeding Int32 — the lane's own type flows from its value
+                    canonicalMove.NativeFloatWriteBits = 32;
+                    ImmediateWriteWidth.ApplyToMove(canonicalMove);
                     _emitted = true;
                     state.Slots[slot] = new LaneSlice(CanonicalSlot(name, slot), 0);
                     if (slot == 0)
@@ -357,8 +346,6 @@ internal sealed class Arm64VectorScalarizer
     /// </summary>
     private void MergeLanesAt(ulong target)
     {
-        // an unwritten register's entry lanes survive a merge — every edge
-        // carries the same entry value — so lazy seeding stays valid here
         var fallThrough = _mergeFallThrough.Contains(target) ? _vectors : null;
         List<Dictionary<string, VectorState>>? branchEdges = null;
         var backwardEdge = false;
@@ -398,10 +385,13 @@ internal sealed class Arm64VectorScalarizer
             {
                 var state = new VectorState { Name = name };
                 var window0Clobbered = false;
-                for (var slot = 0; slot < 4; slot++)
+                // top-down like CanonicalizeLanes: materializing window 0
+                // into the register local first would clobber the old value
+                // that higher windows' shifts still read
+                for (var slot = 3; slot >= 0; slot--)
                 {
                     // an edge that never wrote the register contributes no
-                    // slice: naming the entry element local here would let a
+                    // slice: naming an element local here would let a
                     // consumer read a local that edge never defined — the
                     // merge stays honest and leaves the window unproven
                     var proven = fallThrough == null
@@ -419,8 +409,9 @@ internal sealed class Arm64VectorScalarizer
                         && !IsCanonical(name, slot, liveSlice)
                         && SlotOperand(liveState, slot) is { } value)
                     {
-                        _add(_address, OpCode.Move, [canonical, value])
-                            .NativeIntegerWidthBits = 32;
+                        var canonicalMove = _add(_address, OpCode.Move, [canonical, value]);
+                        canonicalMove.NativeFloatWriteBits = 32;
+                        ImmediateWriteWidth.ApplyToMove(canonicalMove);
                         // writing window 0 into the register local replaces
                         // the whole-register value it held
                         if (slot == 0)
@@ -454,7 +445,7 @@ internal sealed class Arm64VectorScalarizer
         Func<ulong, OpCode, List<IOperand>, Instruction> add,
         Func<Arm64Instruction, int, IOperand> convertOperand)
     {
-        _add = add;
+        InstallEmitter(add);
         _address = insn.Address;
         _emitted = false;
 
@@ -511,7 +502,6 @@ internal sealed class Arm64VectorScalarizer
             // exotic forms may still write any vector register — drop all
             // provenance rather than fold against stale lanes
             _vectors.Clear();
-            _entryValid = false;
             return;
         }
 
@@ -538,15 +528,12 @@ internal sealed class Arm64VectorScalarizer
 
         if (ScalarWholeRegisterWrite(insn, out var writtenBits))
         {
-            // plainly offset-addressed narrow loads also materialize each
-            // covered 32-bit window as its own element local — a D load into a
-            // two-float location then reads or stores its fields one per lane
-            // instead of shifting the register local.
-            var windowed = insn.Mnemonic is Arm64Mnemonic.LDR or Arm64Mnemonic.LDUR or Arm64Mnemonic.LDP
-                && insn.MemIndexMode == Arm64MemoryIndexMode.Offset
-                && insn.MemAddendReg == Arm64Register.INVALID
-                && insn.MemBase != Arm64Register.INVALID;
-            RecordScalarWrite(insn, insn.Op0Reg, insn.MemOffset, writtenBits, windowed);
+            var state = Ensure(insn.Op0Reg);
+            for (var i = 0; i < 4; i++)
+                state.Slots[i] = 32 * i < writtenBits ? new LaneSlice(Reg(insn.Op0Reg), 32 * i) : new LaneSlice(Zero, 0);
+            state.Whole = false; // the local now holds only the narrow scalar
+            ClearCopyOrigin(Normalize(insn.Op0Reg));
+
             // the second destination of a paired load (LDP S/D) follows the
             // same narrow-write rule as Op0 — otherwise its state goes stale
             if (insn.Mnemonic == Arm64Mnemonic.LDP
@@ -555,7 +542,12 @@ internal sealed class Arm64VectorScalarizer
             {
                 var secondBits = RegisterBytes(insn.Op1Reg) * 8;
                 if (secondBits > 0)
-                    RecordScalarWrite(insn, insn.Op1Reg, insn.MemOffset + RegisterBytes(insn.Op0Reg), secondBits, windowed);
+                {
+                    var second = Ensure(insn.Op1Reg);
+                    for (var i = 0; i < 4; i++)
+                        second.Slots[i] = 32 * i < secondBits ? new LaneSlice(Reg(insn.Op1Reg), 32 * i) : new LaneSlice(Zero, 0);
+                    second.Whole = false;
+                }
             }
             return;
         }
@@ -569,44 +561,7 @@ internal sealed class Arm64VectorScalarizer
     }
 
     private VectorState? State(Arm64Register reg)
-    {
-        var name = Normalize(reg);
-        if (_vectors.TryGetValue(name, out var state))
-            return state;
-        // before any clobber or merge, an unwritten register's windows are the
-        // lanes it was entered with: the low window is the register local
-        // itself, the rest its entry element locals
-        if (!CanSeed(name))
-            return null;
-        _vectors[name] = state = EntryState(reg);
-        return state;
-    }
-
-    /// The slice an unwritten register carries at one 32-bit window before
-    /// any clobber. Lane 0 is the register local's own scalar view — the same
-    /// operand `fcmgt s0` / `mov wN, v0.s[0]` already read for it, so a scalar
-    /// parameter's lane keeps its defined spelling. Higher lanes are the
-    /// entry element locals — the same locals a lane extract would read, so
-    /// an unwritten one reports the existing "undefined local" diagnostic
-    /// rather than a guessed value.
-    private static LaneSlice EntrySlice(string name, int slot)
-        => slot == 0
-            ? new LaneSlice(new Register(null, name), 0)
-            : new LaneSlice(ElementRegister(name, 32, slot), 0);
-
-    /// The lanes a register was entered with, readable while no clobber has
-    /// invalidated them. The register local itself is also still current, so
-    /// whole-register reads and copies use it directly.
-    private VectorState EntryState(Arm64Register reg)
-    {
-        var name = Normalize(reg);
-        var state = new VectorState { Whole = true, Name = name };
-        var mask = EntryMask(name);
-        for (var i = 0; i < 4; i++)
-            if ((mask & (1 << i)) != 0)
-                state.Slots[i] = EntrySlice(name, i);
-        return state;
-    }
+        => _vectors.TryGetValue(Normalize(reg), out var state) ? state : null;
 
     /// <summary>
     /// State for lane-level consumers: at least one proven 32-bit window. A
@@ -629,19 +584,65 @@ internal sealed class Arm64VectorScalarizer
     {
         var name = Normalize(reg);
         if (!_vectors.TryGetValue(name, out var state))
-            // an unwritten register still carries its entry lanes before any
-            // clobber — a partial lane write keeps the rest live
-            _vectors[name] = state = CanSeed(name) ? EntryState(reg) : new();
+            _vectors[name] = state = new() { Name = name };
         return state;
     }
 
     private void ClaimDest(Arm64Register reg)
     {
-        _claimedDests.Add(Normalize(reg));
+        var name = Normalize(reg);
+        _claimedDests.Add(name);
+        ClearCopyOrigin(name);
         // a lane-level write leaves the whole-register local stale
-        if (_vectors.TryGetValue(Normalize(reg), out var state))
+        if (_vectors.TryGetValue(name, out var state))
             state.Whole = false;
     }
+
+    /// <summary>
+    /// An overwrite makes every local of the register self-valued again, and
+    /// invalidates copies whose source register just changed value.
+    /// </summary>
+    private void ClearCopyOrigin(string name)
+    {
+        _copySource.Remove(name);
+        var stale = new List<string>();
+        foreach (var (key, value) in _copySource)
+            if (key.StartsWith(name + ".") || ReferencesRegister(value, name))
+                stale.Add(key);
+        foreach (var key in stale)
+            _copySource.Remove(key);
+    }
+
+    private static bool ReferencesRegister(IOperand operand, string name)
+        => operand is Register { Name: { } n } && (n == name || n.StartsWith(name + "."));
+
+    /// <summary>
+    /// Lane-copy provenance rides the emission stream: a Move into a vector
+    /// register makes that register local the source's value; any other write
+    /// makes it self-valued again.
+    /// </summary>
+    private void InstallEmitter(Func<ulong, OpCode, List<IOperand>, Instruction> add)
+    {
+        _add = (addr, op, ops) =>
+        {
+            var emitted = add(addr, op, ops);
+            if (ops.Count != 0 && ops[0] is Register { Name: { } destName } && destName.StartsWith('V'))
+                if (op == OpCode.Move && ops.Count > 1)
+                    _copySource[destName] = ops[1];
+                else
+                    _copySource.Remove(destName);
+            return emitted;
+        };
+    }
+
+    /// <summary>
+    /// What a register local's value came from when the last write was a
+    /// lane copy, else the operand itself.
+    /// </summary>
+    private IOperand CopyOrigin(IOperand operand)
+        => operand is Register { Name: { } n } && _copySource.TryGetValue(n, out var origin)
+            ? origin
+            : operand;
 
     /// <summary>
     /// Records what a whole-vector load proved about <paramref name="reg"/>.
@@ -672,40 +673,6 @@ internal sealed class Arm64VectorScalarizer
             state.Slots[i] = new LaneSlice(laneReg, 0);
         }
         state.Whole = true; // the caller's normal-path Move materialized Vn too
-    }
-
-    /// <summary>
-    /// Records a narrow scalar write: the written windows are covered by the
-    /// register local, and the rest of the vector is zeroed. For a plainly
-    /// offset-addressed load each covered window also materializes as its own
-    /// element local — provenance a lane consumer can read without slicing the
-    /// register local.
-    /// </summary>
-    private void RecordScalarWrite(Arm64Instruction insn, Arm64Register reg, long offset, int writtenBits, bool windowed)
-    {
-        var state = Ensure(reg);
-        var name = Normalize(reg);
-        for (var i = 0; i < 4; i++)
-        {
-            if (32 * i >= writtenBits)
-            {
-                state.Slots[i] = new LaneSlice(Zero, 0);
-                continue;
-            }
-            if (!windowed)
-            {
-                state.Slots[i] = new LaneSlice(Reg(reg), 32 * i);
-                continue;
-            }
-            var laneReg = ElementRegister(name, 32, i);
-            IOperand mem = insn.MemBase == Arm64Register.X31
-                ? new StackOffset((int)(offset + 4 * i))
-                : new MemoryOperand(Reg(insn.MemBase), addend: offset + 4 * i, accessSize: 4);
-            _add(_address, OpCode.Move, [laneReg, mem]).NativeMemoryAccessSize = 4;
-            _emitted = true;
-            state.Slots[i] = new LaneSlice(laneReg, 0);
-        }
-        state.Whole = false; // the local now holds only the narrow scalar
     }
 
     private void Diagnostic(string message)
@@ -749,7 +716,7 @@ internal sealed class Arm64VectorScalarizer
     }
 
     /// <summary>The operand covering a whole 64-bit lane (two adjacent windows).</summary>
-    private IOperand? Lane64Operand(VectorState state, int lane)
+    private IOperand? Lane64Operand(VectorState state, int lane, bool floatRead = false)
     {
         var lo = state.Slots[2 * lane];
         var hi = state.Slots[2 * lane + 1];
@@ -765,22 +732,44 @@ internal sealed class Arm64VectorScalarizer
             && lo.Value.Operand.Equals(hi.Value.Operand))
             return lo.Value.Operand; // one operand already covers the whole lane
 
-        if (lo.Value.BitOffset == 0 && hi.Value.BitOffset == 32
-            && lo.Value.Operand.Equals(hi.Value.Operand))
-            return lo.Value.Operand; // one operand already covers the whole lane
-
         var loOp = SlotOperand(state, 2 * lane);
         var hiOp = SlotOperand(state, 2 * lane + 1);
         if (loOp == null || hiOp == null)
             return null;
 
-        var loMasked = Temp();
-        _add(_address, OpCode.And, [loMasked, loOp, new Immediate(0xFFFFFFFFL)]);
+        if (loOp is Immediate { } loImm && hiOp is Immediate { } hiImm)
+            return floatRead
+                ? new DoubleLiteral(BitConverter.Int64BitsToDouble(
+                    (hiImm.Value << 32) | (loImm.Value & 0xFFFFFFFFL)))
+                : new Immediate((hiImm.Value << 32) | (loImm.Value & 0xFFFFFFFFL), 8);
+
+        // Compose in the 64-bit domain: a narrower carrier would truncate the
+        // shifted high window outright. Widening converts (not marks) seed the
+        // Int64 type the composition needs.
+        var loWide = Temp();
+        var loConvert = _add(_address, OpCode.Convert, [loWide, loOp]);
+        loConvert.ConversionSourceWidthBits = 32;
+        loConvert.ConversionUnsigned = true;
+        loConvert.NativeIntegerWidthBits = 64;
+        var hiWide = Temp();
+        var hiConvert = _add(_address, OpCode.Convert, [hiWide, hiOp]);
+        hiConvert.ConversionSourceWidthBits = 32;
+        hiConvert.ConversionUnsigned = true;
+        hiConvert.NativeIntegerWidthBits = 64;
         var hiShifted = Temp();
-        _add(_address, OpCode.ShiftLeft, [hiShifted, hiOp, new Immediate(32)]);
+        _add(_address, OpCode.ShiftLeft, [hiShifted, hiWide, new Immediate(32)]);
         var composed = Temp();
-        _add(_address, OpCode.Or, [composed, hiShifted, loMasked]);
-        return composed;
+        _add(_address, OpCode.Or, [composed, hiShifted, loWide]);
+        if (!floatRead)
+            return composed;
+        // A scalar-FP consumer wants the double the bits mean, not the Int64
+        // pattern: reinterpret so conversions and float ops see System.Double.
+        var asDouble = Temp();
+        var convert = _add(_address, OpCode.Convert, [asDouble, composed]);
+        convert.ConversionFromFloat = true;
+        convert.ConversionSourceWidthBits = 64;
+        convert.NativeFloatWidthBits = 64;
+        return asDouble;
     }
 
     /// <summary>
@@ -805,12 +794,30 @@ internal sealed class Arm64VectorScalarizer
     /// Best operand for an element read on <paramref name="reg"/>: the proven
     /// window when the register is tracked, otherwise the register local
     /// itself for element 0 (the local holds the scalar a caller left in the
-    /// low lane — an argument register or an FP pipeline result) or the
-    /// element local the caller's normal path would read for higher lanes.
+    /// low lane — an argument register or an FP pipeline result). A lane above
+    /// window 0 on an untracked register is never provable: the signature can
+    /// only place an argument's low lane there, so the read stays unproven
+    /// (null) and the consumer diagnoses it at the instruction.
     /// </summary>
-    private IOperand ResolveElementSource(Arm64Register reg, Arm64VectorElement element)
-        => ResolveLaneElement(reg, element)
-            ?? ElementRegister(Normalize(reg), ElementBits(element), element.Index);
+    private IOperand? ResolveElementSource(Arm64Register reg, Arm64VectorElement element)
+        => ResolveLaneElement(reg, element);
+
+    /// <summary>
+    /// The operand a scalar read of <paramref name="reg"/> should use when the
+    /// register is lane-tracked: the proven operand for the register's scalar
+    /// width — window 0 for S, the composed 64-bit lane for D. Null when the
+    /// register has no proven lane at its scalar width: the caller's
+    /// register-local spelling then stands (untracked or unproven).
+    /// </summary>
+    public IOperand? ScalarLaneOperand(Arm64Register reg)
+    {
+        var state = LaneState(reg);
+        if (state == null)
+            return null;
+        return RegisterBytes(reg) * 8 == 64
+            ? Lane64Operand(state, 0, floatRead: true)
+            : SlotOperand(state, 0);
+    }
 
     /// <summary>
     /// Element read for lane-wise consumers: a tracked register's unproven
@@ -822,9 +829,7 @@ internal sealed class Arm64VectorScalarizer
         var state = State(reg);
         if (state != null)
             return ElementOperand(state, element);
-        return ElementBits(element) * element.Index == 0
-            ? Reg(reg)
-            : ElementRegister(Normalize(reg), ElementBits(element), element.Index);
+        return ElementBits(element) * element.Index == 0 ? Reg(reg) : null;
     }
 
     /// <summary>
@@ -840,7 +845,8 @@ internal sealed class Arm64VectorScalarizer
             return;
         if (slice.Value.Operand is Register { Name: var operandName } && operandName == name)
             return; // the register local already holds the lane-0 value
-        _add(_address, OpCode.Move, [new Register(null, name), slice.Value.Operand]);
+        _add(_address, OpCode.Move, [new Register(null, name), slice.Value.Operand])
+            .NativeFloatWriteBits = 32;
         _emitted = true;
     }
 
@@ -899,6 +905,10 @@ internal sealed class Arm64VectorScalarizer
         var emitted = _add(_address, opCode, [destReg, left, right]);
         if (!isFloat && laneBits == 32)
             emitted.NativeIntegerWidthBits = 32;
+        else if (isFloat && laneBits >= 32)
+            // a float lane's result is a Single/Double: seed it so the lane
+            // local does not inherit a wide operand's aggregate type
+            emitted.NativeFloatWidthBits = laneBits;
         _emitted = true;
         if (laneBits >= 32)
         {
@@ -993,14 +1003,21 @@ internal sealed class Arm64VectorScalarizer
     /// a window with any unwritten lane stays unproven.
     /// </summary>
     private void EmitLaneValue(VectorState dest, string destName, int laneBits, int lane,
-        IOperand value, List<PendingLane>? narrow)
+        IOperand value, List<PendingLane>? narrow, bool integerLanes = false)
     {
         var elementReg = ElementRegister(destName, laneBits, lane);
         if (laneBits >= 32)
         {
             var emitted = _add(_address, OpCode.Move, [elementReg, value]);
+            // An integer lane's local wants the native-int32 mark; a forwarded
+            // float lane must not carry it — only the write's byte width.
             if (laneBits == 32)
-                emitted.NativeIntegerWidthBits = 32;
+            {
+                if (integerLanes)
+                    emitted.NativeIntegerWidthBits = 32;
+                else
+                    emitted.NativeFloatWriteBits = 32;
+            }
             ImmediateWriteWidth.ApplyToMove(emitted);
             _emitted = true;
             // the slot names the element local just written — recording the
@@ -1021,7 +1038,10 @@ internal sealed class Arm64VectorScalarizer
         if (value is Immediate)
         {
             var laneMove = _add(_address, OpCode.Move, [elementReg, laneOperand]);
-            laneMove.NativeIntegerWidthBits = 32;
+            if (integerLanes)
+                laneMove.NativeIntegerWidthBits = 32;
+            else
+                laneMove.NativeFloatWriteBits = 32;
             ImmediateWriteWidth.ApplyToMove(laneMove);
         }
         else
@@ -1121,7 +1141,7 @@ internal sealed class Arm64VectorScalarizer
             _add(_address, OpCode.Move, [elementReg,
                     new Immediate(resultImm.Value & mask,
                         Math.Min(resultImm.EffectiveProvenBytes, destBits / 8))])
-                .NativeIntegerWidthBits = 32;
+                .NativeFloatWriteBits = 32;
         else if (destBits < 32)
         {
             _add(_address, OpCode.Move, [elementReg, result]).NativeIntegerWidthBits = 32;
@@ -1131,7 +1151,7 @@ internal sealed class Arm64VectorScalarizer
         else
         {
             var elementMove = _add(_address, OpCode.Move, [elementReg, result]);
-            elementMove.NativeIntegerWidthBits = destBits == 32 ? 32 : null;
+            elementMove.NativeFloatWriteBits = destBits;
             ImmediateWriteWidth.ApplyToMove(elementMove);
         }
         _emitted = true;
@@ -1285,16 +1305,6 @@ internal sealed class Arm64VectorScalarizer
             return true;
         if (slice.Operand is Register { Name: { } n } && n.Contains('.'))
             return width == 32 || n.Contains(".D");
-        // a bare register window is the register's own low scalar — honest at
-        // the compare width the same way an untracked register is
-        if (slice.Operand is Register { Name: { } entry } && entry == Normalize(reg))
-            return true;
-
-        // an element local always names one scalar lane — the compare reads
-        // exactly what it means, whether the local was written in-method or
-        // carried in at entry
-        if (slice.Operand is Register { Name: { } dotted } && dotted.Contains('.'))
-            return true;
         return width == 32 && IsScalarWholeWindow(state, 0, slice);
     }
 
@@ -1522,7 +1532,7 @@ internal sealed class Arm64VectorScalarizer
         Func<ulong, OpCode, List<IOperand>, Instruction> add,
         Func<Arm64Instruction, int, IOperand> convertOperand)
     {
-        _add = add;
+        InstallEmitter(add);
         _address = insn.Address;
         _emitted = false;
 
@@ -1533,13 +1543,28 @@ internal sealed class Arm64VectorScalarizer
         var (laneBits, laneCount) = Arrangement(insn.Op0Arrangement);
         var destName = Normalize(insn.Op0Reg);
 
-        IOperand source;
+        IOperand? source;
         if (insn.Op1Kind == Arm64OperandKind.Register)
             source = convertOperand(insn, 1);
         else if (insn.Op1Kind == Arm64OperandKind.VectorRegisterElement)
             source = ResolveElementSource(insn.Op1Reg, insn.Op1VectorElement);
         else
             return false;
+
+        if (source == null)
+        {
+            var element = insn.Op1VectorElement;
+            var opaqueDest = Ensure(insn.Op0Reg);
+            ClaimDest(insn.Op0Reg);
+            // the hardware still writes every lane with a value we cannot name
+            var used = laneCount * laneBits / 32;
+            for (var s = 0; s < used; s++)
+                opaqueDest.Slots[s] = null;
+            for (var s = used; s < 4; s++)
+                opaqueDest.Slots[s] = new LaneSlice(Zero, 0);
+            Diagnostic($"ARM64 SIMD lane {Normalize(insn.Op1Reg)}.{ElementLetter(ElementBits(element))}{element.Index} is unproven; broadcast is not safe.");
+            return true;
+        }
 
         var dest = Ensure(insn.Op0Reg);
         ClaimDest(insn.Op0Reg);
@@ -1548,7 +1573,7 @@ internal sealed class Arm64VectorScalarizer
         for (var lane = 0; lane < laneCount; lane++)
         {
             var laneReg = ElementRegister(destName, laneBits, lane);
-            _add(_address, OpCode.Move, [laneReg, source]);
+            _add(_address, OpCode.Move, [laneReg, source]).NativeFloatWriteBits = laneBits;
             _emitted = true;
             if (laneBits == 32)
                 dest.Slots[lane] = new LaneSlice(laneReg, 0);
@@ -1586,7 +1611,7 @@ internal sealed class Arm64VectorScalarizer
         Func<ulong, OpCode, List<IOperand>, Instruction> add,
         Func<Arm64Instruction, int, IOperand> convertOperand)
     {
-        _add = add;
+        InstallEmitter(add);
         _address = insn.Address;
         _emitted = false;
 
@@ -1693,7 +1718,7 @@ internal sealed class Arm64VectorScalarizer
         Func<ulong, OpCode, List<IOperand>, Instruction> add,
         Func<Arm64Instruction, int, IOperand> convertOperand)
     {
-        _add = add;
+        InstallEmitter(add);
         _address = insn.Address;
         _emitted = false;
 
@@ -1783,7 +1808,7 @@ internal sealed class Arm64VectorScalarizer
         Func<ulong, OpCode, List<IOperand>, Instruction> add,
         Func<Arm64Instruction, int, IOperand> convertOperand)
     {
-        _add = add;
+        InstallEmitter(add);
         _address = insn.Address;
         _emitted = false;
 
@@ -1827,13 +1852,21 @@ internal sealed class Arm64VectorScalarizer
         var destName = Normalize(insn.Op0Reg);
         var elementReg = ElementRegister(destName, elementBits, element.Index);
 
-        IOperand source;
+        IOperand? source;
         if (insn.Op1Kind == Arm64OperandKind.VectorRegisterElement)
             source = ResolveElementSource(insn.Op1Reg, insn.Op1VectorElement);
         else
             source = convertOperand(insn, 1);
 
-        _add(_address, OpCode.Move, [elementReg, source]);
+        if (source == null)
+        {
+            var srcElement = insn.Op1VectorElement;
+            dest.Slots[elementBits * element.Index / 32] = null;
+            Diagnostic($"ARM64 SIMD lane {Normalize(insn.Op1Reg)}.{ElementLetter(ElementBits(srcElement))}{srcElement.Index} is unproven; insert source is not safe.");
+            return true;
+        }
+
+        _add(_address, OpCode.Move, [elementReg, source]).NativeFloatWriteBits = elementBits;
         _emitted = true;
 
         switch (elementBits)
@@ -1862,16 +1895,34 @@ internal sealed class Arm64VectorScalarizer
     private bool LowerExtract(Arm64Instruction insn, Func<Arm64Instruction, int, IOperand> convertOperand, bool unsigned)
     {
         var source = State(insn.Op1Reg);
-        if (source == null)
-            return false; // opaque vector: caller's normal path
-
         var element = insn.Op1VectorElement;
         var bits = ElementBits(element);
-        var laneOp = unsigned ? ElementOperand(source, element) : SignedElementOperand(source, element);
-        if (laneOp == null)
+
+        IOperand? laneOp;
+        if (source == null)
         {
-            Diagnostic($"ARM64 SIMD lane {Normalize(insn.Op1Reg)}.{ElementLetter(bits)}{element.Index} is unproven; extraction is not safe.");
-            return true;
+            // an untracked register: only element 0 is provable — the register
+            // local is the low window's own home (a signature can only place an
+            // argument's low lane there). A higher lane was never written in
+            // the method: diagnose here rather than fabricate an element local.
+            if (bits * element.Index != 0)
+            {
+                Diagnostic($"ARM64 SIMD lane {Normalize(insn.Op1Reg)}.{ElementLetter(bits)}{element.Index} is unproven; extraction is not safe.");
+                return true;
+            }
+            laneOp = WholeRegisterElement(insn.Op1Reg, bits, 0, unsigned);
+        }
+        else
+        {
+            laneOp = unsigned ? ElementOperand(source, element) : SignedElementOperand(source, element);
+            // a whole-register materialization holds every lane: read the
+            // element out of the register local the load defined
+            laneOp ??= source.Whole ? WholeRegisterElement(insn.Op1Reg, bits, element.Index, unsigned) : null;
+            if (laneOp == null)
+            {
+                Diagnostic($"ARM64 SIMD lane {Normalize(insn.Op1Reg)}.{ElementLetter(bits)}{element.Index} is unproven; extraction is not safe.");
+                return true;
+            }
         }
 
         var dest = convertOperand(insn, 0);
@@ -1916,7 +1967,7 @@ internal sealed class Arm64VectorScalarizer
             for (var lane = 0; lane < laneCount; lane++)
             {
                 var laneReg = ElementRegister(destName, laneBits, lane);
-                _add(_address, OpCode.Move, [laneReg, laneLiteral]);
+                _add(_address, OpCode.Move, [laneReg, laneLiteral]).NativeFloatWriteBits = laneBits;
                 _emitted = true;
                 if (laneBits == 32)
                     dest.Slots[lane] = new LaneSlice(laneReg, 0);
@@ -1980,14 +2031,16 @@ internal sealed class Arm64VectorScalarizer
             if (source != null)
                 laneOp = width64 ? Lane64Operand(source, 0) : SlotOperand(source, 0);
             laneOp ??= convertOperand(insn, 1); // fall back to the register local itself
+            var dest = Ensure(insn.Op0Reg);
+            // claim before the copy: ClaimDest clears lane-copy origins, and
+            // the Move below records this one
+            ClaimDest(insn.Op0Reg);
             var move = _add(_address, OpCode.Move, [convertOperand(insn, 0), laneOp]);
             move.NativeFloatWriteBits = width64 ? 64 : 32;
             ImmediateWriteWidth.ApplyToMove(move);
             _emitted = true;
-            var dest = Ensure(insn.Op0Reg);
             for (var i = 0; i < 4; i++)
                 dest.Slots[i] = 32 * i < (width64 ? 64 : 32) ? new LaneSlice(Reg(insn.Op0Reg), 32 * i) : new LaneSlice(Zero, 0);
-            ClaimDest(insn.Op0Reg);
             return true;
         }
 
@@ -2043,7 +2096,7 @@ internal sealed class Arm64VectorScalarizer
             for (var lane = 0; lane < laneCount; lane++)
             {
                 var laneReg = ElementRegister(destName, 64, lane);
-                _add(_address, OpCode.Move, [laneReg, new Immediate(lane64, 8)]);
+                _add(_address, OpCode.Move, [laneReg, new Immediate(lane64, 8)]).NativeFloatWriteBits = 64;
                 _emitted = true;
                 dest.Slots[lane * 2] = new LaneSlice(new Immediate(lane64, 8), 0);
                 dest.Slots[lane * 2 + 1] = new LaneSlice(new Immediate(lane64, 8), 32);
@@ -2064,7 +2117,7 @@ internal sealed class Arm64VectorScalarizer
             for (var slot = 0; slot < slotsUsed; slot++)
             {
                 var laneReg = ElementRegister(destName, 32, slot);
-                _add(_address, OpCode.Move, [laneReg, new Immediate(window, 4)]);
+                _add(_address, OpCode.Move, [laneReg, new Immediate(window, 4)]).NativeFloatWriteBits = 32;
                 _emitted = true;
                 dest.Slots[slot] = new LaneSlice(new Immediate(window, 4), 0);
             }
@@ -2398,7 +2451,7 @@ internal sealed class Arm64VectorScalarizer
             }
             var laneReg = ElementRegister(destName, 32, slot);
             var slotMove = _add(_address, OpCode.Move, [laneReg, op]);
-            slotMove.NativeIntegerWidthBits = 32;
+            slotMove.NativeFloatWriteBits = 32;
             ImmediateWriteWidth.ApplyToMove(slotMove);
             _emitted = true;
             dest.Slots[slot] = new LaneSlice(laneReg, 0);
@@ -2495,7 +2548,7 @@ internal sealed class Arm64VectorScalarizer
             var value = operands[lane]!;
             if (insn.Op2Imm != 0)
                 value = EmitTempOp(OpCode.ShiftLeft, value, new Immediate(insn.Op2Imm), destBits);
-            EmitLaneValue(dest, destName, destBits, lane, value, narrow);
+            EmitLaneValue(dest, destName, destBits, lane, value, narrow, integerLanes: true);
         }
         if (narrow != null)
         {
@@ -2554,7 +2607,7 @@ internal sealed class Arm64VectorScalarizer
                 ? new Immediate(laneValue.Value & mask,
                     Math.Min(laneValue.EffectiveProvenBytes, destBits / 8))
                 : EmitTempOp(OpCode.And, operands[lane]!, new Immediate(mask), 32);
-            EmitLaneValue(destState, destName, destBits, firstWritten + lane, value, narrow);
+            EmitLaneValue(destState, destName, destBits, firstWritten + lane, value, narrow, integerLanes: true);
         }
         FlushNarrowLanes(destState, destName, destBits, narrow);
         if (!upper)
@@ -2791,7 +2844,7 @@ internal sealed class Arm64VectorScalarizer
                 EmitTempOp(compare, aOps[lane]!, bOps[lane]!, width), width);
             var sel = EmitTempOp(OpCode.And, diff, mask, width);
             var value = EmitTempOp(OpCode.Xor, bOps[lane]!, sel, width);
-            EmitLaneValue(dest, destName, laneBits, lane, value, narrow);
+            EmitLaneValue(dest, destName, laneBits, lane, value, narrow, integerLanes: true);
         }
         if (narrow != null)
         {
@@ -2855,7 +2908,7 @@ internal sealed class Arm64VectorScalarizer
                 continue;
             }
             var value = EmitVectorShiftLane(vOps[lane]!, sOps[lane]!, laneBits, signed);
-            EmitLaneValue(dest, destName, laneBits, lane, value, narrow);
+            EmitLaneValue(dest, destName, laneBits, lane, value, narrow, integerLanes: true);
         }
         if (narrow != null)
         {
@@ -2953,8 +3006,10 @@ internal sealed class Arm64VectorScalarizer
             return true;
         }
 
+        // FCVT* produce integer lanes; SCVTF/UCVTF float lanes.
+        var integer = insn.Mnemonic is not (Arm64Mnemonic.UCVTF or Arm64Mnemonic.SCVTF);
         for (var lane = 0; lane < laneCount; lane++)
-            EmitLaneValue(dest, destName, laneBits, lane, operands[lane]!, null);
+            EmitLaneValue(dest, destName, laneBits, lane, operands[lane]!, null, integerLanes: integer);
         for (var slot = slotsUsed; slot < 4; slot++)
             dest.Slots[slot] = new LaneSlice(Zero, 0);
         SyncScalarView(dest, destName);
@@ -2971,7 +3026,7 @@ internal sealed class Arm64VectorScalarizer
         Func<ulong, OpCode, List<IOperand>, Instruction> add,
         Action<IOperand, IOperand, IOperand?> emitLane)
     {
-        _add = add;
+        InstallEmitter(add);
         _address = insn.Address;
         _emitted = false;
 
@@ -3070,7 +3125,9 @@ internal sealed class Arm64VectorScalarizer
     private IOperand? WindowOperand(VectorState? state, Arm64Register reg, int window)
     {
         if (state == null)
-            return null;
+            // Element 0 of an untracked register is its scalar home — the
+            // register local. Higher elements were never written: unproven.
+            return window == 0 ? Reg(reg) : null;
         if (state.Slots[window] != null)
             return SlotOperand(state, window);
         return state.Whole ? WholeLaneOperand(reg, 32, window) : null;
@@ -3084,7 +3141,7 @@ internal sealed class Arm64VectorScalarizer
     private IOperand? PermuteSourceOperand(VectorState? state, Arm64Register reg, int laneBits, int lane)
     {
         if (state == null)
-            return null;
+            return lane * laneBits == 0 ? Reg(reg) : null;
         if (LaneValueOperand(state, laneBits, lane, signed: false) is { } op)
             return op;
         return state.Whole ? WholeLaneOperand(reg, laneBits, lane) : null;
@@ -3100,6 +3157,25 @@ internal sealed class Arm64VectorScalarizer
         if (shift == 0)
             return Reg(reg);
         return EmitTempOp(OpCode.ShiftRight, Reg(reg), new Immediate(shift), laneBits);
+    }
+
+    /// <summary>
+    /// One element read out of the whole-register local: a shift plus a mask
+    /// or sign-extension for sub-32-bit elements.
+    /// </summary>
+    private IOperand WholeRegisterElement(Arm64Register reg, int bits, int index, bool unsigned)
+    {
+        var shift = bits * index;
+        IOperand op = Reg(reg);
+        if (shift != 0)
+            op = EmitTempOp(OpCode.ShiftRight, op, new Immediate(shift), 32);
+        if (bits >= 32)
+            return op;
+        return unsigned
+            ? EmitTempOp(OpCode.And, op, new Immediate((1 << bits) - 1), 32)
+            : EmitTempOp(OpCode.ShiftRight,
+                EmitTempOp(OpCode.ShiftLeft, op, new Immediate(32 - bits), 32),
+                new Immediate(32 - bits), 32);
     }
 
     /// <summary>
@@ -3230,7 +3306,7 @@ internal sealed class Arm64VectorScalarizer
                 var temp = Temp();
                 var staged = _add(_address, OpCode.Move, [temp, op]);
                 if (laneBits == 32)
-                    staged.NativeIntegerWidthBits = 32;
+                    staged.NativeFloatWriteBits = 32;
                 ops[i] = temp;
             }
         foreach (var op in ops)
@@ -3355,6 +3431,37 @@ internal sealed class Arm64VectorScalarizer
     }
 
     /// <summary>
+    /// The single operand a paired S-store writes when both lanes came from
+    /// halves of one value: adjacent fields of one local (the two floats of a
+    /// Vector2/Vector3 arg, say) resolve to that local; a register's low half
+    /// and its canonical high-half element or shift temporary resolve to the
+    /// register. Two unrelated lanes return null — the pair stays per-window.
+    /// </summary>
+    private IOperand? PairStoreOperand(LaneSlice lo, LaneSlice hi)
+    {
+        var loOp = CopyOrigin(lo.Operand);
+        var hiOp = CopyOrigin(hi.Operand);
+        if (loOp is FieldReference { Containers.Count: 0 } loField
+            && hiOp is FieldReference { Containers.Count: 0 } hiField
+            && loField.Local == hiField.Local
+            && loField.Field.Offset + 4 == hiField.Field.Offset)
+            return loField.Local;
+        if (loOp is Register { Name: { } loName }
+            && hiOp is Register { Name: { } hiName })
+        {
+            if (hiName == loName + ".S1")
+                return loOp;
+            // element registers for the two 32-bit halves of one register
+            if (loName.EndsWith(".S0") && hiName == loName[..^1] + "1")
+                return new Register(null, loName[..^3]);
+            if (_shiftTemps.TryGetValue($"{loOp}|32", out var shiftTemp)
+                && shiftTemp.Equals(hiOp))
+                return loOp;
+        }
+        return null;
+    }
+
+    /// <summary>
     /// STR/STUR/STP of a vector register: a fully proven vector is stored as
     /// per-window scalar Moves, a partially proven one is diagnosed, and an
     /// opaque one falls through to the caller's path.
@@ -3391,9 +3498,45 @@ internal sealed class Arm64VectorScalarizer
         if (!proven)
             return false;
 
+        // an STP S,S is one 8-byte store: when both lanes came from halves of
+        // one value — adjacent fields of one local, or a register's low and
+        // high halves — the write names that value so the slot keeps its
+        // aggregate type; two unrelated singles keep per-window writes.
+        if (pair && slots == 1
+            && first.Slots[0] is { } pairLo && second!.Slots[0] is { } pairHi
+            && PairStoreOperand(pairLo, pairHi) is { } pairOperand)
+        {
+            IOperand pairMem = insn.MemBase == Arm64Register.X31
+                ? new StackOffset((int)insn.MemOffset)
+                : new MemoryOperand(Reg(insn.MemBase), addend: insn.MemOffset, accessSize: 8);
+            _add(_address, OpCode.Move, [pairMem, pairOperand]).NativeMemoryAccessSize = 8;
+            _emitted = true;
+            return true;
+        }
+
         for (var r = 0; r < (pair ? 2 : 1); r++)
         {
             var state = r == 0 ? first : second!;
+            if (slots == 2)
+            {
+                // A 64-bit scalar store is one wide write when both windows
+                // name the same operand (a whole-register or 64-bit value).
+                // Distinct lane operands are per-lane values — a two-float
+                // copy — so split so each half can resolve its own field in
+                // the store target.
+                var lo = state.Slots[0]!.Value;
+                var hi = state.Slots[1]!.Value;
+                if (lo.BitOffset == 0 && hi.BitOffset == 32 && lo.Operand.Equals(hi.Operand))
+                {
+                    IOperand laneMem = insn.MemBase == Arm64Register.X31
+                        ? new StackOffset((int)(insn.MemOffset + r * bytes))
+                        : new MemoryOperand(Reg(insn.MemBase),
+                            addend: insn.MemOffset + r * bytes, accessSize: 8);
+                    _add(_address, OpCode.Move, [laneMem, lo.Operand]).NativeMemoryAccessSize = 8;
+                    _emitted = true;
+                    continue;
+                }
+            }
             for (var slot = 0; slot < slots; slot++)
             {
                 var op = SlotOperand(state, slot);
