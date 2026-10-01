@@ -670,12 +670,67 @@ internal static class PackedRegisterFields
                         || !SameStruct(receiver, rootDeclaring)
                     : receiver is { IsValueType: true }
                         && !SameStruct(receiver, rootDeclaring))
+            {
                 return null;
+            }
         }
         if (MetadataResolver.MemberPathUnspellable((projected.Field, projected.Containers),
                 method, store: false, addressed: false))
             return null;
+        // Last, the emission contract itself: a field reference whose members
+        // are unusable from the caller substitutes a synthetic default at
+        // emission, swapping this instruction's own diagnostic for a fabricated
+        // value - decline and keep the register read diagnosed instead. The
+        // two inlined-member rewrites emission performs (an enumerator's
+        // `_current` through get_Current, a list's `_size` through get_Count)
+        // keep those reads spellable despite private accessibility.
+        var check = new FieldReference(projected.Field, projected.Local, 0,
+            projected.Containers);
+        if (!IlGenerator.FieldReferenceUsableFrom(check, method, requireToken: false)
+            && !EmissionRescuesFieldReference(check, method))
+            return null;
         return (projected, leafType);
+    }
+
+    // Mirrors the access checks of IlGenerator.TryEmitInlinedEnumeratorCurrent
+    // and TryEmitInlinedListCount: an `_current` head (leaf or first
+    // container) on a local emitting a generic Enumerator<T> with a public
+    // get_Current, and an `_size` leaf on a List<T>, are fetched through the
+    // accessor at emission. The managed-address step there cannot be proven
+    // here; if it fails the operand degrades to the same synthetic default it
+    // always produced.
+    private static bool EmissionRescuesFieldReference(FieldReference field,
+        MethodAnalysisContext method)
+    {
+        if (field.Field.Name == "_size" && field.Containers.Count == 0
+            && IlGenerator.EmittedLocalType(field.Local, method)
+                is GenericInstanceTypeAnalysisContext
+                { GenericType.FullName: "System.Collections.Generic.List`1" } list
+            && list.GenericType.Methods.Any(candidate => candidate.Name == "get_Count"
+                && !candidate.IsStatic && candidate.Parameters.Count == 0))
+            return true;
+
+        var current = field.Field.Name == "_current" && field.Containers.Count == 0
+            ? field.Field
+            : field.Containers.FirstOrDefault();
+        if (current?.Name != "_current"
+            || IlGenerator.EmittedLocalType(field.Local, method)
+                is not GenericInstanceTypeAnalysisContext enumerator
+            || enumerator.GenericType.Methods.FirstOrDefault(candidate => candidate.Name == "get_Current"
+                && !candidate.IsStatic && candidate.Parameters.Count == 0) is not { } getter)
+            return false;
+        if (field.Containers.Count == 0)
+            return true;
+        var currentType = IlGenerator.EffectiveCallReturnType(
+            new ConcreteGenericMethodAnalysisContext(getter, enumerator.GenericArguments, []));
+        var nestedReceiverType = field.Containers.Count == 1
+            ? currentType
+            : field.Containers[^1].FieldType;
+        return IlGenerator.TypeTokenUsableFrom(currentType, method)
+            && field.Containers.Skip(1).All(container => IlGenerator.FieldUsableFrom(container, method))
+            && (IlGenerator.FieldUsableFrom(field.Field, method, receiverType: nestedReceiverType)
+                || (nestedReceiverType != null
+                    && IlGenerator.PublicFieldGetter(nestedReceiverType, field.Field) != null));
     }
 
     // The leaf admissibility a mask needs. An offset-zero mask is a plain read:

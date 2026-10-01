@@ -415,8 +415,9 @@ public class PackedRegisterFieldTests
         // `Move i32dest, v` whole-reads the low four bytes of an 8-byte struct
         // - the Single field at offset 0. The root local is defined by an
         // arithmetic op, so its emitted slot is not provable early; a later
-        // inference restamps the register guess to `System.Single`, on which
-        // `ldfld` cannot be spelled - the emitter would substitute `ldc.r4 0`
+        // inference restamps the register guess to `System.Single`. Single's
+        // own offset-0 field is private to the corlib, so `ldfld` cannot be
+        // spelled from the caller and the emitter would substitute `ldc.r4 0`
         // where control read `ldloc; conv.i4`. The read must stay the register
         // operand in both passes.
         var app = Cpp2IlApi.CurrentAppContext!;
@@ -445,12 +446,8 @@ public class PackedRegisterFieldTests
         slot.Type = app.SystemTypes.SystemSingleType;
         PackedRegisterFields.Run(caller, finalPass: true);
 
-        Assert.That(move.Operands[1], Is.TypeOf<FieldReference>()
-                .And.Matches((FieldReference? reference) =>
-                    reference is { Field.FieldType: var fieldType }
-                        && reference.Local == slot
-                        && fieldType == app.SystemTypes.SystemSingleType),
-            "the final pass may only read through the slot's own settled layout");
+        Assert.That(move.Operands[1], Is.SameAs(slot),
+            "a private corlib member is unspellable from the caller; the whole read stays");
     }
 
     [Test]
