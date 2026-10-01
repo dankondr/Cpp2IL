@@ -8338,11 +8338,10 @@ public static class IlGenerator
         // never made, so the slot takes the diagnosed default instead.
         if (from.IsValueType && to is Analysis.BooleanClaimVetoedSlotTypeAnalysisContext)
             return false;
-        // Mirrors EmitStackCoerce: box/unbox.any across types that can never
-        // hold each other is a guaranteed InvalidCastException, not a coercion.
+        // Mirrors EmitStackCoerce: boxing into a slot that can never hold the
+        // boxed value is a guaranteed InvalidCastException, not a coercion.
         if ((from.IsValueType || fromWidth > 0 || from.FullName is "System.Single" or "System.Double")
-                && !to.IsValueType && !CanHoldBoxed(to, from)
-            || !from.IsValueType && to.IsValueType && !CanHoldBoxed(from, to))
+            && !to.IsValueType && !CanHoldBoxed(to, from))
             return false;
         if (from.IsValueType && !to.IsValueType)
             // box, plus castclass when the reference target narrows - both need
@@ -8364,8 +8363,10 @@ public static class IlGenerator
             && SpanArrayConstructor(spanSlot) != null)
             return true;
         if (!from.IsValueType && to.IsValueType)
-            // unbox.any accepts any managed reference - but not a byref-like target
-            return !IsByRefLike(to) && (!CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context));
+            // unbox.any accepts a managed reference that can hold a boxed `to` -
+            // but not a byref-like target
+            return !IsByRefLike(to) && CanHoldBoxed(from, to)
+                && (!CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context));
         if (!from.IsValueType && !to.IsValueType)
             // castclass narrows any reference pair - unless the caller cannot name it
             return IsAssignableToLoose(from, to) || !CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context);

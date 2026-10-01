@@ -68,9 +68,21 @@ public class ArrayHeaderLengthTests
         {
             Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldlen), Is.EqualTo(1),
                 () => Emit(il));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.False,
-                () => Emit(il));
+            AssertLengthWordOnlyDiagnosesPointerAdd(il);
         });
+    }
+
+    // The folded load leaves `pointer = array + K` behind. That address math on a
+    // managed reference has no IL spelling: it used to emit `unbox.any Int32` of
+    // the array, which throws on every execution (#289), and is now an explicit
+    // unrecoverable-operation note until the dead add is dropped. The length read
+    // itself must stay free of unmanaged-memory diagnostics.
+    private static void AssertLengthWordOnlyDiagnosesPointerAdd(IList<CilInstruction> il)
+    {
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Unbox_Any), Is.False, () => Emit(il));
+        Assert.That(il.Where(i => i.OpCode == CilOpCodes.Ldstr).Select(i => (string)i.Operand!)
+                .All(note => note.StartsWith("Unrecoverable operation: 0 Add pointer")), Is.True,
+            () => Emit(il));
     }
 
     [Test]
@@ -92,8 +104,7 @@ public class ArrayHeaderLengthTests
         {
             Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldlen), Is.EqualTo(1),
                 () => Emit(il));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.False,
-                () => Emit(il));
+            AssertLengthWordOnlyDiagnosesPointerAdd(il);
         });
     }
 
