@@ -61,8 +61,8 @@ public class Instruction : IOperand
     // The width of the S/D-register write that produced this instruction's value
     // (an FMOV or a forwarded vector lane). Unlike NativeFloatWidthBits it never
     // seeds the destination's managed type - the local may legitimately be read
-    // back as a wider vector - it only tells operand normalization how many
-    // bytes the write proved, and what it zero-extended.
+    // back as a wider vector - it only records how many bytes the write took,
+    // so a slot read of a wider type stays diagnosed when the write was narrow.
     public int? NativeFloatWriteBits;
 
     // Width of the native memory access that produced this instruction. Stack-slot

@@ -16,11 +16,11 @@ namespace Cpp2IL.Core.Tests.Regression;
 // Recovery cluster: proven byte width of immediates through FMOV / MOVZ+MOVK /
 // MOVI writes into SIMD-FP registers (castle-recovery#248). A register write
 // records how many bytes of the source the destination actually took - an S
-// or W write zero-extends the register, so the whole 64-bit value is proven
-// even when the immediate itself only spells four bytes. The S/D width rides
-// on the emitted Move and the count rides on the immediate, so a slot that
-// needs a whole Double or Single is filled by the literal instead of being
-// diagnosed.
+// or W write claims only its own bytes, so a wider slot read stays diagnosed;
+// a D or X write, or a movz/movk chain that proves all eight, fills it. The
+// S/D width rides on the emitted Move and the count rides on the immediate,
+// so a slot that needs a whole Double or Single is filled by the literal only
+// when the producing write was at least as wide.
 public class ProvenWidthLiteralTests
 {
     private static List<Instruction> Lift(params uint[] words)
@@ -44,14 +44,17 @@ public class ProvenWidthLiteralTests
 
     // The fmov the lifter emitted, retargeted so its operand lands in a synthetic
     // slot local: the S/D write mark it carries is the real lifter annotation.
+    // keepOperand simulates an immediate the lifter itself spelled; replacing it
+    // simulates the immediate a pass substitutes in for the source register.
     private static (MethodAnalysisContext caller, MethodDefinition method) BuildFromLiftedMove(
         ApplicationAnalysisContext app, ModuleDefinition module,
-        TypeAnalysisContext slotType, uint fmovWord, long value)
+        TypeAnalysisContext slotType, uint fmovWord, long? value = null)
     {
         var move = Lift(fmovWord).Single(i => i.OpCode == OpCode.Move);
         var slot = new LocalVariable("slot", new Register(null, "slot")) { Type = slotType };
         move.SetOperand(0, slot);
-        move.SetOperand(1, new Immediate(value));
+        if (value is { } v)
+            move.SetOperand(1, new Immediate(v));
         return ForeignCaller(app, module, [move, new(1, OpCode.Return)], [slot]);
     }
 
@@ -72,17 +75,41 @@ public class ProvenWidthLiteralTests
     }
 
     [Test]
-    public void FmovSImmediateLiftsAsSingleLiteral()
+    public void FmovSImmediateLiftsAsProvenBitPattern()
     {
         // fmov s0, #1.0 writes a 32-bit single-precision pattern into the low
-        // lane: the operand is a Single literal and the move carries the S
-        // write's width.
+        // lane: the operand is the untyped bit pattern with its four proven
+        // bytes, and the move carries the S write's width.
         var move = Lift(0x1E2E1000).Single(i => i.OpCode == OpCode.Move);
+        var operand = (Immediate)move.Operands[1];
         Assert.Multiple(() =>
         {
-            Assert.That(move.Operands[1], Is.EqualTo(new FloatLiteral(1f)));
+            Assert.That(operand.Value, Is.EqualTo(0x3F800000));
+            Assert.That(operand.ProvenBytes, Is.EqualTo(4));
             Assert.That(move.NativeFloatWriteBits, Is.EqualTo(32));
         });
+    }
+
+    [Test]
+    public void FmovSImmediateReadAsDoubleSlotStaysDiagnosed()
+    {
+        // fmov s0,#imm wrote four bytes: a slot read as Double has a defect in
+        // its type and must stay diagnosed rather than take the zero-extended
+        // pattern as a double literal.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("FmovSDoubleSlot.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemDoubleType, app.SystemTypes.SystemVoidType);
+        var (caller, method) = BuildFromLiftedMove(app, module, app.SystemTypes.SystemDoubleType,
+            0x1E2E1000); // fmov s0, #1.0
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldc_R8), Is.False,
+            () => string.Join("\n", il.Select(i => i.ToString())));
+        AssertDiagnosticSubstitution(method);
     }
 
     [Test]
@@ -114,13 +141,14 @@ public class ProvenWidthLiteralTests
     }
 
     [Test]
-    public void LiftedMovzImmediateFillsDoubleSlot()
+    public void LiftedMovzXImmediateFillsDoubleSlot()
     {
-        // The immediate the movz produced carries its own proven byte count:
-        // movz wrote the whole register, so a Double slot sees all eight
-        // bytes and emits the literal without any write mark on the move.
-        var lifted = Lift(0x52824688) // movz w8, #0x1234
+        // movz x8 wrote all eight bytes of the register, so the immediate it
+        // produced carries proven byte count 8 and a Double slot emits the
+        // literal without any write mark on the move.
+        var lifted = (Immediate)Lift(0xD2824688) // movz x8, #0x1234
             .Single(i => i.OpCode == OpCode.Move).Operands[1];
+        Assert.That(lifted.ProvenBytes, Is.EqualTo(8));
 
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
@@ -139,11 +167,35 @@ public class ProvenWidthLiteralTests
     }
 
     [Test]
-    public void SWriteZeroExtensionFillsDoubleSlot()
+    public void LiftedMovzWImmediateIntoDoubleSlotStaysDiagnosed()
     {
-        // fmov s0,w8 zero-extends into V0: a downstream Double read sees the
-        // source's low word padded with machine zeros, and all eight bytes
-        // are proven.
+        // movz w8 is a W write: it proves four bytes, so the immediate cannot
+        // fill a Double slot even though the register zero-extended.
+        var lifted = (Immediate)Lift(0x52824688) // movz w8, #0x1234
+            .Single(i => i.OpCode == OpCode.Move).Operands[1];
+        Assert.That(lifted.ProvenBytes, Is.EqualTo(4));
+
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("LiftedMovzWSlot.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemDoubleType, app.SystemTypes.SystemVoidType);
+        var (caller, method) = Build(app, module, app.SystemTypes.SystemDoubleType, lifted);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        Assert.That(method.CilMethodBody!.Instructions
+            .Any(i => i.OpCode == CilOpCodes.Ldc_R8), Is.False,
+            () => string.Join("\n", method.CilMethodBody.Instructions.Select(i => i.ToString())));
+        AssertDiagnosticSubstitution(method);
+    }
+
+    [Test]
+    public void SWriteImmediateIntoDoubleSlotStaysDiagnosed()
+    {
+        // A pass-substituted immediate behind an S write keeps only the write's
+        // four proven bytes: a Double slot stays diagnosed - the
+        // zero-extension of the register is not the slot's bytes.
         Cpp2IlApi.ResetInternalState();
         TestGameLoader.LoadSimple2019Game();
         var app = Cpp2IlApi.CurrentAppContext!;
@@ -155,39 +207,24 @@ public class ProvenWidthLiteralTests
         IlGenerator.GenerateIl(caller, method);
 
         var il = method.CilMethodBody!.Instructions;
-        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldc_R8
-                && i.Operand is double d && d == BitConverter.Int64BitsToDouble(0x7FC00000)), Is.True,
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldc_R8), Is.False,
             () => string.Join("\n", il.Select(i => i.ToString())));
-        AssertNoDiagnostic(method);
+        AssertDiagnosticSubstitution(method);
     }
 
     [Test]
-    public void SWriteMasksSourceAboveWriteWidth()
+    public void NarrowWriteKeepsOnlyItsOwnBytes()
     {
-        // The same S write on a source that spelled more than a word: only the
-        // low 32 bits become the register - the recorded value is masked to
-        // the write's width, not widened to the source's.
-        Cpp2IlApi.ResetInternalState();
-        TestGameLoader.LoadSimple2019Game();
-        var app = Cpp2IlApi.CurrentAppContext!;
-        var module = new ModuleDefinition("SWriteMaskSlot.dll");
-        SeedCorLibTypes(app, module, app.SystemTypes.SystemDoubleType, app.SystemTypes.SystemVoidType);
-        var (caller, method) = BuildFromLiftedMove(app, module, app.SystemTypes.SystemDoubleType,
-            0x1E270100, unchecked((long)0xDEADBEEF7FC00000)); // fmov s0, w8
-
-        IlGenerator.GenerateIl(caller, method);
-
-        var il = method.CilMethodBody!.Instructions;
+        // The lifter-side resolution masks an immediate to the write's width
+        // and caps its proven count at the write's extent: an S write of a
+        // wider source keeps only the low word and four proven bytes.
+        var written = ImmediateWriteWidth.ForWrite(
+            new Immediate(unchecked((long)0xDEADBEEF7FC00000), 8), 32, "V0");
         Assert.Multiple(() =>
         {
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldc_R8
-                    && i.Operand is double d && d == BitConverter.Int64BitsToDouble(0x7FC00000)),
-                Is.True, () => string.Join("\n", il.Select(i => i.ToString())));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldc_R8
-                    && i.Operand is double d && d == BitConverter.Int64BitsToDouble(unchecked((long)0xDEADBEEF7FC00000))),
-                Is.False, "the write only took the source's low word");
+            Assert.That(written.Value, Is.EqualTo(0x7FC00000L));
+            Assert.That(written.ProvenBytes, Is.EqualTo(4));
         });
-        AssertNoDiagnostic(method);
     }
 
     [Test]

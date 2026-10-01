@@ -662,6 +662,7 @@ internal sealed class Arm64VectorScalarizer
             var emitted = _add(_address, OpCode.Move, [elementReg, value]);
             if (laneBits == 32)
                 emitted.NativeIntegerWidthBits = 32;
+            ImmediateWriteWidth.ApplyToMove(emitted);
             _emitted = true;
             dest.Slots[lane * laneBits / 32] = new LaneSlice(value, 0);
             if (laneBits == 64)
@@ -675,7 +676,11 @@ internal sealed class Arm64VectorScalarizer
                 Math.Min(laneImm.EffectiveProvenBytes, laneBits / 8))
             : elementReg;
         if (value is Immediate)
-            _add(_address, OpCode.Move, [elementReg, laneOperand]).NativeIntegerWidthBits = 32;
+        {
+            var laneMove = _add(_address, OpCode.Move, [elementReg, laneOperand]);
+            laneMove.NativeIntegerWidthBits = 32;
+            ImmediateWriteWidth.ApplyToMove(laneMove);
+        }
         else
             _add(_address, OpCode.And, [elementReg, value, new Immediate(mask)]).NativeIntegerWidthBits = 32;
         _emitted = true;
@@ -730,7 +735,9 @@ internal sealed class Arm64VectorScalarizer
             }
 
             var windowReg = ElementRegister(destName, 32, window);
-            _add(_address, OpCode.Move, [windowReg, composed]).NativeIntegerWidthBits = 32;
+            var windowMove = _add(_address, OpCode.Move, [windowReg, composed]);
+            windowMove.NativeIntegerWidthBits = 32;
+            ImmediateWriteWidth.ApplyToMove(windowMove);
             _emitted = true;
             dest.Slots[window] = new LaneSlice(windowReg, 0);
         }
@@ -779,8 +786,11 @@ internal sealed class Arm64VectorScalarizer
                 .NativeIntegerWidthBits = 32;
         }
         else
-            _add(_address, OpCode.Move, [elementReg, result])
-                .NativeIntegerWidthBits = destBits == 32 ? 32 : null;
+        {
+            var elementMove = _add(_address, OpCode.Move, [elementReg, result]);
+            elementMove.NativeIntegerWidthBits = destBits == 32 ? 32 : null;
+            ImmediateWriteWidth.ApplyToMove(elementMove);
+        }
         _emitted = true;
 
         var dest = Ensure(destReg);
@@ -1550,8 +1560,9 @@ internal sealed class Arm64VectorScalarizer
             if (source != null)
                 laneOp = width64 ? Lane64Operand(source, 0) : SlotOperand(source, 0);
             laneOp ??= convertOperand(insn, 1); // fall back to the register local itself
-            _add(_address, OpCode.Move, [convertOperand(insn, 0), laneOp])
-                .NativeFloatWriteBits = width64 ? 64 : 32;
+            var move = _add(_address, OpCode.Move, [convertOperand(insn, 0), laneOp]);
+            move.NativeFloatWriteBits = width64 ? 64 : 32;
+            ImmediateWriteWidth.ApplyToMove(move);
             _emitted = true;
             var dest = Ensure(insn.Op0Reg);
             for (var i = 0; i < 4; i++)
@@ -1961,7 +1972,9 @@ internal sealed class Arm64VectorScalarizer
                 continue;
             }
             var laneReg = ElementRegister(destName, 32, slot);
-            _add(_address, OpCode.Move, [laneReg, op]).NativeIntegerWidthBits = 32;
+            var slotMove = _add(_address, OpCode.Move, [laneReg, op]);
+            slotMove.NativeIntegerWidthBits = 32;
+            ImmediateWriteWidth.ApplyToMove(slotMove);
             _emitted = true;
             dest.Slots[slot] = new LaneSlice(laneReg, 0);
         }

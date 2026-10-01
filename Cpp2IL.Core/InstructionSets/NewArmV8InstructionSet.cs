@@ -879,24 +879,25 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         Op1Kind: Arm64OperandKind.Immediate }
                     && move.Operands[1] is Immediate wideImmediate)
                     // A wide-immediate move (movz/movn/orr-zr-imm, all aliased to
-                    // MOV here) writes the whole destination register: the
-                    // spelled chunk plus the zeroed rest all have known bytes.
-                    move.SetOperand(1, wideImmediate with { ProvenBytes = 8 });
+                    // MOV here) proves as many bytes as its destination register
+                    // is wide: an X write covers the whole value, a W write four.
+                    move.SetOperand(1, wideImmediate with { ProvenBytes = RegisterWidthBytes(instruction.Op0Reg) });
                 else if (instruction is { Mnemonic: Arm64Mnemonic.FMOV, Op0Kind: Arm64OperandKind.Register }
                     && IsScalarFloatRegister(instruction.Op0Reg))
                 {
-                    // The S/D write survives normalization only as its width; the
-                    // slot fill reads it back to know the register's proven bytes.
-                    // NativeFloatWriteBits, not NativeFloatWidthBits: the local may
-                    // be read back as a wider vector, so the write must not seed
-                    // its managed type.
+                    // Record the S/D write's width on the Move: it is what the
+                    // emitted immediate was proven against. NativeFloatWriteBits,
+                    // not NativeFloatWidthBits: the local may be read back as a
+                    // wider vector, so the write must not seed its managed type.
                     move.NativeFloatWriteBits =
                         instruction.Op0Reg is >= Arm64Register.S0 and <= Arm64Register.S31 ? 32 : 64;
                     if (instruction.Op1Kind == Arm64OperandKind.FloatingPointImmediate
                         && move.Operands[1] is DoubleLiteral scalarFp
                         && move.NativeFloatWriteBits == 32)
-                        // fmov s0, #imm writes a single-precision pattern, not a double.
-                        move.SetOperand(1, new FloatLiteral((float)scalarFp.Value));
+                        // fmov s0, #imm writes a 4-byte single-precision pattern:
+                        // record the bit pattern with its four proven bytes, not a
+                        // typed float literal that a wider slot could silently take.
+                        move.SetOperand(1, new Immediate(BitConverter.SingleToInt32Bits((float)scalarFp.Value), 4));
                 }
                 break;
             case Arm64Mnemonic.MOVI:

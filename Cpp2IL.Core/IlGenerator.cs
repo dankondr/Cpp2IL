@@ -526,11 +526,6 @@ public static class IlGenerator
                 break;
 
             case OpCode.Move:
-                // The lifter's write-width marks say how many bytes of the source the
-                // destination register actually took; resolve the source immediate to
-                // the value and proven bytes the slot read will see before filling.
-                NormalizeMoveImmediate(instruction);
-
                 // Il2CppClass::static_fields is a native implementation pointer, not a
                 // managed value. Field accesses rooted in this local are emitted as
                 // ldsfld/stsfld, so materializing the pointer only creates a bogus
@@ -4144,11 +4139,11 @@ public static class IlGenerator
                 break;
             case Immediate immediate when literalType?.FullName == "System.Double"
                     && (immediate.Value == 0 || ImmediateProvenBytes(immediate) >= 8):
-                // An 8-byte bit pattern needs all eight bytes proven: a value
-                // too wide for W proves an X-register write, and the lifter's
-                // recorded proven bytes cover D-write and zero-extending
-                // S/W-write sources. A folded movk may have hidden the high
-                // half, so an unproven immediate falls through to the
+                // An 8-byte bit pattern needs all eight bytes proven: the lifter
+                // records how wide a write the immediate actually came through,
+                // and only a D/X-width write (or a movz/movk chain that proves
+                // all eight) may fill the slot. A folded movk may have hidden
+                // the high half, so a narrower write falls through to the
                 // diagnosed default below. Zero is the all-zero value under
                 // either width, so it still emits.
                 instructions.Add(CilOpCodes.Ldc_R8,
@@ -6719,60 +6714,6 @@ public static class IlGenerator
     // decoding where the write is visible; the operand's own fallback covers
     // unannotated immediates the way it always has.
     private static int ImmediateProvenBytes(Immediate immediate) => immediate.EffectiveProvenBytes;
-
-    // A register write records how many bytes of the source the destination
-    // actually took: an S or W write zero-extends the register, so every byte
-    // above the written chunk is the machine's zero and the whole value is
-    // proven; a narrower source keeps only its own proven bytes. Lane-window
-    // destinations (V0.S1 and friends) claim only their lane - the rest of the
-    // register keeps whatever it had. Unmarked moves are pass-inserted copies
-    // whose source carries what it carried. The immediate on the move is
-    // rewritten to the value and proven bytes the slot read sees.
-    private static void NormalizeMoveImmediate(Instruction instruction)
-    {
-        if (instruction.Operands.Count < 2 || instruction.Operands[1] is not Immediate immediate)
-            return;
-
-        int writeBytes;
-        int extentBytes;
-        if (instruction.Operands[0] is LocalVariable destination)
-        {
-            if ((instruction.NativeFloatWriteBits ?? instruction.NativeIntegerWidthBits) is not { } bits)
-                return; // pass-inserted move: the source's proven bytes stand
-            writeBytes = bits / 8;
-            // A whole-register destination sees the write's zero-extension up
-            // to the full word; a lane destination sees only its own extent.
-            extentBytes = LaneExtentBytes(destination.Register.Name) ?? 8;
-        }
-        else
-        {
-            // Memory and field stores write exactly their store width - nothing
-            // zero-extends beyond it.
-            writeBytes = instruction.NativeStoreWidthBytes ?? 8;
-            if (writeBytes >= 8)
-                return;
-            extentBytes = writeBytes;
-        }
-
-        if (writeBytes <= 0 || writeBytes > 8)
-            return;
-
-        var proven = ImmediateProvenBytes(immediate);
-        var filled = proven >= writeBytes
-            ? System.Math.Min(extentBytes, 8)
-            : System.Math.Min(proven, extentBytes);
-        var masked = writeBytes < 8 ? immediate.Value & ((1L << (writeBytes * 8)) - 1) : immediate.Value;
-        if (masked == immediate.Value && filled == proven)
-            return;
-        instruction.SetOperand(1, new Immediate(masked, filled));
-    }
-
-    // "V0.S1"-style lane names denote a window of the register, not the whole
-    // register: the letter after the dot is the lane extent in bytes.
-    private static int? LaneExtentBytes(string? registerName) =>
-        registerName is { } name && name.IndexOf('.') is >= 0 and var dot && dot + 1 < name.Length
-            ? name[dot + 1] switch { 'B' => 1, 'H' => 2, 'S' => 4, 'D' => 8, _ => null }
-            : null;
 
     private static TypeAnalysisContext? NullComparisonType(Instruction instruction, int operandIndex, MethodAnalysisContext context)
     {
