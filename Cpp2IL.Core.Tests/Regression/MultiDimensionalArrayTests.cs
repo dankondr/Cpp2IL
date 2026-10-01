@@ -363,4 +363,144 @@ public class MultiDimensionalArrayTests
         Assert.That(((Immediate)get.Operands[3]).Value, Is.EqualTo(1));
         Assert.That(get.Operands[4], Is.SameAs(y));
     }
+
+    [Test]
+    public void LengthStoresOfAParameterAndOfTheFirstCellAreKept()
+    {
+        // new int[w, h] with its buffer at stack_-40: the first length stored after `&lengths[0]` is
+        // taken, `h` stored as the parameter itself, and the link register spilled beside the buffer.
+        static LocalVariable Cell(long at) => new("cell", new Register(null, $"stack_-{-at:X}"));
+        long[] buffers = [-0x40];
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(DeadCodeEliminator.StoresArrayNewLength(
+                new Instruction(0, OpCode.Move, Cell(-0x40), new Immediate(20)), buffers), Is.True);
+            Assert.That(DeadCodeEliminator.StoresArrayNewLength(
+                new Instruction(1, OpCode.Move, Cell(-0x38), new LocalVariable("h", new Register(null, "X1"))), buffers), Is.True);
+            Assert.That(DeadCodeEliminator.StoresArrayNewLength(
+                new Instruction(2, OpCode.Move, Cell(-0x30), new LocalVariable("lr", new Register(null, "X30"))), buffers), Is.False);
+        });
+    }
+
+    [Test]
+    public void ConstantIndicesFoldedIntoTheDisplacementAreTheElement()
+    {
+        // int grid: [g + 0x20] is g[0, 0]; `q = g + (len1 << 3)`, [q + 0x2c] is g[2, 3];
+        // `p = g + (len1 << 2)`, `r = p + 4`, [r + 0x20] is g[1, 1].
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("Grid.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemObjectType);
+        var int32 = app.SystemTypes.SystemInt32Type;
+        var grid = Local("grid", new ArrayTypeAnalysisContext(int32, 2));
+        LocalVariable b = Local("bounds"), s = Local("s"), q = Local("q"), t = Local("t"), p = Local("p"), r = Local("r"),
+            v0 = Local("v0", int32), v1 = Local("v1", int32), v2 = Local("v2", int32);
+        MemoryOperand Length1() => new(b, null, 0x10, 0, 8);
+        var first = new Instruction(1, OpCode.Move, new MemoryOperand(grid, null, 0x20, 0, 4), v0);
+        var last = new Instruction(4, OpCode.Move, new MemoryOperand(q, null, 0x2c, 0, 4), v1);
+        var inner = new Instruction(8, OpCode.Move, new MemoryOperand(r, null, 0x20, 0, 4), v2);
+        var (caller, _) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, b, new MemoryOperand(grid, null, 0x10, 0, 8)),
+            first,
+            new(2, OpCode.ShiftLeft, s, Length1(), new Immediate(3)),
+            new(3, OpCode.Add, q, grid, s),
+            last,
+            new(5, OpCode.ShiftLeft, t, Length1(), new Immediate(2)),
+            new(6, OpCode.Add, p, grid, t),
+            new(7, OpCode.Add, r, p, new Immediate(4)),
+            inner,
+            new(9, OpCode.Return)], [grid, b, s, q, t, p, r, v0, v1, v2]);
+        caller.ParameterLocals = [grid, v0, v1, v2];
+
+        ArrayRecovery.RecoverMultiDimensionalAccesses(caller);
+
+        Assert.Multiple(() =>
+        {
+            foreach (var (store, i, j, value) in new[] { (first, 0, 0, v0), (last, 2, 3, v1), (inner, 1, 1, v2) })
+            {
+                Assert.That(store.OpCode, Is.EqualTo(OpCode.CallVoid), () => string.Join("\n", Instructions(caller)));
+                Assert.That(store.Operands.Skip(1), Is.EqualTo(new IOperand[] { grid, new Immediate(i), new Immediate(j), value }),
+                    () => string.Join("\n", Instructions(caller)));
+            }
+        });
+    }
+
+    [Test]
+    public void LocalCopiedFromALengthKeepsItsDefinition()
+    {
+        // `n = [b]; c = n == 1`: n is GetLength(0) where it is read, and still defined.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("Grid.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemBooleanType,
+            app.SystemTypes.SystemObjectType);
+        var grid = Local("grid", new ArrayTypeAnalysisContext(app.SystemTypes.SystemInt32Type, 2));
+        LocalVariable b = Local("bounds"), n = Local("n"), c = Local("c", app.SystemTypes.SystemBooleanType);
+        var copy = new Instruction(1, OpCode.Move, n, new MemoryOperand(b, null, 0, 0, 4));
+        var (caller, _) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, b, new MemoryOperand(grid, null, 0x10, 0, 8)),
+            copy,
+            new(2, OpCode.CheckEqual, c, n, new Immediate(1)),
+            new(3, OpCode.Return, c)], [grid, b, n, c]);
+        caller.ParameterLocals = [grid];
+
+        ArrayRecovery.RecoverMultiDimensionalAccesses(caller);
+
+        Assert.That(copy.Destination, Is.SameAs(n), () => string.Join("\n", Instructions(caller)));
+    }
+
+    [Test]
+    public void OffsetWalkFromTheHeaderIsTheElementAtItsCounter()
+    {
+        // for (k = 0; k < len1; k++) x = grid[0, k], with the header folded into the walk's start:
+        // `off` steps by 4 from 0x20 and the access is [grid + off].
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("Grid.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemBooleanType,
+            app.SystemTypes.SystemObjectType);
+        var int32 = app.SystemTypes.SystemInt32Type;
+        var grid = Local("grid", new ArrayTypeAnalysisContext(int32, 2));
+        LocalVariable off = Local("off"), k = Local("k", int32), b = Local("bounds"),
+            ck = Local("ck", app.SystemTypes.SystemBooleanType), p = Local("p"), x = Local("x", int32);
+        var head = new Instruction(3, OpCode.CheckLess, ck, k, new MemoryOperand(b, null, 0x10, 0, 4));
+        var load = new Instruction(5, OpCode.Move, x, new MemoryOperand(p, null, 0, 0, 4));
+        var (caller, _) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, off, new Immediate(0x20)),
+            new(1, OpCode.Move, k, new Immediate(0)),
+            new(2, OpCode.Move, b, new MemoryOperand(grid, null, 0x10, 0, 8)),
+            head,
+            new(4, OpCode.Add, p, grid, off),
+            load,
+            new(6, OpCode.Add, off, off, new Immediate(4)),
+            new(7, OpCode.Add, k, k, new Immediate(1)),
+            new(8, OpCode.ConditionalJump, head, ck),
+            new(9, OpCode.Return, x)], [grid, off, k, b, ck, p, x]);
+        caller.ParameterLocals = [grid];
+
+        ArrayRecovery.RecoverMultiDimensionalAccesses(caller);
+
+        Assert.That(load.OpCode, Is.EqualTo(OpCode.Call), () => string.Join("\n", Instructions(caller)));
+        Assert.That(load.Operands.Skip(2), Is.EqualTo(new IOperand[] { grid, new Immediate(0), k }));
+    }
+
+    [Test]
+    public void OutOfLineGetAtIsProvenByItsBody()
+    {
+        // int[,]::GetAt kept out of line by clang:
+        //   str x30, [sp, #-0x10]!; ldr x8, [x0, #0x10]; ldr w9, [x8]; cmp w1, w9; b.hs fail
+        //   ldr x8, [x8, #0x10]; cmp w2, w8; b.hs fail; madd x8, x8, x1, x2; add x8, x0, x8, lsl #2
+        //   ldr w0, [x8, #0x20]; ldr x30, [sp], #0x10; ret; fail: bl throw
+        uint[] body = [0xf81f0ffe, 0xf9400808, 0xb9400109, 0x6b09003f, 0x54000122, 0xf9400908, 0x6b08005f,
+            0x540000c2, 0x9b010908, 0x8b080808, 0xb9402100, 0xf84107fe, 0xd65f03c0, 0x940049e4];
+        uint? Read(ulong at) => at >= 0x1000 && (at - 0x1000) / 4 < (ulong)body.Length ? body[(at - 0x1000) / 4] : null;
+
+        Assert.That(ArrayRecovery.ProvesOutlinedGetter(0x1000, Read), Is.EqualTo(4));
+        body[9] = 0x8b081008; // lsl #4: 16-byte elements
+        body[10] = 0xa9420500; // ldp x0, x1, [x8, #0x20]
+        Assert.That(ArrayRecovery.ProvesOutlinedGetter(0x1000, Read), Is.EqualTo(16));
+        body[10] = 0xb9402100; // a 4-byte load of 16-byte elements
+        Assert.That(ArrayRecovery.ProvesOutlinedGetter(0x1000, Read), Is.Null);
+        body[10] = 0xa9420500;
+        body[6] = 0x6b08003f; // cmp w1, w8: the column is not checked
+        Assert.That(ArrayRecovery.ProvesOutlinedGetter(0x1000, Read), Is.Null);
+    }
 }
