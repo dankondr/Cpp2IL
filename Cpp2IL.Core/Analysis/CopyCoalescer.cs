@@ -38,10 +38,12 @@ public static class CopyCoalescer
                 var a = groups.Find(group[0]);
                 var b = groups.Find(group[i]);
 
-                if (a == b || (a.Type != null && b.Type != null && !ReferenceEquals(a.Type, b.Type)))
+                var (same, type) = SlotType(a.Type, b.Type);
+                if (a == b || !same)
                     continue;
 
                 groups.Union(a, b);
+                groups.Find(a).Type = type;
             }
         }
 
@@ -78,6 +80,36 @@ public static class CopyCoalescer
         }
 
         return copies;
+    }
+
+    // Versions of one address-taken frame slot are one storage, so they share a local when their
+    // types name the same value: equal types (possibly different objects for one instantiation),
+    // or one the shared-generic form of the other (`List<Int32Enum>.Enumerator` typed from a
+    // shared Dispose, `List<EmoteUseType>.Enumerator` from GetEnumerator); the concrete one wins.
+    private static (bool Same, TypeAnalysisContext? Type) SlotType(TypeAnalysisContext? left, TypeAnalysisContext? right)
+    {
+        if (left == null || right == null)
+            return (true, left ?? right);
+        if (ReferenceEquals(left, right) || left.FullName == right.FullName)
+            return (true, left);
+        if (left is not GenericInstanceTypeAnalysisContext l || right is not GenericInstanceTypeAnalysisContext r
+            || l.GenericType.FullName != r.GenericType.FullName || l.GenericArguments.Count != r.GenericArguments.Count)
+            return (false, null);
+        var leftErased = false;
+        var rightErased = false;
+        for (var i = 0; i < l.GenericArguments.Count; i++)
+        {
+            var (x, y) = (l.GenericArguments[i], r.GenericArguments[i]);
+            if (x.FullName == y.FullName)
+                continue;
+            if (IlGenerator.IsErasedSharedArgument(x))
+                leftErased = true;
+            else if (IlGenerator.IsErasedSharedArgument(y))
+                rightErased = true;
+            else
+                return (false, null);
+        }
+        return leftErased && rightErased ? (false, null) : (true, leftErased ? right : left);
     }
 
     private static List<List<LocalVariable>> FindEscapedSlotGroups(ISILControlFlowGraph cfg)
