@@ -8,6 +8,28 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class KeyFunctionRecoveryTests
 {
+    [Test]
+    public void ClassPredicateRequiresTheExportBodyThroughPureBranches()
+    {
+        var words = new System.Collections.Generic.Dictionary<ulong, uint>
+        {
+            [0x1000] = 0x14000400, // B 0x2000
+            [0x2000] = 0xd65f03c0, // body (RET)
+            [0x3000] = 0x17fffc00, // B backwards to 0x2000
+            [0x4000] = 0x94000000, // BL is not a veneer
+            [0x5000] = 0x14000000, // cycle
+            [0x6000] = 0xaa0003e1  // argument shuffle is not a veneer
+        };
+        bool Match(ulong export, ulong target) => KeyFunctionRecovery.MatchClassIsAssignableFrom(export, target, a => words[a]);
+        Assert.That(Match(0x1000, 0x3000), Is.True);
+        Assert.That(Match(0x1000, 0x2000), Is.True);
+        Assert.That(Match(0x1000, 0x4000), Is.False);
+        Assert.That(Match(0x1000, 0x5000), Is.False);
+        Assert.That(Match(0x1000, 0x6000), Is.False);
+        Assert.That(Match(0, 0x3000), Is.False);
+        Assert.That(Match(0x5000, 0x5000), Is.False);
+    }
+
     [SetUp]
     public void Setup()
     {

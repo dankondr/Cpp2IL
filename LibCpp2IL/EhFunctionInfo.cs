@@ -10,7 +10,14 @@ namespace LibCpp2IL;
 public sealed record EhCallSiteInfo(ulong Start, ulong Length, ulong LandingPad, ulong Action)
 {
     public ulong End => Start + Length;
+
+    // Null means the action/type table could not be decoded; it is not proof of cleanup.
+    public IReadOnlyList<EhActionInfo>? Actions { get; init; }
 }
+
+// Positive filters select a C++ RTTI entry, zero is cleanup, negative filters are
+// exception specifications. TypeInfo is null when the entry could not be resolved.
+public sealed record EhActionInfo(long Filter, ulong? TypeInfo);
 
 /// <summary>
 /// Unwind-table information for one function: its true extent in the binary and, when the
