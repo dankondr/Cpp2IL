@@ -11615,6 +11615,11 @@ public static class IlGenerator
             or OpCode.CheckNotEqual or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual
             or OpCode.Newobj or OpCode.NewArr or OpCode.Box or OpCode.Unbox
             => instruction.Operands.Count > 0 ? instruction.Operands[0] : null,
+        // `new S(...)` built in a value-type local runs the constructor on the local itself
+        // (`ldloca; call S::.ctor`), which writes all of it.
+        OpCode.CallVoid when instruction.Operands is [MethodAnalysisContext { Name: ".ctor", IsStatic: false },
+                LocalVariable { Type.IsValueType: true } built, ..]
+            => built,
         _ => null,
     };
 

@@ -586,4 +586,130 @@ public class AggregateResultLaneTests
 
         Assert.That(high.OpCode, Is.EqualTo(OpCode.Nop));
     }
+
+    private static InjectedTypeAnalysisContext TwoInts()
+    {
+        var int32 = (TypeAnalysisContext)Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemInt32Type;
+        return InjectStruct("Pair", ("a", int32, 0), ("b", int32, 4));
+    }
+
+    // `orr xD, xLo, xHi, lsl #n` as the lifter emits it: the shifted operand in a temp.
+    private static Instruction[] PackPair(string destination, string low, string high, int shift) =>
+    [
+        new(0x10, OpCode.ShiftLeft, Reg("TEMP_LOGICAL_SHIFT"), Reg(high), new Immediate(shift)),
+        new(0x10, OpCode.Or, Reg(destination), Reg(low), Reg("TEMP_LOGICAL_SHIFT")),
+    ];
+
+    [Test]
+    public void ReturnPackedFromHalvesRebuildsTheStruct()
+    {
+        // Quad Make(int a, int b, int c, int d) => new Quad(a, b * 2, c, d):
+        // `orr x8, x3(c), x4(d), lsl #32; orr x0, x1(a), x2(b), lsl #33; mov x1, x8; ret`
+        // (an instance method: the ints sit in X1..X4).
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var quad = FourInts();
+        var callerType = CallerTypeWithField("q", quad, 0x80);
+        var ret = new Instruction(0x20, OpCode.Return, Reg("X0"), Reg("X1"));
+        var int32 = app.SystemTypes.SystemInt32Type;
+        var caller = DriveReturning(callerType, quad, [
+            .. PackPair("X8", "X3", "X4", 32), .. PackPair("X0", "X1", "X2", 33),
+            new Instruction(0x1c, OpCode.Move, Reg("X1"), Reg("X8")), ret],
+            int32, int32, int32, int32);
+
+        var result = (LocalVariable)ret.Operands.Single();
+        var stores = caller.ControlFlowGraph!.Instructions
+            .Where(i => i.OpCode == OpCode.Move && i.Operands[0] is FieldReference { Local: var local } && local == result)
+            .ToDictionary(i => ((FieldReference)i.Operands[0]).Field.Name, i => i.Operands[1]);
+        var parameters = caller.ParameterLocals.Where(p => !p.IsThis).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.Type, Is.SameAs(quad));
+            Assert.That(stores["a"], Is.SameAs(parameters[0]));
+            Assert.That(stores["c"], Is.SameAs(parameters[2]));
+            Assert.That(stores["d"], Is.SameAs(parameters[3]));
+            // `b << 33` puts `b << 1` in the high half.
+            var scaled = caller.ControlFlowGraph.Instructions.Single(i => ReferenceEquals(i.Destination, stores["b"]));
+            Assert.That(scaled.OpCode, Is.EqualTo(OpCode.ShiftLeft));
+            Assert.That(scaled.Operands[1], Is.SameAs(parameters[1]));
+            Assert.That(scaled.Operands[2], Is.EqualTo(new Immediate(1)));
+        });
+
+        var module = new ModuleDefinition("Lanes.dll");
+        var il = EmitReturning(caller, module, quad, callerType, quad).CilMethodBody!.Instructions;
+        Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldstr), Is.EqualTo(0));
+    }
+
+    [Test]
+    public void FieldStoreOfAPackedPairStoresTheStruct()
+    {
+        // this.p = new Pair(a, b): `orr x8, x1, x2, lsl #32; str x8, [x0, #0x80]`.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var pair = TwoInts();
+        var callerType = CallerTypeWithField("p", pair, 0x80);
+        Instruction store = new(0x18, OpCode.Move, new MemoryOperand(Reg("X0"), addend: 0x80, accessSize: 8), Reg("X8"))
+            { NativeMemoryAccessSize = 8 };
+        var caller = Drive(callerType, [.. PackPair("X8", "X1", "X2", 32), store, new Instruction(0x1c, OpCode.Return)],
+            app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemInt32Type);
+
+        Assert.That(store.Operands[1], Is.InstanceOf<LocalVariable>());
+        var value = (LocalVariable)store.Operands[1];
+        var halves = caller.ControlFlowGraph!.Instructions
+            .Where(i => i.OpCode == OpCode.Move && i.Operands[0] is FieldReference { Local: var local } && local == value)
+            .Select(i => (((FieldReference)i.Operands[0]).Field.Name, i.Operands[1])).ToList();
+        var parameters = caller.ParameterLocals.Where(p => !p.IsThis).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(value.Type, Is.SameAs(pair));
+            Assert.That(halves, Is.EqualTo(new[] { ("a", (IOperand)parameters[0]), ("b", parameters[1]) }));
+        });
+
+        var module = new ModuleDefinition("Lanes.dll");
+        var il = Emit(caller, module, callerType, pair).CilMethodBody!.Instructions;
+        Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldstr), Is.EqualTo(0));
+    }
+
+    [Test]
+    public void PairWhoseLowHalfIsSixtyFourBitsWideStaysDiagnosed()
+    {
+        // The low operand is an eight-byte load: its upper half would land in `b`.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var pair = TwoInts();
+        var callerType = CallerTypeWithField("p", pair, 0x80);
+        Instruction store = new(0x18, OpCode.Move, new MemoryOperand(Reg("X0"), addend: 0x80, accessSize: 8), Reg("X8"))
+            { NativeMemoryAccessSize = 8 };
+        Drive(callerType, [
+            new Instruction(0x0c, OpCode.Move, Reg("X3"), new MemoryOperand(Reg("X0"), addend: 0x10, accessSize: 8))
+                { NativeMemoryAccessSize = 8 },
+            .. PackPair("X8", "X3", "X2", 32), store, new Instruction(0x1c, OpCode.Return)],
+            app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemInt32Type);
+
+        Assert.That(((LocalVariable)store.Operands[1]).Type, Is.Not.SameAs(pair));
+    }
+
+    [Test]
+    public void LaneOfTwoIntsReadsEachHalfAsItsField()
+    {
+        // int Sum(Quad v) => v.a + v.b + v.c + v.d reads X2 (v's upper lane) as `w2` and,
+        // through a whole-register copy, as `lsr x9, x11, #32`.
+        var quad = FourInts();
+        var callerType = CallerTypeWithField("q", quad, 0x80);
+        Instruction copy = new(0x0c, OpCode.Move, Reg("X11"), Reg("X2"));
+        Instruction high = new(0x10, OpCode.ShiftRight, Reg("X9"), Reg("X11"), new Immediate(32));
+        Instruction low = new(0x14, OpCode.Add, Reg("X10"), Reg("X2"), Reg("X9")) { NativeIntegerWidthBits = 32 };
+        var caller = DriveReturning(callerType, Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemInt32Type,
+            [copy, high, low, new Instruction(0x18, OpCode.Move, Reg("X0"), Reg("X10")), new Instruction(0x1c, OpCode.Return, Reg("X0"))],
+            quad);
+
+        var v = caller.ParameterLocals.First(p => !p.IsThis);
+        Assert.Multiple(() =>
+        {
+            // The copy keeps both halves; only its 32-bit reads take one.
+            Assert.That(copy.Operands[1], Is.InstanceOf<LocalVariable>());
+            Assert.That(high.OpCode, Is.EqualTo(OpCode.Move));
+            Assert.That(LaneSource(high).Field.Name, Is.EqualTo("d"));
+            Assert.That(LaneSource(high).Local, Is.SameAs(v));
+            Assert.That(LaneSource(low).Field.Name, Is.EqualTo("c"));
+            Assert.That(LaneSource(low).Local, Is.SameAs(v));
+        });
+    }
 }
