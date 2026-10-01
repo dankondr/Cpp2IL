@@ -153,15 +153,16 @@ public static class DeadCodeEliminator
                         yield return indexLocal;
                     break;
                 // A static field access doesn't read the storage pointer it was resolved from, so that
-                // pointer (and the class load feeding it) is free to die.
-                case FieldReference { Field.IsStatic: false, Local: { } fieldLocal }:
+                // pointer (and the class load feeding it) is free to die. The root link decides:
+                // `statics.s.x` is ldsflda s + ldfld x, rooted in a static whatever the leaf is.
+                case FieldReference { Local: { } fieldLocal } fieldRef when !StaticRooted(fieldRef):
                     yield return fieldLocal;
                     break;
                 // Handing out a slot's address is a read of it as far as we can tell, whatever the callee then does with it.
                 case AddressOf { Target: LocalVariable addressed }:
                     yield return addressed;
                     break;
-                case AddressOf { Target: FieldReference { Field.IsStatic: false } addressedField }:
+                case AddressOf { Target: FieldReference addressedField } when !StaticRooted(addressedField):
                     yield return addressedField.Local;
                     break;
                 case ReferenceCast referenceCast:
@@ -197,6 +198,9 @@ public static class DeadCodeEliminator
             }
         }
     }
+
+    private static bool StaticRooted(FieldReference field)
+        => (field.Containers.Count > 0 ? field.Containers[0] : field.Field).IsStatic;
 
     private static IEnumerable<LocalVariable> ArrayAccessLocals(ArrayAccess access)
     {
