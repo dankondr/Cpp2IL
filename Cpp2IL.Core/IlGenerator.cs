@@ -11671,7 +11671,7 @@ public static class IlGenerator
     // Keyed by register rather than local instance because passes wrap the same
     // slot in fresh LocalVariables (lane-split receivers, coalesced copies,
     // inserted edge sources), so identity follows the register.
-    private static HashSet<Register> DefinedLocalRegisters(MethodAnalysisContext context) =>
+    internal static HashSet<Register> DefinedLocalRegisters(MethodAnalysisContext context) =>
         DefinedLocalRegisterCache.GetValue(context, static ctx =>
         {
             HashSet<Register> defined = [];
@@ -11687,6 +11687,10 @@ public static class IlGenerator
                 // write is its own read, so it still holds no value.
                 if (!IsSelfCopy(instruction))
                     MarkStoreReceiverDefined(StoreReceiverOperand(instruction), defined);
+                // A constructor run on a value-type local (`ldloca; call .ctor`) initialises it.
+                if (instruction is { OpCode: OpCode.CallVoid,
+                        Operands: [MethodAnalysisContext { Name: ".ctor", IsStatic: false }, LocalVariable constructed, ..] })
+                    defined.Add(constructed.Register);
                 foreach (var operand in instruction.Operands)
                     CollectEscapedRegisters(operand, defined);
             }

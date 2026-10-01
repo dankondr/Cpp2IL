@@ -61,6 +61,27 @@ public class UndefinedLocalReadTests
     }
 
     [Test]
+    public void ConstructedValueTypeLocalIsDefined()
+    {
+        // `ldloca buffer; call .ctor(…)` initialises the local: a method that builds its struct
+        // result in place reads a defined value when it returns it.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var record = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Record",
+            app.SystemTypes.SystemValueTypeType, System.Reflection.TypeAttributes.Public);
+        var ctor = new InjectedMethodAnalysisContext(record, ".ctor", app.SystemTypes.SystemVoidType,
+            System.Reflection.MethodAttributes.Public, [app.SystemTypes.SystemInt32Type]);
+        var buffer = new LocalVariable("returnBuffer", new Register(8, "X8")) { Type = record };
+        var module = new ModuleDefinition("Constructed.dll");
+        var (caller, _) = ForeignCaller(app, module, [
+            new(0, OpCode.CallVoid, ctor, buffer, new Immediate(1)),
+            new(1, OpCode.Return, buffer)], [buffer]);
+
+        Assert.That(IlGenerator.DefinedLocalRegisters(caller), Does.Contain(buffer.Register));
+    }
+
+    [Test]
     public void EscapedEntryRegisterReadKeepsLdloc()
     {
         // Taking a local's address makes its storage writable through the
