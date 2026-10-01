@@ -501,9 +501,24 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
         catch (Exception) { return null; }
     }
 
+    private TypeAnalysisContext? DefaultsClassType(string? value)
+    {
+        // Use the same absolute-pointer load and published layout map as
+        // SeedIl2CppDefaultsClassTypes. Register copies retain this expression;
+        // joins retain it only when all incoming native states agree.
+        if (!context.AppContext.UnityVersion.GreaterThanOrEquals(6000) || value == null
+            || !value.StartsWith("m((m(#", StringComparison.Ordinal) || !value.EndsWith("))", StringComparison.Ordinal)) return null;
+        var plus = value.LastIndexOf('+');
+        if (plus < 0 || !long.TryParse(value[(plus + 1)..^2], out var offset)) return null;
+        var root = value[3..plus];
+        if (!root.EndsWith(')') || !TryNumber(root[2..^1], out _)) return null;
+        return KeyFunctionRecovery.Unity6PrimitiveDefaultsClass(context.AppContext.SystemTypes, offset);
+    }
+
     private TypeAnalysisContext? ResolveClassType(string? value)
     {
-        var type = code.SelectMany(i => i.Operands).OfType<TypeAnalysisContext>().FirstOrDefault(t => value == "type:" + t.FullName);
+        var type = DefaultsClassType(value)
+            ?? code.SelectMany(i => i.Operands).OfType<TypeAnalysisContext>().FirstOrDefault(t => value == "type:" + t.FullName);
         if (type == null && value != null)
         {
             var loads = 0;
@@ -527,6 +542,7 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
     private TypeAnalysisContext? ResolveCatchType(string? value)
     {
         var type = ResolveClassType(value);
+        if (type == context.AppContext.SystemTypes.SystemObjectType && DefaultsClassType(value) == type) return type;
         for (var parent = type; parent != null; parent = parent.DefaultBaseType)
             if (parent == context.AppContext.SystemTypes.SystemExceptionType) return type;
         return null;
