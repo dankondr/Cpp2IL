@@ -229,7 +229,10 @@ public static class MetadataInitGuardRemover
 
         // Nested metadata guards are common in constructors. Removing an inner guard can make its
         // outer guard a pure init region, so keep scanning until a pass no longer changes the CFG.
+        // Merging duplicated arms is the last resort: a guard that shares its init arm with sibling
+        // guards goes with them as a cluster once everything else has settled.
         bool removedInPass;
+        var mergeArms = false;
         do
         {
             removedInPass = false;
@@ -237,11 +240,12 @@ public static class MetadataInitGuardRemover
             {
                 if (!cfg.Blocks.Contains(guard))
                     continue;
-                removedInPass |= TryRemoveGuard(method, cfg, guard, initialisedFlagOffset);
+                removedInPass |= TryRemoveGuard(method, cfg, guard, initialisedFlagOffset, mergeArms);
             }
 
+            mergeArms = !removedInPass && !mergeArms;
             removedAny |= removedInPass;
-        } while (removedInPass);
+        } while (removedInPass || mergeArms);
 
         removedAny |= FoldKnownMetadataFlags(cfg);
         removedAny |= RemoveBareClassInitCalls(cfg);
@@ -329,7 +333,7 @@ public static class MetadataInitGuardRemover
     }
 
     private static bool TryRemoveGuard(MethodAnalysisContext? method, ISILControlFlowGraph cfg,
-        Block guard, long initialisedFlagOffset)
+        Block guard, long initialisedFlagOffset, bool mergeArms)
     {
         if (guard.BlockType != BlockType.TwoWay || guard.Successors.Count != 2
             || guard.Instructions.Count == 0 || guard.Instructions[^1].OpCode != OpCode.ConditionalJump)
@@ -343,14 +347,66 @@ public static class MetadataInitGuardRemover
         // Either successor could be the init entry; the other is then the merge.
         var first = guard.Successors[0];
         var second = guard.Successors[1];
-        var metadataFlag = GetComparedMemory(guard);
+        var metadataFlag = GetComparedMemory(cfg, guard);
 
         return TryExcise(cfg, guard, first, second, initialisedFlagTest, metadataFlag)
             || TryExcise(cfg, guard, second, first, initialisedFlagTest, metadataFlag)
             || TryExciseThroughSibling(cfg, guard, first, second, initialisedFlagTest, metadataFlag)
             || TryExciseThroughSibling(cfg, guard, second, first, initialisedFlagTest, metadataFlag)
             || (method != null && TryExciseGuardCluster(method, guard, metadataFlag))
+            || (mergeArms && method != null && TryMergeDuplicatedArms(method, guard, metadataFlag))
             || TryFoldMetadataFlag(cfg, guard, metadataFlag);
+    }
+
+    // clang tail-duplicates what follows a class-init guard into both arms; when the init arm is
+    // proven to be the skip arm plus the init call, the guard goes straight to the skip arm.
+    private static bool TryMergeDuplicatedArms(MethodAnalysisContext method, Block guard, MemoryOperand? flag)
+    {
+        var cfg = method.ControlFlowGraph!;
+        if (flag is not { Index: null, Scale: 0, Base: LocalVariable flagBase } flagRead
+            || !Il2CppClassUsefulOffsets.TryGetField((uint)flagRead.Addend, method.AppContext.MetadataVersion,
+                method.AppContext.Binary.is32Bit, out var field, out _)
+            || field != Il2CppClassUsefulOffsets.Il2CppClassField.CctorFinished
+            || RuntimeClassTerms.RepresentedClass(flagBase, new DefUseIndex(cfg)) == null
+            || InitSuccessor(cfg, guard, flagRead) is not { } initEntry)
+            return false;
+
+        var skipEntry = guard.Successors.First(successor => successor != initEntry);
+        return ClassInitArmMerger.TryMerge(cfg, guard, initEntry, skipEntry, IsClassInitCall);
+    }
+
+    private static bool IsClassInitCall(Instruction instruction) =>
+        instruction.IsCall && instruction.Operands is [StringLiteral { Value: ClassInitExport or ClassInitActual or ClassInitCodegen }, ..];
+
+    // The successor the guard takes while the flag is clear: its condition, peeled of negations,
+    // is flag == 0 (taken while clear) or flag != 0 (taken once set).
+    private static Block? InitSuccessor(ISILControlFlowGraph cfg, Block guard, MemoryOperand flag)
+    {
+        if (guard.Instructions[^1].Operands is not [Block taken, var condition]
+            || guard.Successors.FirstOrDefault(successor => successor != taken) is not { } notTaken)
+            return null;
+
+        var negated = false;
+        for (var depth = 0; depth < 4 && condition is LocalVariable local; depth++)
+        {
+            var definitions = cfg.Instructions.Where(i => ReferenceEquals(i.Destination, local)).Take(2).ToList();
+            switch (definitions)
+            {
+                case [{ OpCode: OpCode.Not, Operands: [_, var inner] }]:
+                    negated = !negated;
+                    condition = inner;
+                    continue;
+                case [{ OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual, Operands: [_, var left, var right] } check]:
+                    var tested = IsZero(right) ? left : IsZero(left) ? right : null;
+                    if (tested == null || !Equals(GetFlagMemory(cfg, guard, tested), flag))
+                        return null;
+                    return (check.OpCode == OpCode.CheckEqual) != negated ? taken : notTaken;
+            }
+
+            return null;
+        }
+
+        return null;
     }
 
     // Consecutive `if (!K->cctor_finished) il2cpp_runtime_class_init(K)` guards commonly share one
@@ -385,7 +441,7 @@ public static class MetadataInitGuardRemover
             var cluster = cfg.Blocks.Where(candidate =>
                     candidate.BlockType == BlockType.TwoWay && candidate.Successors.Count == 2
                     && candidate.Successors.Contains(merge)
-                    && GetComparedMemory(candidate) is { } otherFlag
+                    && GetComparedMemory(cfg, candidate) is { } otherFlag
                     && RuntimeClassTerms.TryRead(otherFlag, method.AppContext.MetadataVersion,
                         method.AppContext.Binary.is32Bit, index) is { Field: Il2CppClassUsefulOffsets.Il2CppClassField.CctorFinished } otherRead
                     && SameClassPointer(flagBase, otherRead.ClassLocal, index))
@@ -530,16 +586,21 @@ public static class MetadataInitGuardRemover
         if (significant is [{ OpCode: OpCode.Jump }] && block.Successors.Count == 1)
             return IsThrowTail(cfg, block.Successors[0], depth + 1);
 
+        // A throw block shared by many checks merges their registers in phis it never reads.
         return significant.Any(i => i.OpCode == OpCode.Throw)
             && significant.All(i => i.OpCode is OpCode.Throw or OpCode.Return or OpCode.Move
-                or OpCode.Jump);
+                or OpCode.Jump or OpCode.Phi);
     }
 
     // The taken edge of a conditional inside a region is admissible when it lands in a throw tail:
     // the arm's own fail path, never real control flow.
     private static bool JumpsToThrowTail(ISILControlFlowGraph cfg, Instruction jump) =>
-        jump.Operands[0] is Instruction target
-        && cfg.Blocks.FirstOrDefault(block => block.Instructions.Contains(target)) is { } targetBlock
+        jump.Operands[0] switch
+        {
+            Block block => block,
+            Instruction target => cfg.Blocks.FirstOrDefault(block => block.Instructions.Contains(target)),
+            _ => null,
+        } is { } targetBlock
         && IsThrowTail(cfg, targetBlock);
 
     private static void ExciseCluster(ISILControlFlowGraph cfg, HashSet<Block> cluster, Block merge,
@@ -580,7 +641,7 @@ public static class MetadataInitGuardRemover
         foreach (var block in region)
         {
             foreach (var successor in block.Successors)
-                successor.Predecessors.Remove(block);
+                cfg.RemovePredecessor(successor, block);
             foreach (var predecessor in block.Predecessors)
                 predecessor.Successors.Remove(block);
 
@@ -670,7 +731,7 @@ public static class MetadataInitGuardRemover
         return true;
     }
 
-    private static MemoryOperand? GetComparedMemory(Block guard)
+    private static MemoryOperand? GetComparedMemory(ISILControlFlowGraph cfg, Block guard)
     {
         foreach (var comparison in guard.Instructions.Where(i => i.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual))
         {
@@ -678,7 +739,7 @@ public static class MetadataInitGuardRemover
             {
                 if (!IsZero(comparison.Operands[3 - i]))
                     continue;
-                if (GetLoadedMemory(guard, comparison.Operands[i]) is { } memory)
+                if (GetFlagMemory(cfg, guard, comparison.Operands[i]) is { } memory)
                     return memory;
             }
         }
@@ -686,14 +747,27 @@ public static class MetadataInitGuardRemover
         foreach (var mask in guard.Instructions.Where(i => i.OpCode == OpCode.And))
         {
             if (mask.Operands is [_, var value, Immediate { Value: 1 }]
-                && GetLoadedMemory(guard, value) is { } memory)
+                && GetFlagMemory(cfg, guard, value) is { } memory)
                 return memory;
             if (mask.Operands is [_, Immediate { Value: 1 }, var reversedValue]
-                && GetLoadedMemory(guard, reversedValue) is { } reversedMemory)
+                && GetFlagMemory(cfg, guard, reversedValue) is { } reversedMemory)
                 return reversedMemory;
         }
 
         return null;
+    }
+
+    // clang often loads the flag once and tests it in every tail-duplicated copy of the guard, so
+    // the load can sit in another block; a local with a single definition is that value everywhere.
+    private static MemoryOperand? GetFlagMemory(ISILControlFlowGraph cfg, Block guard, IOperand operand)
+    {
+        if (GetLoadedMemory(guard, operand) is { } memory)
+            return memory;
+        if (operand is not LocalVariable local)
+            return null;
+
+        var definitions = cfg.Instructions.Where(i => ReferenceEquals(i.Destination, local)).Take(2).ToList();
+        return definitions is [{ OpCode: OpCode.Move, Operands: [_, MemoryOperand loaded] }] ? loaded : null;
     }
 
     private static MemoryOperand? GetLoadedMemory(Block guard, IOperand operand)
@@ -989,7 +1063,7 @@ public static class MetadataInitGuardRemover
         foreach (var block in region)
         {
             foreach (var successor in block.Successors)
-                successor.Predecessors.Remove(block);
+                cfg.RemovePredecessor(successor, block);
             foreach (var predecessor in block.Predecessors)
                 predecessor.Successors.Remove(block);
 
