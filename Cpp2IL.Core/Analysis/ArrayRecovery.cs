@@ -29,6 +29,7 @@ public static class ArrayRecovery
         // bulk-copy pass must run first or its redundant-chunk cleanup never sees
         // the MemoryOperand shape it matches.
         RecoverStructArrayBulkCopies(method);
+        RecoverMultiDimensionalAllocations(method);
         RecoverMultiDimensionalAccesses(method);
         RecoverAccesses(method);
         RecoverElementPointerWalkers(method);
@@ -443,6 +444,86 @@ public static class ArrayRecovery
     }
 
     // T[,]::Get/Set/Address: runtime methods of the array type, with no metadata row.
+    // `new T[w, h]` stores the lengths into a stack buffer (`stp x8, x9, [sp]`) and calls a stub with
+    // no metadata of its own: `mov x2, xzr; b NewFull`, i.e. `Array::NewFull(klass, lengths, null)`.
+    // NewFull is where the exported `il2cpp_array_new_full` branches, so the stub is proven by its
+    // body. Its lengths are the buffer's 8-byte cells, one per dimension of the class's array type.
+    internal static void RecoverMultiDimensionalAllocations(MethodAnalysisContext method)
+    {
+        foreach (var block in method.ControlFlowGraph!.Blocks)
+        for (var index = 0; index < block.Instructions.Count; index++)
+        {
+            var call = block.Instructions[index];
+            if (call is not { OpCode: OpCode.Call, Operands: [Immediate target, LocalVariable result,
+                    ArrayTypeAnalysisContext { Rank: > 1 } arrayType, AddressOf { Target: LocalVariable buffer }, ..] }
+                || FrameStructFieldReads.FrameOffset(buffer) is not { } start
+                || !IsArrayNewWithoutBounds(method.AppContext, target.UnsignedValue))
+                continue;
+
+            var stores = block.Instructions.Take(index)
+                .Where(i => i is { OpCode: OpCode.Move, Operands: [LocalVariable cell, _] } && FrameStructFieldReads.FrameOffset(cell) != null)
+                .ToList();
+            var lengths = Enumerable.Range(0, arrayType.Rank).Select(dimension => Length(start + dimension * 8)).ToList();
+            // The latest store covering the cell: an 8-byte length, or a constant vector whose
+            // 64-bit halves are two lengths (`new int[20, 20]` is one `str q0` of {20, 20}).
+            IOperand? Length(long cell)
+            {
+                for (var i = stores.Count - 1; i >= 0; i--)
+                {
+                    var at = FrameStructFieldReads.FrameOffset((LocalVariable)stores[i].Operands[0])!.Value;
+                    if (at == cell)
+                        return stores[i].Operands[1] is Vector128Literal vector ? VectorLength(vector, 0) : stores[i].Operands[1];
+                    if (at == cell - 8 && stores[i].Operands[1] is Vector128Literal low)
+                        return VectorLength(low, 1);
+                }
+                return null;
+            }
+            if (lengths.Any(length => length == null))
+                continue;
+
+            call.OpCode = OpCode.NewArr;
+            call.SetOperands([result, arrayType, .. lengths!]);
+            if (result.Type is not ArrayTypeAnalysisContext)
+                result.Type = arrayType;
+        }
+    }
+
+    // One 64-bit half of a constant vector, as a length.
+    internal static Immediate? VectorLength(Vector128Literal vector, int half)
+    {
+        var (lo, hi) = half == 0 ? (vector.X, vector.Y) : (vector.Z, vector.W);
+        var value = (long)(uint)BitConverter.SingleToInt32Bits(lo) | (long)(uint)BitConverter.SingleToInt32Bits(hi) << 32;
+        return value is >= 0 and <= int.MaxValue ? new Immediate(value) : null;
+    }
+
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<ApplicationAnalysisContext,
+        System.Collections.Concurrent.ConcurrentDictionary<ulong, bool>> ArrayNewStubs = new();
+
+    internal static bool IsArrayNewWithoutBounds(ApplicationAnalysisContext app, ulong address)
+        => ArrayNewStubs.GetOrCreateValue(app).GetOrAdd(address, _ =>
+        {
+            if (app.InstructionSet is not InstructionSets.NewArmV8InstructionSet)
+                return false;
+            uint? Read(ulong at)
+            {
+                var offset = app.Binary.MapVirtualAddressToRaw(at, false);
+                return offset < 0 || offset > app.Binary.RawLength - 4 ? null
+                    : System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(app.Binary.GetRawBinaryContent().Slice((int)offset, 4));
+            }
+            return ProvesArrayNewWithoutBounds(app.Binary.GetVirtualAddressOfExportedFunctionByName("il2cpp_array_new_full"),
+                address, Read);
+        });
+
+    // The exported `il2cpp_array_new_full` is one branch to NewFull; the stub passes no lower bounds
+    // (`mov x2, xzr`) and branches to that same NewFull.
+    internal static bool ProvesArrayNewWithoutBounds(ulong export, ulong address, Func<ulong, uint?> read)
+        => export != 0
+           && read(export) is { } exportJump && (exportJump & 0xfc000000) == 0x14000000
+           && read(address) == 0xaa1f03e2
+           && read(address + 4) is { } jump && (jump & 0xfc000000) == 0x14000000
+           && NonReturningHelperRecovery.BranchTarget(address + 4, jump)
+              == NonReturningHelperRecovery.BranchTarget(export, exportJump);
+
     private static InjectedMethodAnalysisContext Accessor(ArrayTypeAnalysisContext arrayType, string name)
     {
         var app = arrayType.AppContext;

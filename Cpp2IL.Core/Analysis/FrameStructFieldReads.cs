@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 
@@ -40,7 +41,43 @@ internal static class FrameStructFieldReads
                 continue;
             instruction.SetOperand(i, new FieldReference(field.Field, field.Local, field.Offset, field.Containers, field.AccessSize));
         }
+
+        // A struct returned in registers is reloaded from its frame slot right before the
+        // return: lane 0 reads the slot, which SSA versions across the call that filled it
+        // through its address, and each other lane reads a cell inside the slot, which it
+        // does not. Lane 0 alone is the value.
+        if (method.AppContext?.InstructionSet?.CallingConventionResolver is { } resolver && !method.IsVoid
+            && !resolver.ReturnsViaHiddenBuffer(method)
+            && resolver.ExtraLanes(method.ReturnType, resolver.ReturnRegister(method)) is { Count: > 0 } lanes)
+            foreach (var block in cfg.Blocks)
+            {
+                if (block.Instructions is not [.., { OpCode: OpCode.Return } ret] || ret.Operands.Count != lanes.Count + 1
+                    || Reload(ret.Operands[0], block) is not ({ Type: { } type } slot, var first)
+                    || type.FullName != method.ReturnType.FullName || !addressed.Contains(slot)
+                    || FrameOffset(slot) is not { } slotOffset)
+                    continue;
+                var reloads = lanes.Select((lane, k) => Reload(ret.Operands[k + 1], block) is var (cell, at)
+                                                        && FrameOffset(cell) == slotOffset + lane.ByteOffset ? at : -1).ToList();
+                var from = reloads.Append(first).Min();
+                if (from >= 0 && block.Instructions.Skip(from).TakeWhile(i => i != ret)
+                        .All(i => i.OpCode is OpCode.Nop || i is { OpCode: OpCode.Move, Operands: [LocalVariable, _] }))
+                    ret.SetOperands(ret.Operands[0]);
+            }
         return;
+
+        // The frame local an operand reads at the end of `block`, and where it is read:
+        // the local itself, or a copy of it made in that block.
+        (LocalVariable Local, int Index)? Reload(IOperand operand, Block block)
+        {
+            if (operand is not LocalVariable local)
+                return null;
+            if (FrameOffset(local) != null)
+                return (local, block.Instructions.Count - 1);
+            return definitions.TryGetValue(local, out var copy) && copy is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] }
+                                                                && FrameOffset(source) != null && block.Instructions.IndexOf(copy) is >= 0 and var index
+                ? (source, index)
+                : null;
+        }
 
         FieldReference? FieldOf(LocalVariable cell, HashSet<LocalVariable> visiting)
         {
@@ -67,7 +104,7 @@ internal static class FrameStructFieldReads
     }
 
     // The byte offset of a frame cell, from StackAnalyzer's `stack_N` / `stack_-N` names.
-    private static long? FrameOffset(LocalVariable local)
+    internal static long? FrameOffset(LocalVariable local)
     {
         var name = local.Register.Name;
         if (name == null || !name.StartsWith("stack_"))

@@ -58,6 +58,13 @@ public class Instruction : IOperand
     // normalization erases before local type inference.
     public int? NativeFloatWidthBits;
 
+    // The width of the S/D-register write that produced this instruction's value
+    // (an FMOV or a forwarded vector lane). Unlike NativeFloatWidthBits it never
+    // seeds the destination's managed type - the local may legitimately be read
+    // back as a wider vector - it only records how many bytes the write took,
+    // so a slot read of a wider type stays diagnosed when the write was narrow.
+    public int? NativeFloatWriteBits;
+
     // Width of the native memory access that produced this instruction. Stack-slot
     // normalization erases MemoryOperand/StackOffset, but aggregate-return recovery
     // still needs the width to distinguish a whole struct from one of its fields.
@@ -67,6 +74,16 @@ public class Instruction : IOperand
     // AccessSize 0 on their memory operand (a convention other passes read); this is
     // their real width.
     public int? NativeStoreWidthBytes;
+
+    // Bits of the source register an extension or shift actually reads. The
+    // mnemonics (SXTB/SXTH/SXTW/UXTB/UXTH, LSR vs ASR, UBFX vs SBFX) all erase into
+    // Move/ShiftRight, but a packed-struct read still needs the width - and on an
+    // extension the signedness - to name the field at those bits.
+    public int? NativeReadWidthBits;
+
+    // Whether the read sign-extends into the destination (SXT*/ASR/SBFX) or
+    // zero-extends (UXT*/LSR/UBFX). Null when the lifting recorded neither.
+    public bool? NativeReadSignExtend;
 
     public bool IsFallThrough =>
         OpCode switch

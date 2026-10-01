@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Graphs;
@@ -19,9 +20,72 @@ namespace Cpp2IL.Core.Analysis;
 /// </summary>
 public static class DeadCodeEliminator
 {
-    public static void Run(MethodAnalysisContext method) => Run(method.ControlFlowGraph!);
+    public static void Run(MethodAnalysisContext method) => Run(method.ControlFlowGraph!, method);
 
-    public static void Run(ISILControlFlowGraph cfg)
+    /// <summary>
+    /// The lifter ends a method that falls off its last call with a Return; once that call is
+    /// known never to return and became a Throw, nothing reaches the Return after it, and
+    /// emitting it only spells a value that never existed. It is spliced out, not turned into a
+    /// nop, so the body still ends in the throw instead of falling off its end.
+    /// </summary>
+    public static void RemoveReturnsAfterThrow(ISILControlFlowGraph cfg)
+    {
+        foreach (var block in cfg.Blocks.ToList())
+        {
+            var thrown = block.Instructions.FindIndex(i => i.OpCode == OpCode.Throw);
+            if (thrown >= 0 && LoneReturn(block.Instructions.Skip(thrown + 1)))
+                block.Instructions.RemoveRange(thrown + 1, block.Instructions.Count - thrown - 1);
+            // The Return can also sit in a block of its own that only throwing blocks fall into.
+            else if (block != cfg.EntryBlock && block != cfg.ExitBlock && block.Predecessors.Count > 0
+                     && LoneReturn(block.Instructions)
+                     && block.Predecessors.All(p => p.Instructions.LastOrDefault(i => i.OpCode != OpCode.Nop) is { OpCode: OpCode.Throw }))
+            {
+                foreach (var successor in block.Successors)
+                    successor.Predecessors.Remove(block);
+                foreach (var predecessor in block.Predecessors)
+                    predecessor.Successors.Remove(block);
+                cfg.Blocks.Remove(block);
+            }
+        }
+
+        static bool LoneReturn(IEnumerable<Instruction> instructions)
+            => instructions.Where(i => i.OpCode != OpCode.Nop).ToList() is [{ OpCode: OpCode.Return }];
+    }
+
+    /// <summary>
+    /// `new T[w, h]` writes its lengths into a stack buffer and passes only `&amp;lengths[0]` to the
+    /// array stub (<see cref="ArrayRecovery.IsArrayNewWithoutBounds"/>), so the stores of the later
+    /// lengths name cells nothing reads directly. They stay until the stub becomes a NewArr that
+    /// takes them as operands. A store of a register's entry value there is a callee-saved spill
+    /// that happens to sit next to the buffer, not a length.
+    /// </summary>
+    internal static Func<Instruction, bool> StoresArrayNewLengths(MethodAnalysisContext? method, IList<Instruction> instructions)
+    {
+        // ponytail: passes that run DCE on a bare graph reach the app through the global context.
+        if ((method?.AppContext ?? Cpp2IlApi.CurrentAppContext) is not { } app)
+            return _ => false;
+        var buffers = new List<long>();
+        foreach (var call in instructions)
+        {
+            if (call is not { OpCode: OpCode.Call, Operands: [Immediate target, _, _, var lengths, ..] }
+                || !ArrayRecovery.IsArrayNewWithoutBounds(app, target.UnsignedValue))
+                continue;
+            var buffer = lengths as AddressOf ?? (lengths is LocalVariable pointer
+                ? instructions.FirstOrDefault(i => ReferenceEquals(i.Destination, pointer))?.Operands[1] as AddressOf
+                : null);
+            if (buffer is { Target: LocalVariable first } && FrameStructFieldReads.FrameOffset(first) is { } offset)
+                buffers.Add(offset);
+        }
+        // ponytail: lengths of rank <= 4, so three cells past the first.
+        return buffers.Count == 0
+            ? _ => false
+            : store => store is { OpCode: OpCode.Move, Operands: [LocalVariable cell, var value] }
+                       && value is not LocalVariable { Register.Version: < 1 }
+                       && FrameStructFieldReads.FrameOffset(cell) is { } at
+                       && buffers.Any(start => start < at && at - start <= 24);
+    }
+
+    public static void Run(ISILControlFlowGraph cfg, MethodAnalysisContext? method = null)
     {
         // A local is live when an instruction with an effect (a call, store, branch, return)
         // reads it, or a pure definition of a live local does. Marking from the effects, rather
@@ -31,9 +95,12 @@ public static class DeadCodeEliminator
         var live = new HashSet<LocalVariable>();
         var work = new Stack<LocalVariable>();
         var definitions = new Dictionary<LocalVariable, List<Instruction>>();
+        var lengths = StoresArrayNewLengths(method, instructions);
+        LocalVariable? Removable(Instruction instruction)
+            => Pure(instruction) is { } destination && !lengths(instruction) ? destination : null;
         foreach (var instruction in instructions)
         {
-            if (Pure(instruction) is { } destination)
+            if (Removable(instruction) is { } destination)
             {
                 (definitions.TryGetValue(destination, out var list) ? list : definitions[destination] = []).Add(instruction);
                 continue;
@@ -51,7 +118,7 @@ public static class DeadCodeEliminator
                             work.Push(used);
 
         foreach (var instruction in instructions)
-            if (Pure(instruction) is { } destination && !live.Contains(destination))
+            if (Removable(instruction) is { } destination && !live.Contains(destination))
             {
                 instruction.OpCode = OpCode.Nop;
                 instruction.SetOperands();

@@ -62,12 +62,14 @@ public static class SsaSimplifier
         // a memory base/index, so such a use keeps the original local). Drop the defining Move only
         // once the local truly has no reads left; the leftover nops are cleared by SsaForm.Remove.
         var reads = CollectReadLocals(cfg);
+        var lengths = DeadCodeEliminator.StoresArrayNewLengths(method, cfg.Instructions);
         foreach (var block in cfg.Blocks)
             foreach (var instruction in block.Instructions)
                 if (instruction.OpCode == OpCode.Move
                     && instruction.Operands[0] is LocalVariable dest
                     && forwarded.ContainsKey(dest)
-                    && !reads.Contains(dest))
+                    && !reads.Contains(dest)
+                    && !lengths(instruction))
                 {
                     instruction.OpCode = OpCode.Nop;
                     instruction.SetOperands();
