@@ -52,10 +52,7 @@ internal static class AggregateResultLanes
                 || call.Destination is not LocalVariable result)
                 continue;
 
-            var concrete = !callee.IsStatic && call.Operands.Count > 2
-                ? IlGenerator.RetargetToReceiverInstantiation(callee,
-                    IlGenerator.SharedGenericEvidenceType(call.Operands[2], method))
-                : callee;
+            var concrete = Concrete(call, callee, method);
             var resultType = IlGenerator.EffectiveCallReturnType(concrete);
             var lanes = resolver.ExtraLanes(resultType, resolver.ReturnRegister(concrete));
             if (lanes.Count == 0)
@@ -296,6 +293,22 @@ internal static class AggregateResultLanes
                 if (!proven)
                     continue;
 
+                // Lane 0 holding a call's whole result of the return type, with every other
+                // lane that call's own lane register, is the value passed through unchanged,
+                // however its fields straddle the lanes (`Nullable<DateTime>`, `UniTask`).
+                if (lane0 is LocalVariable { Type: { } wholeType } whole
+                    && wholeType.FullName == method.ReturnType.FullName
+                    && method.ControlFlowGraph.Instructions.FirstOrDefault(i => ReferenceEquals(i.Destination, whole)) is
+                        { OpCode: OpCode.Call } call
+                    && CallResultType(call, method)?.FullName == wholeType.FullName
+                    && sources.Skip(1).All(source => source.Operand is LocalVariable { Register: { Version: > 0 } register }
+                                                     && call.ImplicitDefinitions.Contains(register)))
+                {
+                    instruction.SetOperands(whole);
+                    changed = true;
+                    continue;
+                }
+
                 var fields = new List<(FieldAnalysisContext Field, int Offset,
                     IReadOnlyList<FieldAnalysisContext> Containers, int Width)>();
                 foreach (var (_, offset, width) in sources)
@@ -336,6 +349,17 @@ internal static class AggregateResultLanes
 
         return changed;
     }
+
+    private static MethodAnalysisContext Concrete(Instruction call, MethodAnalysisContext callee, MethodAnalysisContext method)
+        => !callee.IsStatic && call.Operands.Count > 2
+            ? IlGenerator.RetargetToReceiverInstantiation(callee,
+                IlGenerator.SharedGenericEvidenceType(call.Operands[2], method))
+            : callee;
+
+    private static TypeAnalysisContext? CallResultType(Instruction call, MethodAnalysisContext method)
+        => call.Operands[0] is MethodAnalysisContext callee
+            ? IlGenerator.EffectiveCallReturnType(Concrete(call, callee, method))
+            : null;
 
     private static IOperand? LaneOperand(IOperand operand, string? registerName) => operand switch
     {
