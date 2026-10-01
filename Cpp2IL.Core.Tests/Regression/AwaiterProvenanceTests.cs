@@ -200,6 +200,37 @@ public class AwaiterProvenanceTests
         });
     }
 
+    // The coverage is the named register's storage, not a flat pointer width:
+    // a phi-edge zero on a V register covers all 128 bits, so the same
+    // 16-byte Decimal that stays diagnosed on an X register is proven on V.
+    [Test]
+    public void PassInsertedMoveZeroIntoVectorRegisterCoversWholeStruct()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var decimalType = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Decimal")!;
+        var slot = new LocalVariable("slot", new Register(null, "V8")) { Type = decimalType };
+        var (caller, method) = ForeignCaller(app, new ModuleDefinition("AwaiterProvenance.dll"), [
+            new(-1, OpCode.Move, slot, new Immediate(0)),
+            new(1, OpCode.Return)], [slot]);
+        SeedCorLibTypes(app, method.DeclaringModule!, app.SystemTypes.SystemVoidType,
+            app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemValueTypeType, decimalType);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(instruction => instruction.OpCode == CilOpCodes.Initobj),
+                Is.True, () => string.Join("\n", il));
+            Assert.That(il.All(instruction =>
+                    instruction.Operand?.ToString()?.Contains("covers one register") != true
+                    && instruction.Operand?.ToString()?.Contains("NoteDecompilerIssue") != true),
+                Is.True, () => string.Join("\n", il));
+        });
+    }
+
     // The same pass-inserted zero into a wider value type (Decimal, 16 bytes)
     // proves only the register it covers: default(T) is still the best value,
     // but it is an implicit fill and stays diagnosed.

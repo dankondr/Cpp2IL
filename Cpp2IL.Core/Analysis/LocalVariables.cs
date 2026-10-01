@@ -1186,6 +1186,28 @@ public static class LocalVariables
             : null;
     }
 
+    /// <summary>
+    /// The storage one register name provably covers: a B/H/S/W/D/X/V/Q
+    /// register-shaped name (`letter + digits`) covers its named width — a
+    /// whole Vector3 or Quaternion lives inside one V register's 16 bytes —
+    /// while a stack-slot, frame or virtual register name only covers a
+    /// pointer-sized cell.
+    /// </summary>
+    internal static int RegisterCoverageBytes(string registerName, int pointerSize)
+    {
+        if (registerName.Length > 1 && char.IsAsciiDigit(registerName[1]))
+            return registerName[0] switch
+            {
+                'B' or 'b' => 1,
+                'H' or 'h' => 2,
+                'S' or 's' or 'W' or 'w' => 4,
+                'D' or 'd' or 'X' or 'x' => 8,
+                'V' or 'v' or 'Q' or 'q' => 16,
+                _ => pointerSize
+            };
+        return pointerSize;
+    }
+
     // A type-metadata global load (Move local, typeof(T)) puts the runtime class pointer for T into
     // the local - an Il2CppClass*, not an instance of T. That is known exactly from the instruction,
     // so it is seeded as ground truth (overriding any prior guess) before the inference fixpoint,
