@@ -328,4 +328,39 @@ public class MultiDimensionalArrayTests
         Assert.That(ArrayRecovery.VectorLength(lengths, 1)?.Value, Is.EqualTo(20));
         Assert.That(ArrayRecovery.VectorLength(new Vector128Literal(0, -1, 0, 0), 0), Is.Null);
     }
+
+    [Test]
+    public void BareRowLengthIsRowOne()
+    {
+        // grid[1, y]: `p = grid + ((y + [b + 0x10]) << 2)`, the row's multiply folded away.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("Grid.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemBooleanType,
+            app.SystemTypes.SystemObjectType);
+        var grid = Local("grid", new ArrayTypeAnalysisContext(app.SystemTypes.SystemInt32Type, 2));
+        var bounds = Local("bounds");
+        var y = Local("y", app.SystemTypes.SystemInt32Type);
+        var cy = Local("cy", app.SystemTypes.SystemBooleanType);
+        var flat = Local("flat");
+        var scaled = Local("scaled");
+        var pointer = Local("pointer");
+        var value = Local("value", app.SystemTypes.SystemInt32Type);
+        var load = new Instruction(6, OpCode.Move, value, new MemoryOperand(pointer, null, 0x20, 0, 4));
+        var (caller, _) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, bounds, new MemoryOperand(grid, null, 0x10, 0, 8)),
+            new(1, OpCode.CheckLess, cy, y, new MemoryOperand(bounds, null, 0x10, 0, 4)),
+            new(3, OpCode.Add, flat, y, new MemoryOperand(bounds, null, 0x10, 0, 4)),
+            new(4, OpCode.ShiftLeft, scaled, flat, new Immediate(2)),
+            new(5, OpCode.Add, pointer, grid, scaled),
+            load,
+            new(7, OpCode.Return, value)], [grid, bounds, y, cy, flat, scaled, pointer, value]);
+        caller.ParameterLocals = [grid, y];
+
+        ArrayRecovery.RecoverMultiDimensionalAccesses(caller);
+
+        var get = Accessor(caller, "Get");
+        Assert.That(get.Operands[3], Is.InstanceOf<Immediate>());
+        Assert.That(((Immediate)get.Operands[3]).Value, Is.EqualTo(1));
+        Assert.That(get.Operands[4], Is.SameAs(y));
+    }
 }
