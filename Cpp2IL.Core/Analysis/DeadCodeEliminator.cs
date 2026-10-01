@@ -56,8 +56,7 @@ public static class DeadCodeEliminator
     /// `new T[w, h]` writes its lengths into a stack buffer and passes only `&amp;lengths[0]` to the
     /// array stub (<see cref="ArrayRecovery.IsArrayNewWithoutBounds"/>), so the stores of the later
     /// lengths name cells nothing reads directly. They stay until the stub becomes a NewArr that
-    /// takes them as operands. A store of a register's entry value there is a callee-saved spill
-    /// that happens to sit next to the buffer, not a length.
+    /// takes them as operands.
     /// </summary>
     internal static Func<Instruction, bool> StoresArrayNewLengths(MethodAnalysisContext? method, IList<Instruction> instructions)
     {
@@ -76,14 +75,24 @@ public static class DeadCodeEliminator
             if (buffer is { Target: LocalVariable first } && FrameStructFieldReads.FrameOffset(first) is { } offset)
                 buffers.Add(offset);
         }
-        // ponytail: lengths of rank <= 4, so three cells past the first.
-        return buffers.Count == 0
-            ? _ => false
-            : store => store is { OpCode: OpCode.Move, Operands: [LocalVariable cell, var value] }
-                       && value is not LocalVariable { Register.Version: < 1 }
-                       && FrameStructFieldReads.FrameOffset(cell) is { } at
-                       && buffers.Any(start => start < at && at - start <= 24);
+        return buffers.Count == 0 ? _ => false : store => StoresArrayNewLength(store, buffers);
     }
+
+    /// <summary>
+    /// A store into one of the length buffers starting at <paramref name="buffers"/> - the first cell
+    /// too: clang may take `&amp;lengths[0]` before storing it, so the address and the store name
+    /// different versions of the cell. A store of a register's entry value there is a callee-saved
+    /// spill that happens to sit next to the buffer, not a length - unless the register is an argument
+    /// register (X0-X7), whose entry value is a parameter: copy propagation leaves `new T[w, h]`
+    /// storing `h` itself.
+    /// </summary>
+    internal static bool StoresArrayNewLength(Instruction store, IReadOnlyCollection<long> buffers)
+        => store is { OpCode: OpCode.Move, Operands: [LocalVariable cell, var value] }
+           && value is not LocalVariable { Register.Version: < 1,
+               Register.Name: not ("X0" or "X1" or "X2" or "X3" or "X4" or "X5" or "X6" or "X7") }
+           && FrameStructFieldReads.FrameOffset(cell) is { } at
+           // ponytail: lengths of rank <= 4, so three cells past the first.
+           && buffers.Any(start => start <= at && at - start <= 24);
 
     public static void Run(ISILControlFlowGraph cfg, MethodAnalysisContext? method = null)
     {
