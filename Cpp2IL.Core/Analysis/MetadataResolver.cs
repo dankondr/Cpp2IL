@@ -1665,15 +1665,13 @@ public static class MetadataResolver
         for (var i = 0; i < instruction.Operands.Count; i++)
         {
             if (instruction.Operands[i] is not MemoryOperand { Base: LocalVariable alias } memory
-                || !definitions.TryGetValue(alias, out var definition)
-                || definition is not { OpCode: OpCode.Add or OpCode.Subtract, Operands: [_, LocalVariable root, Immediate displacement] }
+                || AddressAlias(alias, definitions, []) is not (LocalVariable root, var signed)
                 || ReferenceEquals(root, alias)
                 || EffectiveObjectType(root, definitions, method.DeclaringType) is not { } rootType
                 || rootType.IsValueType && !root.IsThis)
                 continue;
             // ldarg.0 of a struct method's own `this` is &T, so this + disp is interior
             // addressing just like object + disp is for references.
-            var signed = definition.OpCode == OpCode.Subtract ? -displacement.Value : displacement.Value;
             long offset;
             try { offset = checked(memory.Addend + signed); }
             catch (System.OverflowException) { continue; }
@@ -1687,6 +1685,33 @@ public static class MetadataResolver
             changed = true;
         }
         return changed;
+    }
+
+    // The address `root + displacement` a local holds on every path: a root plus a
+    // constant, or a phi whose inputs all hold that same address. A pre-indexed store
+    // on each of two paths (`str x0, [x19, #0x18]!`) steps the base to the same field
+    // address twice, and the access after the join is relative to the merge.
+    private static (LocalVariable Root, long Displacement)? AddressAlias(LocalVariable local,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions, HashSet<LocalVariable> visiting)
+    {
+        if (!visiting.Add(local) || !definitions.TryGetValue(local, out var definition))
+            return null;
+        if (definition is { OpCode: OpCode.Add or OpCode.Subtract, Operands: [_, LocalVariable root, Immediate displacement] })
+            return (root, definition.OpCode == OpCode.Subtract ? -displacement.Value : displacement.Value);
+        if (definition.OpCode != OpCode.Phi)
+            return null;
+        (LocalVariable Root, long Displacement)? common = null;
+        foreach (var input in definition.Operands.Skip(1))
+        {
+            // An input already being resolved is a loop carrying this same value back.
+            if (input is LocalVariable seen && visiting.Contains(seen))
+                continue;
+            if (input is not LocalVariable next || AddressAlias(next, definitions, visiting) is not { } address
+                || common is { } known && (!ReferenceEquals(known.Root, address.Root) || known.Displacement != address.Displacement))
+                return null;
+            common = address;
+        }
+        return common;
     }
 
     private static TypeAnalysisContext? EffectiveObjectType(LocalVariable local,
