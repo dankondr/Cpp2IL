@@ -752,6 +752,12 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // parameters, which C# cannot express - so their uses read the shared root instead.
         ByrefAliasForwarding.Run(this);
 
+        // Late passes still write the reads a packed struct's register carries:
+        // EqualityBranchInverter rewrites comparison conditions, and addressed
+        // stack locals only gained their stored type at TypeAddressedLocals. One
+        // more pass out of SSA rewrites what surfaced here.
+        PackedRegisterFields.Run(this);
+
         LocalVariables.RemoveUnused(this);
 
     }

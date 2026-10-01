@@ -332,6 +332,7 @@ public static class LocalVariables
             changed |= MetadataResolver.ResolveVirtualCalls(method);
             changed |= PropagateFromCallParameters(method, allowCanonicalCallTypes);
             changed |= AggregateResultLanes.Run(method);
+            changed |= PackedRegisterFields.Run(method);
             changed |= MetadataResolver.LoadThroughMergedAddresses(method);
             changed |= MetadataResolver.ResolveFieldOffsets(method);
             changed |= ResolveSharpenedFieldOwners(method);

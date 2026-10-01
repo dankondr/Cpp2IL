@@ -874,7 +874,20 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     break;
                 }
 
-                Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                var move = Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                move.NativeReadWidthBits = instruction.Mnemonic switch
+                {
+                    Arm64Mnemonic.SXTB or Arm64Mnemonic.UXTB => 8,
+                    Arm64Mnemonic.SXTH or Arm64Mnemonic.UXTH => 16,
+                    Arm64Mnemonic.SXTW => 32,
+                    _ => null,
+                };
+                move.NativeReadSignExtend = instruction.Mnemonic switch
+                {
+                    Arm64Mnemonic.SXTB or Arm64Mnemonic.SXTH or Arm64Mnemonic.SXTW => true,
+                    Arm64Mnemonic.UXTB or Arm64Mnemonic.UXTH => false,
+                    _ => null,
+                };
                 break;
             case Arm64Mnemonic.MOVI:
             case Arm64Mnemonic.MVNI when instruction.Op1Kind == Arm64OperandKind.Immediate:
@@ -1254,14 +1267,16 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 break;
             case Arm64Mnemonic.LSR:
             case Arm64Mnemonic.ASR:
-                AddInteger(address, OpCode.ShiftRight, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                AddInteger(address, OpCode.ShiftRight, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2))
+                    .NativeReadSignExtend = instruction.Mnemonic == Arm64Mnemonic.ASR;
                 break;
             case Arm64Mnemonic.UBFX:
             case Arm64Mnemonic.SBFX:
                 {
                     // dest = (src >> lsb) & ((1 << width) - 1)
                     var dest = ConvertOperand(instruction, 0);
-                    AddInteger(address, OpCode.ShiftRight, dest, ConvertOperand(instruction, 1), Imm(instruction.Op2Imm));
+                    AddInteger(address, OpCode.ShiftRight, dest, ConvertOperand(instruction, 1), Imm(instruction.Op2Imm))
+                        .NativeReadSignExtend = instruction.Mnemonic == Arm64Mnemonic.SBFX;
                     AddInteger(address, OpCode.And, dest, dest, Imm((1L << (int)instruction.Op3Imm) - 1));
                     break;
                 }
