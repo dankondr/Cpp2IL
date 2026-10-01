@@ -44,8 +44,10 @@ public class Arm64MissingOpsTests
             .Select(i => (i.OpCode, i.NativeFloatWidthBits)),
             Is.EqualTo(new[] { (OpCode.Move, (int?)32), (OpCode.Call, (int?)32) }));
 
-        Assert.That(Lift(0x4e219800).Any(i => i.OpCode == OpCode.NotImplemented), Is.True,
-            "frintm v0.4s, v0.4s stays conservative until vector rounding is implemented");
+        // the vector form folds lane-wise on entry lanes: every lane of an
+        // unwritten register is its entry lane, so each calls Math.Floor
+        Assert.That(Lift(0x4e219800).Count(i => i.OpCode == OpCode.Call),
+            Is.EqualTo(4), "frintm v0.4s, v0.4s is one Math.Floor call per lane");
     }
 
     [Test]

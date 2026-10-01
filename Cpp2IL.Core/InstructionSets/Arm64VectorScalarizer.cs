@@ -60,9 +60,16 @@ internal sealed class Arm64VectorScalarizer
         /// </summary>
         public bool Whole;
 
+        /// <summary>
+        /// The register's normalized name ("V0"), set when the state is
+        /// created — lets a consumer recover the whole-register local when
+        /// <see cref="Whole"/> says it is current.
+        /// </summary>
+        public string? Name;
+
         public VectorState Clone()
         {
-            var clone = new VectorState { Whole = Whole };
+            var clone = new VectorState { Whole = Whole, Name = Name };
             Array.Copy(Slots, clone.Slots, Slots.Length);
             return clone;
         }
@@ -74,6 +81,51 @@ internal sealed class Arm64VectorScalarizer
     private readonly HashSet<string> _claimedDests = new();
     private int _tempCounter;
     private bool _clearProvenanceNext;
+
+    /// <summary>
+    /// No control-flow boundary has been crossed yet, so the lanes a register
+    /// was entered with are still live: an unwritten register's low window
+    /// reads as the register local itself, higher windows as the entry
+    /// element locals. Merges keep it — every edge carries the same entry
+    /// value; clearing events (code that is not this path, or an instruction
+    /// with no identifiable destination) drop it, and calls restrict it per
+    /// register via <see cref="_entryMask"/>.
+    /// </summary>
+    private bool _entryValid = true;
+    /// Per-register mask of which 32-bit windows still carry the entry value;
+    /// a call invalidates V0-V7 and V16-V31 outright but only the high half of
+    /// callee-saved V8-V15. Absent = all windows valid while _entryValid holds.
+    private readonly Dictionary<string, int> _entryMask = new();
+
+    private int EntryMask(string name) => _entryMask.TryGetValue(name, out var mask) ? mask : 0xF;
+
+    private bool CanSeed(string name) => _entryValid && EntryMask(name) != 0;
+
+    /// <summary>
+    /// AAPCS64: a call clobbers V0-V7 and V16-V31, and the upper halves of
+    /// callee-saved V8-V15 — their low 64 bits, and any tracked lanes that
+    /// live there, survive.
+    /// </summary>
+    private void ClobberCall()
+    {
+        var dropped = new List<string>();
+        foreach (var (name, state) in _vectors)
+        {
+            var reg = name is ['V', ..] && int.TryParse(name[1..], out var n) ? n : -1;
+            if (reg is >= 8 and <= 15)
+            {
+                state.Slots[2] = null;
+                state.Slots[3] = null;
+                state.Whole = false;
+            }
+            else
+                dropped.Add(name);
+        }
+        foreach (var name in dropped)
+            _vectors.Remove(name);
+        for (var v = 0; v < 32; v++)
+            _entryMask["V" + v] = v is >= 8 and <= 15 ? 0b0011 : 0;
+    }
 
     /// <summary>Branch instruction addresses that target each merge point.</summary>
     private readonly Dictionary<ulong, List<ulong>> _mergePreds = new();
@@ -183,6 +235,8 @@ internal sealed class Arm64VectorScalarizer
         _claimedDests.Clear();
         _tempCounter = 0;
         _clearProvenanceNext = false;
+        _entryValid = true;
+        _entryMask.Clear();
         _prevAddress = 0;
 
         foreach (var insn in instructions)
@@ -235,6 +289,7 @@ internal sealed class Arm64VectorScalarizer
         {
             _vectors.Clear();
             _clearProvenanceNext = false;
+            _entryValid = false;
         }
         if (_mergeTargets.Contains(insn.Address))
             MergeLanesAt(insn.Address);
@@ -249,8 +304,16 @@ internal sealed class Arm64VectorScalarizer
         _prevAddress = insn.Address;
     }
 
-    /// <summary>The register a window's value must live in to cross a control-flow edge.</summary>
-    private static Register CanonicalSlot(string name, int slot) => ElementRegister(name, 32, slot);
+    /// <summary>
+    /// The register a window's value must live in to cross a control-flow
+    /// edge. Window 0's canonical home is the register local itself: its low
+    /// 32 bits are the lane, and keeping the lane in the local lets a scalar
+    /// consumer read the phi'd register the way the field-recovery layer
+    /// already resolves (a whole-register move reads the low window). Windows
+    /// 1-3 canonically live in their element registers.
+    /// </summary>
+    private static Register CanonicalSlot(string name, int slot)
+        => slot == 0 ? new Register(null, name) : ElementRegister(name, 32, slot);
 
     private static bool IsCanonical(string name, int slot, LaneSlice slice)
         => slice.BitOffset == 0
@@ -276,6 +339,8 @@ internal sealed class Arm64VectorScalarizer
                         .NativeIntegerWidthBits = 32;
                     _emitted = true;
                     state.Slots[slot] = new LaneSlice(CanonicalSlot(name, slot), 0);
+                    if (slot == 0)
+                        state.Whole = false;
                 }
                 else
                     state.Slots[slot] = null;
@@ -292,6 +357,8 @@ internal sealed class Arm64VectorScalarizer
     /// </summary>
     private void MergeLanesAt(ulong target)
     {
+        // an unwritten register's entry lanes survive a merge — every edge
+        // carries the same entry value — so lazy seeding stays valid here
         var fallThrough = _mergeFallThrough.Contains(target) ? _vectors : null;
         List<Dictionary<string, VectorState>>? branchEdges = null;
         var backwardEdge = false;
@@ -322,16 +389,21 @@ internal sealed class Arm64VectorScalarizer
             // with every window unproven so a later lane consumer diagnoses
             // instead of reading element locals no edge materialized.
             foreach (var name in names)
-                merged[name] = new VectorState();
+                merged[name] = new VectorState { Name = name };
         }
         else
         {
 
             foreach (var name in names)
             {
-                var state = new VectorState();
+                var state = new VectorState { Name = name };
+                var window0Clobbered = false;
                 for (var slot = 0; slot < 4; slot++)
                 {
+                    // an edge that never wrote the register contributes no
+                    // slice: naming the entry element local here would let a
+                    // consumer read a local that edge never defined — the
+                    // merge stays honest and leaves the window unproven
                     var proven = fallThrough == null
                         || fallThrough.TryGetValue(name, out var live) && live.Slots[slot] != null;
                     if (proven && branchEdges != null)
@@ -346,8 +418,14 @@ internal sealed class Arm64VectorScalarizer
                         && liveState.Slots[slot] is { } liveSlice
                         && !IsCanonical(name, slot, liveSlice)
                         && SlotOperand(liveState, slot) is { } value)
+                    {
                         _add(_address, OpCode.Move, [canonical, value])
                             .NativeIntegerWidthBits = 32;
+                        // writing window 0 into the register local replaces
+                        // the whole-register value it held
+                        if (slot == 0)
+                            window0Clobbered = true;
+                    }
                     state.Slots[slot] = new LaneSlice(canonical, 0);
                 }
                 var whole = fallThrough == null
@@ -355,7 +433,7 @@ internal sealed class Arm64VectorScalarizer
                 if (whole && branchEdges != null)
                     foreach (var edge in branchEdges)
                         whole &= edge.TryGetValue(name, out var exit) && exit.Whole;
-                state.Whole = whole;
+                state.Whole = whole && !window0Clobbered;
                 // a name live on any edge stays tracked even when no window is
                 // proven: a lane consumer must diagnose rather than read an
                 // element local no edge materialized
@@ -398,8 +476,9 @@ internal sealed class Arm64VectorScalarizer
         // argument/temporary vector registers and may write the V0 result, an
         // indirect jump's targets cannot be enumerated, and bytes following an
         // unconditional branch or return are not this path's code.
-        if (insn.Mnemonic is Arm64Mnemonic.B or Arm64Mnemonic.BL
-            or Arm64Mnemonic.BR or Arm64Mnemonic.BLR
+        if (insn.Mnemonic is Arm64Mnemonic.BL or Arm64Mnemonic.BLR)
+            ClobberCall();
+        else if (insn.Mnemonic is Arm64Mnemonic.B or Arm64Mnemonic.BR
             or Arm64Mnemonic.RET or Arm64Mnemonic.RETAA or Arm64Mnemonic.RETAB)
             _clearProvenanceNext = true;
 
@@ -432,6 +511,7 @@ internal sealed class Arm64VectorScalarizer
             // exotic forms may still write any vector register — drop all
             // provenance rather than fold against stale lanes
             _vectors.Clear();
+            _entryValid = false;
             return;
         }
 
@@ -489,7 +569,44 @@ internal sealed class Arm64VectorScalarizer
     }
 
     private VectorState? State(Arm64Register reg)
-        => _vectors.TryGetValue(Normalize(reg), out var state) ? state : null;
+    {
+        var name = Normalize(reg);
+        if (_vectors.TryGetValue(name, out var state))
+            return state;
+        // before any clobber or merge, an unwritten register's windows are the
+        // lanes it was entered with: the low window is the register local
+        // itself, the rest its entry element locals
+        if (!CanSeed(name))
+            return null;
+        _vectors[name] = state = EntryState(reg);
+        return state;
+    }
+
+    /// The slice an unwritten register carries at one 32-bit window before
+    /// any clobber. Lane 0 is the register local's own scalar view — the same
+    /// operand `fcmgt s0` / `mov wN, v0.s[0]` already read for it, so a scalar
+    /// parameter's lane keeps its defined spelling. Higher lanes are the
+    /// entry element locals — the same locals a lane extract would read, so
+    /// an unwritten one reports the existing "undefined local" diagnostic
+    /// rather than a guessed value.
+    private static LaneSlice EntrySlice(string name, int slot)
+        => slot == 0
+            ? new LaneSlice(new Register(null, name), 0)
+            : new LaneSlice(ElementRegister(name, 32, slot), 0);
+
+    /// The lanes a register was entered with, readable while no clobber has
+    /// invalidated them. The register local itself is also still current, so
+    /// whole-register reads and copies use it directly.
+    private VectorState EntryState(Arm64Register reg)
+    {
+        var name = Normalize(reg);
+        var state = new VectorState { Whole = true, Name = name };
+        var mask = EntryMask(name);
+        for (var i = 0; i < 4; i++)
+            if ((mask & (1 << i)) != 0)
+                state.Slots[i] = EntrySlice(name, i);
+        return state;
+    }
 
     /// <summary>
     /// State for lane-level consumers: at least one proven 32-bit window. A
@@ -512,7 +629,9 @@ internal sealed class Arm64VectorScalarizer
     {
         var name = Normalize(reg);
         if (!_vectors.TryGetValue(name, out var state))
-            _vectors[name] = state = new();
+            // an unwritten register still carries its entry lanes before any
+            // clobber — a partial lane write keeps the rest live
+            _vectors[name] = state = CanSeed(name) ? EntryState(reg) : new();
         return state;
     }
 
@@ -636,6 +755,15 @@ internal sealed class Arm64VectorScalarizer
         var hi = state.Slots[2 * lane + 1];
         if (lo == null || hi == null)
             return null;
+
+        // the register local is current — the low 64-bit lane is simply its
+        // low half; compose per-window operands only for written states
+        if (lane == 0 && state.Whole && state.Name is { } whole)
+            return new Register(null, whole);
+
+        if (lo.Value.BitOffset == 0 && hi.Value.BitOffset == 32
+            && lo.Value.Operand.Equals(hi.Value.Operand))
+            return lo.Value.Operand; // one operand already covers the whole lane
 
         if (lo.Value.BitOffset == 0 && hi.Value.BitOffset == 32
             && lo.Value.Operand.Equals(hi.Value.Operand))
@@ -875,9 +1003,13 @@ internal sealed class Arm64VectorScalarizer
                 emitted.NativeIntegerWidthBits = 32;
             ImmediateWriteWidth.ApplyToMove(emitted);
             _emitted = true;
-            dest.Slots[lane * laneBits / 32] = new LaneSlice(value, 0);
+            // the slot names the element local just written — recording the
+            // source operand would alias it: a later write to the source's
+            // register would then read through to this lane. Immediates keep
+            // their own slice so constant provenance survives.
+            dest.Slots[lane * laneBits / 32] = new LaneSlice(value is Immediate ? value : elementReg, 0);
             if (laneBits == 64)
-                dest.Slots[lane * 2 + 1] = new LaneSlice(value, 32);
+                dest.Slots[lane * 2 + 1] = new LaneSlice(value is Immediate ? value : elementReg, 32);
             return;
         }
 
@@ -1062,9 +1194,26 @@ internal sealed class Arm64VectorScalarizer
         => slot == 0
             && slice.BitOffset == 0
             && slice.Operand is Register { Name: { } name } && !name.Contains('.')
-            && state.Slots[1] is { Operand: Immediate }
-            && state.Slots[2] is { Operand: Immediate }
-            && state.Slots[3] is { Operand: Immediate };
+            && UpperWindowsProvable(state);
+
+    /// Every upper window provably benign for a scalar-window read: a
+    /// constant or an element local — either proves the window cannot carry
+    /// part of a managed aggregate. A bare register window above bit 32 may
+    /// hide half of a Vector2/3 load, so it does not qualify.
+    /// </summary>
+    private static bool UpperWindowsProvable(VectorState state)
+    {
+        for (var i = 1; i < 4; i++)
+        {
+            if (state.Slots[i] is not { } slice)
+                return false;
+            var ok = slice.Operand is Immediate
+                || slice.Operand is Register { Name: { } upper } && upper.Contains('.');
+            if (!ok)
+                return false;
+        }
+        return true;
+    }
 
     /// <summary>
     /// Whether a lane window is an honest floating-point carrier: an element
@@ -1136,6 +1285,16 @@ internal sealed class Arm64VectorScalarizer
             return true;
         if (slice.Operand is Register { Name: { } n } && n.Contains('.'))
             return width == 32 || n.Contains(".D");
+        // a bare register window is the register's own low scalar — honest at
+        // the compare width the same way an untracked register is
+        if (slice.Operand is Register { Name: { } entry } && entry == Normalize(reg))
+            return true;
+
+        // an element local always names one scalar lane — the compare reads
+        // exactly what it means, whether the local was written in-method or
+        // carried in at entry
+        if (slice.Operand is Register { Name: { } dotted } && dotted.Contains('.'))
+            return true;
         return width == 32 && IsScalarWholeWindow(state, 0, slice);
     }
 
@@ -2130,6 +2289,11 @@ internal sealed class Arm64VectorScalarizer
 
         if (!supported || !anyLaneProven)
         {
+            // bitwise ops are honest as a packed operation — when not one
+            // window can be scalarized the whole-vector form still lifts the
+            // instruction exactly, so refuse rather than diagnose
+            if (supported && bitwise)
+                return false;
             for (var slot = 0; slot < vectorSlots; slot++)
                 dest.Slots[slot] = null;
             for (var slot = vectorSlots; slot < 4; slot++)

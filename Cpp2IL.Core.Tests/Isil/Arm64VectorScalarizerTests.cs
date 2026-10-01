@@ -165,18 +165,18 @@ public class Arm64VectorScalarizerTests
             Assert.That(il.Any(i => i.OpCode == OpCode.Move
                 && i.Operands[0] is Register { Name: "V0.S1" }
                 && i.Operands[1] is MemoryOperand { Base: Register { Name: "X4" }, Addend: 4 }), Is.True);
-            Assert.That(il.Any(i => i.OpCode == OpCode.Move
-                && i.Operands[0] is Register { Name: "X8" }
-                && i.Operands[1] is MemoryOperand { Base: Register { Name: "X4" }, Addend: 4 }), Is.True);
+            Assert.That(il.Any(i => IsMove(i, "X8", "V0.S1")), Is.True,
+                "the extract reads the lane local the load materialized");
             Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
         });
     }
 
     [Test]
-    public void PartiallyProvenVectorEmitsOnlyProvenLanes()
+    public void PartiallyWrittenVectorReadsEntryLanes()
     {
-        // Only lane 1 of v2 is written; lane 0 is hardware-stale. The pass must
-        // emit the provable lane op and report the unprovable one, not guess.
+        // lane 0 was never written in the method — before any merge or
+        // clobber it still carries the value v2 was entered with, so the add
+        // reads the entry lane (the register local) rather than diagnosing
         var il = Lift(
             0x4e0c1d02, // mov v2.s[1], w8
             0x0ea28440); // add v0.2s, v2.2s, v2.2s
@@ -184,9 +184,11 @@ public class Arm64VectorScalarizerTests
         Assert.Multiple(() =>
         {
             Assert.That(FindOp(il, OpCode.Add, "V0.S1"), Is.Not.Null);
-            Assert.That(FindOp(il, OpCode.Add, "V0.S0"), Is.Null);
-            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented
-                && i.Operands[0] is StringLiteral s && s.Value.Contains("scalarized 1 of 2")), Is.True);
+            Assert.That(il.Any(i => i.OpCode == OpCode.Add
+                && i.Operands[0] is Register { Name: "V0.S0" }
+                && i.Operands[1] is Register { Name: "V2" }), Is.True,
+                "the unwritten lane is the entry scalar — the register local");
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
         });
     }
 
@@ -282,18 +284,17 @@ public class Arm64VectorScalarizerTests
     }
 
     [Test]
-    public void PermutedVectorIsNotScalarized()
+    public void PermutedVectorScalarizes()
     {
-        // zip1 permutes lanes; the scalarizer cannot describe it, so the
-        // destination stays opaque and a later extract hits the normal path.
+        // zip1 interleaves lanes: v2 = [v1.s0, v2.s0] — each destination lane
+        // names a proven source lane, so a later extract reads the element local
         var il = Lift(
             0x0e040d02, // dup v2.2s, w8
             0x0e823822, // zip1 v2.2s, v1.2s, v2.2s
             0x0e0c3c48); // mov w8, v2.s[1]
 
-        // tracked-then-poisoned: explicit diagnostic, no guessed extraction
-        Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.True);
-        Assert.That(il.Any(i => IsMove(i, "X8", "V2.S1")), Is.False);
+        Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        Assert.That(il.Any(i => IsMove(i, "X8", "V2.S1")), Is.True);
     }
 
     [Test]
@@ -328,13 +329,14 @@ public class Arm64VectorScalarizerTests
     }
 
     [Test]
-    public void ProvenanceResetsAtMergeTargets()
+    public void MergeOfWrittenAndEntryEdgesStaysUnproven()
     {
-        // A branch target may be reached by a path that never built the
-        // vector, so a window survives the merge only when every predecessor
-        // proves it: the CBZ edge carries no V0 lanes, so V0.S1 is unproven at
-        // the merge and the extract there diagnoses rather than guessing an
-        // element local no edge materialized.
+        // A lane merged from two predecessors: the CBZ edge never wrote V0 so
+        // its lane 1 is only the entry value — it can name the element local
+        // V0.S1 only if that local is defined at method entry, which is a
+        // lane:types-ssa question — while the B edge wrote it via DUP. The
+        // merge cannot express that phi, so the window stays unproven and the
+        // extract diagnoses rather than guessing.
         var entryBranch = MakeInsn(m =>
         {
             Set(m, "Mnemonic", Arm64Mnemonic.CBZ);
@@ -385,7 +387,7 @@ public class Arm64VectorScalarizerTests
         scalarizer.BeginInstruction(entryBranch, Add);
         scalarizer.TryBroadcastDup(dup, Add, conv);
         scalarizer.BeginInstruction(branch, Add);
-        scalarizer.BeginInstruction(extract, Add); // merge target: V0.S1 meets an unproven edge
+        scalarizer.BeginInstruction(extract, Add); // merge target: V0.S1 meets an unwritten edge
         Assert.Multiple(() =>
         {
             Assert.That(scalarizer.TryConvert(extract, Add, conv), Is.True,
@@ -606,6 +608,10 @@ public class Arm64VectorScalarizerTests
         // A vector register is a tuple of lanes: two paths build V0/V2
         // differently (a DUP broadcast versus an LDR D pair), and the FMUL
         // below the merge still lifts as one scalar multiply per lane.
+        // Lane 0's canonical home is the register local itself — its low
+        // 32 bits are the lane and the field-recovery layer resolves a
+        // whole-register read as that window — so the merged lane-0 op
+        // reads V0/V2 while lane 1 reads the element locals V0.S1/V2.S1.
         var il = Lift(
             0x34000088, // cbz w8, #0x10        -> else-path
             0x0e040d00, // dup v0.2s, w8         then: broadcast
@@ -623,8 +629,8 @@ public class Arm64VectorScalarizerTests
             var hi = FindOp(il, OpCode.Multiply, "V0.S1");
             Assert.That(lo, Is.Not.Null);
             Assert.That(hi, Is.Not.Null);
-            Assert.That(lo!.Operands[1], Is.EqualTo(new Register(null, "V0.S0")));
-            Assert.That(lo.Operands[2], Is.EqualTo(new Register(null, "V2.S0")));
+            Assert.That(lo!.Operands[1], Is.EqualTo(new Register(null, "V0")));
+            Assert.That(lo.Operands[2], Is.EqualTo(new Register(null, "V2")));
             Assert.That(hi!.Operands[1], Is.EqualTo(new Register(null, "V0.S1")));
             Assert.That(hi.Operands[2], Is.EqualTo(new Register(null, "V2.S1")));
         });

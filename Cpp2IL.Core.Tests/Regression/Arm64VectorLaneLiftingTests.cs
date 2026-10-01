@@ -173,20 +173,26 @@ public class Arm64VectorLaneLiftingTests
         });
     }
 
-    // A reduction over an opaque vector cannot name the remaining addends — it
-    // must stay an explicit diagnostic, not a partial fold.
+    // A reduction over a partly-written vector reads the written lane and the
+    // entry lanes alike — every lane is a scalar element local, so the sum
+    // folds; a lane whose element local was never materialized keeps its
+    // "undefined local" diagnostic downstream instead of a guessed value.
     [Test]
-    public void AddvOnUnprovenLanesStaysDiagnosed()
+    public void AddvOnWrittenAndEntryLanesFoldsReduction()
     {
         var il = Lift(
-            0x4e041d00, // mov v0.s[0], w8 — proves element 0 only
-            0x4eb1b801); // addv s1, v0.4s   — lanes 1..3 are opaque
+            0x4e041d00, // mov v0.s[0], w8 — proves element 0
+            0x4eb1b801); // addv s1, v0.4s   — lanes 1..3 are entry lanes
 
         Assert.Multiple(() =>
         {
-            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.True);
-            Assert.That(FindOp(il, OpCode.Move, "V1.S0"), Is.Null,
-                "an unproven reduction must not fabricate a scalar lane");
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+            Assert.That(FindOp(il, OpCode.Move, "V1.S0"), Is.Not.Null,
+                "the reduction result is written to the scalar destination");
+            for (var lane = 1; lane < 4; lane++)
+                Assert.That(il.Any(i => i.Operands.Any(o
+                        => o is Register { Name: { } n } && n == $"V0.S{lane}")), Is.True,
+                    $"lane {lane} must read the entry element local V0.S{lane}");
         });
     }
 
@@ -234,8 +240,14 @@ public class Arm64VectorLaneLiftingTests
     [Test]
     public void CmgeEmitsPerLaneMask()
     {
-        var opaque = Lift(0x6ea08821); // cmge v1.4s, v1.4s, #0 — never written
-        Assert.That(opaque.Any(i => i.OpCode == OpCode.NotImplemented), Is.True);
+        var entry = Lift(0x6ea08821); // cmge v1.4s, v1.4s, #0 — entry lanes
+        Assert.Multiple(() =>
+        {
+            Assert.That(entry.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+            for (var lane = 0; lane < 4; lane++)
+                Assert.That(FindOp(entry, OpCode.CheckGreaterOrEqual, $"V1.S{lane}"),
+                    Is.Not.Null, $"lane {lane} must fold to its own compare");
+        });
 
         var il = Lift(
             0x4f002621, // movi v1.4s, #0x11, lsl #8
@@ -352,15 +364,31 @@ public class Arm64VectorLaneLiftingTests
         });
     }
 
-    // SSHL on an opaque source reports rather than guessing.
+    // SSHL on entry-sourced registers reads each lane's entry element local —
+    // the shifts fold per lane and any never-materialized lane keeps its
+    // "undefined local" diagnosis downstream rather than a guessed value.
     [Test]
-    public void SshlOnOpaqueSourceIsDiagnosed()
+    public void SshlOnEntryLanesReadsEntryElementLocals()
     {
         var il = Lift(
             0x0f010400, // movi v0.2s, #0x20
-            0x0ea14441); // sshl v1.2s, v2.2s, v1.2s — v1/v2 were never written
+            0x0ea14441); // sshl v1.2s, v2.2s, v1.2s — v1/v2 arrive unwritten
 
-        Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.True);
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+            for (var lane = 0; lane < 2; lane++)
+            {
+                Assert.That(FindOp(il, OpCode.Move, $"V1.S{lane}"), Is.Not.Null,
+                    $"lane {lane} result must be written to its element local");
+                // lane 0 reads the register's own scalar view, lane 1 the
+                // entry element local — both proven, never guessed
+                var expected = lane == 0 ? "V2" : $"V2.S{lane}";
+                Assert.That(il.Any(i => i.Operands.Any(o
+                        => o is Register { Name: { } n } && n == expected)), Is.True,
+                    $"lane {lane} must read entry operand {expected}");
+            }
+        });
     }
 
     // SMIN folds to the branchless select per lane.
@@ -382,17 +410,23 @@ public class Arm64VectorLaneLiftingTests
 
     // An unproven USHLL stays an explicit diagnostic and writes no lanes.
     [Test]
-    public void UnprovenUshllIsDiagnosedNotGuessed()
+    public void UshllReadsWrittenAndEntryLanes()
     {
         var il = Lift(
-            0x4e041d00, // mov v0.s[0], w8 — proves slot 0 only
-            0x2f08a401); // ushll v1.8h, v0.8b, #0 — reads B lanes 0..7
+            0x4e041d00, // mov v0.s[0], w8 — proves slot 0
+            0x2f08a401); // ushll v1.8h, v0.8b, #0 — B lanes of slots 0..1
 
         Assert.Multiple(() =>
         {
-            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.True);
-            Assert.That(il.Any(i => i.OpCode == OpCode.Move
-                && i.Operands[0] is Register { Name: { } n } && n.StartsWith("V1.")), Is.False);
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+            for (var lane = 0; lane < 8; lane++)
+                Assert.That(il.Any(i => i.OpCode == OpCode.And
+                    && i.Operands[0] is Register { Name: { } n } && n == $"V1.H{lane}"),
+                    Is.True, $"B lane {lane} must widen into V1.H{lane}");
+            // bytes 4..7 come from the entry element local V0.S1
+            Assert.That(il.Any(i => i.Operands.Any(o
+                    => o is Register { Name: "V0.S1" })), Is.True,
+                "the high source window must read the entry element local V0.S1");
         });
     }
 }
