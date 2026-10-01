@@ -590,8 +590,36 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     protected MethodAnalysisContext(ApplicationAnalysisContext context) : base(0, context)
     { }
 
+    // ConvertedIsil is assigned early inside AnalyzeCore, so it cannot mark
+    // completion: only this does. Recovery passes may ask for a member's lifted
+    // body mid-pipeline (see InlinedMemberRecovery) - the lock serializes a
+    // nested Analyze() against the parallel decompile's own call, and waiting
+    // callers resume on the flag, not on the first writes.
+    private volatile bool _analysisDone;
+
     [MemberNotNull(nameof(ConvertedIsil))]
     public void Analyze()
+    {
+        if (_analysisDone)
+        {
+            ConvertedIsil ??= [];
+            return;
+        }
+
+        lock (this)
+        {
+            if (_analysisDone)
+            {
+                ConvertedIsil ??= [];
+                return;
+            }
+            AnalyzeCore();
+            _analysisDone = true;
+        }
+    }
+
+    [MemberNotNull(nameof(ConvertedIsil))]
+    private void AnalyzeCore()
     {
         if (MaxMethodSizeBytes != -1 && RawBytes.Length > MaxMethodSizeBytes)
         {
@@ -728,6 +756,12 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         CallArgumentTrimmer.Run(this);
         InlinedListClearRecovery.Run(this);
         InlinedListAddRecovery.Run(this);
+
+        // Member accesses an inlined member left behind - a store into a field the
+        // caller cannot name, or a read behind a private container - map back to
+        // the accessible member (ctor, setter, factory, getter) whose own lifted
+        // body is exactly that access.
+        InlinedMemberRecovery.Run(this);
 
         // ARM64 ELF block-memory imports (`bl` into a GOT veneer whose relocated symbol
         // is memcpy/memset/memmove) become dedicated block ops, scalar imports get a
