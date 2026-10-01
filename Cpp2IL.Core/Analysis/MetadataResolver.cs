@@ -565,7 +565,8 @@ public static class MetadataResolver
                 if (!consumed.All(IsStruct) || consumed.Select(t => t!.FullName).Distinct().Count() != 1)
                     continue;
                 whole = consumed[0];
-                cells = cells.Select(c => c is { Field: { } f } ? Widened(f, whole!) is { } w ? (w, whole!) : null : c).ToList();
+                cells = cells.Select(c => c is { Read: FieldReference f } ? Widened(f, whole!) is { } w ? ((IOperand?)w, whole!) : null
+                    : c is { Read: ArrayAccess } ? null : c).ToList();
             }
 
             if (cells.Any(c => c == null) || cells.Select(c => c!.Value.Type.FullName).Distinct().Count() != 1)
@@ -575,7 +576,8 @@ public static class MetadataResolver
             // runs where the join is not reached: only a read that cannot fault may go there - a
             // literal slot, or a field of `this`.
             if (cells.Where((c, k) => block.Predecessors[k].Successors.Count != 1)
-                .Any(c => c!.Value.Field is { } edgeRead && !IsThisValue(edgeRead.Local)))
+                .Any(c => c!.Value.Read is ArrayAccess
+                          || c.Value.Read is FieldReference edgeRead && !IsThisValue(edgeRead.Local)))
                 continue;
 
             // A load of a struct cell reads only the bytes it covers, not the value; a primitive cell
@@ -590,13 +592,13 @@ public static class MetadataResolver
             var values = new List<IOperand> { NewLocal(type) };
             for (var k = 0; k < cells.Count; k++)
             {
-                if (cells[k]!.Value.Field is not { } field)
+                if (cells[k]!.Value.Read is not { } read)
                 {
                     values.Add(phi.Operands[1 + k]);
                     continue;
                 }
                 var value = NewLocal(type);
-                SsaForm.InsertBeforeTerminator(block.Predecessors[k], [new Instruction(-1, OpCode.Move, value, field)]);
+                SsaForm.InsertBeforeTerminator(block.Predecessors[k], [new Instruction(-1, OpCode.Move, value, read)]);
                 values.Add(value);
             }
             block.Instructions.Insert(block.Instructions.IndexOf(phi) + 1, new Instruction(-1, OpCode.Phi, values));
@@ -615,8 +617,9 @@ public static class MetadataResolver
 
         // The cell an incoming address names: `&o.f`, `o + offset` of a typed reference
         // (the fixpoint sees this form; RecoverObjectFieldAddresses turns it into `&o.f`
-        // later), or a string literal slot.
-        (FieldReference? Field, TypeAnalysisContext Type)? Cell(IOperand operand, int accessSize)
+        // later), an element of an array at a constant index (`&wheels[0]` is
+        // `wheels + 0x20`), or a string literal slot.
+        (IOperand? Read, TypeAnalysisContext Type)? Cell(IOperand operand, int accessSize)
         {
             if (operand is AddressOf { Target: FieldReference addressed })
                 return (new FieldReference(addressed.Field, addressed.Local, addressed.Offset, addressed.Containers,
@@ -625,12 +628,30 @@ public static class MetadataResolver
                 return null;
             if (definition is { OpCode: OpCode.Move, Operands: [_, StringLiteral] })
                 return (null, method.AppContext.SystemTypes.SystemStringType);
+            if (definition is { OpCode: OpCode.Add, Operands: [_, LocalVariable { Type: SzArrayTypeAnalysisContext { ElementType: var elementType } } array, Immediate elementOffset] }
+                && HoldsObject(array, [])
+                && PrimitiveStorageSize(elementType, method.AppContext.Binary.PointerSizeBytes) is { } elementSize
+                && (accessSize == 0 || accessSize == elementSize)
+                && elementOffset.Value - 4L * method.AppContext.Binary.PointerSizeBytes is >= 0 and var inData
+                && inData % elementSize == 0)
+                return (new ArrayAccess(array, new Immediate(inData / elementSize)), elementType);
             if (definition is { OpCode: OpCode.Add, Operands: [_, LocalVariable { Type: { IsValueType: false } ownerType } owner, Immediate offset] }
                 && FindInstanceFieldPathAtOffset(ownerType, offset.Value, accessSize) is { } path)
                 return (new FieldReference(path.Field, owner, (int)offset.Value, path.Containers, accessSize),
                     path.Field.FieldType);
             return null;
         }
+
+        // The array itself on every path, not an element address the merge of `a` and
+        // `a + i*4` still types as the array: no definition on the way is address arithmetic.
+        bool HoldsObject(LocalVariable local, HashSet<LocalVariable> seen)
+            => !seen.Add(local) || !definitions.TryGetValue(local, out var definition)
+               || definition.OpCode switch
+               {
+                   OpCode.Phi => definition.Operands.Skip(1).All(input => input is LocalVariable next && HoldsObject(next, seen)),
+                   OpCode.Move => definition.Operands[1] is not LocalVariable source || HoldsObject(source, seen),
+                   _ => definition.OpCode is not (OpCode.Add or OpCode.Subtract or OpCode.Or),
+               };
 
         static bool Mentions(IOperand operand, LocalVariable local) => operand switch
         {
