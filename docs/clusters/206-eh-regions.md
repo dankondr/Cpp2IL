@@ -47,7 +47,7 @@ still need proofs.
 
 The narrow class-predicate recognizer is the authorized exception to the
 [dankondr/castle-recovery#208](https://github.com/dankondr/castle-recovery/issues/208)
-lane boundary, in its own commit `a64ad3f6`. It follows only bounded, pure ARM64 B
+lane boundary, in its own commit `4c6a4c6e`. It follows only bounded, pure ARM64 B
 veneers from the binary's `il2cpp_class_is_assignable_from` export and compares the
 terminal body with the call target. It does not change the general key-function
 rewrite table. In r241, export `37CC198` and call veneer `37C3128` both branch to
@@ -137,17 +137,19 @@ Absolute-address stores are effects even when `Instruction.Destination` omits th
 An unmatched store refuses the proof. Returning closure tests cover different
 arguments, an extra global write and a caller that returns instead of unwinding.
 
-## Verification, third continuation
+## Verification after the foreach fix (#180)
 
 Task: dankondr/castle-recovery#206 (slice 2). Continues PR #175 and addresses
 [dankondr/Cpp2IL#80](https://github.com/dankondr/Cpp2IL/issues/80).
 The separately committed class-predicate recognizer remains the authorized
 castle-recovery#208 exception; this continuation changes no key-function recognition.
 
-Control: `238110429dbf6ca2034ba327b4cf986277b87e03` (`development`, merged #179). The branch was rebased first
-onto #177 and again when #179 landed during validation. Final code: `e0cf9ddb`.
+Control: `19dc0743f7820dca0138bf369e5a9ce7093445ba` (`development`, merged #180). PR #175 was rebased after
+[the review comment about stale Current reads](https://github.com/dankondr/Cpp2IL/pull/175#issuecomment-5921843917).
+The merged `FrameStructFieldReads` fix runs in both control and branch. EH code:
+`0c825bfa`; measured branch: `c884b394`. This recheck changes no lifter source.
 Both full sweeps process 69,982 native methods, emit 183 assemblies and report
-178,274 methods. Outputs: `astra206-r5-control` and `astra206-r5-verified`.
+178,274 methods. Outputs: `astra206-r6-control` and `astra206-r6-branch`.
 
 | Scope | Methods | Diagnosed control → branch | Newly clean | Clean regressions | Pads control → branch |
 |---|---:|---:|---:|---:|---:|
@@ -156,8 +158,24 @@ Both full sweeps process 69,982 native methods, emit 183 assemblies and report
 | CastleClashers.Game | 14,423 | 2,673 → 2,442 | 231 | 0 | 9,865 → 6,659 |
 | Castle-building owners + nested types | 280 | 100 → 87 | 13 | 0 | 882 → 684 |
 
-No method gains a diagnostic in any scope; the regression list is empty. The final
-clean list is below. Warning text was not hidden or reworded.
+Against this fresh control, no method gains a diagnostic in any scope; the
+regression list is empty. The 330-method diagnostic-free list is unchanged from
+before the rebase. Here, "clean" means no recovery diagnostics; it is not a claim
+that all behavior has been tested. The Current defect is checked separately below.
+Warning text was not hidden or reworded.
+
+Compared with the previous branch output on #179, owned diagnostic occurrences
+increase from 37,410 to 37,418 in four already-diagnosed methods. The same eight
+additional synthetic-default warnings appear in the new control. They are exposed
+by #180, not introduced by EH recovery:
+
+| Method | Additional warnings | Operand type |
+|---|---:|---|
+| `CastleMaker.SpawnShieldsFromPlacements` | 5 | SpriteOutlineController |
+| `Voodoo.Live.RandomReward.GetItems` | 1 | Reward |
+| `Voodoo.Live.Offers.FeatureClient.Dispose` | 1 | Campaign |
+| `Tournament.TournamentsData.PruneExcept` | 1 | String |
+
 
 ### Castle-building newly clean methods
 
@@ -209,12 +227,12 @@ checks but add zero native finally proofs on this corpus.
 ### Tests and ILVerify
 
 - Release `net10.0` build: success, 13 existing warnings. `netstandard2.0` was left alone.
-- Full rebased Core.Tests: **1199/1199**.
+- Full rebased Core.Tests: **1205/1205**.
 - LibCpp2ILTests: **12/12**; JitOracle.Tests: **9/9**.
-- Focused EH tests: **36/36**, including serialized-assembly execution through the real emitter. These run after
-  the final assembly-identity and unscaled-index guards.
-- Disabling catch-local registration and returning-closure continuation makes six
-  of these regression cases fail; restoring the changes passes them.
+- The full Core run includes the 36 EH cases and three new FrameStructFieldRead cases.
+  EH cases include serialized-assembly execution through the real emitter.
+- In the prior continuation, disabling catch-local registration and returning-closure
+  continuation made six regression cases fail; restoring the changes passed them.
 - Both audits: **170,144 valid**, **416 invalid**,
   7,714 partial/no-body entries. **0 status transitions**,
   including **0 valid→invalid**. The broader Bootstrap reachability gate remains
@@ -222,9 +240,24 @@ checks but add zero native finally proofs on this corpus.
 
 ### Additional native/IL review
 
-The 16 finally examples in the checked-in report remain the original clean-method
-review; all 16 serialized bodies are unchanged in the final output. For this
-continuation, all 14 methods with new clauses were read against ARM64 and LSDA.
+The 16 finally examples in the checked-in report were checked again against their
+ARM64 disassembly and the new serialized IL. Nine bodies change with #180: four
+CastleMaker methods, LevelCostTable.RebuildIndex, both MatchTelemetryTracker payload
+methods, AdnDictionaryConverter.ConvertValues and TransactionDebugUI.PopulateValues.
+The other seven bodies are unchanged. In all 16, each get_Current is unreachable
+from normal entry without passing MoveNext on the same enumerator. Each finally
+still calls Dispose on that enumerator and ends in endfinally. The sequence of
+other managed calls is unchanged. The pre-loop Current copies disappear in the
+nine corrected bodies; their loop-body consumers read the fresh value.
+
+For example, GetDecorationsAtPosition has native MoveNext at `3E57278`, a false-exit
+test at `3E5727C`, and the Current reload from `[SP+0x30]` at `3E57280`. Its emitted
+MoveNext is IL_00B3, Current is IL_00C5/IL_00D7, and Dispose is IL_029A. The try spans
+IL_00AE–IL_0296. RebuildIndex similarly moves Current from the pre-loop copy to
+IL_008E after MoveNext at IL_007C, preserving Dispose at IL_01E8.
+
+All 14 typed-catch bodies from round 3 are unchanged after this rebase. Their
+original ARM64/LSDA review remains applicable.
 Every type-test mismatch rewraps/propagates the original exception. Metadata global
 `81AAA48` points to the usage at `839E900`, which resolves to `System.Exception`;
 the already-recognized metadata-inline helper supplies that class to the predicate.
@@ -261,7 +294,8 @@ ranges do not become an invented larger try. Its other diagnostics remain.
 
 The >50% target is **not met**. Owned pad messages fall by 4,721/15,537
 (**30.4%**), with **10,816** remaining; the target is at most 7,768.
-Keep #175 a draft. 557 owned methods retain pads, including
+The user authorized merging this verified slice and continuing toward that target
+in a follow-up PR. 557 owned methods retain pads, including
 111 pad-only methods.
 
 | Remaining coverage | Methods | Remaining pad messages |
@@ -272,7 +306,7 @@ Keep #175 a draft. 557 owned methods retain pads, including
 
 Native finally proofs still cover 7,084 pads. Typed catches prove 454 more,
 for a union of 7,538; 2,817 proven pads remain
-unmaterialized. A proof can cover more native sites than survive in emitted IL.
+unmaterialized. All 1,019 native proof summaries match the previous branch output. A proof can cover more native sites than survive in emitted IL.
 
 ### Why previously proven finally pads are refused
 
@@ -323,7 +357,10 @@ fixable emission gap and was fixed here.
   proof in r241. Unknown cleanup arguments and side effects still refuse proof.
 - `Simplifier.cs`, `LocalVariables.cs`, `MetadataResolver.cs`, `ArrayRecovery.cs`,
   `DeadCodeEliminator.cs`, enumerator emission and block-operation emission were
-  not edited. The prior get_Current hoisting observation remains with that lane.
+  not edited by the EH branch. The previously reported frame-cell Current defect is
+  now addressed by merged #180 and included in both measured builds. Its own report
+  still lists one unexamined enumerator pattern; this recheck does not claim to
+  prove every foreach method's behavior.
 - No negative LSDA selectors or undecodable action chains were observed in these
   1,019 methods. Managed filters and fault blocks remain unsupported; iterator
   unwind dispatch is not relabelled as finally without a normal-path equivalence.
@@ -343,7 +380,7 @@ methods naming a canonical shared-generic type: 170
 | other | 1389 | 555 | 16422 |
 | memory: unmanaged load | 1230 | 313 | 6247 |
 | dataflow: undefined local | 976 | 171 | 2459 |
-| type: synthetic default in operand slot | 709 | 152 | 1754 |
+| type: synthetic default in operand slot | 709 | 152 | 1762 |
 | lift: unimplemented or unrecoverable op | 660 | 106 | 2284 |
 | call: unresolved target | 619 | 40 | 1122 |
 | memory: unmanaged store dropped | 535 | 117 | 2610 |
@@ -401,7 +438,7 @@ methods naming a canonical shared-generic type: 105
 | memory: unmanaged load | 707 | 199 | 3709 |
 | dataflow: undefined local | 638 | 80 | 1677 |
 | lift: unimplemented or unrecoverable op | 502 | 67 | 1786 |
-| type: synthetic default in operand slot | 480 | 79 | 1349 |
+| type: synthetic default in operand slot | 480 | 79 | 1355 |
 | memory: unmanaged store dropped | 446 | 104 | 2214 |
 | call: unresolved target | 375 | 18 | 672 |
 | access: inaccessible member | 140 | 22 | 457 |
@@ -457,7 +494,7 @@ methods naming a canonical shared-generic type: 170
 | memory: unmanaged load | 1230 | 322 | 6246 |
 | dataflow: undefined local | 976 | 176 | 2459 |
 | other | 936 | 225 | 11701 |
-| type: synthetic default in operand slot | 709 | 170 | 1754 |
+| type: synthetic default in operand slot | 709 | 170 | 1762 |
 | lift: unimplemented or unrecoverable op | 660 | 108 | 2284 |
 | call: unresolved target | 619 | 40 | 1122 |
 | memory: unmanaged store dropped | 535 | 120 | 2610 |
@@ -514,7 +551,7 @@ methods naming a canonical shared-generic type: 105
 | memory: unmanaged load | 707 | 204 | 3708 |
 | dataflow: undefined local | 638 | 83 | 1677 |
 | lift: unimplemented or unrecoverable op | 502 | 67 | 1786 |
-| type: synthetic default in operand slot | 480 | 88 | 1349 |
+| type: synthetic default in operand slot | 480 | 88 | 1355 |
 | memory: unmanaged store dropped | 446 | 107 | 2214 |
 | other | 433 | 65 | 7150 |
 | call: unresolved target | 375 | 18 | 672 |
