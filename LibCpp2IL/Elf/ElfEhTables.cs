@@ -119,7 +119,7 @@ public static class ElfEhTables
 
                 var entry = new EhFunctionInfo { Start = start, Size = size };
                 if (lsda != 0)
-                    ReadCallSites(file, checked((int)FileOffset(lsda)), start, is32Bit, entry.CallSites);
+                    ReadCallSites(file, checked((int)FileOffset(lsda)), lsda, start, is32Bit, FileOffset, entry.CallSites);
                 result[start] = entry;
             }
             catch (Exception e) when (e is InvalidDataException or ArgumentOutOfRangeException or IndexOutOfRangeException or OverflowException)
@@ -183,16 +183,22 @@ public static class ElfEhTables
         return result;
     }
 
-    private static void ReadCallSites(ReadOnlySpan<byte> file, int offset, ulong functionStart, bool is32Bit, List<EhCallSiteInfo> sites)
+    private static void ReadCallSites(ReadOnlySpan<byte> file, int offset, ulong lsda, ulong functionStart, bool is32Bit, Func<ulong, long> fileOffset, List<EhCallSiteInfo> sites)
     {
+        var lsdaOffset = offset;
         var landingBase = functionStart;
         var encoding = file[offset++];
         if (encoding != DwEhPeOmit)
             (landingBase, offset) = ReadEncoded(file, offset, encoding, 0, is32Bit);
 
-        encoding = file[offset++];
-        if (encoding != DwEhPeOmit)
-            (_, offset) = ReadUleb(file, offset); // type-table base, unused here
+        var typeEncoding = file[offset++];
+        var typeBase = 0;
+        if (typeEncoding != DwEhPeOmit)
+        {
+            var (distance, after) = ReadUleb(file, offset);
+            offset = after;
+            typeBase = checked(after + (int)distance);
+        }
 
         encoding = file[offset++];
         var (tableLength, cursor) = ReadUleb(file, offset);
@@ -206,8 +212,74 @@ public static class ElfEhTables
             var (action, after) = ReadUleb(file, cursor);
             cursor = after;
             if (pad != 0)
-                sites.Add(new EhCallSiteInfo(functionStart + start, size, landingBase + pad, action));
+                sites.Add(new EhCallSiteInfo(functionStart + start, size, landingBase + pad, action)
+                {
+                    Actions = ReadActions(file, end, action, typeBase, typeEncoding,
+                        lsda, lsdaOffset, is32Bit, fileOffset)
+                });
         }
+    }
+
+    private static IReadOnlyList<EhActionInfo>? ReadActions(ReadOnlySpan<byte> file, int tableStart,
+        ulong action, int typeBase, byte typeEncoding, ulong lsda, int lsdaOffset,
+        bool is32Bit, Func<ulong, long> fileOffset)
+    {
+        if (action == 0)
+            return [new EhActionInfo(0, null)];
+        try
+        {
+            var cursor = checked(tableStart + (int)action - 1);
+            var visited = new HashSet<int>();
+            var result = new List<EhActionInfo>();
+            // A malformed action chain must not consume arbitrary following LSDAs.
+            while (visited.Add(cursor) && visited.Count <= 64)
+            {
+                if (cursor < tableStart || typeBase != 0 && cursor >= typeBase) return null;
+                var (filter, nextField) = ReadSleb(file, cursor);
+                var (next, _) = ReadSleb(file, nextField);
+                ulong? typeInfo = null;
+                if (filter > 0 && typeBase != 0)
+                {
+                    var width = (typeEncoding & 0x0F) switch
+                    {
+                        0 => is32Bit ? 4 : 8,
+                        2 or 0x0A => 2,
+                        3 or 0x0B => 4,
+                        4 or 0x0C => 8,
+                        _ => 0,
+                    };
+                    if (width == 0)
+                        return null;
+                    var position = checked(typeBase - (int)filter * width);
+                    var address = lsda + (ulong)(position - lsdaOffset);
+                    // A zero RTTI entry denotes catch-all, even with pcrel/indirect encoding.
+                    var (raw, _) = ReadEncoded(file, position, (byte)(typeEncoding & 0x0F), 0, is32Bit);
+                    if (raw == 0)
+                        typeInfo = 0;
+                    else
+                    {
+                        var (value, _) = ReadEncoded(file, position, typeEncoding, address, is32Bit);
+                        if ((typeEncoding & 0x80) != 0)
+                        {
+                            var pointer = checked((int)fileOffset(value));
+                            value = is32Bit ? ReadU32(file, pointer) : ReadU64(file, pointer);
+                        }
+                        typeInfo = value;
+                    }
+                }
+                result.Add(new EhActionInfo(filter, typeInfo));
+                if (next == 0)
+                    return result;
+                cursor = checked(nextField + (int)next);
+                if (cursor < tableStart)
+                    return null;
+            }
+        }
+        catch (Exception e) when (e is InvalidDataException or ArgumentOutOfRangeException or IndexOutOfRangeException or OverflowException)
+        {
+            // Keep the call-site and its unproven-pad diagnostic when only its actions fail.
+        }
+        return null;
     }
 
     private static (ulong, int) ReadEncoded(ReadOnlySpan<byte> file, int offset, byte encoding, ulong address, bool is32Bit)

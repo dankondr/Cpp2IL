@@ -205,6 +205,63 @@ public class ElfEhTablesTests
         Assert.Equal(0x80B8UL, explicitBase.CallSites[0].LandingPad); // 0x8080 landing base + 0x38
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ReadsCatchTypeAndCleanupActionChain(bool indirectPcRelative)
+    {
+        var (file, sections) = Build();
+        var cursor = (int)Except;
+        file[cursor++] = 0xFF;
+        file[cursor++] = indirectPcRelative ? (byte)0x9B : (byte)0x03;
+        cursor = Uleb(file, cursor, 0x35); // type-table base = Except + 0x38
+        file[cursor++] = 0x01;
+        file[cursor++] = 4;
+        file[cursor++] = 0;
+        file[cursor++] = 0x10;
+        file[cursor++] = 0x20;
+        file[cursor++] = 3;
+        file[cursor++] = 0; // cleanup
+        file[cursor++] = 0;
+        file[cursor++] = 1; // type 1, followed by preceding cleanup record
+        file[cursor] = 0x7D; // -3, relative to this next-action field
+        if (indirectPcRelative)
+        {
+            S32(file, (int)Except + 0x34, -0x0C);
+            U32(file, (int)Except + 0x28, 0x123456);
+            U32(file, (int)Except + 0x2C, 0);
+        }
+        else
+            U32(file, (int)Except + 0x34, 0x123456);
+
+        var site = Assert.Single(ElfEhTables.Read(file, sections)![0x8100].CallSites);
+        Assert.NotNull(site.Actions);
+        Assert.Collection(site.Actions!,
+            a => { Assert.Equal(1, a.Filter); Assert.Equal(0x123456UL, a.TypeInfo); },
+            a => { Assert.Equal(0, a.Filter); Assert.Null(a.TypeInfo); });
+    }
+
+    [Fact]
+    public void MalformedActionChainKeepsTheCallSiteWithoutProof()
+    {
+        var (file, sections) = Build();
+        var cursor = (int)Except;
+        file[cursor++] = 0xFF;
+        file[cursor++] = 0xFF;
+        file[cursor++] = 0x01;
+        file[cursor++] = 4;
+        file[cursor++] = 0;
+        file[cursor++] = 0x10;
+        file[cursor++] = 0x20;
+        file[cursor++] = 1;
+        file[cursor++] = 0;
+        file[cursor] = 0x7F; // -1 points back to this action
+
+        var site = Assert.Single(ElfEhTables.Read(file, sections)![0x8100].CallSites);
+        Assert.Equal(0x8120UL, site.LandingPad);
+        Assert.Null(site.Actions);
+    }
+
     [Fact]
     public void MissingEhFrameHdrReturnsNull()
     {
