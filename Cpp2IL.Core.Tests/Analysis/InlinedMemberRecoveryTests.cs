@@ -578,4 +578,133 @@ public class InlinedMemberRecoveryTests
             Assert.That(call!.Operands[0], Is.SameAs((IOperand)setter));
         });
     }
+
+    // `result = <statics>.field; return result` - a static getter's body.
+    private static ISILControlFlowGraph ReturnsStatic(TypeAnalysisContext holder,
+        FieldAnalysisContext field, AssemblyAnalysisContext assembly)
+    {
+        var statics = Local("statics", new StaticFieldStorageTypeAnalysisContext(holder, assembly));
+        var result = Local("result", field.FieldType);
+        return new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, result, new FieldReference(field, statics, 0)),
+            new Instruction(1, OpCode.Return, result),
+        ]);
+    }
+
+    private static Block Body(MethodAnalysisContext method) =>
+        method.ControlFlowGraph!.Blocks.First(b => b.Instructions.Count > 0);
+
+    // A getter's own read of its static is not an inlined copy of itself:
+    // rewriting it would make the getter call itself forever.
+    [Test]
+    public void StaticGetterKeepsItsOwnRead()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+
+        var holder = InjectedStruct("Counter");
+        var count = Field(holder, "count", App.SystemTypes.SystemInt32Type,
+            FieldAttributes.Private | FieldAttributes.Static);
+        var getter = Member(holder, "Read", App.SystemTypes.SystemInt32Type,
+            MethodAttributes.Public | MethodAttributes.Static);
+        holder.Methods.Add(getter);
+        getter.ControlFlowGraph = ReturnsStatic(holder, count, Mscorlib);
+
+        InlinedMemberRecovery.Run(getter);
+
+        var read = Body(getter).Instructions.First(i => i.OpCode == OpCode.Move).Operands[1];
+        Assert.Multiple(() =>
+        {
+            Assert.That(Body(getter).Instructions.Any(i => i.OpCode == OpCode.Call), Is.False);
+            Assert.That(read, Is.TypeOf<FieldReference>());
+            Assert.That(((FieldReference)read).Field, Is.SameAs((FieldAnalysisContext)count));
+        });
+    }
+
+    // A static the caller can name - here a private one of its own assembly,
+    // the `count++` beside `Read() => count` shape - is read directly, not
+    // through the holder's getter.
+    [Test]
+    public void AccessibleStaticReadStaysDirect()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+
+        var holder = InjectedStruct("Counter");
+        var count = Field(holder, "count", App.SystemTypes.SystemInt32Type,
+            FieldAttributes.Private | FieldAttributes.Static);
+        var getter = Member(holder, "Read", App.SystemTypes.SystemInt32Type,
+            MethodAttributes.Public | MethodAttributes.Static);
+        holder.Methods.Add(getter);
+        getter.ControlFlowGraph = ReturnsStatic(holder, count, Mscorlib);
+
+        var caller = CallerIn(Mscorlib);
+        var statics = Local("statics", new StaticFieldStorageTypeAnalysisContext(holder, Mscorlib));
+        var destination = Local("d", App.SystemTypes.SystemInt32Type);
+        var read = new FieldReference(count, statics, 0);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, destination, read),
+            new Instruction(1, OpCode.Return),
+        ]);
+
+        InlinedMemberRecovery.Run(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(Body(caller).Instructions.Any(i => i.OpCode == OpCode.Call), Is.False);
+            Assert.That(Body(caller).Instructions.First(i => i.OpCode == OpCode.Move).Operands[1],
+                Is.SameAs((IOperand)read));
+        });
+    }
+
+    // Two instantiations of one generic holder keep separate statics: each
+    // read calls its own instantiation's getter and never reuses the other's
+    // result.
+    [Test]
+    public void GenericHolderInstantiationsCallTheirOwnGetter()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+
+        // A concrete instantiation's getter only has a body through the
+        // binary's variants, so the holder is a real generic type whose
+        // variants get the synthetic `return hidden` body.
+        var holder = Mscorlib.GetTypeByFullName("System.Collections.Generic.EqualityComparer`1")!;
+        var hidden = new InjectedFieldAnalysisContext("hidden", App.SystemTypes.SystemInt32Type,
+            FieldAttributes.Private | FieldAttributes.Static, holder);
+        var getter = holder.Methods.Single(m => m.Name == "get_Default");
+        var variants = App.ConcreteGenericMethodsByRef.Values
+            .Where(v => v.BaseMethodContext == getter && v.UnderlyingPointer != 0).ToList();
+        Assert.That(variants, Is.Not.Empty);
+        foreach (var variant in variants)
+            variant.ControlFlowGraph = ReturnsStatic(holder, hidden, Mscorlib);
+
+        var ofInt = holder.MakeGenericInstanceType(App.SystemTypes.SystemInt32Type);
+        var ofString = holder.MakeGenericInstanceType(App.SystemTypes.SystemStringType);
+        var caller = CallerIn(OtherAssembly);
+        var a = Local("a", App.SystemTypes.SystemInt32Type);
+        var b = Local("b", App.SystemTypes.SystemInt32Type);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, a, new FieldReference(hidden,
+                Local("s1", new StaticFieldStorageTypeAnalysisContext(ofInt, Mscorlib)), 0)),
+            new Instruction(1, OpCode.Move, b, new FieldReference(hidden,
+                Local("s2", new StaticFieldStorageTypeAnalysisContext(ofString, Mscorlib)), 0)),
+            new Instruction(2, OpCode.Return),
+        ]);
+
+        InlinedMemberRecovery.Run(caller);
+
+        var instructions = Body(caller).Instructions;
+        var calls = instructions.Where(i => i.OpCode == OpCode.Call).ToList();
+        IOperand SourceOf(LocalVariable destination) => instructions
+            .First(i => i.OpCode == OpCode.Move && i.Operands[0] == destination).Operands[1];
+        Assert.That(calls, Has.Count.EqualTo(2));
+        Assert.Multiple(() =>
+        {
+            Assert.That(calls.Select(c => ((MethodAnalysisContext)c.Operands[0]).DeclaringType!.FullName),
+                Is.EqualTo(new[] { ofInt.FullName, ofString.FullName }));
+            Assert.That(SourceOf(a), Is.SameAs(calls[0].Operands[1]));
+            Assert.That(SourceOf(b), Is.SameAs(calls[1].Operands[1]));
+        });
+    }
 }
