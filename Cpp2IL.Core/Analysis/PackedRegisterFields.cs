@@ -645,14 +645,18 @@ internal static class PackedRegisterFields
             // only when the slot emits an address of the container's declaring
             // struct - `ldloca`/`ldarga`/`&` receivers. An object-emitting local
             // yields a readonly unbox result instead, and `ldflda` on it does
-            // not verify. During the in-SSA invocation a register local's Type
-            // is still a register-reuse guess later passes restamp, so the hop
-            // waits for the final pass where the emitted type is settled.
-            if (!finalPass)
-                return null;
-            var receiver = IlGenerator.EmittedLocalType(projected.Local, method)
-                is ByRefTypeAnalysisContext byRef ? byRef.ElementType
-                : IlGenerator.EmittedLocalType(projected.Local, method);
+            // not verify. The emitted type is provable early for signature and
+            // call-defined slots; a register-reuse guess a later pass can
+            // restamp waits for the final pass where it is settled.
+            var receiver = ProvenContainerReceiver(projected.Local, method);
+            if (receiver == null)
+            {
+                if (!finalPass)
+                    return null;
+                receiver = IlGenerator.EmittedLocalType(projected.Local, method)
+                    is ByRefTypeAnalysisContext byRef ? byRef.ElementType
+                    : IlGenerator.EmittedLocalType(projected.Local, method);
+            }
             if (receiver is not { IsValueType: true }
                 || !SameStruct(receiver, containerOwner))
                 return null;
@@ -751,6 +755,40 @@ internal static class PackedRegisterFields
             CustomModifierTypeAnalysisContext modifier => ContainsGenericParameter(modifier.ElementType, depth + 1),
             _ => false,
         };
+
+    // The type a slot provably emits without consulting Type guesses: `this`
+    // and parameters carry the signature, and a local defined only by calls
+    // emits the callee's return type - the same derivation
+    // IlGenerator.CallDefinedLocalType takes before any Type a later pass
+    // could restamp. Anything else answers null and waits for the final pass.
+    private static TypeAnalysisContext? ProvenContainerReceiver(LocalVariable local,
+        MethodAnalysisContext method)
+    {
+        if (local.IsThis)
+            return method.DeclaringType;
+        for (var index = 0; index < method.Parameters.Count
+                && index < method.ParameterLocals.Count; index++)
+            if (ReferenceEquals(method.ParameterLocals[index], local))
+                return method.Parameters[index].ParameterType
+                    is ByRefTypeAnalysisContext byRef ? byRef.ElementType
+                    : method.Parameters[index].ParameterType;
+        TypeAnalysisContext? produced = null;
+        var found = false;
+        foreach (var candidate in method.ControlFlowGraph!.Instructions)
+        {
+            if (!ReferenceEquals(candidate.Destination, local))
+                continue;
+            if (candidate is not { OpCode: OpCode.Call,
+                    Operands: [MethodAnalysisContext { IsVoid: false } callee, ..] })
+                return null;
+            var returnType = IlGenerator.EffectiveCallReturnType(callee);
+            if (produced != null && !SameStruct(produced, returnType))
+                return null;
+            produced = returnType;
+            found = true;
+        }
+        return found ? produced : null;
+    }
 
     // Structural type identity, mirroring IlGenerator.SameTypeIdentity: context
     // objects for the same metadata type need not be reference-equal.
