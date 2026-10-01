@@ -75,6 +75,19 @@ public class Instruction : IOperand
     // their real width.
     public int? NativeStoreWidthBytes;
 
+    // A Convert reads a floating-point value when set (FCVT*); unset it reads an
+    // integer (SCVTF/UCVTF). Register normalization erases which, so the lifter
+    // records it - a float source and an int source emit different IL.
+    public bool ConversionFromFloat;
+
+    // The Convert treats the integer side as unsigned (FCVTZU/UCVTF family).
+    public bool ConversionUnsigned;
+
+    // Width in bits of the value a Convert reads: the source register's width,
+    // which register normalization erases (an S source and a D source both land
+    // on Vn). Sets the slot the source loads through, not the result type.
+    public int? ConversionSourceWidthBits;
+
     public bool IsFallThrough =>
         OpCode switch
         {
@@ -152,6 +165,7 @@ public class Instruction : IOperand
             case OpCode.VectorMin:
             case OpCode.VectorMax:
             case OpCode.SignExtend32:
+            case OpCode.Convert:
             case OpCode.CheckEqual:
             case OpCode.CheckGreater:
             case OpCode.CheckLess:
@@ -210,7 +224,7 @@ public class Instruction : IOperand
         {
             OpCode.Move or OpCode.ConditionalJump
                 or OpCode.ShiftStack or OpCode.Not or OpCode.Negate
-                or OpCode.Newobj or OpCode.SignExtend32
+                or OpCode.Newobj or OpCode.SignExtend32 or OpCode.Convert
                 => [_operands[1]],
 
             OpCode.Box => [_operands[2]],

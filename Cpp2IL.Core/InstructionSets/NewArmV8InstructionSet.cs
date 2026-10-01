@@ -623,6 +623,84 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 call.NativeFloatWidthBits = 32;
         }
 
+        // Round(float|double, MidpointRounding.AwayFromZero): the only rounding a
+        // managed helper cannot express with one argument, so it resolves on its
+        // own two-parameter overload.
+        void EmitRoundAwayFromZero(IOperand destination, IOperand source, bool isDouble)
+        {
+            var assembly = context.AppContext.SystemTypes.SystemDoubleType.DeclaringAssembly;
+            var numberType = isDouble
+                ? context.AppContext.SystemTypes.SystemDoubleType
+                : context.AppContext.SystemTypes.SystemSingleType;
+            var mathType = assembly.GetTypeByFullName(isDouble ? "System.Math" : "System.MathF")
+                ?? assembly.GetTypeByFullName("System.Math");
+            var method = mathType?.Methods.FirstOrDefault(candidate =>
+                candidate.IsStatic && candidate.Name == "Round" && candidate.Parameters.Count == 2
+                && candidate.Parameters[0].ParameterType == numberType
+                && candidate.Parameters[1].ParameterType.FullName == "System.MidpointRounding");
+            if (method == null)
+            {
+                Add(address, OpCode.NotImplemented,
+                    new StringLiteral("ARM64 round-away-from-zero conversion is unavailable for this target framework."));
+                return;
+            }
+            var call = Add(address, OpCode.Call, method, destination);
+            call.AddOperands([source, new Immediate(1)]); // MidpointRounding.AwayFromZero
+        }
+
+        // Scalar float<->integer and float<->float conversions. The Convert
+        // carries what register normalization erases - which side is floating
+        // point, the unsigned flag, and the source width - so the destination's
+        // type is its own width, never the converted operand's. Anything that is
+        // not a plain two-register scalar form stays an honest diagnostic.
+        void EmitNumericConversion(Arm64Instruction insn)
+        {
+            var mnemonic = insn.Mnemonic;
+            if (insn.Op0Kind != Arm64OperandKind.Register
+                || insn.Op1Kind != Arm64OperandKind.Register
+                || RegisterWidthBytes(insn.Op0Reg) is not (4 or 8)
+                || RegisterWidthBytes(insn.Op1Reg) is not (4 or 8)
+                || insn.Op2Kind == Arm64OperandKind.Immediate)
+            {
+                Add(address, OpCode.NotImplemented,
+                    new StringLiteral($"Instruction {mnemonic} not yet implemented."));
+                return;
+            }
+
+            IOperand source = ConvertOperand(insn, 1);
+            // Rounding-mode conversions pre-round through the managed math
+            // helper; the truncating Convert then keeps only the integer part.
+            var rounding = mnemonic switch
+            {
+                Arm64Mnemonic.FCVTMS or Arm64Mnemonic.FCVTMU => "Floor",
+                Arm64Mnemonic.FCVTPS or Arm64Mnemonic.FCVTPU => "Ceiling",
+                Arm64Mnemonic.FCVTNS or Arm64Mnemonic.FCVTNU => "Round",
+                Arm64Mnemonic.FCVTAS or Arm64Mnemonic.FCVTAU => "RoundAway",
+                _ => null,
+            };
+            if (rounding != null)
+            {
+                var rounded = new Register(null, "TEMP_ROUND");
+                var sourceIsDouble = insn.Op1Reg is >= Arm64Register.D0 and <= Arm64Register.D31;
+                if (rounding == "RoundAway")
+                    EmitRoundAwayFromZero(rounded, source, sourceIsDouble);
+                else
+                    EmitMathUnary(rounding, rounded, source, sourceIsDouble);
+                source = rounded;
+            }
+
+            var convert = Add(address, OpCode.Convert, ConvertOperand(insn, 0), source);
+            convert.ConversionFromFloat = mnemonic is not (Arm64Mnemonic.SCVTF or Arm64Mnemonic.UCVTF);
+            convert.ConversionUnsigned = mnemonic is Arm64Mnemonic.UCVTF or Arm64Mnemonic.FCVTZU
+                or Arm64Mnemonic.FCVTMU or Arm64Mnemonic.FCVTNU or Arm64Mnemonic.FCVTPU
+                or Arm64Mnemonic.FCVTAU;
+            convert.ConversionSourceWidthBits = RegisterWidthBytes(insn.Op1Reg) * 8;
+            if (mnemonic is Arm64Mnemonic.SCVTF or Arm64Mnemonic.UCVTF or Arm64Mnemonic.FCVT)
+                convert.NativeFloatWidthBits = RegisterWidthBytes(insn.Op0Reg) * 8;
+            else
+                convert.NativeIntegerWidthBits = RegisterWidthBytes(insn.Op0Reg) * 8;
+        }
+
         // A call target that is an adrp+ldr(+add)+br GOT trampoline names its
         // import through the dynamic relocation on the pointer slot. Pure scalar
         // libm calls lower to their managed equivalents; AAPCS64 passes the
@@ -854,20 +932,6 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.SXTW:
             case Arm64Mnemonic.UXTB:
             case Arm64Mnemonic.UXTH:
-            // conversions are moves for analysis purposes, same as the x86 handling of cvt*
-            case Arm64Mnemonic.FCVT:
-            case Arm64Mnemonic.FCVTZS:
-            case Arm64Mnemonic.FCVTZU:
-            case Arm64Mnemonic.FCVTMS:
-            case Arm64Mnemonic.FCVTMU:
-            case Arm64Mnemonic.FCVTNS:
-            case Arm64Mnemonic.FCVTNU:
-            case Arm64Mnemonic.FCVTPS:
-            case Arm64Mnemonic.FCVTPU:
-            case Arm64Mnemonic.FCVTAS:
-            case Arm64Mnemonic.FCVTAU:
-            case Arm64Mnemonic.SCVTF:
-            case Arm64Mnemonic.UCVTF:
                 if (instruction.Op0Kind == Arm64OperandKind.Register && IsReg31(instruction.Op0Reg))
                 {
                     Add(address, OpCode.Nop); // write to xzr, discard
@@ -899,6 +963,30 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         // typed float literal that a wider slot could silently take.
                         move.SetOperand(1, new Immediate(BitConverter.SingleToInt32Bits((float)scalarFp.Value), 4));
                 }
+                break;
+            // Scalar float<->integer and float<->float conversions are not moves:
+            // a conversion's result type is its destination register's width, and
+            // forwarding the source or seeding its type would merge an integer
+            // with the floating-point value it was converted from.
+            case Arm64Mnemonic.FCVT:
+            case Arm64Mnemonic.FCVTZS:
+            case Arm64Mnemonic.FCVTZU:
+            case Arm64Mnemonic.FCVTMS:
+            case Arm64Mnemonic.FCVTMU:
+            case Arm64Mnemonic.FCVTNS:
+            case Arm64Mnemonic.FCVTNU:
+            case Arm64Mnemonic.FCVTPS:
+            case Arm64Mnemonic.FCVTPU:
+            case Arm64Mnemonic.FCVTAS:
+            case Arm64Mnemonic.FCVTAU:
+            case Arm64Mnemonic.SCVTF:
+            case Arm64Mnemonic.UCVTF:
+                if (instruction.Op0Kind == Arm64OperandKind.Register && IsReg31(instruction.Op0Reg))
+                {
+                    Add(address, OpCode.Nop); // write to xzr, discard
+                    break;
+                }
+                EmitNumericConversion(instruction);
                 break;
             case Arm64Mnemonic.MOVI:
             case Arm64Mnemonic.MVNI when instruction.Op1Kind == Arm64OperandKind.Immediate:
