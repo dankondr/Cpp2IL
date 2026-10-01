@@ -33,6 +33,16 @@ shifts and extends those registers where IL reads fields.
 - The pass runs inside the type-resolution fixpoint (register spill typing
   unlocks field reads) and once more out of SSA (late passes surface new
   selections; `TypeAddressedLocals` gives stack locals their type late).
+- A container hop (`v.outer.inner`) emits `ldflda` on the root local, which
+  verifies only when that local emits an address of the container's declaring
+  struct. The emitted type is provable early for `this`, parameters and
+  locals defined only by non-void calls (`ProvenContainerReceiver`, the same
+  derivation `CallDefinedLocalType` makes); a register-reuse guess a later
+  pass could restamp waits for the post-SSA pass where `EmittedLocalType` is
+  settled, and a mismatch stays diagnosed rather than emitting unverifiable
+  IL. A local whose register was reused by a pointer-producing call is not a
+  struct carrier: the whole method is skipped when operand and pointer slot
+  locals overlap, and pointer-typed leaves are never projected.
 
 ## Emission boundaries (other lanes)
 
@@ -51,5 +61,8 @@ shifts and extends those registers where IL reads fields.
 `Cpp2IL.Core.Tests/Regression/PackedRegisterFieldTests.cs`: `Nullable<int>`
 `hasValue` mask and `value` shift, `Nullable<bool>` bound check, a two-`int`
 tuple's high lane, `Vector2Int.y` (`ASR #32`) indexing `T[,]` through `Get`, a
-partial-byte mask staying diagnosed, a top-half mask on a signed lane, and a
-low mask read into destinations of matching and wider width.
+partial-byte mask staying diagnosed, a top-half mask on a signed lane, a
+low mask read into destinations of matching and wider width, an awaiter
+chain whose root local's type is restamped after the early pass staying
+diagnosed until the final pass projects it, and a pointer-typed local
+keeping every read in its method diagnosed.
