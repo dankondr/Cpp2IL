@@ -134,7 +134,7 @@ internal static class ExceptionRegionRecovery
                     {
                         if (current.Next.Count != 1) { valid = false; break; }
                         current = current.Next.Single();
-                        if (copy.Contains(current) || current.Previous.Any(p => p != copy[^1])) { valid = false; break; }
+                        if (copy.Contains(current) || current.Previous.Any(p => dominators.ContainsKey(p) && p != copy[^1])) { valid = false; break; }
                         copy.Add(current);
                         if (current.Source != null && effect.Calls.Contains(current.Source.NativeAddress)) break;
                         if (current.Source is not { OpCode: OpCode.Nop or OpCode.Jump }
@@ -198,7 +198,7 @@ internal static class ExceptionRegionRecovery
                 }
                 if (!seeds.All(protectedUnits.Contains)
                     || protectedUnits.Any(u => u.Code.Any(i => i.OpCode.Code == CilCode.Ret))
-                    || protectedUnits.Any(u => u != entry && u.Previous.Any(p => !protectedUnits.Contains(p)))
+                    || protectedUnits.Any(u => u != entry && u.Previous.Any(p => dominators.ContainsKey(p) && !protectedUnits.Contains(p)))
                     || protectedUnits.Any(u => NativeCall(u)
                         && !sites.Any(s => u.Source!.NativeAddress >= s.Start && u.Source.NativeAddress < s.End)))
                     continue;
@@ -208,13 +208,19 @@ internal static class ExceptionRegionRecovery
             }
             // A shared normal copy can be erased only when every way of reaching it
             // exits one of these finally clauses.
-            if (planned.SelectMany(r => r.Cleanups).Distinct().Any(c => c.Previous.Any(previous =>
-                    !planned.Any(r => r.Units.Contains(previous) || r.Cleanups.Contains(previous))))) continue;
+            if (planned.SelectMany(r => r.Cleanups).Distinct().Any(c => c.Previous.Any(previous => dominators.ContainsKey(previous)
+                    && !planned.Any(r => r.Units.Contains(previous) || r.Cleanups.Contains(previous))))) continue;
             regions.AddRange(planned);
         }
         foreach (var (proof, handler) in catches ?? [])
         {
-            var merge = units.FirstOrDefault(u => u.Source?.NativeAddress == proof.MergeAddress);
+            Unit? merge;
+            if (proof.Return is { } returned && instructionMap.TryGetValue(returned, out var continuation))
+            {
+                merge = new Unit(returned, continuation, units.Count);
+                units.Add(merge);
+            }
+            else merge = units.FirstOrDefault(u => u.Source?.NativeAddress == proof.MergeAddress);
             var seeds = units.Where(u => u.Source != null && dominators.ContainsKey(u) && proof.Sites.Any(s =>
                 u.Source.NativeAddress >= s.Start && u.Source.NativeAddress < s.End)).ToList();
             if (merge == null || seeds.Count == 0 || handler.Count == 0) continue;
@@ -236,9 +242,20 @@ internal static class ExceptionRegionRecovery
             }
             if (!seeds.All(protectedUnits.Contains)
                 || protectedUnits.Any(u => u.Code.Any(i => i.OpCode.Code == CilCode.Ret))
-                || protectedUnits.Any(u => u != entry && u.Previous.Any(p => !protectedUnits.Contains(p)))
+                || protectedUnits.Any(u => u != entry && u.Previous.Any(p => dominators.ContainsKey(p) && !protectedUnits.Contains(p)))
                 || protectedUnits.Any(u => NativeCall(u) && !proof.Sites.Any(s =>
-                    u.Source!.NativeAddress >= s.Start && u.Source.NativeAddress < s.End))) continue;
+                    u.Source!.NativeAddress >= s.Start && u.Source.NativeAddress < s.End)))
+            {
+                // Disjoint native ranges need not share one CLI try. Each emitted
+                // unit is stack-balanced and has one legal entry; copying this
+                // returning handler preserves the exceptional edge at every site.
+                // ponytail: one clause per unit in this fallback; coalesce only if
+                // clause count becomes a measured cost.
+                if (seeds.Any(u => u == merge || u.Code.Any(i => i.OpCode.Code == CilCode.Ret))) continue;
+                foreach (var seed in seeds)
+                    regions.Add(new Region(seed, [seed], [], handler, []) { Catch = proof, Merge = merge });
+                continue;
+            }
             regions.Add(new Region(entry, protectedUnits, [], handler, []) { Catch = proof, Merge = merge });
         }
         if (regions.Count == 0) return;
@@ -264,11 +281,12 @@ internal static class ExceptionRegionRecovery
         // a separate entry proof, which this straight-line catch recognizer lacks.
         if (regions.Any(r => r.Catch != null && !membership[r.Merge!].SequenceEqual(
                 membership[r.Entry].Where(parent => parent != r)))) return;
-        // Validate all entries before changing instructions. A branch can enter only at
+        // Validate reachable entries before changing instructions. Dead incoming edges
+        // are redirected to the same legal entry anchor below. A live branch can enter only at
         // the proven region entry, through an anchor immediately before its try start.
         foreach (var unit in units)
         foreach (var next in unit.Next)
-            if (membership[next].Except(membership[unit]).Any(r => next != r.Entry)) return;
+            if (dominators.ContainsKey(unit) && membership[next].Except(membership[unit]).Any(r => next != r.Entry)) return;
         foreach (var unit in units)
         foreach (var instruction in unit.Code)
             if (instruction.Operand is CilInstructionLabel { Instruction: { } target }
