@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using AsmResolver.DotNet;
+using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
 using Cpp2IL.Core.InstructionSets;
 using Cpp2IL.Core.ISIL;
@@ -225,6 +226,61 @@ public class ProvenWidthLiteralTests
             Assert.That(written.Value, Is.EqualTo(0x7FC00000L));
             Assert.That(written.ProvenBytes, Is.EqualTo(4));
         });
+    }
+
+    [Test]
+    public void MarkedSinglePrecisionCallResultFillsFloatSlot()
+    {
+        // castle-recovery#262: a helper bridged onto a Double-declared method
+        // whose native write was single-precision produces four bytes. The
+        // declared return type does not widen it, so a comparison against a
+        // 4-byte fmov literal fills a System.Single slot with ldc.r4.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var dbl = app.SystemTypes.SystemDoubleType;
+        var mathType = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"],
+            "Tests", "Math", app.SystemTypes.SystemObjectType,
+            TypeAttributes.Public | TypeAttributes.Class);
+        var sqrt = mathType.InjectMethodContext("Sqrt", dbl,
+            MethodAttributes.Public | MethodAttributes.Static, dbl);
+        var module = new ModuleDefinition("MarkedWidth.dll");
+        SeedCorLibTypes(app, module, dbl, app.SystemTypes.SystemSingleType,
+            app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemBooleanType,
+            app.SystemTypes.SystemVoidType);
+        var mathDefinition = new TypeDefinition("Tests", "Math",
+            AsmResolver.PE.DotNet.Metadata.Tables.TypeAttributes.Public
+            | AsmResolver.PE.DotNet.Metadata.Tables.TypeAttributes.Class,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(mathDefinition);
+        mathType.PutExtraData("AsmResolverType", mathDefinition);
+        var sqrtDefinition = new MethodDefinition("Sqrt",
+            AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Public
+            | AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Double,
+                [module.CorLibTypeFactory.Double]));
+        mathDefinition.Methods.Add(sqrtDefinition);
+        sqrt.PutExtraData("AsmResolverMethod", sqrtDefinition);
+        var arg = new LocalVariable("arg", new Register(null, "arg")) { Type = dbl };
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var cond = new LocalVariable("cond", new Register(null, "cond"),
+            app.SystemTypes.SystemBooleanType);
+        var call = new Instruction(0, OpCode.Call, sqrt, result, arg)
+        {
+            NativeFloatWidthBits = 32,
+        };
+        var (caller, method) = ForeignCaller(app, module, [
+            new(-1, OpCode.Move, arg, new Immediate(0)),
+            call,
+            new(1, OpCode.CheckLess, cond, result, new Immediate(0x3F800000, 4)),
+            new(2, OpCode.Return)], [arg, result, cond]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        Assert.That(method.CilMethodBody!.Instructions
+            .Any(i => i.OpCode == CilOpCodes.Ldc_R4), Is.True,
+            () => string.Join("\n", method.CilMethodBody.Instructions.Select(i => i.ToString())));
+        AssertNoDiagnostic(method);
     }
 
     [Test]

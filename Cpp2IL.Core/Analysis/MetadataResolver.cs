@@ -2442,7 +2442,8 @@ public static class MetadataResolver
                 if (!ReferenceEquals(resolved, representedMethod)
                     && ReferenceEquals(BaseMethodOf(resolved), BaseMethodOf(representedMethod))
                     && ErasedGenericArgumentCount(representedMethod) < ErasedGenericArgumentCount(resolved)
-                    && ReceiverTypeConsistent(instruction, representedMethod))
+                    && ReceiverTypeConsistent(instruction, representedMethod)
+                    && CallShapeConsistentWithMethodInfo(instruction, representedMethod, method))
                 {
                     instruction.SetOperand(0, representedMethod);
                     representedMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, representedMethod);
@@ -2462,11 +2463,13 @@ public static class MetadataResolver
             var hiddenParamIndex = firstArg
                 + (representedMethod.AppContext.InstructionSet.CallingConventionResolver?.ReturnsViaHiddenBuffer(representedMethod) == true ? 1 : 0)
                 + (representedMethod.IsStatic ? 0 : 1) + representedMethod.Parameters.Count;
+
             if (!ReferenceEquals(representedMethod, method)
                 && hiddenParamIndex < instruction.Operands.Count
                 && AsMethodInfo(instruction.Operands[hiddenParamIndex]) is { RepresentedMethod: { } hiddenMethod }
                 && ReferenceEquals(BaseMethodOf(hiddenMethod), BaseMethodOf(representedMethod))
-                && ReceiverTypeConsistent(instruction, representedMethod))
+                && ReceiverTypeConsistent(instruction, representedMethod)
+                && CallShapeConsistentWithMethodInfo(instruction, representedMethod, method))
             {
                 instruction.SetOperand(0, representedMethod);
                 representedMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, representedMethod);
@@ -2484,7 +2487,8 @@ public static class MetadataResolver
 
                 if (hiddenParamIndex >= instruction.Operands.Count
                     || AsMethodInfo(instruction.Operands[hiddenParamIndex]) == null
-                    || !ReceiverTypeConsistent(instruction, representedMethod))
+                    || !ReceiverTypeConsistent(instruction, representedMethod)
+                    || !CallShapeConsistentWithMethodInfo(instruction, representedMethod, method))
                     continue;
 
                 instruction.SetOperand(0, representedMethod);
@@ -2499,7 +2503,8 @@ public static class MetadataResolver
             //Try to actually match on the method name so we don't just replace a call with something else.
             var representedBase = BaseMethodOf(representedMethod);
             if (!candidates.Any(candidate => ReferenceEquals(BaseMethodOf(candidate), representedBase))
-                || !ReceiverTypeConsistent(instruction, representedMethod))
+                || !ReceiverTypeConsistent(instruction, representedMethod)
+                || !CallShapeConsistentWithMethodInfo(instruction, representedMethod, method))
                 continue;
 
             instruction.SetOperand(0, representedMethod);
@@ -2697,8 +2702,13 @@ public static class MetadataResolver
         if (receiverType is RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext
             or RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext
             or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext)
-            // Runtime handle operands say nothing about the receiver object.
-            return true;
+            // Runtime handle operands say nothing about the receiver object - and
+            // they cannot BE one either, except where the callee is itself the
+            // reflection surface the handle represents (methodinfo.Invoke,
+            // type.InvokeMember). A methodinfo in the receiver slot of a
+            // Dictionary.TryGetValue or List+Enumerator.MoveNext bind is a stale
+            // register leftover, not a receiver.
+            return IsReflectionReceiverFamily(declaring);
 
         if (receiverType is not ByRefTypeAnalysisContext { ElementType: { } receiverElement })
             // Only a managed-pointer operand carries reliable receiver evidence: a
@@ -2727,6 +2737,146 @@ public static class MetadataResolver
                 : addressedField.Local.Type;
             if (addressedStruct is { IsValueType: true })
                 return SameTypeFamily(addressedStruct, declaring);
+        }
+        return false;
+    }
+
+    // Only the reflection surface a runtime handle represents can legitimately
+    // receive the handle itself as `this`.
+    private static bool IsReflectionReceiverFamily(TypeAnalysisContext declaring) =>
+        declaring.FullName is "System.Object" or "System.Type" or "System.Delegate"
+            or "System.MulticastDelegate"
+            || declaring.FullName?.StartsWith("System.Reflection.") == true
+            || declaring.FullName?.StartsWith("System.RuntimeType") == true;
+
+    // A MethodInfo*-bound callee is only believable when the operands sitting in
+    // its argument slots could actually fill them: a stale register leftover can
+    // still put a methodinfo at the hidden slot while the real arguments of the
+    // sibling helper call remain in place (an enum `out` slot holding a Boolean
+    // flag local, a Vector2Int key slot holding a List<>). Rejecting the bind
+    // leaves the call's unresolved-target diagnostic intact instead of typing
+    // the shared register-version locals to the wrong parameter contract.
+    private static bool CallShapeConsistentWithMethodInfo(Instruction call,
+        MethodAnalysisContext representedMethod, MethodAnalysisContext containingMethod)
+    {
+        // Hidden return buffers shift the argument registers on conventions
+        // where they consume a slot; positional evidence is unreliable there.
+        var resolver = representedMethod.AppContext.InstructionSet.CallingConventionResolver;
+        if (resolver?.ReturnsViaHiddenBuffer(representedMethod) == true)
+            return true;
+
+        var firstArg = call.OpCode == OpCode.CallVoid ? 1 : 2;
+        var thisSlots = representedMethod.IsStatic ? 0 : 1;
+        for (var i = 0; i < representedMethod.Parameters.Count; i++)
+        {
+            var operandIndex = firstArg + thisSlots + i;
+            if (operandIndex >= call.Operands.Count)
+                return true;
+            var operand = call.Operands[operandIndex];
+            if (operand is Immediate)
+                continue;
+
+            var parameterType = representedMethod.Parameters[i].ParameterType;
+            if (parameterType is not { } pt || pt is GenericParameterTypeAnalysisContext
+                || pt.HasAnyGenericParameters()
+                || pt.FullName?.Contains("__Il2CppFullySharedGeneric") == true)
+                continue;
+
+            var emitted = OperandEmittedType(operand);
+            if (emitted is GenericParameterTypeAnalysisContext
+                || emitted?.FullName?.Contains("__Il2CppFullySharedGeneric") == true)
+                continue;
+
+            if (pt is ByRefTypeAnalysisContext { ElementType: { } byRefElement })
+            {
+                if (emitted is ByRefTypeAnalysisContext byRefEmitted)
+                {
+                    if (!SameTypeFamily(byRefEmitted.ElementType!, byRefElement)
+                        && ZeroOffsetField(byRefEmitted.ElementType!, byRefElement) == null)
+                        return false;
+                    continue;
+                }
+                if (emitted is PointerTypeAnalysisContext || IsNativeHandleOperand(emitted))
+                    continue;
+                if (operand is AddressOf)
+                    continue;
+                if (emitted == null
+                    && operand is LocalVariable addressLocal
+                    && LocalCarriesAddressValue(containingMethod, addressLocal))
+                    continue;
+                // A typed non-address local (or an untyped register version that
+                // never held an address) cannot be the pointer an out/ref takes.
+                return false;
+            }
+
+            if (emitted == null)
+                continue;
+
+            if (pt.IsValueType)
+            {
+                // A byref proven to point at the same family is a `constrained.`
+                // receiver, fine; any other pointer shape cannot be the value.
+                if (emitted is ByRefTypeAnalysisContext byRefValue)
+                {
+                    if (!SameTypeFamily(byRefValue.ElementType!, pt)
+                        && ZeroOffsetField(byRefValue.ElementType!, pt) == null)
+                        return false;
+                    continue;
+                }
+                if (emitted is PointerTypeAnalysisContext || IsNativeHandleOperand(emitted)
+                    || !emitted.IsValueType)
+                    return false;
+                continue;
+            }
+
+            // Reference-type parameter: a proven byref to a different family, or
+            // a proven value type (boxing never produces this slot's type), is a
+            // wrong-bind shape. Object accepts everything.
+            if (pt.FullName == "System.Object")
+                continue;
+            if (emitted is ByRefTypeAnalysisContext byRefRef)
+            {
+                if (!SameTypeFamily(byRefRef.ElementType!, pt)
+                    && ZeroOffsetField(byRefRef.ElementType!, pt) == null)
+                    return false;
+                continue;
+            }
+            if (IsNativeHandleOperand(emitted))
+            {
+                if (!IsRuntimeHandleFamily(pt))
+                    return false;
+                continue;
+            }
+            if (emitted.IsValueType)
+                return false;
+        }
+        return true;
+    }
+
+    private static bool IsRuntimeHandleFamily(TypeAnalysisContext type) =>
+        IsNativeHandleOperand(type)
+        || IsReflectionReceiverFamily(type)
+        || type.FullName?.StartsWith("System.Runtime") == true;
+
+    private static bool IsNativeHandleOperand(TypeAnalysisContext? type) =>
+        type is RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext
+            or RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext
+            or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext
+        || type?.FullName is "System.IntPtr" or "System.UIntPtr";
+
+    // A register-version local carries an address when any def moves an
+    // address-of operand into it (an `add x0, sp, #off` or a `&local` fill).
+    private static bool LocalCarriesAddressValue(MethodAnalysisContext containingMethod,
+        LocalVariable local)
+    {
+        foreach (var definition in containingMethod.ControlFlowGraph?.Instructions ?? [])
+        {
+            if (!ReferenceEquals(definition.Destination, local))
+                continue;
+            if (definition is { OpCode: OpCode.Move or OpCode.Phi, Operands.Count: > 1 }
+                && definition.Operands.Skip(1).Any(operand => operand is AddressOf
+                    or ByRefTypeAnalysisContext or PointerTypeAnalysisContext))
+                return true;
         }
         return false;
     }
