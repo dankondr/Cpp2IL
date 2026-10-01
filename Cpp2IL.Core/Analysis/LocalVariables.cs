@@ -1037,7 +1037,7 @@ public static class LocalVariables
                     if (ReferenceEquals(operand, destination))
                         continue;
                     if (RewriteHiddenReturnStackOperand(operand, buffer, result, resultType,
-                            next.NativeMemoryAccessSize ?? 0, local => StoredAfter(definedAt, local, callIndex)) is { } rewritten)
+                            next.NativeMemoryAccessSize ?? 0, local => StoredBetween(definedAt, local, callIndex, i)) is { } rewritten)
                         next.SetOperand(operandIndex, rewritten);
                 }
             }
@@ -1080,7 +1080,7 @@ public static class LocalVariables
                     ? result.HiddenReturnBuffer == null || operandIndex == 0 && instruction.IsAssignment ? null
                         : RewriteHiddenReturnStackOperand(operand, result.HiddenReturnBuffer, result,
                             resultType, instruction.NativeMemoryAccessSize ?? 0,
-                            local => StoredAfter(definedAt, local, instructions.IndexOf(call)))
+                            local => StoredBetween(definedAt, local, instructions.IndexOf(call), instructions.IndexOf(instruction)))
                     : HiddenReturnField(resultType, result, field.Offset, field.AccessSize);
                 if (replacement == null)
                     continue;
@@ -1129,11 +1129,12 @@ public static class LocalVariables
         return positions;
     }
 
-    // A cell version stored after the call no longer holds the bytes the call returned into it:
-    // the frame slot was reused (`stp xzr, x9, [sp, #0x38]` after the enumerator moved out). A
-    // store before the call (zero-initialization of the buffer) is overwritten by the call.
-    private static bool StoredAfter(Dictionary<LocalVariable, int> definedAt, LocalVariable local, int callIndex)
-        => definedAt.TryGetValue(local, out var at) && at > callIndex;
+    // A cell stored between the call and the read no longer holds the bytes the call returned
+    // into it: the frame slot was reused (`stp xzr, x9, [sp, #0x38]` after the enumerator moved
+    // out). A store before the call (the buffer's zeroing) is overwritten by the call, and one
+    // after the read has not happened yet.
+    private static bool StoredBetween(Dictionary<LocalVariable, int> definedAt, LocalVariable local, int callIndex, int readIndex)
+        => definedAt.TryGetValue(local, out var at) && at > callIndex && at < readIndex;
 
     // A read of a buffer cell is the returned struct's field only while the cell still holds the
     // returned bytes.
