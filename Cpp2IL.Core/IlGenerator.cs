@@ -10191,13 +10191,21 @@ public static class IlGenerator
                 return false; // `&x` is a managed pointer, not bits a carrier can hold
             if (operands[i] is LocalVariable { Type: null })
             {
-                // Inference-only operand: the emitted stack type is a guess, so
-                // it adapts to the lane instead of pinning one — but a float
-                // guess still marks the carrier (its bits reinterpret like a
-                // declared float's), while a reference or struct guess can
-                // never enter a carrier and keeps the op diagnosed.
+                // Inference-only operand: a float guess still marks the carrier
+                // and contributes its emitted width to consensus (the emitted
+                // stack type is what the IL will compute on) — what it does
+                // not do is veto a destination-pinned lane, since a guessed
+                // width adapts there. A reference or struct guess can never
+                // enter a carrier and keeps the op diagnosed.
                 if (emitted?.FullName is "System.Single" or "System.Double")
+                {
                     sawFloat = true;
+                    var inferredWidth = emitted.FullName == "System.Single" ? 4 : 8;
+                    if (joinsCarrier && consensusWidth == 0)
+                        consensusWidth = inferredWidth;
+                    else if (joinsCarrier && consensusWidth != inferredWidth)
+                        consensusWidth = -1;
+                }
                 else if (IntegralStackWidth(emitted) == 0)
                     return false;
                 continue;
