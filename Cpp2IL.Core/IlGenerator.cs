@@ -382,6 +382,7 @@ public static class IlGenerator
         Analysis.ExceptionRegionRecovery.Apply(context, definition, instructionMap, catchHandlers);
 
         RemoveDiscardedDefaults(definition, writeLine);
+        RemoveDeadThrowTails(body, writeLine);
 
         // Nothing may fall off the physical end of a body: a conditional branch
         // (or any other fall-through-capable opcode) as the last instruction
@@ -7484,20 +7485,14 @@ public static class IlGenerator
         }
     }
 
-    // A slot whose operand was never produced is filled with a synthetic
-    // default (a note plus ldnull/ldc/default(T)); a destination with no store
-    // spelling then reports the drop by popping that value right back off, and
-    // the pair decompiles to `_ = <expr>` (CS8183 for `_ = null`). The
-    // diagnostics already name the site, so cut the discarded value and its
-    // pop out of the emitted sequence entirely.
-    private static void RemoveDiscardedDefaults(MethodDefinition method, IMethodDescriptor writeLine)
+    // Every instruction another instruction or handler boundary points at
+    // is a label target; removing one of those would orphan the label. By
+    // identity: CilInstruction equality compares opcode, operand and offset,
+    // so every other `ldnull` would read as a target too.
+    private static HashSet<CilInstruction> LabelTargets(CilMethodBody body)
     {
-        var instructions = method.CilMethodBody!.Instructions;
-
-        // Every instruction another instruction or handler boundary points at
-        // is a label target; removing one of those would orphan the label.
-        HashSet<CilInstruction> referenced = [];
-        foreach (var instruction in instructions)
+        var referenced = new HashSet<CilInstruction>(ReferenceEqualityComparer.Instance);
+        foreach (var instruction in body.Instructions)
         {
             switch (instruction.Operand)
             {
@@ -7514,7 +7509,7 @@ public static class IlGenerator
                     break;
             }
         }
-        foreach (var handler in method.CilMethodBody.ExceptionHandlers)
+        foreach (var handler in body.ExceptionHandlers)
         {
             foreach (var boundary in new ICilLabel?[]
                      {
@@ -7527,6 +7522,58 @@ public static class IlGenerator
                     referenced.Add(boundaryTarget);
             }
         }
+        return referenced;
+    }
+
+    // A stub throws in place of the value it could not recover, but the
+    // instruction that consumed the value (stloc, ret, and, ...) is still
+    // emitted after the throw. Nothing there runs until a branch or handler
+    // boundary lands, yet il2cpp converts dead code too, with an empty stack,
+    // and one `Stack empty.` aborts the whole assembly. Cut each dead tail; its
+    // note pairs move ahead of the throw so every diagnostic stays counted.
+    // Repeat until stable: a label that only dead code branched to is dead too.
+    // ponytail: linear, not a reachability walk - a dead loop whose label only
+    // its own back edge targets survives; walk the flow graph if one shows up.
+    private static void RemoveDeadThrowTails(CilMethodBody body, IMethodDescriptor writeLine)
+    {
+        var instructions = body.Instructions;
+        bool removed;
+        do
+        {
+            removed = false;
+            var referenced = LabelTargets(body);
+            for (var i = 0; i < instructions.Count; i++)
+            {
+                if (instructions[i].OpCode != CilOpCodes.Throw)
+                    continue;
+                var end = i + 1;
+                while (end < instructions.Count && !referenced.Contains(instructions[end]))
+                    end++;
+                if (end == i + 1)
+                    continue;
+                List<CilInstruction> notes = [];
+                for (var k = i + 1; k + 1 < end; k++)
+                    if (IsDecompilerNotePair(instructions[k], instructions[k + 1], writeLine))
+                        notes.AddRange([instructions[k], instructions[++k]]);
+                for (var k = end - 1; k > i; k--)
+                    instructions.RemoveAt(k);
+                foreach (var note in notes)
+                    instructions.Insert(i++, note);
+                removed = true;
+            }
+        } while (removed);
+    }
+
+    // A slot whose operand was never produced is filled with a synthetic
+    // default (a note plus ldnull/ldc/default(T)); a destination with no store
+    // spelling then reports the drop by popping that value right back off, and
+    // the pair decompiles to `_ = <expr>` (CS8183 for `_ = null`). The
+    // diagnostics already name the site, so cut the discarded value and its
+    // pop out of the emitted sequence entirely.
+    private static void RemoveDiscardedDefaults(MethodDefinition method, IMethodDescriptor writeLine)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        var referenced = LabelTargets(method.CilMethodBody);
 
         for (var i = instructions.Count - 1; i >= 0; i--)
         {
