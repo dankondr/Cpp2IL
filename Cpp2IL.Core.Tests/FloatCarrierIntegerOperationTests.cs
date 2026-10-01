@@ -218,95 +218,54 @@ public class FloatCarrierIntegerOperationTests
         Assert.That(run.Invoke(null, [-12.75f]), Is.EqualTo(-12));
     }
 
-    // A Single operand next to an Int64 operand (and vice versa) has no single
-    // carrier the native code could have used: the op stays unrecoverable.
-    [TestCase("System.Single", "System.Int64")]
-    [TestCase("System.Double", "System.Int32")]
-    public void MixedWidthStaysUnrecoverable(string floatName, string intName)
+    // Operand widths disagreeing with the lane the destination pins adapt, not
+    // veto: `orr w8, s9-bits, x10` reads x10's low dword (an X register read as
+    // W) and `orr x8, ...` zero-extends a W-produced operand — both are the
+    // exact bit patterns the machine computed.
+    [TestCase(1.5f, -1L, -1)]
+    [TestCase(1.5f, 0x1234567890L, 0x3FD67890)]
+    public void WiderMateKeepsLowDword(float value, long mask, int expected)
     {
-        var app = App;
-        var floatType = floatName == "System.Single"
-            ? app.SystemTypes.SystemSingleType : app.SystemTypes.SystemDoubleType;
-        var intType = intName == "System.Int32"
-            ? app.SystemTypes.SystemInt32Type : app.SystemTypes.SystemInt64Type;
-        var value = new LocalVariable("value", new Register(null, "V0")) { Type = floatType };
-        var mask = new LocalVariable("mask", new Register(null, "X0")) { Type = intType };
-        var result = new LocalVariable("result", new Register(null, "X0_v1")) { Type = intType };
-        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
-            intType, ReflectionMethodAttributes.Static, [floatType, intType], ["value", "mask"]);
-        context.ControlFlowGraph = new ISILControlFlowGraph([
-            new Instruction(0, OpCode.Or, result, value, mask),
-            new Instruction(1, OpCode.Return, result)]);
-        context.Locals = new List<LocalVariable> { value, mask, result };
-        context.ParameterLocals = new List<LocalVariable> { value, mask };
-        context.AnalysisWarnings = [];
-
-        var module = new ModuleDefinition("MixedWidth.dll");
-        SeedCorLibTypes(module, app.SystemTypes.SystemObjectType, app.SystemTypes.SystemSingleType,
-            app.SystemTypes.SystemDoubleType, app.SystemTypes.SystemInt32Type,
-            app.SystemTypes.SystemInt64Type, app.SystemTypes.SystemVoidType);
-        var type = new TypeDefinition("Tests", "Carrier", TypeAttributes.Public,
-            module.CorLibTypeFactory.Object.Type);
-        module.TopLevelTypes.Add(type);
-        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
-            MethodSignature.CreateStatic(CorLibSignature(module, intType),
-                [CorLibSignature(module, floatType), CorLibSignature(module, intType)]));
-        method.ParameterDefinitions.Add(new ParameterDefinition(1, "value", 0));
-        method.ParameterDefinitions.Add(new ParameterDefinition(2, "mask", 0));
-        type.Methods.Add(method);
-
-        IlGenerator.GenerateIl(context, method);
-        var il = method.CilMethodBody!.Instructions;
-        Assert.Multiple(() =>
-        {
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Throw), Is.True,
-                () => string.Join("\n", il));
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
-                    && i.Operand?.ToString()?.Contains("Unrecoverable integer operation") == true), Is.True);
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call
-                    && i.Operand?.ToString()?.Contains("BitConverter") == true), Is.False);
-        });
+        var run = EmitCarrierFixture(OpCode.Or, App.SystemTypes.SystemSingleType,
+            App.SystemTypes.SystemInt64Type, App.SystemTypes.SystemInt32Type,
+            out var method);
+        Assert.That(method.CilMethodBody!.Instructions.Any(i => i.OpCode == CilOpCodes.Or), Is.True,
+            () => string.Join("\n", method.CilMethodBody.Instructions));
+        Assert.That(method.CilMethodBody.Instructions.Any(i => i.OpCode == CilOpCodes.Ldstr
+                && i.Operand?.ToString()?.Contains("Unrecoverable") == true), Is.False);
+        Assert.That(run.Invoke(null, [value, mask]), Is.EqualTo(expected));
     }
 
-    // A destination of the other float width is no proven FP consumer for this
-    // carrier either: the op stays unrecoverable.
     [Test]
-    public void MismatchedFloatConsumerStaysUnrecoverable()
+    public void WiderFloatKeepsLowDword()
     {
-        var app = App;
-        var value = new LocalVariable("value", new Register(null, "V0"))
-            { Type = app.SystemTypes.SystemSingleType };
-        var mask = new LocalVariable("mask", new Register(null, "X0"))
-            { Type = app.SystemTypes.SystemInt32Type };
-        var result = new LocalVariable("result", new Register(null, "V0_v1"))
-            { Type = app.SystemTypes.SystemDoubleType };
-        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
-            app.SystemTypes.SystemDoubleType, ReflectionMethodAttributes.Static,
-            [app.SystemTypes.SystemSingleType, app.SystemTypes.SystemInt32Type], ["value", "mask"]);
-        context.ControlFlowGraph = new ISILControlFlowGraph([
-            new Instruction(0, OpCode.Or, result, value, mask),
-            new Instruction(1, OpCode.Return, result)]);
-        context.Locals = new List<LocalVariable> { value, mask, result };
-        context.ParameterLocals = new List<LocalVariable> { value, mask };
-        context.AnalysisWarnings = [];
-
-        var module = new ModuleDefinition("MismatchedConsumer.dll");
-        SeedCorLibTypes(module, app.SystemTypes.SystemObjectType, app.SystemTypes.SystemSingleType,
-            app.SystemTypes.SystemDoubleType, app.SystemTypes.SystemInt32Type,
-            app.SystemTypes.SystemVoidType);
-        var type = new TypeDefinition("Tests", "Carrier", TypeAttributes.Public,
-            module.CorLibTypeFactory.Object.Type);
-        module.TopLevelTypes.Add(type);
-        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
-            MethodSignature.CreateStatic(module.CorLibTypeFactory.Double,
-                [module.CorLibTypeFactory.Single, module.CorLibTypeFactory.Int32]));
-        method.ParameterDefinitions.Add(new ParameterDefinition(1, "value", 0));
-        method.ParameterDefinitions.Add(new ParameterDefinition(2, "mask", 0));
-        type.Methods.Add(method);
-
-        IlGenerator.GenerateIl(context, method);
-        Assert.That(method.CilMethodBody!.Instructions.Any(i => i.OpCode == CilOpCodes.Throw), Is.True,
+        var run = EmitCarrierFixture(OpCode.Xor, App.SystemTypes.SystemDoubleType,
+            App.SystemTypes.SystemInt32Type, App.SystemTypes.SystemInt32Type,
+            out var method);
+        Assert.That(method.CilMethodBody!.Instructions.Any(i => i.OpCode == CilOpCodes.Xor), Is.True,
             () => string.Join("\n", method.CilMethodBody.Instructions));
+        // conv.i4 on the double's bits = fmov w10,s10 = the low dword
+        Assert.That(run.Invoke(null, [BitConverter.Int64BitsToDouble(0x3FF80000_00000042), 0xFF]),
+            Is.EqualTo(0x42 ^ 0xFF));
+        Assert.That(run.Invoke(null, [1.5, 0xFF]), Is.EqualTo(0xFF)); // 1.5's low dword is 0
+    }
+
+    // A float destination reinterprets the carrier at the lane's own width:
+    // `fmov d8,x8` moves the assembled 64 bits back, so a narrow operand that
+    // zero-extended into the X lane round-trips honestly.
+    [Test]
+    public void NarrowOperandWiderFloatConsumer()
+    {
+        var run = EmitCarrierFixture(OpCode.Or, App.SystemTypes.SystemSingleType,
+            App.SystemTypes.SystemInt32Type, App.SystemTypes.SystemDoubleType,
+            out var method);
+        Assert.That(method.CilMethodBody!.Instructions.Any(i => i.OpCode == CilOpCodes.Call
+                && i.Operand?.ToString()?.Contains("Int64BitsToDouble") == true), Is.True,
+            () => string.Join("\n", method.CilMethodBody.Instructions));
+        var result = run.Invoke(null, [1.5f, 0x123]);
+        // x8 = conv.u8(bits(1.5f)) | conv.u8(0x123); d8 = fmov d8,x8
+        Assert.That(BitConverter.DoubleToInt64Bits((double)result!),
+            Is.EqualTo(unchecked((long)0x000000003FC00123)));
     }
 
     // `lsr x8, x9, #32` on a double's bits yields the carrier's high dword; the
@@ -389,6 +348,116 @@ public class FloatCarrierIntegerOperationTests
         var run = LoadAndGet(module);
         // 0x3FC00000 | 0x80000000 = 0xBFC00000; zero-extended, not sign-extended.
         Assert.That(run.Invoke(null, [1.5f, unchecked((int)0x80000000)]), Is.EqualTo(0x00000000BFC00000L));
+    }
+
+    // A bitwise op whose mate operand carries only an *inferred* width still joins
+    // the carrier at the proven width: `and w8, s9, w10` ran on integer registers
+    // whatever the analysis guessed for w10. Repro of the V-register-as-integer-
+    // mask shape: the numeric union seeds the undeclared temp Double (an arith
+    // mate's declared width), which must not veto the Single the binary proved.
+    [Test]
+    public void InferredMateJoinsCarrierAtProvenWidth()
+    {
+        var app = App;
+        var wide = new LocalVariable("wide", new Register(null, "V8_v3"))
+            { Type = app.SystemTypes.SystemDoubleType };
+        var value = new LocalVariable("value", new Register(null, "V1_v3"))
+            { Type = app.SystemTypes.SystemSingleType };
+        var folded = new LocalVariable("folded", new Register(null, "TEMP3_v7"));
+        var result = new LocalVariable("result", new Register(null, "X0_v1"))
+            { Type = app.SystemTypes.SystemInt32Type };
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemInt32Type, ReflectionMethodAttributes.Static,
+            [app.SystemTypes.SystemDoubleType, app.SystemTypes.SystemSingleType],
+            ["wide", "raw"]);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            // value's union class picks up the Double constraint; folded shares it
+            new Instruction(0, OpCode.Subtract, value, wide, value),
+            new Instruction(1, OpCode.Xor, folded, value, value),
+            new Instruction(2, OpCode.And, result, value, folded),
+            new Instruction(3, OpCode.Return, result)]);
+        context.Locals = new List<LocalVariable> { wide, value, folded, result };
+        context.ParameterLocals = new List<LocalVariable> { wide, value };
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("InferredMate.dll");
+        SeedCorLibTypes(module, app.SystemTypes.SystemObjectType, app.SystemTypes.SystemSingleType,
+            app.SystemTypes.SystemDoubleType, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemVoidType, app.SystemTypes.SystemStringType);
+        var type = new TypeDefinition("Tests", "Carrier", TypeAttributes.Public,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32,
+                [module.CorLibTypeFactory.Double, module.CorLibTypeFactory.Single]));
+        method.ParameterDefinitions.Add(new ParameterDefinition(1, "wide", 0));
+        method.ParameterDefinitions.Add(new ParameterDefinition(2, "raw", 0));
+        type.Methods.Add(method);
+
+        IlGenerator.GenerateIl(context, method);
+        var il = method.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                && i.Operand?.ToString()?.Contains("Unrecoverable") == true), Is.False,
+            () => string.Join("\n", il));
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.And), Is.True,
+            () => string.Join("\n", il));
+        var run = LoadAndGet(module);
+        // folded holds 0 (x ^ x), so bits(value) & 0 = 0 whatever the float is
+        Assert.That(run.Invoke(null, [1.5, 1.5f]), Is.EqualTo(0));
+    }
+
+    // An undeclared local whose numeric union settled on Double is still a float
+    // carrier at runtime: `and w8, w9, #1` reads the low dword of whatever the
+    // register held, which for a double slot is the low dword of its bit
+    // pattern — DoubleToInt64Bits then conv.i4, not a value conversion.
+    [Test]
+    public void InferredFloatOperandReinterpretsBitsAtLaneWidth()
+    {
+        var app = App;
+        var wide = new LocalVariable("wide", new Register(null, "V0"))
+            { Type = app.SystemTypes.SystemDoubleType };
+        var x = new LocalVariable("x", new Register(null, "X8_v75"));
+        var other = new LocalVariable("other", new Register(null, "V1_v1"));
+        var result = new LocalVariable("result", new Register(null, "TEMP_v67"))
+            { Type = app.SystemTypes.SystemInt32Type };
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemInt32Type, ReflectionMethodAttributes.Static,
+            [app.SystemTypes.SystemDoubleType], ["wide"]);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            // x's union class picks up the Double constraint from wide
+            new Instruction(0, OpCode.Subtract, other, wide, x),
+            new Instruction(1, OpCode.And, result, x, new Immediate(1)),
+            new Instruction(2, OpCode.Return, result)]);
+        context.Locals = new List<LocalVariable> { wide, x, other, result };
+        context.ParameterLocals = new List<LocalVariable> { wide };
+        context.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("InferredFloat.dll");
+        SeedCorLibTypes(module, app.SystemTypes.SystemObjectType, app.SystemTypes.SystemSingleType,
+            app.SystemTypes.SystemDoubleType, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemVoidType, app.SystemTypes.SystemStringType);
+        var type = new TypeDefinition("Tests", "Carrier", TypeAttributes.Public,
+            module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);
+        var method = new MethodDefinition("Run", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32,
+                [module.CorLibTypeFactory.Double]));
+        method.ParameterDefinitions.Add(new ParameterDefinition(1, "wide", 0));
+        type.Methods.Add(method);
+
+        IlGenerator.GenerateIl(context, method);
+        var il = method.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr
+                && i.Operand?.ToString()?.Contains("Unrecoverable") == true), Is.False,
+            () => string.Join("\n", il));
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call
+                && i.Operand?.ToString()?.Contains("DoubleToInt64Bits") == true), Is.True,
+            () => string.Join("\n", il));
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.And), Is.True,
+            () => string.Join("\n", il));
+        var run = LoadAndGet(module);
+        // x is a Double local holding 0.0: trunc(bits(0.0)) & 1 = 0
+        Assert.That(run.Invoke(null, [1.5]), Is.EqualTo(0));
     }
 
     private static System.Reflection.MethodInfo EmitCarrierFixture(OpCode opcode,
