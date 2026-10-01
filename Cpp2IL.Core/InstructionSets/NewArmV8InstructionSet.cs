@@ -660,7 +660,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 || insn.Op1Kind != Arm64OperandKind.Register
                 || RegisterWidthBytes(insn.Op0Reg) is not (4 or 8)
                 || RegisterWidthBytes(insn.Op1Reg) is not (4 or 8)
-                || insn.Op2Kind == Arm64OperandKind.Immediate)
+                || insn.Op2Kind is not (Arm64OperandKind.None or Arm64OperandKind.Immediate))
             {
                 Add(address, OpCode.NotImplemented,
                     new StringLiteral($"Instruction {mnemonic} not yet implemented."));
@@ -668,6 +668,19 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             }
 
             IOperand source = ConvertOperand(insn, 1);
+            var fixedPoint = insn.Op2Kind == Arm64OperandKind.Immediate;
+            var sourceIsDouble = insn.Op1Reg is >= Arm64Register.D0 and <= Arm64Register.D31;
+            if (fixedPoint && mnemonic is not (Arm64Mnemonic.SCVTF or Arm64Mnemonic.UCVTF))
+            {
+                // FCVT* fixed: dest = conv(src * 2^fbits) - scale first.
+                var scaled = new Register(null, "TEMP_FIXED");
+                var scale = Math.Pow(2.0, insn.Op2Imm);
+                var mul = Add(address, OpCode.Multiply, scaled, source,
+                    sourceIsDouble ? new DoubleLiteral(scale) : new FloatLiteral((float)scale));
+                mul.NativeFloatWidthBits = sourceIsDouble ? 64 : 32;
+                source = scaled;
+            }
+
             // Rounding-mode conversions pre-round through the managed math
             // helper; the truncating Convert then keeps only the integer part.
             var rounding = mnemonic switch
@@ -681,7 +694,6 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             if (rounding != null)
             {
                 var rounded = new Register(null, "TEMP_ROUND");
-                var sourceIsDouble = insn.Op1Reg is >= Arm64Register.D0 and <= Arm64Register.D31;
                 if (rounding == "RoundAway")
                     EmitRoundAwayFromZero(rounded, source, sourceIsDouble);
                 else
@@ -699,6 +711,16 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 convert.NativeFloatWidthBits = RegisterWidthBytes(insn.Op0Reg) * 8;
             else
                 convert.NativeIntegerWidthBits = RegisterWidthBytes(insn.Op0Reg) * 8;
+
+            if (fixedPoint && mnemonic is Arm64Mnemonic.SCVTF or Arm64Mnemonic.UCVTF)
+            {
+                // SCVTF/UCVTF fixed: dest = conv(src) * 2^-fbits - scale after.
+                var destIsDouble = insn.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31;
+                var inverse = Math.Pow(2.0, -insn.Op2Imm);
+                var mul = Add(address, OpCode.Multiply, ConvertOperand(insn, 0), ConvertOperand(insn, 0),
+                    destIsDouble ? new DoubleLiteral(inverse) : new FloatLiteral((float)inverse));
+                mul.NativeFloatWidthBits = destIsDouble ? 64 : 32;
+            }
         }
 
         // A call target that is an adrp+ldr(+add)+br GOT trampoline names its

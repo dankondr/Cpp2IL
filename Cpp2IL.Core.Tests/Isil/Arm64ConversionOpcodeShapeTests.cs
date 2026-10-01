@@ -103,6 +103,40 @@ public class Arm64ConversionOpcodeShapeTests
         });
     }
 
+    // The fixed-point form scvtf s, w, #fbits converts the integer, then
+    // scales it by 2^-fbits - a power-of-two multiply is exact.
+    [Test]
+    public void ScvtfFixedPointConvertsThenScales()
+    {
+        var il = Lift(0x1e02f820); // scvtf s0, w1, #2
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+            var convert = il.Single(i => i.OpCode == OpCode.Convert);
+            Assert.That(convert.Operands[0], Is.EqualTo(new Register(null, "V0")));
+            Assert.That(convert.ConversionFromFloat, Is.False);
+            var mul = il.Single(i => i.OpCode == OpCode.Multiply
+                && i.Operands[0] is Register { Name: "V0" });
+            Assert.That(mul.Operands[2], Is.EqualTo(new FloatLiteral(0.25f)));
+        });
+    }
+
+    // The fixed-point form fcvtzs w, s, #fbits scales the float by 2^fbits,
+    // then truncates it to the integer.
+    [Test]
+    public void FcvtzsFixedPointScalesThenConverts()
+    {
+        var il = Lift(0x1e18e809); // fcvtzs w9, s0, #6
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+            var mul = il.Single(i => i.OpCode == OpCode.Multiply);
+            Assert.That(mul.Operands[2], Is.EqualTo(new FloatLiteral(64f)));
+            Assert.That(il.Any(i => i.OpCode == OpCode.Convert
+                && i.Operands[0] is Register { Name: "X9" }), Is.True);
+        });
+    }
+
     // Rounding variants pre-round through Math before the truncating
     // conversion: fcvtms floors, fcvtps ceils, fcvtns rounds, fcvtas rounds
     // away from zero.

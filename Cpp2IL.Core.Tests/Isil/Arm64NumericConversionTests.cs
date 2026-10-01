@@ -223,6 +223,32 @@ public class Arm64NumericConversionTests
         Assert.That(result, Is.EqualTo(int.MinValue));
     }
 
+    // The fixed-point form scvtf s, w, #fbits converts the integer and scales
+    // it by 2^-fbits: 7 with 2 fraction bits is 1.75.
+    [Test]
+    public void ScvtfFixedPointExecutesScaledSemantics()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var result = EmitAndInvoke([
+            0x528000e1, // mov w1, #7
+            0x1e02f820, // scvtf s0, w1, #2
+            Ret,
+        ], app.SystemTypes.SystemSingleType, [], []);
+        Assert.That(result, Is.EqualTo(1.75f));
+    }
+
+    // fcvtzs w, s, #fbits scales by 2^fbits before truncating.
+    [Test]
+    public void FcvtzsFixedPointExecutesScaledSemantics()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var result = EmitAndInvoke([
+            0x1e18e800, // fcvtzs w0, s0, #6
+            Ret,
+        ], app.SystemTypes.SystemInt32Type, [app.SystemTypes.SystemSingleType], [0.25f]);
+        Assert.That(result, Is.EqualTo(16));
+    }
+
     // scvtf of an integer constant converts the number, never its bit pattern.
     [Test]
     public void ScvtfOfIntegerConstantEmitsTheNumber()
