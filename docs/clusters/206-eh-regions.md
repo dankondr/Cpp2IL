@@ -1,5 +1,138 @@
 # EH region recovery (206, slice 2)
 
+## Round 5: catch value returns (2026-10-01)
+
+**Draft: 9,474 owned pad warnings remain; the target is at most 7,768.**
+This increment removes 90 owned pads. Against the original 15,537, the total
+reduction is 6,063 (39.0%); 1,706 more must be removed.
+Earlier sections retain their historical controls and counts.
+
+### Control and proof
+
+Control: `a87c8ff03fa5db47d94d9ec33b4c1054fbd8977a`, the existing PR after
+merging development through #187, #188, and #189
+(`8bc9beb81d0a4c79e68a20353695fe87a827006b`). #181 remains open.
+Full sweeps: `astra206-r10-control` and `astra206-r10-branch`;
+69,982/69,982 native methods, 183 assemblies, 178,274 reported methods each.
+
+A non-void catch may now reach a separately proven value return. The proof walks
+only register moves, stack restoration, and single-successor jumps to the native
+return. It resolves the operand from an actual handler result, the caught object,
+a metadata string literal, or an immediate. Primitive returns are restricted to
+Int32 and canonical Boolean constants. References must have an assignable base
+type, or be null. Pointer, byref, generic, unknown-value, and effectful epilogues
+remain refused. Every original wrapper/type/mismatch proof remains required.
+
+The catch leaves to its own return continuation outside EH. Normal paths retain
+their own SSA return value. Return operands participate in proof grouping, so
+handlers with different values do not share a continuation.
+
+Generated EH locals are now marked as such. The parameter fallback previously
+mistook an out-of-CFG catch result for the method's sole parameter of the same
+type. The marker prevents that substitution for both the caught object and
+handler results. It leaves ordinary local/parameter recovery unchanged.
+
+### Measurements
+
+| Scope | Diagnosed control → branch | Newly clean | Regressions | Pads control → branch |
+|---|---:|---:|---:|---:|
+| All | 16,012 → 16,012 | 0 | 0 | 41,921 → 41,689 |
+| Game-owned | 3,829 → 3,829 | 0 | 0 | 9,564 → 9,474 |
+| CastleClashers.Game | 2,326 → 2,326 | 0 | 0 | 6,154 → 6,113 |
+| Castle-building owners + nested types | 83 → 83 | 0 | 0 | 684 → 684 |
+
+No method gains a diagnostic. Newly clean methods: none.
+
+ILVerify: **0 status transitions; 0 valid→invalid**. Both runs have 170,144 valid / 416 invalid / 7,714 partial methods. The Bootstrap reachability gate remains blocked at 29/29.
+
+| Method | Pads control → branch |
+|---|---:|
+| ``System.Collections.Generic.Dictionary`2<System.String, System.Object> MatchTelemetryTrackerController::BuildBotWheelPayload()`` | 19 → 2 |
+| ``System.String SaveController::GetFileAsJson(System.String)`` | 6 → 2 |
+| ``System.String SaveController::GetFileAsJsonFromPath(System.String)`` | 6 → 2 |
+| ``System.Int32 HapticNative::GetMotorType()`` | 15 → 13 |
+| ``System.Int32[0..., 0...] CastleClashers.HumanLikeBots.PlayerProfileFetcher::ParseCastleGrid(System.Object)`` | 16 → 2 |
+| ``System.Boolean PaperPlaneTools.RateBox::SaveStatistics()`` | 11 → 2 |
+| ``System.Int32 Voodoo.ADN.Internal.AdnSignalsHelper::GetAdsCount(System.String)`` | 3 → 2 |
+| ``System.String Voodoo.ADN.Internal.AdnSignalsHelper::GetAndUpdateSessionDate(System.String, System.String)`` | 4 → 2 |
+| ``UnityEngine.AndroidJavaClass Voodoo.ADN.Internal.AdnSdkAndroid::PluginClassInstance()`` | 3 → 2 |
+| ``Voodoo.ADN.Internal.AdnSdkAndroid+BackgroundEventCallbackProxy Voodoo.ADN.Internal.AdnSdkAndroid::EventCallbackInstance()`` | 3 → 2 |
+| ``System.String Voodoo.Live.ConfigLoader::GetRequestError(UnityEngine.Networking.UnityWebRequest, System.Double)`` | 21 → 2 |
+| ``System.Boolean Voodoo.Live.Sample.RotationOperator::CastFields(System.Object[], Voodoo.Live.IBlackboard)`` | 5 → 2 |
+| ``System.Boolean Voodoo.Live.Sample.Offers.VoodooLiveBridge::ApplyItemDelta(System.String, System.Int32)`` | 5 → 2 |
+| ``Voodoo.Live.IPrice Voodoo.Live.Offers.ServerSpin::GetRerollPrice()`` | 3 → 2 |
+| ``System.Boolean TrustedTimeService::TryParseJsonEpoch(System.String, System.Int64&)`` | 11 → 2 |
+
+### Native and IL review
+
+`TrustedTimeService.TryParseJsonEpoch`: after ending the native catch at
+`3F32CD8`, the pad sets X0 to zero, restores the private exception-stack index,
+and jumps through register restoration to `3F32C60: Return X0`. The generated
+Object catch stores the supplied exception and leaves to `ldc.i4.0; ret`.
+The normal success/failure return still loads its original Boolean SSA local.
+Nine primary pad warnings disappear; the two auxiliary pads remain.
+
+`SaveController.GetFileAsJson`: the handler calls the caught exception's virtual
+`get_Message`, concatenates a metadata literal, initializes Debug, and calls
+`LogError`. Its native exit reaches `3F277A8: X0 = 0`, then returns at `3F277B4`.
+The IL loads the actual message and concatenation locals, then leaves to a separate
+`ldnull; ret`. The normal decoded string has a separate exit. The original emitted
+handler incorrectly loaded `fileName` for both message and concatenation results;
+the EH-local marker corrects those reads.
+
+### Tests and remaining work
+
+The regression fixture executes Int32, Boolean, string, and original-object
+returns through real CLR catches and checks the normal path separately. It also
+refuses an unknown return register, an effectful epilogue, pointer and byref
+returns. The string case has a parameter of the same type as the handler result;
+it fails before the EH-local marker and returns the actual handler result after it.
+Six portable cases against unchanged control code: four positive failures and
+two negative passes. The return-local collision separately fails before its fix.
+Tests: **Core 1,260/1,260**, then **74/74** for EH, aggregate lanes and
+parameter-local recovery after merging #189. The full Core build preceded that
+merge; the final focused run includes its new whole-result store case.
+**LibCpp2IL 12/12; JitOracle 9/9**. The final focused run includes all 60 EH cases.
+
+The state-machine cohort remains 133 methods / 3,162 pads. Its earlier first-failure
+counts remain applicable: this change proves no new state-machine handler.
+Catch returns do not make an unknown builder signature, captured heap value,
+state-guarded cleanup, or uncovered normal call safe.
+
+Two separate experiments remain outside production: filtering unused ABI argument
+registers produces zero extra proofs across 1,019 methods; preserving original
+reference parameters produces nine native proofs in `NativeWebView.OpenAndroid`
+and `AudiomobPluginInitialization.DoInitialization`. The latter still needs
+synthetic tests, CLR emission review, and a full measurement before adoption.
+
+The reserved normal cleanup-receiver failures remain listed below, including
+`StoreController.OpenSection` and the shield-building methods. No repair of their
+normal emission was added here.
+
+Native proofs cover 8,381 pads in the original owned cohort.
+**2,318 proven pads remain unmaterialized in 118 methods.**
+The fixed 132-method class-test cohort is now 835 pads (925 on control).
+The refusal categories from Round 4 still apply; this return extension changes
+neither the remaining native state shapes nor the normal cleanup emitters.
+
+### Castle-building scope
+
+| Method | Pads control → branch |
+|---|---:|
+| ``System.Void CastleBuildingController::ShowUpgradeAdditions()`` | 35 → 35 |
+| ``System.Void CastleBuildingController::TriggerInterior()`` | 35 → 35 |
+| ``System.Void CastleBuildingController::RelocateUnitsToValidPositions()`` | 41 → 41 |
+| ``System.Nullable`1<UnityEngine.Vector2Int> CastleMaker::PickBestAvailablePosition(System.Collections.Generic.List`1<UnityEngine.Vector2Int>, System.Collections.Generic.HashSet`1<UnityEngine.Vector2Int>, CastleClashers.HumanLikeBots.BotTier, System.Boolean)`` | 12 → 12 |
+| ``System.Void CastleMaker::Build(System.Boolean, System.Boolean, System.Boolean)`` | 43 → 43 |
+| ``System.Void CastleMaker::SpawnShields(System.Boolean)`` | 224 → 224 |
+| ``System.Void CastleMaker::SpawnShieldsFromPlacements(System.Collections.Generic.List`1<EnemyShieldPlacement>)`` | 217 → 217 |
+| ``System.Void CastleMaker::SaveShieldsData()`` | 47 → 47 |
+| ``System.Void CastleMaker::SetShieldTypeForGridPos(UnityEngine.Vector2Int, System.Int32)`` | 14 → 14 |
+| ``System.Void CastleMaker::MarkCastleShieldPositionsInUpgradeData()`` | 7 → 7 |
+| ``UnityEngine.GameObject[0..., 0...] CastleMaker::BuildGridAuto(System.Collections.Generic.List`1<UnityEngine.Transform>, System.Boolean, System.Single)`` | 9 → 9 |
+
+Reproduction uses the original brief commands with the two frozen output roots above.
+
 Task: dankondr/castle-recovery#206. Continues slice 1 and addresses dankondr/Cpp2IL#80.
 
 ## Round 4: catch-all through the defaults class (2026-10-01)

@@ -214,7 +214,13 @@ internal static class ExceptionRegionRecovery
         }
         foreach (var (proof, handler) in catches ?? [])
         {
-            var merge = units.FirstOrDefault(u => u.Source?.NativeAddress == proof.MergeAddress);
+            Unit? merge;
+            if (proof.Return is { } returned && instructionMap.TryGetValue(returned, out var continuation))
+            {
+                merge = new Unit(returned, continuation, units.Count);
+                units.Add(merge);
+            }
+            else merge = units.FirstOrDefault(u => u.Source?.NativeAddress == proof.MergeAddress);
             var seeds = units.Where(u => u.Source != null && dominators.ContainsKey(u) && proof.Sites.Any(s =>
                 u.Source.NativeAddress >= s.Start && u.Source.NativeAddress < s.End)).ToList();
             if (merge == null || seeds.Count == 0 || handler.Count == 0) continue;

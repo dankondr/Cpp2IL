@@ -119,7 +119,7 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
     }
 
     internal sealed record CatchResult(TypeAnalysisContext Type, LocalVariable ExceptionLocal,
-        List<Instruction> Handler, List<EhCallSiteInfo> Sites, HashSet<ulong> Pads, ulong MergeAddress);
+        List<Instruction> Handler, List<EhCallSiteInfo> Sites, HashSet<ulong> Pads, ulong MergeAddress, Instruction? Return = null);
 
     internal List<CatchResult> FindCatches(Func<ulong, bool>? wrapperTypeProof = null)
     {
@@ -208,11 +208,13 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
             {
                 if (states.ContainsKey(index)) { merge = index; break; }
                 var instruction = code[index];
-                if (endedCatch && context.IsVoid && instruction.OpCode == OpCode.Return && instruction.Operands.Count == 0)
+                if (endedCatch && instruction.OpCode == OpCode.Return)
                 {
-                    // A separate void return has no live value to merge. Reuse a
-                    // reachable normal return as the leave destination outside EH.
-                    merge = states.Keys.Where(i => code[i].OpCode == OpCode.Return && code[i].Operands.Count == 0).DefaultIfEmpty(-1).First();
+                    // Void catches reuse a normal return; a value catch proves its
+                    // own return operand and gets a separate continuation below.
+                    merge = context.IsVoid
+                        ? states.Keys.Where(i => code[i].OpCode == OpCode.Return && code[i].Operands.Count == 0).DefaultIfEmpty(-1).First()
+                        : index;
                     break;
                 }
                 if (instruction.IsCall || instruction.OpCode == OpCode.IndirectCall)
@@ -286,16 +288,30 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
                 if (next.Count != 1) break;
                 index = next[0];
             }
-            // Returning a changed value or joining live native locals needs an explicit
-            // SSA merge. Until that is available, only a void epilogue is proven here.
-            if (merge < 0 || !endedCatch || !VoidEpilogue(merge, out var mergeAddress)) continue;
+            // A value return gets its own continuation outside the catch. It must
+            // not read the normal path's SSA return local, which has no catch input.
+            Instruction? returned = null;
+            ulong mergeAddress;
+            if (merge < 0 || !endedCatch) continue;
+            if (context.IsVoid)
+            {
+                if (!VoidEpilogue(merge, out mergeAddress)) continue;
+            }
+            else
+            {
+                returned = CatchReturn(merge, state, exceptionLocal, handlerValues);
+                if (returned == null) continue;
+                mergeAddress = returned.NativeAddress;
+            }
             var existing = result.FirstOrDefault(r => r.Type == type && r.MergeAddress == mergeAddress
+                && (r.Return == null ? returned == null : returned != null
+                    && r.Return.Operands.Select(HandlerOperandKey).SequenceEqual(returned.Operands.Select(HandlerOperandKey)))
                 && r.Handler.Count == handler.Count && r.Handler.Zip(handler).All(p =>
                     p.First.OpCode == p.Second.OpCode && p.First.IsVirtualDispatch == p.Second.IsVirtualDispatch
                     && p.First.Operands.Select(HandlerOperandKey)
                         .SequenceEqual(p.Second.Operands.Select(HandlerOperandKey))));
             if (existing != null) { existing.Sites.Add(site); existing.Pads.UnionWith(state.Pads); }
-            else result.Add(new(type, exceptionLocal, handler, [site], state.Pads, mergeAddress));
+            else result.Add(new(type, exceptionLocal, handler, [site], state.Pads, mergeAddress, returned));
         }
         return result;
     }
@@ -343,6 +359,44 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
             index = successors[0];
         }
         return false;
+    }
+
+    private Instruction? CatchReturn(int index, State state, LocalVariable exceptionLocal,
+        Dictionary<string, LocalVariable> handlerValues)
+    {
+        if (context.ReturnType is PointerTypeAnalysisContext or ByRefTypeAnalysisContext or GenericParameterTypeAnalysisContext) return null;
+        state = state.Copy();
+        var seen = new HashSet<int>();
+        while (index < code.Count && seen.Add(index))
+        {
+            var instruction = code[index];
+            if (instruction.OpCode == OpCode.Return)
+            {
+                if (instruction.Operands.Count != 1) return null;
+                var value = CatchArgument(instruction.Operands[0], state, exceptionLocal, handlerValues);
+                var types = context.AppContext.SystemTypes;
+                if (context.ReturnType.IsValueType)
+                {
+                    if (value is not Immediate { Value: >= int.MinValue and <= int.MaxValue }
+                        || context.ReturnType != types.SystemInt32Type && context.ReturnType != types.SystemBooleanType
+                        || context.ReturnType == types.SystemBooleanType && value is not Immediate { Value: 0 or 1 }) return null;
+                }
+                else if (value is not Immediate { Value: 0 })
+                {
+                    var type = value is StringLiteral ? types.SystemStringType : (value as LocalVariable)?.Type;
+                    while (type != null && type != context.ReturnType) type = type.DefaultBaseType;
+                    if (type == null) return null;
+                }
+                return new Instruction(0, OpCode.Return, [value!]) { NativeAddress = instruction.NativeAddress };
+            }
+            if (instruction.OpCode is not (OpCode.Move or OpCode.ShiftStack or OpCode.Nop or OpCode.Jump)
+                || instruction.OpCode == OpCode.Move && instruction.Destination is not Register) return null;
+            Transfer(instruction, state);
+            var next = Successors(code, index, state).ToList();
+            if (next.Count != 1) return null;
+            index = next[0];
+        }
+        return null;
     }
 
     private IOperand? CatchArgument(IOperand operand, State state, LocalVariable exceptionLocal,
