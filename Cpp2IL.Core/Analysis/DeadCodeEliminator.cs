@@ -21,6 +21,36 @@ public static class DeadCodeEliminator
 {
     public static void Run(MethodAnalysisContext method) => Run(method.ControlFlowGraph!);
 
+    /// <summary>
+    /// The lifter ends a method that falls off its last call with a Return; once that call is
+    /// known never to return and became a Throw, nothing reaches the Return after it, and
+    /// emitting it only spells a value that never existed. It is spliced out, not turned into a
+    /// nop, so the body still ends in the throw instead of falling off its end.
+    /// </summary>
+    public static void RemoveReturnsAfterThrow(ISILControlFlowGraph cfg)
+    {
+        foreach (var block in cfg.Blocks.ToList())
+        {
+            var thrown = block.Instructions.FindIndex(i => i.OpCode == OpCode.Throw);
+            if (thrown >= 0 && LoneReturn(block.Instructions.Skip(thrown + 1)))
+                block.Instructions.RemoveRange(thrown + 1, block.Instructions.Count - thrown - 1);
+            // The Return can also sit in a block of its own that only throwing blocks fall into.
+            else if (block != cfg.EntryBlock && block != cfg.ExitBlock && block.Predecessors.Count > 0
+                     && LoneReturn(block.Instructions)
+                     && block.Predecessors.All(p => p.Instructions.LastOrDefault(i => i.OpCode != OpCode.Nop) is { OpCode: OpCode.Throw }))
+            {
+                foreach (var successor in block.Successors)
+                    successor.Predecessors.Remove(block);
+                foreach (var predecessor in block.Predecessors)
+                    predecessor.Successors.Remove(block);
+                cfg.Blocks.Remove(block);
+            }
+        }
+
+        static bool LoneReturn(IEnumerable<Instruction> instructions)
+            => instructions.Where(i => i.OpCode != OpCode.Nop).ToList() is [{ OpCode: OpCode.Return }];
+    }
+
     public static void Run(ISILControlFlowGraph cfg)
     {
         // A local is live when an instruction with an effect (a call, store, branch, return)

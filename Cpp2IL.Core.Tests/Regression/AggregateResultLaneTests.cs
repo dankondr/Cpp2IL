@@ -426,4 +426,80 @@ public class AggregateResultLaneTests
                 "the rebuilt return carries no diagnostic note");
         });
     }
+
+    private static InjectedTypeAnalysisContext FourInts()
+    {
+        var int32 = (TypeAnalysisContext)Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemInt32Type;
+        return InjectStruct("Quad", ("a", int32, 0), ("b", int32, 4), ("c", int32, 8), ("d", int32, 12));
+    }
+
+    [Test]
+    public void ReturnOfACallResultWhoseFieldsStraddleTheLanesReturnsThatResult()
+    {
+        // bl GetQuad; ret: X0 and X1 each hold two ints, so no lane is one field, yet
+        // the pair is the callee's whole result of the same type.
+        var quad = FourInts();
+        var callerType = CallerTypeWithField("pos", quad, 0x80);
+        var getQuad = callerType.InjectMethodContext("GetQuad", quad,
+            R.MethodAttributes.Public | R.MethodAttributes.Static);
+        var call = new Instruction(0x14, OpCode.Call, getQuad, Reg("X0"));
+        call.ImplicitDefinitions.Add(Reg("X1"));
+        var ret = new Instruction(0x18, OpCode.Return, Reg("X0"), Reg("X1"));
+        var caller = DriveReturning(callerType, quad, [call, ret]);
+
+        Assert.That(ret.Operands, Has.Count.EqualTo(1));
+        Assert.That(ret.Operands[0], Is.SameAs(call.Destination));
+
+        var module = new ModuleDefinition("Lanes.dll");
+        SeedCallee(getQuad, module, quad);
+        var il = EmitReturning(caller, module, quad, callerType, quad).CilMethodBody!.Instructions;
+        Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldstr), Is.EqualTo(0));
+    }
+
+    [Test]
+    public void ReturnWhoseHighLaneWasRewrittenAfterTheCallKeepsItsLanes()
+    {
+        var quad = FourInts();
+        var callerType = CallerTypeWithField("pos", quad, 0x80);
+        var getQuad = callerType.InjectMethodContext("GetQuad", quad,
+            R.MethodAttributes.Public | R.MethodAttributes.Static);
+        var call = new Instruction(0x14, OpCode.Call, getQuad, Reg("X0"));
+        call.ImplicitDefinitions.Add(Reg("X1"));
+        var ret = new Instruction(0x1c, OpCode.Return, Reg("X0"), Reg("X1"));
+        DriveReturning(callerType, quad, [call, new Instruction(0x18, OpCode.Move, Reg("X1"), new Immediate(5)), ret]);
+
+        Assert.That(ret.Operands, Has.Count.EqualTo(2));
+    }
+
+    private static Instruction ReturnLaneZero(TypeAnalysisContext returnType)
+    {
+        // `float X(Transform t) => t.position.x` is `b Transform.get_position`: the caller's S0
+        // is the callee's x.
+        var vector3 = Vector3();
+        var callerType = CallerTypeWithField("pos", vector3, 0x80);
+        var getPosition = callerType.InjectMethodContext("GetPosition", vector3,
+            R.MethodAttributes.Public | R.MethodAttributes.Static);
+        var call = new Instruction(0x14, OpCode.Call, getPosition, Reg("V0"));
+        call.ImplicitDefinitions.AddRange([Reg("V1"), Reg("V2")]);
+        var ret = new Instruction(0x18, OpCode.Return, Reg("V0"));
+        DriveReturning(callerType, returnType, [call, ret]);
+        return ret;
+    }
+
+    [Test]
+    public void ScalarReturnOfAnAggregateCallResultReturnsItsFirstField()
+    {
+        var ret = ReturnLaneZero(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemSingleType);
+
+        Assert.That(ret.Operands[0], Is.InstanceOf<FieldReference>());
+        Assert.That(((FieldReference)ret.Operands[0]).Field.Name, Is.EqualTo("x"));
+    }
+
+    [Test]
+    public void ScalarReturnOfAnotherTypeKeepsTheCallResult()
+    {
+        var ret = ReturnLaneZero(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemInt32Type);
+
+        Assert.That(ret.Operands[0], Is.InstanceOf<LocalVariable>());
+    }
 }

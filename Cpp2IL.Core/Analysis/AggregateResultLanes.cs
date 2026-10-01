@@ -52,10 +52,7 @@ internal static class AggregateResultLanes
                 || call.Destination is not LocalVariable result)
                 continue;
 
-            var concrete = !callee.IsStatic && call.Operands.Count > 2
-                ? IlGenerator.RetargetToReceiverInstantiation(callee,
-                    IlGenerator.SharedGenericEvidenceType(call.Operands[2], method))
-                : callee;
+            var concrete = Concrete(call, callee, method);
             var resultType = IlGenerator.EffectiveCallReturnType(concrete);
             var lanes = resolver.ExtraLanes(resultType, resolver.ReturnRegister(concrete));
             if (lanes.Count == 0)
@@ -149,6 +146,7 @@ internal static class AggregateResultLanes
         // the fields its bytes hold - before the projection loop below so the
         // operands still name their registers.
         var changed = RebuildAggregateReturns(method, resolver, pointerSize);
+        changed |= ProjectScalarReturns(method, resolver, pointerSize);
 
         if (provenLanes.Count == 0 && lateLanes.Count == 0 && entryLanes.Count == 0)
             return created || changed;
@@ -296,6 +294,22 @@ internal static class AggregateResultLanes
                 if (!proven)
                     continue;
 
+                // Lane 0 holding a call's whole result of the return type, with every other
+                // lane that call's own lane register, is the value passed through unchanged,
+                // however its fields straddle the lanes (`Nullable<DateTime>`, `UniTask`).
+                if (lane0 is LocalVariable { Type: { } wholeType } whole
+                    && wholeType.FullName == method.ReturnType.FullName
+                    && method.ControlFlowGraph.Instructions.FirstOrDefault(i => ReferenceEquals(i.Destination, whole)) is
+                        { OpCode: OpCode.Call } call
+                    && CallResultType(call, method)?.FullName == wholeType.FullName
+                    && sources.Skip(1).All(source => source.Operand is LocalVariable { Register: { Version: > 0 } register }
+                                                     && call.ImplicitDefinitions.Contains(register)))
+                {
+                    instruction.SetOperands(whole);
+                    changed = true;
+                    continue;
+                }
+
                 var fields = new List<(FieldAnalysisContext Field, int Offset,
                     IReadOnlyList<FieldAnalysisContext> Containers, int Width)>();
                 foreach (var (_, offset, width) in sources)
@@ -336,6 +350,48 @@ internal static class AggregateResultLanes
 
         return changed;
     }
+
+    // A method returning one scalar can hand back lane 0 of an aggregate call result as is:
+    // `float X(Transform t) => t.position.x` is `b Transform.get_position`, and the caller's S0
+    // is the callee's `x`. The value returned is that lane's field, not the whole aggregate.
+    private static bool ProjectScalarReturns(MethodAnalysisContext method, BaseCallingConventionResolver resolver,
+        int pointerSize)
+    {
+        if (method.IsVoid || resolver.ExtraLanes(method.ReturnType, resolver.ReturnRegister(method)).Count > 0)
+            return false;
+        var changed = false;
+        var instructions = method.ControlFlowGraph!.Instructions;
+        foreach (var ret in instructions.Where(i => i.OpCode == OpCode.Return))
+        {
+            if (ret.Operands is not [LocalVariable result]
+                || instructions.FirstOrDefault(i => ReferenceEquals(i.Destination, result)) is not
+                    { OpCode: OpCode.Call, Operands: [MethodAnalysisContext callee, ..] } call
+                || resolver.ReturnRegister(Concrete(call, callee, method)) is var laneZero
+                   && laneZero.Name != resolver.ReturnRegister(method).Name
+                || CallResultType(call, method) is not { IsValueType: true } aggregate
+                || resolver.ExtraLanes(aggregate, laneZero) is not { Count: > 0 } lanes
+                || MetadataResolver.FindInstanceFieldPathAtOffset(aggregate, 0, lanes[0].ByteOffset) is not { } path
+                || path.Field.FieldType.FullName != method.ReturnType.FullName
+                || TypeSizes.MinimumUnboxedSize(path.Field.FieldType, pointerSize) != lanes[0].ByteOffset
+                || instructions.Any(i => i != ret && i != call && DeadCodeEliminator.UsedLocals(i).Contains(result)))
+                continue;
+            result.Type = aggregate;
+            ret.SetOperand(0, new FieldReference(path.Field, result, 0, path.Containers, lanes[0].ByteOffset));
+            changed = true;
+        }
+        return changed;
+    }
+
+    private static MethodAnalysisContext Concrete(Instruction call, MethodAnalysisContext callee, MethodAnalysisContext method)
+        => !callee.IsStatic && call.Operands.Count > 2
+            ? IlGenerator.RetargetToReceiverInstantiation(callee,
+                IlGenerator.SharedGenericEvidenceType(call.Operands[2], method))
+            : callee;
+
+    private static TypeAnalysisContext? CallResultType(Instruction call, MethodAnalysisContext method)
+        => call.Operands[0] is MethodAnalysisContext callee
+            ? IlGenerator.EffectiveCallReturnType(Concrete(call, callee, method))
+            : null;
 
     private static IOperand? LaneOperand(IOperand operand, string? registerName) => operand switch
     {
