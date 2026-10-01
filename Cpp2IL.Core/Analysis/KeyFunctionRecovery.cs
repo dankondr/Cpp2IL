@@ -1189,10 +1189,12 @@ public static class KeyFunctionRecovery
                                   && candidate.Register == local.Register
                                   && i.Operands is [_, MemoryOperand { IsConstant: true }]);
 
-    // Unity 6 Il2CppDefaults starts with corlib and corlib_gen, followed by primitive class pointers.
+    // Unity 6 Il2CppDefaults starts with corlib and corlib_gen, then object_class, followed by
+    // primitive class pointers. object_class is what a catch of any managed exception compares to.
     internal static TypeAnalysisContext? Unity6PrimitiveDefaultsClass(SystemTypesContext types, long offset) =>
         offset switch
         {
+            0x10 => types.SystemObjectType,
             0x18 => types.SystemByteType,
             0x20 => types.SystemVoidType,
             0x28 => types.SystemBooleanType,

@@ -404,6 +404,17 @@ public class KeyFunctionRecoveryTests
     }
 
     [Test]
+    public void Unity6DefaultsObjectClassFollowsTheTwoImages()
+    {
+        // corlib @0, corlib_gen @8, object_class @0x10: the class a catch of any managed
+        // exception compares against.
+        var types = Cpp2IlApi.CurrentAppContext!.SystemTypes;
+
+        Assert.That(KeyFunctionRecovery.Unity6PrimitiveDefaultsClass(types, 0x10), Is.SameAs(types.SystemObjectType));
+        Assert.That(KeyFunctionRecovery.Unity6PrimitiveDefaultsClass(types, 0x8), Is.Null);
+    }
+
+    [Test]
     public void Unity6DefaultsClassLoadSeedsRuntimeClassType()
     {
         Cpp2IlApi.ResetInternalState();
