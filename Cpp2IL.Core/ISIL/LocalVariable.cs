@@ -15,6 +15,8 @@ public class LocalVariable(string name, Register register, TypeAnalysisContext? 
     public bool IsThis = false;
     public bool IsReturn = false;
     public bool IsMethodInfo = false;
+    // Defined by the CLI exception entry or handler code outside the normal CFG.
+    public bool IsExceptionHandlerLocal = false;
 
     // The native stack slot backing a synthesized hidden-return local. Kept so a
     // later generic sharpening pass can resolve offsets that did not exist in the

@@ -158,7 +158,16 @@ public static class IlGenerator
         RewriteFrameSlotLoads(context, frameSlotLocals);
 
         var catchProofs = provenCatches ?? new Analysis.NativeExceptionRegionProof(context).FindCatches();
-        foreach (var proof in catchProofs) context.Locals.Add(proof.ExceptionLocal);
+        foreach (var proof in catchProofs)
+        {
+            proof.ExceptionLocal.IsExceptionHandlerLocal = true;
+            context.Locals.Add(proof.ExceptionLocal);
+            foreach (var local in proof.Handler.Select(i => i.Destination).OfType<LocalVariable>().Distinct())
+            {
+                local.IsExceptionHandlerLocal = true;
+                context.Locals.Add(local);
+            }
+        }
 
         // Map ISIL locals to IL. The declared type joins the method body's locals
         // signature, so a local whose recovered type cannot be named here is
@@ -344,14 +353,31 @@ public static class IlGenerator
             // is emitted here rather than in the normal-path ISIL graph.
             DefinedLocalRegisters(context).Add(proof.ExceptionLocal.Register);
             foreach (var instruction in proof.Handler)
+            {
+                var first = body.Instructions.Count;
                 GenerateInstructions(instruction, context, definition, locals, writeLine, constructorPairs, thisConstructorCalls, frameSlotLocals);
+                if (instruction.Destination is LocalVariable result && body.Instructions.Skip(first)
+                    .Any(i => i.OpCode.Code is CilCode.Stloc or CilCode.Stloc_S && ReferenceEquals(i.Operand, locals[result])))
+                    DefinedLocalRegisters(context).Add(result.Register);
+            }
             var handler = body.Instructions.Skip(start).ToList();
             while (body.Instructions.Count > start) body.Instructions.RemoveAt(start);
             if (handler.Count(i => i.OpCode.FlowControl == CilFlowControl.Call) == proof.Handler.Count(i => i.IsCall)
-                && !handler.Any(i => i.Operand is string diagnostic && diagnostic.Length > 0
+                && !handler.Any(i => ReferenceEquals(i.Operand, writeLine)
                     || i.OpCode.FlowControl is CilFlowControl.Branch or CilFlowControl.ConditionalBranch
                         or CilFlowControl.Return or CilFlowControl.Throw))
+            {
+                if (proof.Return is { } returned)
+                {
+                    GenerateInstructions(returned, context, definition, locals, writeLine, constructorPairs, thisConstructorCalls, frameSlotLocals);
+                    var continuation = body.Instructions.Skip(start).ToList();
+                    while (body.Instructions.Count > start) body.Instructions.RemoveAt(start);
+                    if (continuation.Count == 0 || continuation[^1].OpCode.Code != CilCode.Ret
+                        || continuation.Any(i => ReferenceEquals(i.Operand, writeLine))) continue;
+                    instructionMap[returned] = continuation;
+                }
                 catchHandlers[proof] = handler;
+            }
         }
         Analysis.ExceptionRegionRecovery.Apply(context, definition, instructionMap, catchHandlers);
 
@@ -11442,7 +11468,7 @@ public static class IlGenerator
         if (context.ParameterLocals.Contains(local))
             return context.Parameters.FirstOrDefault(p => p.ParameterName == local.Name);
 
-        if (local is { IsThis: false, IsReturn: false, IsMethodInfo: false, Type: { } localType }
+        if (local is { IsThis: false, IsReturn: false, IsMethodInfo: false, IsExceptionHandlerLocal: false, Type: { } localType }
             && context.ControlFlowGraph?.Instructions.All(instruction =>
                 !ReferenceEquals(instruction.Destination, local)) == true)
         {
