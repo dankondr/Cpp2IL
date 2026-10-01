@@ -8023,6 +8023,12 @@ public static class IlGenerator
             "System.Double" => factory.Double,
             _ => null
         };
+        // A boxed value whose type the slot can never hold makes the cast throw
+        // on every execution - that is no conversion, so the slot is defaulted.
+        if ((primitive != null || from.IsValueType) && !to.IsValueType
+            && to is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext)
+            && !CanHoldBoxed(to, from))
+            return false;
         if (primitive != null && !to.IsValueType
             && to is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext))
         {
@@ -8076,8 +8082,9 @@ public static class IlGenerator
 
         if (!from.IsValueType && to.IsValueType)
         {
-            // unbox.any on a ref struct is not legal IL either.
-            if (IsByRefLike(to))
+            // unbox.any on a ref struct is not legal IL either, nor is it a
+            // conversion when the source's type can never hold a boxed `to`.
+            if (IsByRefLike(to) || !CanHoldBoxed(from, to))
                 return false;
             if (!CanEmitTypeToken(to))
                 return true;
@@ -8330,6 +8337,12 @@ public static class IlGenerator
         // slot has no honest conversion - `box` would fabricate one the binary
         // never made, so the slot takes the diagnosed default instead.
         if (from.IsValueType && to is Analysis.BooleanClaimVetoedSlotTypeAnalysisContext)
+            return false;
+        // Mirrors EmitStackCoerce: box/unbox.any across types that can never
+        // hold each other is a guaranteed InvalidCastException, not a coercion.
+        if ((from.IsValueType || fromWidth > 0 || from.FullName is "System.Single" or "System.Double")
+                && !to.IsValueType && !CanHoldBoxed(to, from)
+            || !from.IsValueType && to.IsValueType && !CanHoldBoxed(from, to))
             return false;
         if (from.IsValueType && !to.IsValueType)
             // box, plus castclass when the reference target narrows - both need
@@ -9983,6 +9996,31 @@ public static class IlGenerator
         }
 
         return derivedType.InterfaceContexts.Any(@interface => IsAssignableToLoose(@interface, baseType));
+    }
+
+    // Can a reference of static type `reference` ever hold a boxed `value`? A boxed
+    // value type is only an Object, a ValueType, an Enum (when it is an enum) and the
+    // interfaces it implements; any other class or array makes box+castclass and
+    // unbox.any throw on every execution. Nullable<T> boxes to T or null, and a
+    // reference kind without a metadata definition (type parameter, boxed wrapper,
+    // injected or sentinel type) cannot be classified, so both stay permitted.
+    private static bool CanHoldBoxed(TypeAnalysisContext reference, TypeAnalysisContext value)
+    {
+        if (value is GenericInstanceTypeAnalysisContext { GenericType.FullName: "System.Nullable`1" }
+            || reference.FullName is "System.Object" or "System.ValueType")
+            return true;
+        if (reference.FullName == "System.Enum")
+            return value.IsEnumType;
+        var definition = reference is GenericInstanceTypeAnalysisContext instance ? instance.GenericType : reference;
+        if (reference is not (SzArrayTypeAnalysisContext or ArrayTypeAnalysisContext) && definition.Definition == null)
+            return true;
+        if (!reference.IsInterface)
+            return false;
+        // An implemented instantiation of the same generic interface may still
+        // match through variance, so only an unimplemented definition refuses.
+        return IsAssignableToLoose(value, reference)
+            || reference is GenericInstanceTypeAnalysisContext { GenericType: var interfaceDefinition }
+            && IsAssignableToLoose(value, interfaceDefinition);
     }
 
     // True when ToTypeSignature can produce a usable operand for box/unbox/castclass.
