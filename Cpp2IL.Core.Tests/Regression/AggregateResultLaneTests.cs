@@ -470,4 +470,36 @@ public class AggregateResultLaneTests
 
         Assert.That(ret.Operands, Has.Count.EqualTo(2));
     }
+
+    private static Instruction ReturnLaneZero(TypeAnalysisContext returnType)
+    {
+        // `float X(Transform t) => t.position.x` is `b Transform.get_position`: the caller's S0
+        // is the callee's x.
+        var vector3 = Vector3();
+        var callerType = CallerTypeWithField("pos", vector3, 0x80);
+        var getPosition = callerType.InjectMethodContext("GetPosition", vector3,
+            R.MethodAttributes.Public | R.MethodAttributes.Static);
+        var call = new Instruction(0x14, OpCode.Call, getPosition, Reg("V0"));
+        call.ImplicitDefinitions.AddRange([Reg("V1"), Reg("V2")]);
+        var ret = new Instruction(0x18, OpCode.Return, Reg("V0"));
+        DriveReturning(callerType, returnType, [call, ret]);
+        return ret;
+    }
+
+    [Test]
+    public void ScalarReturnOfAnAggregateCallResultReturnsItsFirstField()
+    {
+        var ret = ReturnLaneZero(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemSingleType);
+
+        Assert.That(ret.Operands[0], Is.InstanceOf<FieldReference>());
+        Assert.That(((FieldReference)ret.Operands[0]).Field.Name, Is.EqualTo("x"));
+    }
+
+    [Test]
+    public void ScalarReturnOfAnotherTypeKeepsTheCallResult()
+    {
+        var ret = ReturnLaneZero(Cpp2IlApi.CurrentAppContext!.SystemTypes.SystemInt32Type);
+
+        Assert.That(ret.Operands[0], Is.InstanceOf<LocalVariable>());
+    }
 }

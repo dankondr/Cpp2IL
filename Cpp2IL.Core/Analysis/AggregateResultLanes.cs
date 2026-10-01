@@ -146,6 +146,7 @@ internal static class AggregateResultLanes
         // the fields its bytes hold - before the projection loop below so the
         // operands still name their registers.
         var changed = RebuildAggregateReturns(method, resolver, pointerSize);
+        changed |= ProjectScalarReturns(method, resolver, pointerSize);
 
         if (provenLanes.Count == 0 && lateLanes.Count == 0 && entryLanes.Count == 0)
             return created || changed;
@@ -347,6 +348,37 @@ internal static class AggregateResultLanes
             }
         }
 
+        return changed;
+    }
+
+    // A method returning one scalar can hand back lane 0 of an aggregate call result as is:
+    // `float X(Transform t) => t.position.x` is `b Transform.get_position`, and the caller's S0
+    // is the callee's `x`. The value returned is that lane's field, not the whole aggregate.
+    private static bool ProjectScalarReturns(MethodAnalysisContext method, BaseCallingConventionResolver resolver,
+        int pointerSize)
+    {
+        if (method.IsVoid || resolver.ExtraLanes(method.ReturnType, resolver.ReturnRegister(method)).Count > 0)
+            return false;
+        var changed = false;
+        var instructions = method.ControlFlowGraph!.Instructions;
+        foreach (var ret in instructions.Where(i => i.OpCode == OpCode.Return))
+        {
+            if (ret.Operands is not [LocalVariable result]
+                || instructions.FirstOrDefault(i => ReferenceEquals(i.Destination, result)) is not
+                    { OpCode: OpCode.Call, Operands: [MethodAnalysisContext callee, ..] } call
+                || resolver.ReturnRegister(Concrete(call, callee, method)) is var laneZero
+                   && laneZero.Name != resolver.ReturnRegister(method).Name
+                || CallResultType(call, method) is not { IsValueType: true } aggregate
+                || resolver.ExtraLanes(aggregate, laneZero) is not { Count: > 0 } lanes
+                || MetadataResolver.FindInstanceFieldPathAtOffset(aggregate, 0, lanes[0].ByteOffset) is not { } path
+                || path.Field.FieldType.FullName != method.ReturnType.FullName
+                || TypeSizes.MinimumUnboxedSize(path.Field.FieldType, pointerSize) != lanes[0].ByteOffset
+                || instructions.Any(i => i != ret && i != call && DeadCodeEliminator.UsedLocals(i).Contains(result)))
+                continue;
+            result.Type = aggregate;
+            ret.SetOperand(0, new FieldReference(path.Field, result, 0, path.Containers, lanes[0].ByteOffset));
+            changed = true;
+        }
         return changed;
     }
 
