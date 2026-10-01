@@ -213,6 +213,10 @@ internal static class InlinedMemberRecovery
                         readOf = field.Containers[0];
                         suffix = field.Containers.Skip(1).Append(field.Field).ToList();
                     }
+                    // Only a static the caller cannot name was reached through an
+                    // inlined accessor; a nameable one is read as it stands.
+                    if (IlGenerator.FieldUsableFrom(readOf, context, requireToken: false))
+                        continue;
                     receiverOperand = null;
                 }
                 else
@@ -250,10 +254,16 @@ internal static class InlinedMemberRecovery
 
                 var getter = FindReturnedFieldAccessor(holderType, readOf, context,
                     staticAccess: receiverOperand == null);
-                if (getter == null)
+                // A method is never its own inlined accessor: that rewrite is a
+                // self-call. Instantiations share a definition, so compare that.
+                if (getter == null
+                    || receiverOperand == null && DefinitionOf(getter) == DefinitionOf(context))
                     continue;
 
-                var key = $"{getter.Name}|{receiverOperand}";
+                // The full name carries the holder and its instantiation:
+                // `Vector2.get_zero` and `Vector3.get_zero`, or `Gen<int>.Get`
+                // and `Gen<string>.Get`, never share a result.
+                var key = $"{getter.FullName}|{receiverOperand}";
                 if (!cached.TryGetValue(key, out var produced))
                 {
                     produced = FreshLocal(context, $"inl_{block.ID}_{index}_{i}",
@@ -927,6 +937,12 @@ internal static class InlinedMemberRecovery
 
     private static bool SameField(FieldAnalysisContext a, FieldAnalysisContext b) =>
         FieldKey.Of(a) == FieldKey.Of(b);
+
+    private static object DefinitionOf(MethodAnalysisContext method)
+    {
+        var open = (method as ConcreteGenericMethodAnalysisContext)?.BaseMethodContext ?? method;
+        return (object?)open.Definition ?? open;
+    }
 
     private static LocalVariable FreshLocal(MethodAnalysisContext method, string name,
         TypeAnalysisContext? type)
