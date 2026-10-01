@@ -356,10 +356,11 @@ public class PackedRegisterFieldTests
 
         var slot = new LocalVariable("slot", new Register(null, "X8"), outer);
         var result = Local("result", app.SystemTypes.SystemBooleanType);
-        var check = new Instruction(0, OpCode.CheckEqual, result,
+        var fill = new Instruction(0, OpCode.Move, slot, new Immediate(0));
+        var check = new Instruction(1, OpCode.CheckEqual, result,
             new FieldReference(task, slot, 0), new Immediate(0));
         var (caller, method) = ForeignCaller(app, module,
-            [check, new Instruction(1, OpCode.Return)], [slot, result]);
+            [fill, check, new Instruction(2, OpCode.Return)], [slot, result]);
 
         LocalVariables.ResolveTypesAndFields(caller);
         // The restamp a later pass performs on the same local.
@@ -406,6 +407,50 @@ public class PackedRegisterFieldTests
         IlGenerator.GenerateIl(caller, method);
         Assert.That(method.CilMethodBody!.Instructions.Any(i => i.OpCode == CilOpCodes.Ldflda),
             Is.True, () => "the writable-address hop reaches the emitted body:\n" + Dump(method));
+    }
+
+    [Test]
+    public void FieldReadOnRestampedPrimitiveSlotStaysDiagnosed()
+    {
+        // `Move i32dest, v` whole-reads the low four bytes of an 8-byte struct
+        // - the Single field at offset 0. The root local is defined by an
+        // arithmetic op, so its emitted slot is not provable early; a later
+        // inference restamps the register guess to `System.Single`, on which
+        // `ldfld` cannot be spelled - the emitter would substitute `ldc.r4 0`
+        // where control read `ldloc; conv.i4`. The read must stay the register
+        // operand in both passes.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var pack = InjectStruct(app, "FloatPack");
+        InjectField("m_value", app.SystemTypes.SystemSingleType, pack, 0);
+        InjectField("pad", app.SystemTypes.SystemInt32Type, pack, 4);
+        var module = new ModuleDefinition("Packed.dll");
+        Seed(module, app, pack);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemSingleType,
+            app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemBooleanType,
+            app.SystemTypes.SystemVoidType);
+
+        var slot = new LocalVariable("slot", new Register(null, "X8"), pack);
+        var operand = new LocalVariable("operand", new Register(null, "X9"), pack);
+        var dest = Local("dest", app.SystemTypes.SystemInt32Type);
+        var sub = new Instruction(0, OpCode.Subtract, slot, operand, new Immediate(1));
+        var move = new Instruction(1, OpCode.Move, dest, slot);
+        var (caller, method) = ForeignCaller(app, module,
+            [sub, move, new Instruction(2, OpCode.Return)], [slot, operand, dest]);
+
+        LocalVariables.ResolveTypesAndFields(caller);
+        Assert.That(move.Operands[1], Is.SameAs(slot),
+            "an unprovable arithmetic root keeps its register read until its slot type settles");
+
+        // The restamp a later inference performs on the same register local.
+        slot.Type = app.SystemTypes.SystemSingleType;
+        PackedRegisterFields.Run(caller, finalPass: true);
+
+        Assert.That(move.Operands[1], Is.TypeOf<FieldReference>()
+                .And.Matches((FieldReference? reference) =>
+                    reference is { Field.FieldType: var fieldType }
+                        && reference.Local == slot
+                        && fieldType == app.SystemTypes.SystemSingleType),
+            "the final pass may only read through the slot's own settled layout");
     }
 
     [Test]

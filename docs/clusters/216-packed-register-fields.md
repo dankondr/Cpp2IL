@@ -35,14 +35,19 @@ shifts and extends those registers where IL reads fields.
   selections; `TypeAddressedLocals` gives stack locals their type late).
 - A container hop (`v.outer.inner`) emits `ldflda` on the root local, which
   verifies only when that local emits an address of the container's declaring
-  struct. The emitted type is provable early for `this`, parameters and
-  locals defined only by non-void calls (`ProvenContainerReceiver`, the same
-  derivation `CallDefinedLocalType` makes); a register-reuse guess a later
-  pass could restamp waits for the post-SSA pass where `EmittedLocalType` is
-  settled, and a mismatch stays diagnosed rather than emitting unverifiable
-  IL. A local whose register was reused by a pointer-producing call is not a
-  struct carrier: the whole method is skipped when operand and pointer slot
-  locals overlap, and pointer-typed leaves are never projected.
+  struct; a leaf hop emits `ldfld`, which additionally rides a reference slot
+  through `unbox` but never a primitive or mismatched-struct slot. The emitted
+  type is provable early for `this`, parameters and locals defined only by
+  non-void calls (`ProvenContainerReceiver`, the same derivation
+  `CallDefinedLocalType` makes) or stamped and never written again (a local
+  with no definitions); an arithmetic result or a register-reuse guess a
+  later pass could restamp waits for the post-SSA pass where
+  `EmittedLocalType` is settled, and a slot restamped to a primitive or a
+  different struct keeps the register read diagnosed rather than emitting
+  `ldfld` where the emitter must substitute a synthetic default. A local
+  whose register was reused by a pointer-producing call is not a struct
+  carrier: the whole method is skipped when operand and pointer slot locals
+  overlap, and pointer-typed leaves are never projected.
 
 ## Emission boundaries (other lanes)
 
@@ -64,5 +69,7 @@ tuple's high lane, `Vector2Int.y` (`ASR #32`) indexing `T[,]` through `Get`, a
 partial-byte mask staying diagnosed, a top-half mask on a signed lane, a
 low mask read into destinations of matching and wider width, an awaiter
 chain whose root local's type is restamped after the early pass staying
-diagnosed until the final pass projects it, and a pointer-typed local
-keeping every read in its method diagnosed.
+diagnosed until the final pass projects it, a whole-read of a
+`Single`-carrying field on an arithmetic-defined root staying the register
+operand until the slot settles (`FieldReadOnRestampedPrimitiveSlotStaysDiagnosed`),
+and a pointer-typed local keeping every read in its method diagnosed.

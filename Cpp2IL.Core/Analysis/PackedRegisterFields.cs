@@ -638,16 +638,24 @@ internal static class PackedRegisterFields
         };
         if (projected == null)
             return null;
-        if (projected.Containers.Count > 0
-            && projected.Containers[0].DeclaringType is { IsValueType: true } containerOwner)
+        var rootDeclaring = (projected.Containers.Count > 0
+                ? projected.Containers[0].DeclaringType
+                : projected.Field.DeclaringType)
+            is { IsValueType: true } declaring ? declaring : null;
+        if (rootDeclaring != null)
         {
-            // A container hop emits `ldflda` on the root local: that verifies
-            // only when the slot emits an address of the container's declaring
-            // struct - `ldloca`/`ldarga`/`&` receivers. An object-emitting local
-            // yields a readonly unbox result instead, and `ldflda` on it does
-            // not verify. The emitted type is provable early for signature and
-            // call-defined slots; a register-reuse guess a later pass can
-            // restamp waits for the final pass where it is settled.
+            // The emitted operand roots at the local's own slot: `ldflda` for a
+            // container hop, `ldfld` for a leaf. A container's writable address
+            // verifies only on an address-emitting slot of the container's
+            // declaring struct (`ldloca`/`ldarga`/`&` receivers - an
+            // object-emitting local yields a readonly unbox result instead).
+            // A leaf read can additionally ride a reference-typed slot through
+            // `unbox`, but never a primitive or mismatched-struct slot: a
+            // register-reuse guess (`Single`, `Int64`) that outlives the
+            // struct typing cannot spell `ldfld` at all. The emitted type is
+            // provable early for signature and call-defined slots; a
+            // register-reuse guess a later pass can restamp waits for the
+            // final pass where it is settled.
             var receiver = ProvenContainerReceiver(projected.Local, method);
             if (receiver == null)
             {
@@ -657,8 +665,11 @@ internal static class PackedRegisterFields
                     is ByRefTypeAnalysisContext byRef ? byRef.ElementType
                     : IlGenerator.EmittedLocalType(projected.Local, method);
             }
-            if (receiver is not { IsValueType: true }
-                || !SameStruct(receiver, containerOwner))
+            if (projected.Containers.Count > 0
+                    ? receiver is not { IsValueType: true }
+                        || !SameStruct(receiver, rootDeclaring)
+                    : receiver is { IsValueType: true }
+                        && !SameStruct(receiver, rootDeclaring))
                 return null;
         }
         if (MetadataResolver.MemberPathUnspellable((projected.Field, projected.Containers),
@@ -787,7 +798,10 @@ internal static class PackedRegisterFields
             produced = returnType;
             found = true;
         }
-        return found ? produced : null;
+        // A local nothing defines (a register parameter is the common case)
+        // keeps the type it was stamped: no inference step writes it, so no
+        // later pass can restamp it either.
+        return found ? produced : local.Type;
     }
 
     // Structural type identity, mirroring IlGenerator.SameTypeIdentity: context
