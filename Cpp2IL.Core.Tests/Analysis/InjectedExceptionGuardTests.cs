@@ -53,6 +53,67 @@ public class InjectedExceptionGuardTests
         Assert.That(Matches("System.NullReferenceException", element, call), Is.True);
     }
 
+    // A constructor result is never null, so a null check on it is constant and
+    // the branch into the throw is dead even when the throw's provenance is
+    // undecidable (e.g. a shared helper flagged ThrowFromNonReturningCall).
+    [Test]
+    public void NullCheckOnFreshAllocationIsFolded()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, []);
+        var allocated = Local("allocated");
+        var flag = Local("flag");
+        var result = Local("result");
+        var throwInstruction = new Instruction(5, OpCode.Throw);
+        method.ControlFlowGraph = new([
+            new Instruction(0, OpCode.Newobj, allocated, app.SystemTypes.SystemObjectType),
+            new Instruction(1, OpCode.CheckEqual, flag, allocated, new Immediate(0)),
+            new Instruction(2, OpCode.ConditionalJump, throwInstruction, flag),
+            new Instruction(3, OpCode.Move, result, new Immediate(1)),
+            new Instruction(4, OpCode.Return, result),
+            throwInstruction,
+        ]);
+
+        InjectedCheckRemover.Run(method.ControlFlowGraph);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(method.ControlFlowGraph.Instructions.Any(instruction => instruction.OpCode == OpCode.Throw), Is.False);
+            Assert.That(method.ControlFlowGraph.Instructions.Any(instruction => instruction.OpCode == OpCode.ConditionalJump), Is.False);
+            Assert.That(method.ControlFlowGraph.Instructions.Any(instruction => instruction.OpCode == OpCode.Newobj), Is.True);
+            Assert.That(method.ControlFlowGraph.Instructions.Any(instruction => instruction.OpCode == OpCode.Return), Is.True);
+        });
+    }
+
+    // Without the allocation proof the same shape is undecidable for this pass
+    // and must be left for the check-removal analysis.
+    [Test]
+    public void NullCheckWithoutAllocationIsNotFolded()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, []);
+        var flag = Local("flag");
+        var result = Local("result");
+        var throwInstruction = new Instruction(4, OpCode.Throw);
+        method.ControlFlowGraph = new([
+            new Instruction(0, OpCode.CheckEqual, flag, Local("mystery"), new Immediate(0)),
+            new Instruction(1, OpCode.ConditionalJump, throwInstruction, flag),
+            new Instruction(2, OpCode.Move, result, new Immediate(1)),
+            new Instruction(3, OpCode.Return, result),
+            throwInstruction,
+        ]);
+
+        InjectedCheckRemover.Run(method.ControlFlowGraph);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(method.ControlFlowGraph.Instructions.Any(instruction => instruction.OpCode == OpCode.Throw), Is.True);
+            Assert.That(method.ControlFlowGraph.Instructions.Any(instruction => instruction.OpCode == OpCode.ConditionalJump), Is.True);
+        });
+    }
+
     private static bool Matches(string exception, IOperand checkedValue, Instruction implicitFailure,
         Instruction? setup = null)
     {

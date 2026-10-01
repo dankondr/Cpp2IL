@@ -27,13 +27,31 @@ public static class InjectedCheckRemover
             if (terminator.OpCode != OpCode.ConditionalJump)
                 continue;
 
-            if (terminator.Operands[0] is not Block target || GetInjectedThrowType(target) is not { } thrownType)
+            if (terminator.Operands[0] is not Block target)
+                continue;
+
+            // A null check on a just-allocated reference is provably constant:
+            // fold the guard itself so its impossible edge dies with the block
+            // it targeted, whatever the target holds.
+            if (terminator.Operands[1] is LocalVariable guarded
+                && defOf.TryGetValue(guarded, out var guardCheck)
+                && AllocatedNullCheckValue(guardCheck, defOf) is { } folded
+                && DropImpossibleEdge(block, terminator, target, cfg, folded))
+            {
+                removedAny = true;
+                continue;
+            }
+
+            var thrownType = GetInjectedThrowType(target);
+            if (thrownType == null)
                 continue;
 
             if (terminator.Operands[1] is not LocalVariable condition
                 || !defOf.TryGetValue(condition, out var definition)
                 || !IsInjectedCheck(definition, thrownType))
+            {
                 continue;
+            }
 
             terminator.OpCode = OpCode.Nop;
             terminator.SetOperands();
@@ -50,6 +68,48 @@ public static class InjectedCheckRemover
         // delete any throw blocks
         cfg.RemoveUnreachableBlocks();
         DeadCodeEliminator.Run(cfg);
+    }
+
+    // A constructor result is never null, so `allocated == null` folds to false
+    // and `allocated != null` to true. Returns the constant the check evaluates
+    // to, or null when the checked value is not provably a fresh allocation.
+    private static long? AllocatedNullCheckValue(Instruction check,
+        Dictionary<LocalVariable, Instruction> definitions)
+    {
+        if (check.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual))
+            return null;
+
+        var operand = check.Operands[1] is Immediate { Value: 0 } ? check.Operands[2]
+            : check.Operands[2] is Immediate { Value: 0 } ? check.Operands[1] : null;
+        if (operand is not LocalVariable local)
+            return null;
+
+        local = ResolveLocal(local, definitions);
+        if (local == null || !definitions.TryGetValue(local, out var definition)
+            || definition.OpCode != OpCode.Newobj)
+            return null;
+
+        return check.OpCode == OpCode.CheckEqual ? 0L : 1L;
+    }
+
+    // Removes the edge a constant-folded branch can never take and nops the
+    // terminator. Returns false when the surviving layout is ambiguous.
+    private static bool DropImpossibleEdge(Block block, Instruction terminator, Block target,
+        ISILControlFlowGraph cfg, long foldedValue)
+    {
+        var dead = foldedValue != 0
+            ? block.Successors.FirstOrDefault(successor => successor != target && successor != cfg.ExitBlock)
+            : target;
+        if (dead == null)
+            return false;
+
+        terminator.OpCode = OpCode.Nop;
+        terminator.SetOperands();
+
+        block.Successors.Remove(dead);
+        dead.Predecessors.Remove(block);
+        block.CalculateBlockType();
+        return true;
     }
 
     private static bool IsInjectedCheck(Instruction definition, string thrownType) =>
@@ -280,9 +340,9 @@ public static class InjectedCheckRemover
                 case OpCode.Return when thrown != null:
                     continue;
 
-                case OpCode.Throw when thrown == null
-                    && !instruction.ThrowFromNonReturningCall
-                    && instruction.Operands is [TypeAnalysisContext { FullName: "System.NullReferenceException" or "System.IndexOutOfRangeException" } exception]:
+                case OpCode.Throw when !instruction.ThrowFromNonReturningCall
+                    && instruction.Operands is [TypeAnalysisContext { FullName: "System.NullReferenceException" or "System.IndexOutOfRangeException" } exception]
+                    && (thrown == null || thrown == exception.FullName):
                     thrown = exception.FullName;
                     continue;
 

@@ -724,6 +724,11 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         ConstantBranchFolder.Run(this);
 
+        // Canonicalize `x ?? (x = v)` cache-store merges to a single post-join
+        // read so the guarded block stays a bare store, the shape ILSpy's
+        // cached-`??` transforms fold.
+        CoalesceStoreRecovery.Run(this);
+
         // Near-last, as it depends on the final block layout
         EqualityBranchInverter.Run(this);
 
