@@ -21,10 +21,11 @@ namespace Cpp2IL.Core.InstructionSets;
 /// A lane-wise op folds into scalar ISIL on those operands only when every
 /// consumed window of every vector input is proven; wraparound, lane width and
 /// signedness are preserved because each emitted op carries the lane's real
-/// bit width. Permutes, sub-32-bit element writes, wide loads and opaque or
-/// unsupported vector ops leave the corresponding windows unproven.
-/// Provenance resets at branch targets since a merge may join paths that
-/// built the register differently, and at an unproven consumption the pass
+/// bit width. Opaque or unsupported vector ops leave the corresponding
+/// windows unproven. At a branch target the incoming edges merge window by
+/// window — a window survives only when every converted predecessor proves
+/// it, materialized into its canonical element register, while a backward
+/// edge leaves everything unproven. At an unproven consumption the pass
 /// emits an explicit NotImplemented diagnostic instead of guessing.
 ///
 /// Whole-vector loads (LDR/LDUR/LDP of V registers) are dual provenance: the
@@ -58,6 +59,13 @@ internal sealed class Arm64VectorScalarizer
         /// write. Lets a full-width store fall back to the register read.
         /// </summary>
         public bool Whole;
+
+        public VectorState Clone()
+        {
+            var clone = new VectorState { Whole = Whole };
+            Array.Copy(Slots, clone.Slots, Slots.Length);
+            return clone;
+        }
     }
 
     private readonly Dictionary<string, VectorState> _vectors = new();
@@ -66,6 +74,21 @@ internal sealed class Arm64VectorScalarizer
     private readonly HashSet<string> _claimedDests = new();
     private int _tempCounter;
     private bool _clearProvenanceNext;
+
+    /// <summary>Branch instruction addresses that target each merge point.</summary>
+    private readonly Dictionary<ulong, List<ulong>> _mergePreds = new();
+
+    /// <summary>Merge targets also reached by falling through from the previous instruction.</summary>
+    private readonly HashSet<ulong> _mergeFallThrough = new();
+
+    /// <summary>
+    /// Lane state snapshot taken at a branch instruction — the value one
+    /// incoming edge hands to the merge its target reaches.
+    /// </summary>
+    private readonly Dictionary<ulong, Dictionary<string, VectorState>> _edgeExit = new();
+
+    /// <summary>Address of the previously converted instruction.</summary>
+    private ulong _prevAddress;
 
     private Func<ulong, OpCode, List<IOperand>, Instruction> _add = null!;
     private ulong _address;
@@ -134,62 +157,217 @@ internal sealed class Arm64VectorScalarizer
     private static Register ElementRegister(string vectorName, int laneBits, int index)
         => new(null, $"{vectorName}.{ElementLetter(laneBits)}{index}");
 
+    private static bool IsBranch(Arm64Mnemonic mnemonic) => mnemonic is
+        Arm64Mnemonic.B or Arm64Mnemonic.BC
+        or Arm64Mnemonic.CBZ or Arm64Mnemonic.CBNZ
+        or Arm64Mnemonic.TBZ or Arm64Mnemonic.TBNZ;
+
+    /// <summary>Whether the instruction passes control to the next one in address order.</summary>
+    private static bool FallsThrough(Arm64Instruction insn) => insn.Mnemonic is not
+        (Arm64Mnemonic.B or Arm64Mnemonic.BR
+            or Arm64Mnemonic.RET or Arm64Mnemonic.RETAA or Arm64Mnemonic.RETAB);
+
     /// <summary>
     /// Called once per method before conversion. Records every intra-method
-    /// branch target so provenance can be dropped where control flow merges.
+    /// branch target so lane provenance can be merged there window by window,
+    /// and remembers which branch instructions feed each target.
     /// </summary>
     public void Begin(IReadOnlyList<Arm64Instruction> instructions)
     {
         _vectors.Clear();
         _shiftTemps.Clear();
         _mergeTargets.Clear();
+        _mergePreds.Clear();
+        _mergeFallThrough.Clear();
+        _edgeExit.Clear();
         _claimedDests.Clear();
         _tempCounter = 0;
         _clearProvenanceNext = false;
+        _prevAddress = 0;
 
         foreach (var insn in instructions)
         {
-            switch (insn.Mnemonic)
+            ulong? target = insn.Mnemonic switch
             {
-                case Arm64Mnemonic.B:
-                    _mergeTargets.Add(insn.BranchTarget);
-                    break;
-                case Arm64Mnemonic.BC:
-                    _mergeTargets.Add(insn.Op0PcRelImm);
-                    break;
-                case Arm64Mnemonic.CBZ or Arm64Mnemonic.CBNZ:
-                    _mergeTargets.Add((ulong)((long)insn.Address + insn.Op1Imm));
-                    break;
-                case Arm64Mnemonic.TBZ or Arm64Mnemonic.TBNZ:
-                    _mergeTargets.Add((ulong)((long)insn.Address + insn.Op2Imm));
-                    break;
-            }
+                Arm64Mnemonic.B => insn.BranchTarget,
+                Arm64Mnemonic.BC => insn.Op0PcRelImm,
+                Arm64Mnemonic.CBZ or Arm64Mnemonic.CBNZ => (ulong)((long)insn.Address + insn.Op1Imm),
+                Arm64Mnemonic.TBZ or Arm64Mnemonic.TBNZ => (ulong)((long)insn.Address + insn.Op2Imm),
+                _ => null
+            };
+            if (target is not { } t)
+                continue;
+            _mergeTargets.Add(t);
+            if (!_mergePreds.TryGetValue(t, out var preds))
+                _mergePreds[t] = preds = [];
+            preds.Add(insn.Address);
         }
+
+        for (var i = 1; i < instructions.Count; i++)
+            if (_mergeTargets.Contains(instructions[i].Address) && FallsThrough(instructions[i - 1]))
+                _mergeFallThrough.Add(instructions[i].Address);
     }
 
     /// <summary>
-    /// Called before each instruction is converted. A branch target may be
-    /// reached by a path that built each vector differently, so all lane state
-    /// is dropped there; the same applies after any control-flow instruction
-    /// whose effect on registers cannot be tracked (calls clobber V0-V7 and
-    /// V16-V31, indirect jumps cannot be enumerated).
+    /// Called before each instruction is converted. At a branch target the
+    /// incoming edges are merged window by window: every proven window is
+    /// materialized into its canonical element register on the edges that need
+    /// it, and a window survives only when every converted predecessor proves
+    /// it — an edge from a not-yet-converted (backward) branch leaves it
+    /// unproven. The same applies after any control-flow instruction whose
+    /// effect on registers cannot be tracked (calls clobber V0-V7 and V16-V31,
+    /// indirect jumps cannot be enumerated). At a branch instruction every
+    /// proven window is first canonicalized so the edge carries element locals.
     /// </summary>
-    public void BeginInstruction(ulong address)
+    public void BeginInstruction(Arm64Instruction insn,
+        Func<ulong, OpCode, List<IOperand>, Instruction> add)
     {
         _claimedDests.Clear();
         // A cached shift names its source by register, not by value: once the next
         // instruction may have redefined that register, the temporary holds the high
         // half of the old value. It is only reused within one instruction.
         _shiftTemps.Clear();
-        if (_mergeTargets.Contains(address) || _clearProvenanceNext)
+        _add = add;
+        // merge-edge materializations are stamped with the predecessor's
+        // address so a branch's target lookup never lands on them
+        _address = _prevAddress;
+        if (_clearProvenanceNext)
         {
             _vectors.Clear();
             _clearProvenanceNext = false;
         }
+        if (_mergeTargets.Contains(insn.Address))
+            MergeLanesAt(insn.Address);
+        if (IsBranch(insn.Mnemonic))
+        {
+            CanonicalizeLanes();
+            var exit = new Dictionary<string, VectorState>(_vectors.Count);
+            foreach (var (name, state) in _vectors)
+                exit[name] = state.Clone();
+            _edgeExit[insn.Address] = exit;
+        }
+        _prevAddress = insn.Address;
+    }
+
+    /// <summary>The register a window's value must live in to cross a control-flow edge.</summary>
+    private static Register CanonicalSlot(string name, int slot) => ElementRegister(name, 32, slot);
+
+    private static bool IsCanonical(string name, int slot, LaneSlice slice)
+        => slice.BitOffset == 0
+            && slice.Operand is Register { Name: var operandName }
+            && operandName == CanonicalSlot(name, slot).Name;
+
+    /// <summary>
+    /// On a control-flow edge every proven window is materialized into its
+    /// canonical element register: after this, a merge can name the window
+    /// identically no matter which edge produced it, and SSA merges the element
+    /// registers like any scalar.
+    /// </summary>
+    private void CanonicalizeLanes()
+    {
+        foreach (var (name, state) in _vectors)
+            for (var slot = 0; slot < 4; slot++)
+            {
+                if (state.Slots[slot] is not { } slice || IsCanonical(name, slot, slice))
+                    continue;
+                if (SlotOperand(state, slot) is { } value)
+                {
+                    _add(_address, OpCode.Move, [CanonicalSlot(name, slot), value])
+                        .NativeIntegerWidthBits = 32;
+                    _emitted = true;
+                    state.Slots[slot] = new LaneSlice(CanonicalSlot(name, slot), 0);
+                }
+                else
+                    state.Slots[slot] = null;
+            }
     }
 
     /// <summary>
-    /// Attempt to emit scalar equivalents for <paramref name="insn"/>. Returns
+    /// Meets the incoming edges of a branch target window by window. A window
+    /// that every predecessor proves becomes the canonical element register —
+    /// written on the fall-through edge here if that path does not already
+    /// carry it, already canonical on branch edges (their ends canonicalize).
+    /// A predecessor that has not been converted yet — a backward edge — makes
+    /// every window unproven: nothing is guessed.
+    /// </summary>
+    private void MergeLanesAt(ulong target)
+    {
+        var fallThrough = _mergeFallThrough.Contains(target) ? _vectors : null;
+        List<Dictionary<string, VectorState>>? branchEdges = null;
+        var backwardEdge = false;
+        if (_mergePreds.TryGetValue(target, out var predAddresses))
+        {
+            branchEdges = new(predAddresses.Count);
+            foreach (var pred in predAddresses)
+            {
+                if (_edgeExit.TryGetValue(pred, out var exit))
+                    branchEdges.Add(exit);
+                else
+                    backwardEdge = true;
+            }
+        }
+
+        var merged = new Dictionary<string, VectorState>();
+        var names = new HashSet<string>();
+        if (fallThrough != null)
+            names.UnionWith(fallThrough.Keys);
+        if (branchEdges != null)
+            foreach (var edge in branchEdges)
+                names.UnionWith(edge.Keys);
+
+        if (backwardEdge)
+        {
+            // A predecessor that has not converted yet (a loop back-edge)
+            // carries lane values this pass never saw: keep each name tracked
+            // with every window unproven so a later lane consumer diagnoses
+            // instead of reading element locals no edge materialized.
+            foreach (var name in names)
+                merged[name] = new VectorState();
+        }
+        else
+        {
+
+            foreach (var name in names)
+            {
+                var state = new VectorState();
+                for (var slot = 0; slot < 4; slot++)
+                {
+                    var proven = fallThrough == null
+                        || fallThrough.TryGetValue(name, out var live) && live.Slots[slot] != null;
+                    if (proven && branchEdges != null)
+                        foreach (var edge in branchEdges)
+                            proven &= edge.TryGetValue(name, out var exit) && exit.Slots[slot] != null;
+                    if (!proven)
+                        continue;
+
+                    var canonical = CanonicalSlot(name, slot);
+                    if (fallThrough != null
+                        && fallThrough.TryGetValue(name, out var liveState)
+                        && liveState.Slots[slot] is { } liveSlice
+                        && !IsCanonical(name, slot, liveSlice)
+                        && SlotOperand(liveState, slot) is { } value)
+                        _add(_address, OpCode.Move, [canonical, value])
+                            .NativeIntegerWidthBits = 32;
+                    state.Slots[slot] = new LaneSlice(canonical, 0);
+                }
+                var whole = fallThrough == null
+                    || (fallThrough.TryGetValue(name, out var wholeState) && wholeState.Whole);
+                if (whole && branchEdges != null)
+                    foreach (var edge in branchEdges)
+                        whole &= edge.TryGetValue(name, out var exit) && exit.Whole;
+                state.Whole = whole;
+                // a name live on any edge stays tracked even when no window is
+                // proven: a lane consumer must diagnose rather than read an
+                // element local no edge materialized
+                merged[name] = state;
+            }
+        }
+
+        _vectors.Clear();
+        foreach (var (name, state) in merged)
+            _vectors[name] = state;
+    }
+
     /// true when the instruction was fully handled — folded to lane ops or
     /// reported via an explicit diagnostic — and false when the caller should
     /// run its normal lowering path.
@@ -280,11 +458,15 @@ internal sealed class Arm64VectorScalarizer
 
         if (ScalarWholeRegisterWrite(insn, out var writtenBits))
         {
-            var state = Ensure(insn.Op0Reg);
-            for (var i = 0; i < 4; i++)
-                state.Slots[i] = 32 * i < writtenBits ? new LaneSlice(Reg(insn.Op0Reg), 32 * i) : new LaneSlice(Zero, 0);
-            state.Whole = false; // the local now holds only the narrow scalar
-
+            // plainly offset-addressed narrow loads also materialize each
+            // covered 32-bit window as its own element local — a D load into a
+            // two-float location then reads or stores its fields one per lane
+            // instead of shifting the register local.
+            var windowed = insn.Mnemonic is Arm64Mnemonic.LDR or Arm64Mnemonic.LDUR or Arm64Mnemonic.LDP
+                && insn.MemIndexMode == Arm64MemoryIndexMode.Offset
+                && insn.MemAddendReg == Arm64Register.INVALID
+                && insn.MemBase != Arm64Register.INVALID;
+            RecordScalarWrite(insn, insn.Op0Reg, insn.MemOffset, writtenBits, windowed);
             // the second destination of a paired load (LDP S/D) follows the
             // same narrow-write rule as Op0 — otherwise its state goes stale
             if (insn.Mnemonic == Arm64Mnemonic.LDP
@@ -293,12 +475,7 @@ internal sealed class Arm64VectorScalarizer
             {
                 var secondBits = RegisterBytes(insn.Op1Reg) * 8;
                 if (secondBits > 0)
-                {
-                    var second = Ensure(insn.Op1Reg);
-                    for (var i = 0; i < 4; i++)
-                        second.Slots[i] = 32 * i < secondBits ? new LaneSlice(Reg(insn.Op1Reg), 32 * i) : new LaneSlice(Zero, 0);
-                    second.Whole = false;
-                }
+                    RecordScalarWrite(insn, insn.Op1Reg, insn.MemOffset + RegisterBytes(insn.Op0Reg), secondBits, windowed);
             }
             return;
         }
@@ -376,6 +553,40 @@ internal sealed class Arm64VectorScalarizer
             state.Slots[i] = new LaneSlice(laneReg, 0);
         }
         state.Whole = true; // the caller's normal-path Move materialized Vn too
+    }
+
+    /// <summary>
+    /// Records a narrow scalar write: the written windows are covered by the
+    /// register local, and the rest of the vector is zeroed. For a plainly
+    /// offset-addressed load each covered window also materializes as its own
+    /// element local — provenance a lane consumer can read without slicing the
+    /// register local.
+    /// </summary>
+    private void RecordScalarWrite(Arm64Instruction insn, Arm64Register reg, long offset, int writtenBits, bool windowed)
+    {
+        var state = Ensure(reg);
+        var name = Normalize(reg);
+        for (var i = 0; i < 4; i++)
+        {
+            if (32 * i >= writtenBits)
+            {
+                state.Slots[i] = new LaneSlice(Zero, 0);
+                continue;
+            }
+            if (!windowed)
+            {
+                state.Slots[i] = new LaneSlice(Reg(reg), 32 * i);
+                continue;
+            }
+            var laneReg = ElementRegister(name, 32, i);
+            IOperand mem = insn.MemBase == Arm64Register.X31
+                ? new StackOffset((int)(offset + 4 * i))
+                : new MemoryOperand(Reg(insn.MemBase), addend: offset + 4 * i, accessSize: 4);
+            _add(_address, OpCode.Move, [laneReg, mem]).NativeMemoryAccessSize = 4;
+            _emitted = true;
+            state.Slots[i] = new LaneSlice(laneReg, 0);
+        }
+        state.Whole = false; // the local now holds only the narrow scalar
     }
 
     private void Diagnostic(string message)
@@ -1073,6 +1284,56 @@ internal sealed class Arm64VectorScalarizer
                     && insn.Op0Arrangement != Arm64ArrangementSpecifier.None
                     && insn.Op0Arrangement == insn.Op1Arrangement:
                 return LowerConvert(insn);
+
+            case Arm64Mnemonic.EXT
+                when insn.Op0Kind == Arm64OperandKind.Register
+                    && insn.Op1Kind == Arm64OperandKind.Register
+                    && insn.Op2Kind == Arm64OperandKind.Register
+                    && insn.Op3Kind == Arm64OperandKind.Immediate
+                    && IsVectorRegister(insn.Op0Reg)
+                    && insn.Op0Arrangement != Arm64ArrangementSpecifier.None:
+                return LowerExt(insn);
+
+            case Arm64Mnemonic.ZIP1 or Arm64Mnemonic.ZIP2
+                or Arm64Mnemonic.UZP1 or Arm64Mnemonic.UZP2
+                or Arm64Mnemonic.TRN1 or Arm64Mnemonic.TRN2
+                when insn.Op0Kind == Arm64OperandKind.Register
+                    && insn.Op1Kind == Arm64OperandKind.Register
+                    && insn.Op2Kind == Arm64OperandKind.Register
+                    && IsVectorRegister(insn.Op0Reg)
+                    && insn.Op0Arrangement != Arm64ArrangementSpecifier.None:
+                return LowerPermute(insn);
+
+            case Arm64Mnemonic.REV64
+                when insn.Op0Kind == Arm64OperandKind.Register
+                    && insn.Op1Kind == Arm64OperandKind.Register
+                    && IsVectorRegister(insn.Op0Reg)
+                    && insn.Op0Arrangement != Arm64ArrangementSpecifier.None:
+                return LowerPermute(insn);
+
+            case Arm64Mnemonic.LD1R
+                when insn.Op0Kind == Arm64OperandKind.Register
+                    && insn.Op1Kind == Arm64OperandKind.Memory
+                    && insn.MemIndexMode == Arm64MemoryIndexMode.Offset
+                    && insn.MemAddendReg == Arm64Register.INVALID
+                    && insn.MemBase != Arm64Register.INVALID:
+                return LowerReplicateLoad(insn);
+
+            case Arm64Mnemonic.LD1
+                when insn.Op0Kind == Arm64OperandKind.VectorRegisterElement
+                    && insn.Op1Kind == Arm64OperandKind.Memory
+                    && insn.MemIndexMode == Arm64MemoryIndexMode.Offset
+                    && insn.MemAddendReg == Arm64Register.INVALID
+                    && insn.MemBase != Arm64Register.INVALID:
+                return LowerElementLoad(insn);
+
+            case Arm64Mnemonic.LD1
+                when insn.Op0Kind == Arm64OperandKind.Register
+                    && insn.Op0Arrangement != Arm64ArrangementSpecifier.None
+                    && insn.MemIndexMode == Arm64MemoryIndexMode.Offset
+                    && insn.MemAddendReg == Arm64Register.INVALID
+                    && insn.MemBase != Arm64Register.INVALID:
+                return LowerStructureLoad(insn);
 
             case Arm64Mnemonic.ST1
                 when insn.Op0Kind == Arm64OperandKind.VectorRegisterElement
@@ -2633,6 +2894,298 @@ internal sealed class Arm64VectorScalarizer
             ? new StackOffset((int)insn.MemOffset)
             : new MemoryOperand(Reg(insn.MemBase), addend: insn.MemOffset, accessSize: bytes);
         _add(_address, OpCode.Move, [mem, op]).NativeMemoryAccessSize = bytes;
+        _emitted = true;
+        return true;
+    }
+
+    /// <summary>
+    /// A 32-bit window of a register, for permute sources: the proven slice
+    /// when the register is lane-tracked, an extraction from the whole-register
+    /// local when only the whole vector is materialized, else null.
+    /// </summary>
+    private IOperand? WindowOperand(VectorState? state, Arm64Register reg, int window)
+    {
+        if (state == null)
+            return null;
+        if (state.Slots[window] != null)
+            return SlotOperand(state, window);
+        return state.Whole ? WholeLaneOperand(reg, 32, window) : null;
+    }
+
+    /// <summary>
+    /// One permute element of <paramref name="reg"/>: the proven lane operand
+    /// when lane-tracked, an extraction from the whole-register local when the
+    /// whole vector is materialized, else null.
+    /// </summary>
+    private IOperand? PermuteSourceOperand(VectorState? state, Arm64Register reg, int laneBits, int lane)
+    {
+        if (state == null)
+            return null;
+        if (LaneValueOperand(state, laneBits, lane, signed: false) is { } op)
+            return op;
+        return state.Whole ? WholeLaneOperand(reg, laneBits, lane) : null;
+    }
+
+    /// <summary>
+    /// A lane read straight out of the materialized whole-register local —
+    /// the register holds every bit, so a shift exposes any lane honestly.
+    /// </summary>
+    private IOperand WholeLaneOperand(Arm64Register reg, int laneBits, int lane)
+    {
+        var shift = laneBits * lane;
+        if (shift == 0)
+            return Reg(reg);
+        return EmitTempOp(OpCode.ShiftRight, Reg(reg), new Immediate(shift), laneBits);
+    }
+
+    /// <summary>
+    /// EXT Vd.T, Vn.T, Vm.T, #i: a byte-wise concatenate-and-extract — each
+    /// destination window is a verbatim copy of one source window, so proven
+    /// source windows move straight into the destination's element registers.
+    /// </summary>
+    private bool LowerExt(Arm64Instruction insn)
+    {
+        var slotCount = insn.Op0Arrangement == Arm64ArrangementSpecifier.SixteenB ? 4 : 2;
+        var byteShift = insn.Op3Imm;
+        if (byteShift % 4 != 0)
+            return false; // a byte-misaligned extract is not a window permutation
+        var windowShift = (int)(byteShift / 4);
+        var stateA = LaneState(insn.Op1Reg);
+        var stateB = LaneState(insn.Op2Reg);
+        if (stateA == null && stateB == null)
+            return false;
+
+        // gather every source operand before any destination write: EXT may
+        // write a register it also reads
+        var ops = new IOperand?[slotCount];
+        var proven = 0;
+        for (var window = 0; window < slotCount; window++)
+        {
+            var source = window + windowShift;
+            ops[window] = source < 4
+                ? WindowOperand(stateA, insn.Op1Reg, source)
+                : WindowOperand(stateB, insn.Op2Reg, source - 4);
+            if (ops[window] != null)
+                proven++;
+        }
+        StageAliasedSources(insn, ops, 32);
+
+        var destName = Normalize(insn.Op0Reg);
+        var dest = Ensure(insn.Op0Reg);
+        ClaimDest(insn.Op0Reg);
+        for (var window = 0; window < slotCount; window++)
+            if (ops[window] is { } op)
+                EmitLaneValue(dest, destName, 32, window, op, null);
+            else
+                dest.Slots[window] = null;
+        for (var slot = slotCount; slot < 4; slot++)
+            dest.Slots[slot] = new LaneSlice(Zero, 0);
+        SyncScalarView(dest, destName);
+        if (proven < slotCount)
+            Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarized {proven} of {slotCount} windows.");
+        return true;
+    }
+
+    /// <summary>
+    /// ZIP1/ZIP2, UZP1/UZP2, TRN1/TRN2 and REV64: pure lane permutations —
+    /// each destination element is a verbatim copy of one source element, so a
+    /// proven source lane moves straight into the destination's element local.
+    /// </summary>
+    private bool LowerPermute(Arm64Instruction insn)
+    {
+        var (laneBits, laneCount) = Arrangement(insn.Op0Arrangement);
+        if (laneBits is not (32 or 64) || laneCount == 0)
+            return false;
+        var twoSources = insn.Mnemonic != Arm64Mnemonic.REV64;
+        var stateA = LaneState(insn.Op1Reg);
+        var stateB = twoSources ? LaneState(insn.Op2Reg) : null;
+        if (stateA == null && stateB == null)
+            return false;
+
+        var half = laneCount / 2;
+        (VectorState? State, Arm64Register Reg, int Elem) Source(int lane)
+        {
+            var (second, elem) = insn.Mnemonic switch
+            {
+                // ZIP: interleave the halves; UZP: gather evens/odds; TRN:
+                // transpose pairs; REV64: reverse within 64-bit groups
+                Arm64Mnemonic.ZIP1 => (lane % 2 == 1, lane / 2),
+                Arm64Mnemonic.ZIP2 => (lane % 2 == 1, half + lane / 2),
+                Arm64Mnemonic.UZP1 => lane < half ? (false, 2 * lane) : (true, 2 * (lane - half)),
+                Arm64Mnemonic.UZP2 => lane < half ? (false, 2 * lane + 1) : (true, 2 * (lane - half) + 1),
+                Arm64Mnemonic.TRN1 => lane % 2 == 0 ? (false, lane) : (true, lane - 1),
+                Arm64Mnemonic.TRN2 => lane % 2 == 0 ? (false, lane + 1) : (true, lane),
+                _ => (false, (lane / (64 / laneBits)) * (64 / laneBits) + (64 / laneBits - 1 - lane % (64 / laneBits)))
+            };
+            return second ? (stateB, insn.Op2Reg, elem) : (stateA, insn.Op1Reg, elem);
+        }
+
+        // gather every source operand before any destination write: a permute
+        // may write a register it also reads
+        var ops = new IOperand?[laneCount];
+        var proven = 0;
+        for (var lane = 0; lane < laneCount; lane++)
+        {
+            var (state, reg, elem) = Source(lane);
+            ops[lane] = PermuteSourceOperand(state, reg, laneBits, elem);
+            if (ops[lane] != null)
+                proven++;
+        }
+        StageAliasedSources(insn, ops, laneBits);
+
+        var destName = Normalize(insn.Op0Reg);
+        var dest = Ensure(insn.Op0Reg);
+        ClaimDest(insn.Op0Reg);
+        for (var lane = 0; lane < laneCount; lane++)
+            if (ops[lane] is { } op)
+                EmitLaneValue(dest, destName, laneBits, lane, op, null);
+            else
+                for (var w = lane * laneBits / 32; w < (lane + 1) * laneBits / 32; w++)
+                    dest.Slots[w] = null;
+        for (var slot = laneCount * laneBits / 32; slot < 4; slot++)
+            dest.Slots[slot] = new LaneSlice(Zero, 0);
+        SyncScalarView(dest, destName);
+        if (proven < laneCount)
+            Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarized {proven} of {laneCount} lanes.");
+        return true;
+    }
+
+    /// <summary>
+    /// When a permute writes a register it also reads, every gathered operand
+    /// is first staged into a temp so the writes cannot clobber a source.
+    /// </summary>
+    private void StageAliasedSources(Arm64Instruction insn, IOperand?[] ops, int laneBits)
+    {
+        var destName = Normalize(insn.Op0Reg);
+        if (destName != Normalize(insn.Op1Reg)
+            && (insn.Op2Kind != Arm64OperandKind.Register || destName != Normalize(insn.Op2Reg)))
+            return;
+        for (var i = 0; i < ops.Length; i++)
+            if (ops[i] is { } op && op is not Immediate)
+            {
+                var temp = Temp();
+                var staged = _add(_address, OpCode.Move, [temp, op]);
+                if (laneBits == 32)
+                    staged.NativeIntegerWidthBits = 32;
+                ops[i] = temp;
+            }
+        foreach (var op in ops)
+            _emitted |= op != null;
+    }
+
+    /// <summary>
+    /// LD1R (single register): broadcast a loaded element to every lane — one
+    /// memory read materialized into every destination element local.
+    /// </summary>
+    private bool LowerReplicateLoad(Arm64Instruction insn)
+    {
+        var (laneBits, laneCount) = Arrangement(insn.Op0Arrangement);
+        if (laneBits is not (32 or 64) || laneCount == 0)
+            return false;
+        var bytes = laneBits / 8;
+        IOperand mem = insn.MemBase == Arm64Register.X31
+            ? new StackOffset((int)insn.MemOffset)
+            : new MemoryOperand(Reg(insn.MemBase), addend: insn.MemOffset, accessSize: bytes);
+
+        var dest = Ensure(insn.Op0Reg);
+        ClaimDest(insn.Op0Reg);
+        var destName = Normalize(insn.Op0Reg);
+        for (var lane = 0; lane < laneCount; lane++)
+            EmitLaneValue(dest, destName, laneBits, lane, mem, null);
+        for (var slot = laneCount * laneBits / 32; slot < 4; slot++)
+            dest.Slots[slot] = new LaneSlice(Zero, 0);
+        SyncScalarView(dest, destName);
+        return true;
+    }
+
+    /// <summary>
+    /// LD1 (single element to one lane): the load materializes the element
+    /// local directly; other lanes keep their values.
+    /// </summary>
+    private bool LowerElementLoad(Arm64Instruction insn)
+    {
+        var element = insn.Op0VectorElement;
+        var bits = ElementBits(element);
+        var bytes = bits / 8;
+        IOperand mem = insn.MemBase == Arm64Register.X31
+            ? new StackOffset((int)insn.MemOffset)
+            : new MemoryOperand(Reg(insn.MemBase), addend: insn.MemOffset, accessSize: bytes);
+
+        var elementReg = ElementRegister(Normalize(insn.Op0Reg), bits, element.Index);
+        _add(_address, OpCode.Move, [elementReg, mem]).NativeMemoryAccessSize = bytes;
+        _emitted = true;
+
+        var dest = Ensure(insn.Op0Reg);
+        ClaimDest(insn.Op0Reg);
+        if (bits == 32)
+            dest.Slots[element.Index] = new LaneSlice(elementReg, 0);
+        else if (bits == 64)
+        {
+            dest.Slots[element.Index * 2] = new LaneSlice(elementReg, 0);
+            dest.Slots[element.Index * 2 + 1] = new LaneSlice(elementReg, 32);
+        }
+        else
+            dest.Slots[bits * element.Index / 32] = null; // a partial window is unproven
+        dest.Whole = false;
+        return true;
+    }
+
+    /// <summary>
+    /// LD1 (multiple structures, one or more registers): a contiguous load —
+    /// register k's element j reads mem + k*regBytes + j*elementBytes. Each
+    /// covered window materializes as the register's element local, so later
+    /// lane consumers see proven values.
+    /// </summary>
+    private bool LowerStructureLoad(Arm64Instruction insn)
+    {
+        var (laneBits, laneCount) = Arrangement(insn.Op0Arrangement);
+        if (laneBits is not (32 or 64) || laneCount == 0)
+            return false;
+        var regBytes = laneCount * laneBits / 8;
+        var elementBytes = laneBits / 8;
+
+        var dests = new List<Arm64Register>();
+        for (var i = 0; i < 4; i++)
+        {
+            var (kind, reg) = i switch
+            {
+                0 => (insn.Op0Kind, insn.Op0Reg),
+                1 => (insn.Op1Kind, insn.Op1Reg),
+                2 => (insn.Op2Kind, insn.Op2Reg),
+                _ => (insn.Op3Kind, insn.Op3Reg)
+            };
+            if (kind == Arm64OperandKind.Memory)
+                break;
+            if (kind != Arm64OperandKind.Register || !IsVectorRegister(reg))
+                return false;
+            dests.Add(reg);
+        }
+        if (dests.Count == 0)
+            return false;
+
+        for (var r = 0; r < dests.Count; r++)
+        {
+            var name = Normalize(dests[r]);
+            var dest = Ensure(dests[r]);
+            ClaimDest(dests[r]);
+            var baseOffset = insn.MemOffset + r * regBytes;
+            // the whole-register local is materialized too, mirroring the
+            // caller's normal-path Move for whole-vector loads
+            IOperand whole = insn.MemBase == Arm64Register.X31
+                ? new StackOffset((int)baseOffset)
+                : new MemoryOperand(Reg(insn.MemBase), addend: baseOffset, accessSize: regBytes);
+            _add(_address, OpCode.Move, [Reg(dests[r]), whole]).NativeMemoryAccessSize = regBytes;
+            for (var lane = 0; lane < laneCount; lane++)
+            {
+                IOperand mem = insn.MemBase == Arm64Register.X31
+                    ? new StackOffset((int)(baseOffset + lane * elementBytes))
+                    : new MemoryOperand(Reg(insn.MemBase), addend: baseOffset + lane * elementBytes, accessSize: elementBytes);
+                EmitLaneValue(dest, name, laneBits, lane, mem, null);
+            }
+            for (var slot = laneCount * laneBits / 32; slot < 4; slot++)
+                dest.Slots[slot] = new LaneSlice(Zero, 0);
+            dest.Whole = true;
+        }
         _emitted = true;
         return true;
     }

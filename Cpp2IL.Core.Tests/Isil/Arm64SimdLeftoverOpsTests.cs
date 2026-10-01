@@ -294,16 +294,17 @@ public class Arm64SimdLeftoverOpsTests
     }
 
     [Test]
-    public void ScalarCompareOnWideCarrierStaysDiagnostic()
+    public void ScalarCompareOnDoubleLoadFolds()
     {
-        // ldr d0 gives V0 64-bit provenance — its local may hold a managed
-        // aggregate, so a scalar compare over it stays one honest diagnostic
+        // ldr d0 materializes the low float field as an element local — an
+        // honest 32-bit carrier — so a scalar compare over it folds
         var il = Lift(
             0xFD400000, // ldr d0, [x0]
             0x7EA1E403, // fcmgt s3, s0, s1
             0xD65F03C0);
-        Assert.That(il.Count(i => i.OpCode == OpCode.NotImplemented), Is.EqualTo(1));
-        Assert.That(il.Any(i => i.OpCode is OpCode.CheckGreater or OpCode.Negate), Is.False);
+        Assert.That(il.Any(i => i.OpCode == OpCode.CheckGreater), Is.True);
+        Assert.That(il.Any(i => i.OpCode == OpCode.Negate), Is.True);
+        Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
     }
 
     [Test]
@@ -320,18 +321,18 @@ public class Arm64SimdLeftoverOpsTests
     }
 
     [Test]
-    public void BitSelectOnWideCarrierStaysDiagnostic()
+    public void BitSelectOnDoubleLoadFolds()
     {
-        // the select operand is a D-write local — folding would read a managed
-        // aggregate through an integer op and materialize reinterpret loads
+        // the select operand's lanes are element locals of the D load — the
+        // per-lane selects read real lane locals, not a managed aggregate
         var il = Lift(
-            0xFD400000, // ldr d0, [x0] — v0 is the wide-carrier input
+            0xFD400000, // ldr d0, [x0] — v0 is the select input
             0x0E040C21, // dup v1.2s, w1
             0x0E040C42, // dup v2.2s, w2
             0x2EA21C01, // bit v1.8b, v0.8b, v2.8b
             0xD65F03C0);
-        Assert.That(il.Count(i => i.OpCode == OpCode.NotImplemented), Is.EqualTo(1));
-        Assert.That(il.Any(i => i.OpCode is OpCode.And or OpCode.Not), Is.False);
+        Assert.That(il.Any(i => i.OpCode == OpCode.And), Is.True);
+        Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
     }
 
     [Test]

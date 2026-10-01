@@ -810,7 +810,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         }
 
         var preserveAdrpOffset = false;
-        scalarizer.BeginInstruction(address);
+        scalarizer.BeginInstruction(instruction, Add);
         // lane-wise SIMD chains (DUP broadcast + following integer lanes) are
         // scalarized by the helper when lane provenance is fully proven; it
         // returns false for anything it cannot prove, leaving the normal path
