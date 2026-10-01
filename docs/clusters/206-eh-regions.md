@@ -1,5 +1,156 @@
 # EH region recovery (206, slice 2)
 
+## Round 6: original reference parameters and call storage (2026-10-01)
+
+**Draft: 9,465 owned pad warnings remain; target ≤7,768.** This increment
+removes nine pads on the control merge described below.
+The total reduction from 15,537 is 6,072 (39.1%); another 1,697 are required.
+
+### Proof and control
+
+`CatchArgument` may use an existing reference parameter only when the reaching
+native value is that exact parameter's entry-register root. Register copies and
+saved frame cells retain the identity; joins retain it only when all inputs agree.
+Pointer, byref, generic and hidden MethodInfo parameters remain excluded. No
+parameter is selected by its type alone.
+
+An arbitrary call can mutate heap memory through aliases or static state.
+The shared call-storage invalidation now discards stored heap values on normal
+and exceptional edges and between handler calls. Previously, a handler could
+reload a heap cell after a call and return its old stored constant. Class
+initializers use the same invalidation, including the memory intersection at
+conditional initializer joins. Tracked frame cells still use the existing
+address and width checks.
+
+Control: local merge `24ca861d00b944af9b5c74023eefda78871f1c2e`, formed from
+prior EH commit `f30aa8fef8ff82abdb24e177aa10a0bf28711391` and development
+`40fd405c8a5661af3b158dbe5bf651829ea621c1` (#190, #192, #183).
+Branch merge: `a1b8da64f5a5cfcd1dc98510f4d608b569307d12`.
+Control sweep: `astra206-r11-fresh-control`; branch sweep:
+`astra206-r11-fresh-branch`, frozen executable `astra206-r11-fresh-branch-bin`.
+Each completed 69,982/69,982 native methods, 183 assemblies, 178,274 reported
+methods. The same development is included on both sides. The earlier paired sweep on
+the #189 base (`astra206-r10-branch` / `astra206-r11-final2`) also removes nine
+owned pads with no added diagnostic or ILVerify transition. #181 remains open.
+
+### Measurements
+
+| Scope | Diagnosed control → branch | Newly clean | Regressions | Pads control → branch |
+|---|---:|---:|---:|---:|
+| All | 15,958 → 15,958 | 0 | 0 | 41,689 → 41,608 |
+| Game-owned | 3,818 → 3,818 | 0 | 0 | 9,474 → 9,465 |
+| CastleClashers.Game | 2,315 → 2,315 | 0 | 0 | 6,113 → 6,113 |
+| Castle-building owners + nested types | 80 → 80 | 0 | 0 | 684 → 684 |
+
+No newly clean method, added diagnostic, or clean regression. ILVerify:
+**0 status transitions, 0 valid→invalid**; both runs have 170,144 valid,
+416 invalid, and 7,714 partial methods. The Bootstrap reachability gate remains
+blocked at 29/29. Both required `diag_families.py` scopes were run.
+
+| Changed owned method | Pads control → branch |
+|---|---:|
+| ``System.Void NativeWebView::OpenAndroid(System.String)`` | 15 → 13 |
+| ``System.Void Audiomob.Unmanaged.AudiomobPluginInitialization::DoInitialization(System.Action`1<System.Boolean>)`` | 16 → 9 |
+
+### Native and IL review
+
+`NativeWebView.OpenAndroid`: entry `3955A98` saves original X0 (`url`) in X19.
+The catch calls the actual exception message getter, concatenates the error text,
+runs Debug/Application class initialization, and logs the error. At `3955F90`
+X0 is restored from X19; `3955F98` calls OpenURL. The emitted handler uses
+`ldarg url; call Application.OpenURL`, then leaves to the native merge.
+Thirteen auxiliary pad warnings remain.
+
+`AudiomobPluginInitialization.DoInitialization`: `3973450` saves the callback
+in X19 at entry. The catch restores it to X0 at `39737FC`, restores the native frame,
+sets X1 to zero at `3973808`, and calls `InvokeInitCallback` at `3973814`.
+Its IL uses `ldarg callback; ldc.i4.0; call InvokeInitCallback`, then leaves
+to the normal return. Nine auxiliary pad warnings remain.
+
+The newly emitted methods were reviewed against native disassembly. Neither
+method becomes clean because its other unresolved code remains diagnosed.
+
+### Development merge impact
+
+Compared with the prior #189 control, the new development makes 54 methods clean
+(11 owned; three in the castle-building owners). These changes are present in
+both fresh sweeps; their pad counts remain unchanged. The three newly clean
+castle methods are MirrorGridHorizontally, ToObscured, and ToPlain.
+No previously clean method regresses. Eleven already diagnosed methods gain
+at least one diagnostic, including these three owned methods:
+
+| Method | Added diagnostic from development |
+|---|---|
+| ChestController.OpenChests | ChestType cannot convert to the ValueTuple slot |
+| MatchMakingController.StartMatchmaking | Packed ValueTuple operands remain unresolved in Subtract/Add |
+| ChestController.<>c.<OpenChests>b__33_0 | Int32 receiver is unavailable for a projected field |
+
+The added diagnostics reproduce in the fresh control. They are in the reserved
+normal array/packed-value recovery lane; this EH increment adds none.
+
+### Tests
+
+The CLR return fixture now has two reference parameters of the same type and
+checks that the catch returns the second original value, while the normal path
+returns its own string. Its unknown-register variant remains refused. Against
+unchanged control code, the positive parameter case fails and the negative
+case passes.
+
+A heap-store/reload negative case fails before invalidation: a protected call
+may change the stored value, but the old proof emits `Return 7`. With the fix,
+the proof refuses that stale value and retains the pad warning.
+The focused EH run passed 63/63 cases. Full Core passed before the development
+merge; after it, EH + packed fields + multidimensional arrays passed 85/85.
+The full-suite counts below precede that merge.
+**Core: 1265/1265.**
+**LibCpp2IL: 12/12.**
+**JitOracle: 9/9.**
+
+### Gaps
+
+Fresh native proof coverage is **7,084 finally + 1,306 catch = 8,390 pads**.
+No existing native proof disappears; exactly nine new pads are proven and
+materialized. **2,318 proven pads in 118 methods remain unmaterialized**,
+with the same pad set as Round 5. Its emission refusal counts still apply:
+1,051 unusable/different cleanup IL; 812 no reachable emitted protected unit;
+274 unsafe region crossings; 169 unassigned cleanup locals; eight incomplete
+shared-pad coverage; four unavailable catch merges/seeds/handlers.
+
+The state-machine cohort remains **133 methods / 3,162 pads**. The earlier
+per-pad first-failure classification remains the investigation map; no new
+state-machine proof was accepted in this increment.
+
+`Bootstrap.<InitializeVoodooLive>.MoveNext` still reaches native builder target
+`398913C` with null MethodInfo. That target is absent from the managed address
+map and is a complex body, not a forwarding thunk. The metadata-backed
+AsyncUniTaskVoidMethodBuilder.SetException body at `6F03E38` has different
+instructions and layout. Similar behavior does not establish managed identity;
+a SetException signature was not assigned to the unknown target.
+
+A separate helper-contract experiment found eight additional native finally
+pads in CrashReportManager.SelectCrashReporter. It remains outside production
+pending contract-specific negative tests and a full emission measurement.
+Fresh reference-field loads alone produced no additional native proofs in the
+same 1,019-method cohort. Reserved normal receiver/frame passes remain untouched.
+
+### Castle-building scope
+
+| Method | Pads control → branch |
+|---|---:|
+| ``System.Void CastleBuildingController::ShowUpgradeAdditions()`` | 35 → 35 |
+| ``System.Void CastleBuildingController::TriggerInterior()`` | 35 → 35 |
+| ``System.Void CastleBuildingController::RelocateUnitsToValidPositions()`` | 41 → 41 |
+| ``System.Nullable`1<UnityEngine.Vector2Int> CastleMaker::PickBestAvailablePosition(System.Collections.Generic.List`1<UnityEngine.Vector2Int>, System.Collections.Generic.HashSet`1<UnityEngine.Vector2Int>, CastleClashers.HumanLikeBots.BotTier, System.Boolean)`` | 12 → 12 |
+| ``System.Void CastleMaker::Build(System.Boolean, System.Boolean, System.Boolean)`` | 43 → 43 |
+| ``System.Void CastleMaker::SpawnShields(System.Boolean)`` | 224 → 224 |
+| ``System.Void CastleMaker::SpawnShieldsFromPlacements(System.Collections.Generic.List`1<EnemyShieldPlacement>)`` | 217 → 217 |
+| ``System.Void CastleMaker::SaveShieldsData()`` | 47 → 47 |
+| ``System.Void CastleMaker::SetShieldTypeForGridPos(UnityEngine.Vector2Int, System.Int32)`` | 14 → 14 |
+| ``System.Void CastleMaker::MarkCastleShieldPositionsInUpgradeData()`` | 7 → 7 |
+| ``UnityEngine.GameObject[0..., 0...] CastleMaker::BuildGridAuto(System.Collections.Generic.List`1<UnityEngine.Transform>, System.Boolean, System.Single)`` | 9 → 9 |
+
+Earlier sections retain their historical controls and measurements.
+
 ## Round 5: catch value returns (2026-10-01)
 
 **Draft: 9,474 owned pad warnings remain; the target is at most 7,768.**
