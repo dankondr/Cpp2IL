@@ -961,6 +961,19 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 }
 
                 var move = Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                move.NativeReadWidthBits = instruction.Mnemonic switch
+                {
+                    Arm64Mnemonic.SXTB or Arm64Mnemonic.UXTB => 8,
+                    Arm64Mnemonic.SXTH or Arm64Mnemonic.UXTH => 16,
+                    Arm64Mnemonic.SXTW => 32,
+                    _ => null,
+                };
+                move.NativeReadSignExtend = instruction.Mnemonic switch
+                {
+                    Arm64Mnemonic.SXTB or Arm64Mnemonic.SXTH or Arm64Mnemonic.SXTW => true,
+                    Arm64Mnemonic.UXTB or Arm64Mnemonic.UXTH => false,
+                    _ => null,
+                };
                 if (instruction is { Mnemonic: Arm64Mnemonic.MOV or Arm64Mnemonic.MOVZ,
                         Op1Kind: Arm64OperandKind.Immediate }
                     && move.Operands[1] is Immediate wideImmediate)
