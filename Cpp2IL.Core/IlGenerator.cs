@@ -282,7 +282,11 @@ public static class IlGenerator
 
             if (instruction.OpCode == OpCode.Jump || instruction.OpCode == OpCode.ConditionalJump)
             {
-                var ilBranch = il.First(i => i.OpCode == CilOpCodes.Br || i.OpCode == CilOpCodes.Brtrue);
+                // The branch belonging to this instruction is the last branch in
+                // its emitted range: operand loads (select, inlined null tests)
+                // may emit internal branches earlier in the same range.
+                var ilBranch = il.Last(i => i.OpCode == CilOpCodes.Br || i.OpCode == CilOpCodes.Brtrue
+                    || i.OpCode == CilOpCodes.Brfalse);
 
                 if (instruction.Operands[0] is Block targetBlock)
                 {
@@ -1603,6 +1607,9 @@ public static class IlGenerator
                 break;
 
             case OpCode.ConditionalJump:
+                if (TryEmitInlinedBranchCondition(instruction, context, method, locals, writeLine, instructions))
+                    break;
+
                 var conditionType = EmittedOperandType(instruction.Operands[1], context);
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, null, context);
                 // brtrue won't pop an i64; the native branch tested the full register
@@ -1983,6 +1990,78 @@ public static class IlGenerator
         }
 
         return instructions.ToList().GetRange(startIndex, instructions.Count - startIndex); // Return added IL
+    }
+
+    // `flag = (x == null); if (flag)` - the lifter materializes every branch
+    // condition into a bool local, but a managed compiler feeds a null test to
+    // the branch directly. When the condition local's definition in the same
+    // block is a Check*Equal against a zero constant over a reference operand
+    // (optionally behind Not/Move flag locals), emit `load x; brtrue/brfalse`
+    // inline so the CIL keeps the shape ILSpy's `??` transforms recognize -
+    // e.g. `if (slot == null) { slot = new Delegate(...) }` fold.
+    // The flag's own instructions still emit normally; they are simply unused.
+    private static bool TryEmitInlinedBranchCondition(Instruction jump, MethodAnalysisContext context,
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals,
+        IMethodDescriptor writeLine, CilInstructionCollection instructions)
+    {
+        if (jump.Operands[1] is not LocalVariable condition)
+            return false;
+
+        var block = context.ControlFlowGraph!.FindBlockByInstruction(jump);
+        if (block == null)
+            return false;
+
+        var negated = false;
+        var current = condition;
+        Instruction? comparison = null;
+        for (var depth = 0; depth < 4; depth++)
+        {
+            var definition = block.Instructions
+                .TakeWhile(instruction => instruction != jump)
+                .LastOrDefault(instruction => ReferenceEquals(instruction.Destination, current));
+            if (definition == null)
+                return false;
+
+            if (definition.OpCode is OpCode.Not or OpCode.Move
+                && definition.Operands.Count == 2
+                && definition.Operands[1] is LocalVariable next)
+            {
+                negated ^= definition.OpCode == OpCode.Not;
+                current = next;
+                continue;
+            }
+
+            comparison = definition;
+            break;
+        }
+
+        if (comparison is not { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual }
+            || comparison.Operands.Count < 3)
+            return false;
+
+        // Only operands whose load is a straight-line sequence with no branches
+        // of its own can inline here: anything else (select, memory, casts) may
+        // emit internal branches the jump fixup would retarget.
+        var storage = IsZeroConstant(comparison.Operands[2]) ? comparison.Operands[1]
+            : IsZeroConstant(comparison.Operands[1]) ? comparison.Operands[2]
+            : null;
+        if (storage is not (LocalVariable or FieldReference)
+            || EmittedOperandType(storage, context) is not { IsValueType: false } emittedStorage)
+            return false;
+        if (storage is LocalVariable local && !locals.ContainsKey(local))
+            return false;
+
+        // The jump fires when the condition is true; the condition is the
+        // equality test, optionally negated. Jump on the raw operand: brfalse
+        // fires when the slot is null (the "equal" case), brtrue when non-null.
+        // A generic parameter cannot feed brtrue/brfalse directly - it is
+        // boxed first, matching the comparison's own reference-slot coercion.
+        var jumpWhenNull = (comparison.OpCode == OpCode.CheckEqual) != negated;
+        LoadOperand(storage, method, locals, writeLine, null, context);
+        if (emittedStorage is GenericParameterTypeAnalysisContext)
+            instructions.Add(CilOpCodes.Box, emittedStorage.ToTypeSignature().ToTypeDefOrRef());
+        instructions.Add(jumpWhenNull ? CilOpCodes.Brfalse : CilOpCodes.Brtrue, new CilInstructionLabel());
+        return true;
     }
 
     private static bool IsExceptionValueReturnedFromIncompatibleMethod(MethodAnalysisContext context, IOperand operand)
