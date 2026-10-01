@@ -81,3 +81,86 @@ Known gaps:
   `CastleMaker::GetBottomPartAverageUpgradeLevel` (same pattern now typed
   `Int32`, emitting the honest bits `2143289344` plus one `Double` diagnosis
   elsewhere in the method) are examples.
+
+## Sweep result: exposure, not recovery
+
+The stricter rule grew the counts. `diag_families.py --dispositions
+manifests/castle-busters/1.11.1/dispositions.json --assemblies
+CastleClashers.Game` on control `642aa361` vs this head: incomplete
+2,434 -> 2,482 (+48); all-assembly `Literal operand cannot fill`
+211 -> 304 (+93). The result is exposure: control's
+`FloatLiteral`/`DoubleLiteral` conversion and its `>u32` value-range fill
+were hiding narrow proofs.
+
+Milestone scope (`CastleBuildingController`, `TimedCastleBuildingController`,
+`CastleMaker`, `EngineersController` + nested types): 280 methods; methods
+with diagnostics 85 -> 93. Changed methods:
+
+| method | control | branch |
+|---|---|---|
+| CastleMaker::Build | 960 | 795 (`No legal conversion` -165) |
+| CastleMaker::SpawnShieldsFromPlacements | 328 | 323 (`No legal conversion` -5) |
+| CastleMaker::GetImpactedObjects | 1 | 7 (fill) |
+| CastleMaker::InitRefs | 80 | 83 (fill +3) |
+| CastleMaker::UpgradeElement | 14 | 18 (fill +4) |
+| TimedCastleBuildingController::GetGemsToInstantlyUnlock | 14 | 16 (fill +2) |
+| CastleMaker::AddPartAtIndex | 10 | 12 (fill +2) |
+| CastleMaker::AddFoundation | 0 | 2 (fill) |
+| CastleMaker::RemoveFoundation | 0 | 2 (fill) |
+| CastleMaker::CheckIfBelongsToAnyFoundation | 0 | 3 (fill) |
+| CastleMaker::BuildGridAuto | 33 | 35 (fill +2) |
+| CastleMaker::CanPlaceFoundationAtPosition | 2 | 4 (fill +2) |
+| CastleMaker::CheckIfHasFoundationAbove | 0 | 1 (fill) |
+| CastleMaker::LocalPosToGridPosition | 3 | 4 (fill +1) |
+| CastleMaker::<>c__DisplayClass123_0::<DetectStep>b__0 | 0 | 2 (fill) |
+| CastleMaker::GetBottomPartAverageUpgradeLevel | 1 | 1 (same family: the S-write NaN pattern now types Int32 and emits honest bits `2143289344`) |
+| CastleBuildingController::AddPartAtIndex | 9 | 10 (fill +1) |
+| EngineersController::IsBorderSpotOccupied | 1 | 3 (conver -> lift: Int32 operand in a Vector2 Add) |
+| EngineersController::ApplyHoldToEngineer | 2 | 3 (lift +1) |
+| EngineersController::CheckIfTargetPositionIsTooClose | 0 | 1 (fill) |
+| EngineersController::IsInRange | 0 | 1 (fill) |
+| CastleMaker::BuildFoundations | 9 | 10 (conver +1) |
+| CastleMaker::CheckIfBannerAtThisPosition | 5 | 6 (conver +1) |
+| CastleMaker::Paint | 0 | 1 (conver: Int32 -> Color) |
+
+The two big drops are real recovery: an untyped `Immediate` converts into
+integer slots a `FloatLiteral`/`DoubleLiteral` could not enter, so 165 + 5
+conversion failures left `CastleMaker::Build`/`SpawnShieldsFromPlacements`
+entirely. All growth is the same unmasking.
+
+## Decided sample: 20 of the 84 clean->diagnosed methods
+
+Each row names the producing instruction (disassembled at the method's
+`Native.Address`), the slot the literal was read as, and how control filled
+it. No row is a lost legitimate fill: none has a D/X write or a full
+movz/movk x-chain behind the diagnosed operand.
+
+| method | producing instruction | slot | control filled it by |
+|---|---|---|---|
+| PvP.PvpProtocol::TryDecodePickupConsumed | `mov w22, #-0x80000000` (movn, W) | Double | value-range fill (`Int64BitsToDouble`) |
+| CastleMaker::CheckIfHasFoundationAbove | `fmov s11, #0.5` (S) | Double | literal conversion |
+| EngineersController::CheckIfTargetPositionIsTooClose | `fmov s10, #2.0` (S) | Double | literal conversion |
+| EngineersController::IsInRange | `fmov s12, #1.0` (S) | Double | literal conversion |
+| InfiniteScrollRect+<FocusRoutine>::MoveNext | `fmov s1, #1.0` (S) | Double | literal conversion |
+| RewardMoneyItem+<CountTo>::MoveNext | `fmov s2, #1.0` (S) | Double | literal conversion |
+| UnitPreviewPlaybackContext+<FadeToBlack>::MoveNext | `fmov s3, #1.0` (S) | Color | literal conversion (Single -> Color) |
+| WheelSelectionConfigSO::GetWinningBotLevelBonus | `fmov s1, #1.0` (S) | Double | literal conversion |
+| UnitLevelUtility::ClampToMaxInternalLevel | `mov w8, #-0x80000000` (movn, W) | Double | value-range fill |
+| EconomyScaler::RoundToNearest | `fmov s1, #1.0` (S) | Double | literal conversion |
+| EnemyTrophySelector::SampleTriangularOffset | `fmov s0, #1.0` (S) | Double | literal conversion |
+| CastleMaker+<>c__DisplayClass123_0::<DetectStep>b__0 | `fmov s2, #-1.0` (S) | Double | literal conversion |
+| WeeklyLeaderboardController::GetNormalizedLeaderboardTime | `fmov s1, #1.0` (S) | Double | literal conversion |
+| CastleBottom::SetSlowed | `fmov s2, #0.5` (S) | Color | literal conversion (Single -> Color) |
+| CastleVisualController::RestoreCastlePartsInstant | `fmov s0-s3, #1.0` (S) | Color | literal conversion (Single -> Color) |
+| LasermanTimerHandler::UpdateVisual | `fmov s0, #10.0` (S) | (Unrecoverable: Int32 operand in float arithmetic) | literal conversion |
+| UtilitiesTutorialController::TriggerTutorial | `mov w9, #-0x3de00000` (movn, W) | Vector2 | value-range fill |
+| MoreMountains.Tools.MMMaths::RoundToDecimal | `fmov s0, #10.0` (S) | Double | literal conversion |
+| MMRigidbodyCenterOfMass::OnDrawGizmosSelected | `fmov s4, #1.0` (S) | Color | literal conversion |
+| RootMotion.FinalIK.IKSolverVR+BodyPart::Visualize | `fmov s0, #1.0` (S) | (Unrecoverable: Int32 operand) | literal conversion |
+
+All 84 newly-diagnosed methods classify the same way: 71 have an
+`fmov s*, #imm` S-write literal (control lifted it `DoubleLiteral` and
+converted it into the slot), 13 a `movn`/`mov w*, #-…` W-write whose
+sign-extended value passed control's `>u32` check (`Int64BitsToDouble` of a
+degenerate bit pattern). Zero carry an X/D-width producer, so nothing here
+is a fill the binary actually proves.
