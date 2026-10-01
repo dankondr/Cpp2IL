@@ -732,6 +732,80 @@ public class IlGeneratorTests
     }
 
     [Test]
+    public void HiddenReturnBufferCellStoredAfterTheCallHoldsItsOwnValue()
+    {
+        // `stp xzr, xzr, [sp]` zeroes the buffer, GetEnumerator returns into it, and once the
+        // enumerator moved out the slot is reused: `str x9, [sp, #8]` saves &copy for the
+        // finally's Dispose. The zeroed _current cell reads the returned field; the reused _index
+        // cell reads the saved address.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var list = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var instance = new GenericInstanceTypeAnalysisContext(list, [app.SystemTypes.SystemStringType]);
+        var getEnumerator = new ConcreteGenericMethodAnalysisContext(
+            list.Methods.Single(method => method.Name == "GetEnumerator"), [app.SystemTypes.SystemObjectType], []);
+        var receiver = new LocalVariable("receiver", new Register(null, "X0")) { Type = instance };
+        var buffer = new LocalVariable("buffer", new Register(null, "stack_-20"));
+        var pointer = new LocalVariable("pointer", new Register(null, "X8"));
+        var currentSlot = new LocalVariable("currentSlot", new Register(null, "stack_-10"));
+        var current = new LocalVariable("current", new Register(null, "X2"));
+        var saved = new LocalVariable("saved", new Register(null, "X9"));
+        var reusedSlot = new LocalVariable("reusedSlot", new Register(null, "stack_-18"));
+        var receiverOfDispose = new LocalVariable("disposeReceiver", new Register(null, "X0"));
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Read",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        var call = new Instruction(2, OpCode.Call, getEnumerator, new MemoryOperand(pointer), receiver);
+        var currentCopy = new Instruction(3, OpCode.Move, current, currentSlot);
+        var reload = new Instruction(5, OpCode.Move, receiverOfDispose, reusedSlot);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, currentSlot, new Immediate(0)),
+            new(1, OpCode.Move, pointer, new AddressOf(buffer)), call, currentCopy,
+            new(4, OpCode.Move, reusedSlot, saved), reload, new(6, OpCode.Return)]);
+        context.Locals = [receiver, buffer, pointer, currentSlot, current, saved, reusedSlot, receiverOfDispose];
+        context.ParameterLocals = [];
+
+        Cpp2IL.Core.Analysis.LocalVariables.ResolveHiddenReturnBuffers(context);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(currentCopy.Operands[1], Is.TypeOf<FieldReference>());
+            Assert.That(((FieldReference)currentCopy.Operands[1]).Field.Name, Is.EqualTo("_current"));
+            Assert.That(reload.Operands[1], Is.SameAs(reusedSlot));
+        });
+    }
+
+    [Test]
+    public void ValueTypeReceiverCarriedThroughCopiesIsItsAddress()
+    {
+        // `add x9, sp, #0x70; str x9, [sp, #0x40]; …; ldr x0, [sp, #0x40]; bl Enumerator.Dispose`
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var list = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var enumeratorType = list.NestedTypes.Single(type => type.Name.StartsWith("Enumerator"));
+        var dispose = enumeratorType.Methods.Single(method => method.Name == "Dispose");
+        var enumerator = new LocalVariable("enumerator", new Register(null, "stack_-80")) { Type = enumeratorType };
+        var address = new LocalVariable("address", new Register(null, "X9"));
+        var saved = new LocalVariable("saved", new Register(null, "stack_-B0"));
+        var receiver = new LocalVariable("receiver", new Register(null, "X0"));
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, address, new AddressOf(enumerator)),
+            new(1, OpCode.Move, saved, address),
+            new(2, OpCode.Move, receiver, saved),
+            new(3, OpCode.CallVoid, dispose, receiver),
+            new(4, OpCode.Return)]);
+        context.Locals = [enumerator, address, saved, receiver];
+        context.ParameterLocals = [];
+
+        Cpp2IL.Core.Analysis.LocalVariables.ResolveTypesAndFields(context);
+
+        Assert.That(receiver.Type, Is.TypeOf<ByRefTypeAnalysisContext>());
+    }
+
+    [Test]
     public void ReusedHiddenReturnBufferDoesNotCrossEnumeratorLifetimes()
     {
         Cpp2IlApi.ResetInternalState();
