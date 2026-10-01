@@ -383,10 +383,12 @@ public static class ArrayRecovery
             return [.. Enumerable.Repeat<IOperand>(new Immediate(0), last), Unextended(flat)];
         }
 
+        // The outer index times the dimension's length; a bare length is outer index 1 (`grid[1, x]`
+        // reads `len1 + x` with no multiply).
         IOperand? Factor(IOperand operand, IOperand array, int dimension)
             => Definition(operand) is { OpCode: OpCode.Multiply, Operands: [_, var a, var b] }
                 ? IsLength(a, array, dimension) ? b : IsLength(b, array, dimension) ? a : null
-                : null;
+                : IsLength(operand, array, dimension) ? new Immediate(1) : null;
 
         bool Compared(IOperand index, IOperand array, int dimension)
             => cfg.Instructions.Any(check => check.OpCode is OpCode.CheckLess or OpCode.CheckGreater

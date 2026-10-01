@@ -681,7 +681,7 @@ public static class MetadataResolver
             OpCode.Nop or OpCode.Phi or OpCode.Jump or OpCode.ConditionalJump => false,
             OpCode.Move or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
                 or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not
-                or OpCode.Negate or OpCode.SignExtend32 or OpCode.CheckEqual or OpCode.CheckNotEqual
+                or OpCode.Negate or OpCode.SignExtend32 or OpCode.Convert or OpCode.CheckEqual or OpCode.CheckNotEqual
                 or OpCode.CheckGreater or OpCode.CheckLess or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual
                 => instruction.Operands is not [LocalVariable, ..],
             _ => true,
@@ -1099,7 +1099,7 @@ public static class MetadataResolver
             case OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
                 or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And
                 or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
-                or OpCode.SignExtend32 or OpCode.VectorMin or OpCode.VectorMax or OpCode.NewArr:
+                or OpCode.SignExtend32 or OpCode.Convert or OpCode.VectorMin or OpCode.VectorMax or OpCode.NewArr:
                 return producedType is not { IsValueType: true }
                        and not ByRefTypeAnalysisContext and not PointerTypeAnalysisContext
                        and not GenericParameterTypeAnalysisContext;

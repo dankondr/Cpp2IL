@@ -785,6 +785,17 @@ public static class IlGenerator
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 break;
 
+            case OpCode.Convert:
+                LoadConversionSource(instruction, method, context, locals, writeLine);
+                instructions.Add(ConversionOpCode(instruction));
+                if (instruction.ConversionUnsigned && instruction.NativeFloatWidthBits == 32)
+                    // conv.r.un yields the native float; an f32 destination narrows it.
+                    instructions.Add(CilOpCodes.Conv_R4);
+                EmitStackCoerceOrDefault(Analysis.LocalVariables.ConversionResultType(instruction, context),
+                    StoreContract(instruction.Operands[0], context), method, context);
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
+                break;
+
             case OpCode.NewArr:
                 var newArrayDestination = StoreContract(instruction.Operands[0], context);
                 if (instruction.Operands is [_, SzArrayTypeAnalysisContext { ElementType: { } newArrayElement }, { } length])
@@ -3190,7 +3201,7 @@ public static class IlGenerator
         or "System.Collections.Generic.IReadOnlyCollection`1"
         or "System.Collections.Generic.IReadOnlyList`1";
 
-    private static bool IsErasedSharedArgument(TypeAnalysisContext argument) =>
+    internal static bool IsErasedSharedArgument(TypeAnalysisContext argument) =>
         argument is GenericParameterTypeAnalysisContext
         || argument.FullName is "System.Object" or "System.ValueType"
         || IsSharedEnumMarker(argument);
@@ -6953,6 +6964,136 @@ public static class IlGenerator
         return fallback;
     }
 
+    // The slot a Convert's source is loaded through: the register content at the
+    // recorded width - a float value for the FCVT family, an integer for
+    // SCVTF/UCVTF (including integer bits held in an S/D register).
+    private static TypeAnalysisContext ConversionSourceContract(Instruction instruction, MethodAnalysisContext context)
+    {
+        var systemTypes = context.AppContext.SystemTypes;
+        var wide = instruction.ConversionSourceWidthBits != 32;
+        if (instruction.ConversionFromFloat)
+            return wide ? systemTypes.SystemDoubleType : systemTypes.SystemSingleType;
+        if (wide)
+            return instruction.ConversionUnsigned
+                ? systemTypes.SystemUInt64Type : systemTypes.SystemInt64Type;
+        return instruction.ConversionUnsigned
+            ? systemTypes.SystemUInt32Type : systemTypes.SystemInt32Type;
+    }
+
+    // The CIL conversion opcode - the numeric step only. The source arrives at
+    // its proven width and converts straight to the destination's kind:
+    // conv.i*/u* truncate a float to an integer, conv.r* size a float or take a
+    // signed integer to float, conv.r.un an unsigned one.
+    private static CilOpCode ConversionOpCode(Instruction instruction)
+    {
+        if (instruction.NativeFloatWidthBits is { } floatWidth)
+        {
+            if (instruction.ConversionFromFloat)
+                return floatWidth == 64 ? CilOpCodes.Conv_R8 : CilOpCodes.Conv_R4;
+            return instruction.ConversionUnsigned ? CilOpCodes.Conv_R_Un
+                : floatWidth == 64 ? CilOpCodes.Conv_R8 : CilOpCodes.Conv_R4;
+        }
+        var integerWidth = instruction.NativeIntegerWidthBits ?? 32;
+        if (instruction.ConversionUnsigned)
+            return integerWidth == 64 ? CilOpCodes.Conv_U8 : CilOpCodes.Conv_U4;
+        return integerWidth == 64 ? CilOpCodes.Conv_I8 : CilOpCodes.Conv_I4;
+    }
+
+    // Loads a Convert's source as the register content the hardware reads: the
+    // low ConversionSourceWidthBits of the register, read as a float for the
+    // FCVT family or an integer for SCVTF/UCVTF. The operand's own managed type
+    // only picks how the bits arrive on the stack - same-domain loads move the
+    // value, cross-domain loads reinterpret through BitConverter like the `fmov`
+    // between the integer and FP banks they mirror. A read wider than what the
+    // managed value proves is a diagnosed default, not a guess.
+    private static void LoadConversionSource(Instruction instruction, MethodDefinition method,
+        MethodAnalysisContext context, Dictionary<LocalVariable, CilLocalVariable> locals,
+        IMethodDescriptor writeLine)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        var operand = instruction.Operands[1];
+        var fromFloat = instruction.ConversionFromFloat;
+        var sourceBytes = instruction.ConversionSourceWidthBits == 32 ? 4 : 8;
+
+        switch (operand)
+        {
+            case DoubleLiteral doubleLiteral:
+                if (sourceBytes == 4)
+                    instructions.Add(CilOpCodes.Ldc_R4, (float)doubleLiteral.Value);
+                else
+                    instructions.Add(CilOpCodes.Ldc_R8, doubleLiteral.Value);
+                return;
+            case FloatLiteral floatLiteral:
+                instructions.Add(CilOpCodes.Ldc_R4, floatLiteral.Value);
+                return;
+            case Immediate immediate when fromFloat:
+                // The register's bits, not its integer value.
+                if (sourceBytes == 4)
+                    instructions.Add(CilOpCodes.Ldc_R4,
+                        System.BitConverter.Int32BitsToSingle(unchecked((int)immediate.Value)));
+                else
+                    instructions.Add(CilOpCodes.Ldc_R8, System.BitConverter.Int64BitsToDouble(immediate.Value));
+                return;
+            case Immediate immediate:
+                // An integer constant is the number itself, not its bit pattern.
+                if (immediate.Value is >= int.MinValue and <= int.MaxValue)
+                    instructions.Add(CilOpCodes.Ldc_I4, (int)immediate.Value);
+                else
+                    instructions.Add(CilOpCodes.Ldc_I8, immediate.Value);
+                return;
+        }
+
+        var emitted = EmittedOperandType(operand, context);
+        var emittedIsFloat = emitted?.FullName is "System.Single" or "System.Double";
+        var emittedBytes = emitted?.FullName switch
+        {
+            "System.Single" or "System.Int32" or "System.UInt32" => 4,
+            "System.Double" or "System.Int64" or "System.UInt64" => 8,
+            _ => 0,
+        };
+
+        if (emittedBytes == 0)
+        {
+            // Inference-only or non-numeric operand: load through the conversion's
+            // own contract so inference fills it; an uncoercible fill stays diagnosed.
+            LoadOperandIntoSlot(operand, ConversionSourceContract(instruction, context),
+                context, method, locals, writeLine);
+            return;
+        }
+        if (emittedBytes < sourceBytes)
+        {
+            EmitNullOrDefault(ConversionSourceContract(instruction, context), method, instructions, context,
+                $"Numeric conversion reads {sourceBytes * 8} bits of a register whose managed value proves only {emittedBytes * 8}.");
+            return;
+        }
+        if (emittedBytes == sourceBytes && emittedIsFloat == fromFloat)
+        {
+            // Same domain at the same width: the value loads unchanged.
+            LoadOperand(operand, method, locals, writeLine, emitted, context);
+            return;
+        }
+
+        var factory = method.DeclaringModule!.CorLibTypeFactory;
+        var bitConverter = factory.CorLibScope.CreateTypeReference("System", "BitConverter");
+        LoadOperand(operand, method, locals, writeLine, emitted, context);
+        if (emittedIsFloat)
+        {
+            var single = emitted!.FullName == "System.Single";
+            instructions.Add(CilOpCodes.Call, bitConverter.CreateMemberReference(
+                single ? "SingleToInt32Bits" : "DoubleToInt64Bits",
+                MethodSignature.CreateStatic(single ? factory.Int32 : factory.Int64,
+                    [single ? factory.Single : factory.Double])));
+        }
+        if (emittedBytes > sourceBytes)
+            // The S/W view of a wider register keeps only the low bits.
+            instructions.Add(CilOpCodes.Conv_I4);
+        if (fromFloat)
+            instructions.Add(CilOpCodes.Call, bitConverter.CreateMemberReference(
+                sourceBytes == 4 ? "Int32BitsToSingle" : "Int64BitsToDouble",
+                MethodSignature.CreateStatic(sourceBytes == 4 ? factory.Single : factory.Double,
+                    [sourceBytes == 4 ? factory.Int32 : factory.Int64])));
+    }
+
     // The interface instantiation a produced instance satisfies: its
     // definition's interface list still mentions the definition's parameters,
     // so each entry is rebound through the instance's own arguments. Returns
@@ -8360,7 +8501,7 @@ public static class IlGenerator
                 case OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
                     or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And or OpCode.Or or OpCode.Xor
                     or OpCode.Not or OpCode.Negate or OpCode.VectorMin or OpCode.VectorMax
-                    or OpCode.SignExtend32 or OpCode.Nop or OpCode.Return:
+                    or OpCode.SignExtend32 or OpCode.Convert or OpCode.Nop or OpCode.Return:
                     break;
                 default:
                     return false;
@@ -9294,6 +9435,11 @@ public static class IlGenerator
             case OpCode.Move or OpCode.Phi:
                 return (index == 0 ? null : StoreContract(instruction.Operands[0], context),
                     false);
+            case OpCode.Convert:
+                // The source position reads the register content the conversion
+                // consumes: a float for the FCVT family, an integer for
+                // SCVTF/UCVTF.
+                return (index == 0 ? null : ConversionSourceContract(instruction, context), false);
             case OpCode.Return:
                 return (context.ReturnType, false);
             case OpCode.Box:
@@ -11438,7 +11584,7 @@ public static class IlGenerator
         OpCode.Move or OpCode.Phi or OpCode.Add or OpCode.Subtract or OpCode.Multiply
             or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight
             or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
-            or OpCode.VectorMin or OpCode.VectorMax or OpCode.SignExtend32
+            or OpCode.VectorMin or OpCode.VectorMax or OpCode.SignExtend32 or OpCode.Convert
             or OpCode.CheckEqual or OpCode.CheckGreater or OpCode.CheckLess
             or OpCode.CheckNotEqual or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual
             or OpCode.Newobj or OpCode.NewArr or OpCode.Box or OpCode.Unbox
