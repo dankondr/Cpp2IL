@@ -71,7 +71,12 @@ internal sealed class Arm64VectorScalarizer
     private ulong _address;
     private bool _emitted;
 
-    private static readonly Immediate Zero = new(0);
+    private static readonly Immediate Zero = new(0, 8);
+
+    // Bytes an extraction still proves: the source's own count minus the bytes
+    // shifted past, capped at the extraction width.
+    private static int ExtractedProvenBytes(Immediate source, int droppedBits, int widthBytes)
+        => Math.Clamp(source.EffectiveProvenBytes - droppedBits / 8, 0, widthBytes);
 
     private static string Normalize(Arm64Register reg) => reg switch
     {
@@ -398,7 +403,8 @@ internal sealed class Arm64VectorScalarizer
 
         var (operand, offset) = slice;
         if (operand is Immediate imm)
-            return new Immediate(unchecked((int)(uint)(imm.UnsignedValue >> offset)));
+            return new Immediate(unchecked((int)(uint)(imm.UnsignedValue >> offset)),
+                ExtractedProvenBytes(imm, offset, 4));
         if (offset == 0)
             return operand;
 
@@ -504,8 +510,9 @@ internal sealed class Arm64VectorScalarizer
         var slotOp = SlotOperand(state, slot);
         if (slotOp == null)
             return null;
-        if (slotOp is Immediate { Value: var raw })
-            return new Immediate((int)(((uint)raw >> offsetInSlot) & ((1u << bits) - 1)));
+        if (slotOp is Immediate { } slotImm)
+            return new Immediate((int)(((uint)slotImm.Value >> offsetInSlot) & ((1u << bits) - 1)),
+                ExtractedProvenBytes(slotImm, offsetInSlot, bits / 8));
         var shifted = slotOp;
         if (offsetInSlot != 0)
         {
@@ -529,8 +536,14 @@ internal sealed class Arm64VectorScalarizer
         var slotOp = SlotOperand(state, offset / 32);
         if (slotOp == null)
             return null;
-        if (slotOp is Immediate { Value: var raw })
-            return new Immediate((int)raw << (32 - offset % 32 - bits) >> (32 - bits));
+        if (slotOp is Immediate { } signedSlotImm)
+        {
+            // A fully proven lane sign-extends into a fully known word; a
+            // partially proven one keeps only its proven bytes.
+            var kept = ExtractedProvenBytes(signedSlotImm, offset % 32, bits / 8);
+            return new Immediate((int)signedSlotImm.Value << (32 - offset % 32 - bits) >> (32 - bits),
+                kept >= bits / 8 ? 4 : kept);
+        }
         // (value << (32 - off - bits)) >> (32 - bits): arithmetic shift sign-extends.
         var left = Temp();
         _add(_address, OpCode.ShiftLeft, [left, slotOp, new Immediate(32 - offset % 32 - bits)]);
@@ -572,8 +585,10 @@ internal sealed class Arm64VectorScalarizer
     /// </summary>
     private IOperand EmitTempOp(OpCode opCode, IOperand left, IOperand right, int widthBits)
     {
-        if (left is Immediate { Value: var l } && right is Immediate { Value: var r })
+        if (left is Immediate { } leftImm && right is Immediate { } rightImm)
         {
+            var l = leftImm.Value;
+            var r = rightImm.Value;
             long? folded = opCode switch
             {
                 OpCode.And => l & r,
@@ -590,7 +605,11 @@ internal sealed class Arm64VectorScalarizer
             {
                 if (widthBits < 64)
                     result &= (1L << widthBits) - 1;
-                return new Immediate(result);
+                // A folded byte is proven only where every input byte was;
+                // the result itself only describes the folded width.
+                return new Immediate(result,
+                    Math.Min(Math.Min(leftImm.EffectiveProvenBytes, rightImm.EffectiveProvenBytes),
+                        widthBits / 8));
             }
         }
         var temp = Temp();
@@ -602,8 +621,9 @@ internal sealed class Arm64VectorScalarizer
 
     private IOperand EmitTempUnary(OpCode opCode, IOperand operand, int widthBits)
     {
-        if (operand is Immediate { Value: var v })
+        if (operand is Immediate { } operandImm)
         {
+            var v = operandImm.Value;
             long? folded = opCode switch
             {
                 OpCode.Not => ~v,
@@ -615,7 +635,8 @@ internal sealed class Arm64VectorScalarizer
             {
                 if (widthBits < 64)
                     result &= (1L << widthBits) - 1;
-                return new Immediate(result);
+                return new Immediate(result,
+                    Math.Min(operandImm.EffectiveProvenBytes, widthBits / 8));
             }
         }
         var temp = Temp();
@@ -649,8 +670,9 @@ internal sealed class Arm64VectorScalarizer
         }
 
         var mask = (1L << laneBits) - 1;
-        var laneOperand = value is Immediate { Value: var raw }
-            ? (IOperand)new Immediate(raw & mask)
+        var laneOperand = value is Immediate { } laneImm
+            ? (IOperand)new Immediate(laneImm.Value & mask,
+                Math.Min(laneImm.EffectiveProvenBytes, laneBits / 8))
             : elementReg;
         if (value is Immediate)
             _add(_address, OpCode.Move, [elementReg, laneOperand]).NativeIntegerWidthBits = 32;
@@ -687,16 +709,24 @@ internal sealed class Arm64VectorScalarizer
             }
 
             IOperand composed = parts[0]!;
+            // Every part of a composed window was a written lane, so the window
+            // claims its whole width only when all of them were proven.
+            var fullyProven = true;
+            foreach (var part in parts)
+                fullyProven &= part is Immediate { EffectiveProvenBytes: var partProven }
+                    && partProven >= laneBits / 8;
             for (var part = 1; part < partsPerWindow; part++)
             {
-                if (parts[part] is Immediate { Value: var raw })
-                    parts[part] = new Immediate(raw << (part * laneBits));
+                if (parts[part] is Immediate { } partImm)
+                    parts[part] = new Immediate(partImm.Value << (part * laneBits), laneBits / 8);
                 var shifted = parts[part] is Immediate
                     ? parts[part]
                     : EmitTempOp(OpCode.ShiftLeft, parts[part]!, new Immediate(part * laneBits), 32);
-                composed = composed is Immediate && parts[part] is Immediate
-                    ? new Immediate(((Immediate)composed).Value | ((Immediate)parts[part]!).Value)
-                    : EmitTempOp(OpCode.Or, composed, parts[part]!, 32);
+                composed = composed is Immediate { } composedImm && shifted is Immediate { } shiftedImm
+                    ? new Immediate(composedImm.Value | shiftedImm.Value,
+                        fullyProven ? 4 : Math.Min(composedImm.EffectiveProvenBytes,
+                            shiftedImm.EffectiveProvenBytes))
+                    : EmitTempOp(OpCode.Or, composed, shifted!, 32);
             }
 
             var windowReg = ElementRegister(destName, 32, window);
@@ -737,8 +767,10 @@ internal sealed class Arm64VectorScalarizer
         var destName = Normalize(destReg);
         var elementReg = ElementRegister(destName, destBits, 0);
         var mask = destBits < 64 ? (1L << destBits) - 1 : -1L;
-        if (result is Immediate { Value: var raw })
-            _add(_address, OpCode.Move, [elementReg, new Immediate(raw & mask)])
+        if (result is Immediate { } resultImm)
+            _add(_address, OpCode.Move, [elementReg,
+                    new Immediate(resultImm.Value & mask,
+                        Math.Min(resultImm.EffectiveProvenBytes, destBits / 8))])
                 .NativeIntegerWidthBits = 32;
         else if (destBits < 32)
         {
@@ -1476,10 +1508,15 @@ internal sealed class Arm64VectorScalarizer
         // scalar GPR -> FP: FMOV Sd/Dd, Wn/Xn — a scalar-defining write
         if (destIsScalarFp && insn.Op1Kind == Arm64OperandKind.Register && IsGpr(insn.Op1Reg))
         {
-            _add(_address, OpCode.Move, [convertOperand(insn, 0), convertOperand(insn, 1)]);
+            var width = insn.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31 ? 64 : 32;
+            // The S/D width is what a later slot read needs to know which of
+            // the source's bytes the register actually took. NativeFloatWriteBits
+            // keeps it provenance-only: the destination may still be read back
+            // as a wider vector, so the write must not seed its managed type.
+            _add(_address, OpCode.Move, [convertOperand(insn, 0), convertOperand(insn, 1)])
+                .NativeFloatWriteBits = width;
             _emitted = true;
             var dest = Ensure(insn.Op0Reg);
-            var width = insn.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31 ? 64 : 32;
             for (var i = 0; i < 4; i++)
                 dest.Slots[i] = 32 * i < width ? new LaneSlice(Reg(insn.Op0Reg), 32 * i) : new LaneSlice(Zero, 0);
             ClaimDest(insn.Op0Reg);
@@ -1513,7 +1550,8 @@ internal sealed class Arm64VectorScalarizer
             if (source != null)
                 laneOp = width64 ? Lane64Operand(source, 0) : SlotOperand(source, 0);
             laneOp ??= convertOperand(insn, 1); // fall back to the register local itself
-            _add(_address, OpCode.Move, [convertOperand(insn, 0), laneOp]);
+            _add(_address, OpCode.Move, [convertOperand(insn, 0), laneOp])
+                .NativeFloatWriteBits = width64 ? 64 : 32;
             _emitted = true;
             var dest = Ensure(insn.Op0Reg);
             for (var i = 0; i < 4; i++)
@@ -1538,10 +1576,10 @@ internal sealed class Arm64VectorScalarizer
         if (insn.Op0Arrangement == Arm64ArrangementSpecifier.None)
         {
             var value = insn.Mnemonic == Arm64Mnemonic.MVNI ? ~insn.Op1Imm : insn.Op1Imm;
-            _add(_address, OpCode.Move, [convertOperand(insn, 0), new Immediate(value)]);
+            _add(_address, OpCode.Move, [convertOperand(insn, 0), new Immediate(value, 8)]);
             _emitted = true;
-            dest.Slots[0] = new LaneSlice(new Immediate(value), 0);
-            dest.Slots[1] = new LaneSlice(new Immediate(value), 32);
+            dest.Slots[0] = new LaneSlice(new Immediate(value, 8), 0);
+            dest.Slots[1] = new LaneSlice(new Immediate(value, 8), 32);
             dest.Slots[2] = new LaneSlice(Zero, 0);
             dest.Slots[3] = new LaneSlice(Zero, 0);
             return true;
@@ -1574,10 +1612,10 @@ internal sealed class Arm64VectorScalarizer
             for (var lane = 0; lane < laneCount; lane++)
             {
                 var laneReg = ElementRegister(destName, 64, lane);
-                _add(_address, OpCode.Move, [laneReg, new Immediate(lane64)]);
+                _add(_address, OpCode.Move, [laneReg, new Immediate(lane64, 8)]);
                 _emitted = true;
-                dest.Slots[lane * 2] = new LaneSlice(new Immediate(lane64), 0);
-                dest.Slots[lane * 2 + 1] = new LaneSlice(new Immediate(lane64), 32);
+                dest.Slots[lane * 2] = new LaneSlice(new Immediate(lane64, 8), 0);
+                dest.Slots[lane * 2 + 1] = new LaneSlice(new Immediate(lane64, 8), 32);
             }
         }
         else
@@ -1595,9 +1633,9 @@ internal sealed class Arm64VectorScalarizer
             for (var slot = 0; slot < slotsUsed; slot++)
             {
                 var laneReg = ElementRegister(destName, 32, slot);
-                _add(_address, OpCode.Move, [laneReg, new Immediate(window)]);
+                _add(_address, OpCode.Move, [laneReg, new Immediate(window, 4)]);
                 _emitted = true;
-                dest.Slots[slot] = new LaneSlice(new Immediate(window), 0);
+                dest.Slots[slot] = new LaneSlice(new Immediate(window, 4), 0);
             }
         }
         for (var slot = slotsUsed; slot < 4; slot++)
@@ -2074,8 +2112,9 @@ internal sealed class Arm64VectorScalarizer
         var mask = (1L << destBits) - 1;
         for (var lane = 0; lane < srcLanes; lane++)
         {
-            var value = operands[lane]! is Immediate { Value: var raw }
-                ? new Immediate(raw & mask)
+            var value = operands[lane]! is Immediate { } laneValue
+                ? new Immediate(laneValue.Value & mask,
+                    Math.Min(laneValue.EffectiveProvenBytes, destBits / 8))
                 : EmitTempOp(OpCode.And, operands[lane]!, new Immediate(mask), 32);
             EmitLaneValue(destState, destName, destBits, firstWritten + lane, value, narrow);
         }
