@@ -858,6 +858,11 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // final and no later pass can restamp them.
         PackedRegisterFields.Run(this, finalPass: true);
 
+        // A bounds-checked indexed read of a constant table is LLVM's
+        // switch-to-lookup-table lowering; recover it to a real switch once
+        // local types and operand forms are final.
+        SwitchLookupTableRecovery.Run(this);
+
         LocalVariables.RemoveUnused(this);
 
     }

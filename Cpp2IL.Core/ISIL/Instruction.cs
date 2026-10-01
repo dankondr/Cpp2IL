@@ -101,7 +101,8 @@ public class Instruction : IOperand
     public bool IsFallThrough =>
         OpCode switch
         {
-            OpCode.Return or OpCode.Jump or OpCode.ConditionalJump or OpCode.IndirectJump or OpCode.Throw => false,
+            OpCode.Return or OpCode.Jump or OpCode.ConditionalJump or OpCode.IndirectJump or OpCode.Throw
+                or OpCode.Switch => false,
             _ => true
         };
 
@@ -245,6 +246,10 @@ public class Instruction : IOperand
                 or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight
                 or OpCode.And or OpCode.Or or OpCode.Xor
                 => [_operands[2], _operands[1]],
+
+            // Operand 0 is the default target and operands past 1 the case
+            // entry instructions; only the selector is a value source.
+            OpCode.Switch => [_operands[1]],
 
             OpCode.Call => _operands.Skip(2).ToList(),
 
