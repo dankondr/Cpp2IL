@@ -339,6 +339,7 @@ public static class MetadataResolver
                 if (genericOwner != null && field is not ConcreteGenericFieldAnalysisContext)
                     field = BindResolvedFieldLeaf(owner, resolved.Value.Containers, field);
 
+                NarrowMergeToOwner(local, owner, staticOwner ?? byRefElement, definitions);
                 instruction.SetOperand(i, new FieldReference(field, local, (int)memory.Addend,
                     resolved!.Value.Containers, memory.AccessSize));
                 changed = true;
@@ -1687,6 +1688,46 @@ public static class MetadataResolver
         return changed;
     }
 
+    // A merge whose wider annotation came from a use (op_Equality's UnityEngine.Object)
+    // holds the owner the access just resolved against on every path (MergedObjectType).
+    // The merge, the copies the access reads it through and the merge's inputs are
+    // declared with that owner, so the access is spelled as the source did, with no cast.
+    private static void NarrowMergeToOwner(LocalVariable local, TypeAnalysisContext owner,
+        TypeAnalysisContext? notInstance, IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+    {
+        if (notInstance != null || owner.IsValueType || !Wider(local) || !ReachesMerge(local, []))
+            return;
+        Narrow(local, []);
+
+        bool Wider(LocalVariable current) => current.Type is { IsValueType: false } declared
+            && owner.FullName != declared.FullName && owner.IsAssignableTo(declared);
+
+        bool ReachesMerge(LocalVariable current, HashSet<LocalVariable> seen) => seen.Add(current)
+            && definitions.TryGetValue(current, out var definition)
+            && (definition.OpCode == OpCode.Phi
+                || definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] } && ReachesMerge(source, seen));
+
+        void Narrow(LocalVariable current, HashSet<LocalVariable> seen)
+        {
+            if (!seen.Add(current))
+                return;
+            if (Wider(current))
+                current.Type = owner;
+            if (!definitions.TryGetValue(current, out var definition))
+                return;
+            var inputs = definition switch
+            {
+                { OpCode: OpCode.Move, Operands: [_, LocalVariable source] } => [source],
+                { OpCode: OpCode.Phi } => definition.Operands.Skip(1).OfType<LocalVariable>()
+                    .Where(input => !(definitions.TryGetValue(input, out var constant)
+                                      && constant is { OpCode: OpCode.Move, Operands: [_, Immediate { Value: 0 }] })),
+                _ => [],
+            };
+            foreach (var input in inputs)
+                Narrow(input, seen);
+        }
+    }
+
     // The address `root + displacement` a local holds on every path: a root plus a
     // constant, or a phi whose inputs all hold that same address. A pre-indexed store
     // on each of two paths (`str x0, [x19, #0x18]!`) steps the base to the same field
@@ -1767,11 +1808,38 @@ public static class MetadataResolver
             { OpCode: OpCode.Move, Operands: [_, AddressOf { Target: ArrayAccess element }] }
                 => EffectiveObjectType(element.Array, definitions, visiting, thisType) is SzArrayTypeAnalysisContext { ElementType: { IsValueType: true } elementType }
                     ? elementType : null,
+            { OpCode: OpCode.Phi } => MergedObjectType(definition),
             _ => null,
         };
 
         visiting.Remove(local);
         return recovered ?? fallback;
+
+        // `x = c ? a.config : null` holds a config or null on every path, whatever wider
+        // type a use gave the merge (op_Equality's UnityEngine.Object): the inputs that
+        // are not null must agree on one object type, a narrowing of the merge's own.
+        TypeAnalysisContext? MergedObjectType(Instruction phi)
+        {
+            TypeAnalysisContext? common = null;
+            foreach (var input in phi.Operands.Skip(1))
+            {
+                if (IsNullConstant(input) || input is LocalVariable seen && visiting.Contains(seen))
+                    continue;
+                // An address computed into an object (`a + i*4`) can carry the object's type.
+                if (input is not LocalVariable next
+                    || definitions.TryGetValue(next, out var inputDefinition)
+                    && inputDefinition.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Or
+                    || EffectiveObjectType(next, definitions, visiting, thisType) is not { IsValueType: false } type
+                    || common != null && common.FullName != type.FullName)
+                    return null;
+                common = type;
+            }
+            return common != null && (local.Type == null || common.IsAssignableTo(local.Type)) ? common : null;
+        }
+
+        bool IsNullConstant(IOperand operand) => operand is Immediate { Value: 0 }
+            || operand is LocalVariable constant && definitions.TryGetValue(constant, out var constantDefinition)
+            && constantDefinition is { OpCode: OpCode.Move, Operands: [_, Immediate { Value: 0 }] };
     }
 
     private static bool ResolvesToKnownAccess(TypeAnalysisContext owner, MemoryOperand memory, int pointerSize,

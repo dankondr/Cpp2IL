@@ -62,6 +62,12 @@ public static class IlGenerator
         // foreign reference.
         Analysis.InlinedEventRaiseRecovery.Run(context);
 
+        // Analysis asks for emitted slot types mid-pipeline (a field base's receiver
+        // check), which fills these per-method caches from a graph later passes still
+        // rewrote: emission derives them again from the graph it emits.
+        foreach (var cache in (string[])["RawAddressLocals", "MemoryBaseLocals", "NumericLocalTypes"])
+            context.PutExtraData<object>(cache, null!);
+
         // Change branch targets to instructions
         foreach (var instruction in context.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))
         {
