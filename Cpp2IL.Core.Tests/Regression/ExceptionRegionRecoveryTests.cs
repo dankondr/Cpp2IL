@@ -688,15 +688,19 @@ public class ExceptionRegionRecoveryTests
     [TestCase(0, false, true)]
     [TestCase(4, false, false)]
     [TestCase(5, false, false)]
+    [TestCase(6, false, false)]
+    [TestCase(6, true, false)]
+    [TestCase(7, false, false)]
     public void CatchReturnPreservesItsOwnValue(int returnKind, bool unknownReturn, bool effectInEpilogue)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         TypeAnalysisContext resultType = returnKind == 4 ? new PointerTypeAnalysisContext(app.SystemTypes.SystemInt32Type)
             : returnKind == 5 ? new ByRefTypeAnalysisContext(app.SystemTypes.SystemInt32Type)
-            : returnKind == 0 ? app.SystemTypes.SystemInt32Type : returnKind == 3 ? app.SystemTypes.SystemBooleanType : returnKind == 1 ? app.SystemTypes.SystemStringType : app.SystemTypes.SystemObjectType;
+            : returnKind is 0 or 7 ? app.SystemTypes.SystemInt32Type : returnKind == 3 ? app.SystemTypes.SystemBooleanType : returnKind is 1 or 6 ? app.SystemTypes.SystemStringType : app.SystemTypes.SystemObjectType;
         var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "ReturnCatch", app.SystemTypes.SystemObjectType, R.TypeAttributes.Public);
         var caller = owner.InjectMethodContext("M", resultType, R.MethodAttributes.Public | R.MethodAttributes.Static,
-            returnKind == 1 ? new[] { app.SystemTypes.SystemStringType } : []);
+            returnKind == 1 ? new[] { app.SystemTypes.SystemStringType }
+                : returnKind == 6 ? new[] { app.SystemTypes.SystemStringType, app.SystemTypes.SystemStringType } : []);
         var work = owner.InjectMethodContext("Work", app.SystemTypes.SystemVoidType, R.MethodAttributes.Public | R.MethodAttributes.Static, []);
         var text = owner.InjectMethodContext("Text", app.SystemTypes.SystemStringType, R.MethodAttributes.Public | R.MethodAttributes.Static, []);
         Instruction At(ulong a, OpCode op, params IOperand[] args) => new(0, op, args.ToList()) { NativeAddress = a };
@@ -706,6 +710,16 @@ public class ExceptionRegionRecoveryTests
         var merge = effectInEpilogue ? At(0x1008, OpCode.Move, new MemoryOperand(addend: 0x9000), new Immediate(1)) : ret;
         var mismatch = At(0x2100, OpCode.CallVoid, new StringLiteral("il2cpp_raise_exception"), exception);
         caller.ConvertedIsil = [call, At(0x1004, OpCode.Move, x0, new Immediate(7))];
+        if (returnKind == 6)
+        {
+            caller.ParameterLocals = caller.Parameters.Select((p, i) =>
+                new LocalVariable(p.ParameterName, new Register(null, "X" + i), p.ParameterType)).ToList();
+            caller.ParameterOperands = caller.ParameterLocals.Select(l => (IOperand)l.Register).ToList();
+            caller.ConvertedIsil.Insert(0, At(0xFFC, OpCode.Move, saved, new Register(null, "X1")));
+        }
+        if (returnKind == 7)
+            caller.ConvertedIsil.InsertRange(0, [At(0xFF8, OpCode.Move, new Register(null, "X22"), new Immediate(0x9000)),
+                At(0xFFC, OpCode.Move, new MemoryOperand(new Register(null, "X22")), new Immediate(7))]);
         if (effectInEpilogue) caller.ConvertedIsil.Add(merge);
         caller.ConvertedIsil.AddRange([ret,
             At(0x2000, OpCode.Call, new StringLiteral("__cxa_begin_catch"), x0, x0),
@@ -716,13 +730,13 @@ public class ExceptionRegionRecoveryTests
         caller.ConvertedIsil.AddRange([
             At(0x201C, OpCode.CallVoid, new StringLiteral("__cxa_end_catch")),
             At(0x2020, OpCode.Move, x0, unknownReturn ? new Register(null, "unknown")
-                : returnKind == 0 ? new Immediate(-9) : returnKind is 3 or 4 or 5 ? new Immediate(0) : returnKind == 1 ? saved : exception),
+                : returnKind == 7 ? new MemoryOperand(new Register(null, "X22")) : returnKind == 0 ? new Immediate(-9) : returnKind is 3 or 4 or 5 ? new Immediate(0) : returnKind is 1 or 6 ? saved : exception),
             returnKind == 2 ? At(0x2024, OpCode.Return, x0) : At(0x2024, OpCode.Jump, merge), mismatch]);
-        caller.UnwindInfo = new EhFunctionInfo { Start = 0x1000, Size = 0x1104 };
+        caller.UnwindInfo = new EhFunctionInfo { Start = returnKind == 7 ? 0xFF8UL : returnKind == 6 ? 0xFFCUL : 0x1000UL, Size = 0x1108 };
         caller.UnwindInfo.CallSites.Add(new EhCallSiteInfo(0x1000, 4, 0x2000, 1) { Actions = [new EhActionInfo(1, 0xABC)] });
         EhRegionPartition.Partition(caller);
         var proofs = new NativeExceptionRegionProof(caller).FindCatches(a => a == 0xABC);
-        if (unknownReturn || effectInEpilogue || returnKind is 4 or 5)
+        if (unknownReturn || effectInEpilogue || returnKind is 4 or 5 or 7)
         {
             Assert.That(proofs, Is.Empty); Assert.That(caller.AnalysisWarnings, Has.Count.EqualTo(1)); return;
         }
@@ -751,11 +765,11 @@ public class ExceptionRegionRecoveryTests
         SyntheticFixture.SeedCorLibTypes(app, module, app.SystemTypes.SystemVoidType, app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemStringType, app.SystemTypes.SystemObjectType, app.SystemTypes.SystemExceptionType);
         var normal = At(0x1010, OpCode.Return, returnKind == 0 ? new Immediate(7) : returnKind == 3 ? new Immediate(1) : new StringLiteral("normal"));
         caller.ControlFlowGraph = new Cpp2IL.Core.Graphs.ISILControlFlowGraph([call, normal]); caller.Locals = [];
-        var definition = RuntimeMethod("M", returnKind == 0 ? module.CorLibTypeFactory.Int32 : returnKind == 3 ? module.CorLibTypeFactory.Boolean : returnKind == 1 ? module.CorLibTypeFactory.String : module.CorLibTypeFactory.Object);
-        if (returnKind == 1)
+        var definition = RuntimeMethod("M", returnKind == 0 ? module.CorLibTypeFactory.Int32 : returnKind == 3 ? module.CorLibTypeFactory.Boolean : returnKind is 1 or 6 ? module.CorLibTypeFactory.String : module.CorLibTypeFactory.Object);
+        foreach (var p in caller.Parameters)
         {
             definition.Signature!.ParameterTypes.Add(module.CorLibTypeFactory.String);
-            definition.ParameterDefinitions.Add(new ParameterDefinition(1, caller.Parameters[0].ParameterName, default));
+            definition.ParameterDefinitions.Add(new ParameterDefinition((ushort)(p.ParameterIndex + 1), p.ParameterName, default));
         }
         IlGenerator.GenerateIl(caller, definition, proofs);
         var body = definition.CilMethodBody!; Assert.That(body.ExceptionHandlers, Has.Count.EqualTo(1)); Assert.That(caller.AnalysisWarnings, Is.Empty);
@@ -763,11 +777,12 @@ public class ExceptionRegionRecoveryTests
         foreach (var local in body.LocalVariables)
             local.VariableType = local.VariableType.FullName == "System.String" ? module.CorLibTypeFactory.String : new TypeDefOrRefSignature(module.DefaultImporter.ImportType(typeof(Exception)), false);
         var runtime = Load(module).GetType("Tests.ReturnCatch")!; var run = runtime.GetMethod("M")!;
-        Assert.That(run.Invoke(null, returnKind == 1 ? new object[] { "parameter" } : null), Is.EqualTo(returnKind == 0 ? (object)7 : returnKind == 3 ? true : "normal"));
+        object[]? inputs = returnKind == 1 ? ["parameter"] : returnKind == 6 ? ["first", "second"] : null;
+        Assert.That(run.Invoke(null, inputs), Is.EqualTo(returnKind == 0 ? (object)7 : returnKind == 3 ? true : "normal"));
         var thrown = new Exception("original"); runtime.GetField("Original")!.SetValue(null, thrown); runtime.GetField("Fail")!.SetValue(null, true);
-        var value = run.Invoke(null, returnKind == 1 ? new object[] { "parameter" } : null);
+        var value = run.Invoke(null, inputs);
         if (returnKind == 2) Assert.That(value, Is.SameAs(thrown));
-        else Assert.That(value, Is.EqualTo(returnKind == 0 ? (object)(-9) : returnKind == 3 ? false : "caught"));
+        else Assert.That(value, Is.EqualTo(returnKind == 0 ? (object)(-9) : returnKind == 3 ? false : returnKind == 6 ? "second" : "caught"));
         var clause = body.ExceptionHandlers[0];
         var handlerStart = body.Instructions.IndexOf(((CilInstructionLabel)clause.HandlerStart!).Instruction!);
         var handlerEnd = body.Instructions.IndexOf(((CilInstructionLabel)clause.HandlerEnd!).Instruction!);

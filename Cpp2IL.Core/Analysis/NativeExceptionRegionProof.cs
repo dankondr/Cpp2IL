@@ -405,6 +405,10 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
         var value = Value(operand, state);
         if (value == Exception) return exceptionLocal;
         if (value != null && handlerValues.TryGetValue(value, out var result)) return result;
+        var parameterLocal = context.ParameterLocals.FirstOrDefault(l => !l.IsMethodInfo && l.Type is { IsValueType: false }
+            and not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext or GenericParameterTypeAnalysisContext)
+            && value == "argument:" + l.Register.Name);
+        if (parameterLocal != null) return parameterLocal;
         try
         {
             if (MetadataAddress(value) is { } literalAddress
@@ -478,6 +482,7 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
                     || instruction.Operands.Count <= (instruction.OpCode == OpCode.CallVoid ? 1 : 2) || Value(instruction.Operands[instruction.OpCode == OpCode.CallVoid ? 1 : 2], initializedState) != klass)
                     return false;
                 called = true;
+                InvalidateCallStorage(instruction, initializedState, null);
                 Clobber(initializedState);
             }
             else if (instruction.OpCode != OpCode.Nop
@@ -495,6 +500,7 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
         initialized = new Instruction(index, OpCode.CallVoid, [runInitializer, type]) { NativeAddress = code[index + 1].NativeAddress };
         after = state.Copy();
         Intersect(after.Registers, initializedState.Registers);
+        Intersect(after.Memory, initializedState.Memory);
         return true;
     }
 
@@ -677,6 +683,10 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
 
     private void InvalidateCallStorage(Instruction instruction, State state, MethodAnalysisContext? callee)
     {
+        // A call can mutate heap cells through aliases or static state, even
+        // without a pointer argument. Retain only independently tracked frame cells.
+        foreach (var cell in state.Memory.Keys.Where(k => !k.StartsWith("f", StringComparison.Ordinal)).ToArray())
+            state.Memory.Remove(cell);
         var arguments = instruction.Operands.Skip(instruction.OpCode == OpCode.CallVoid ? 1 : 2);
         // Boxing copies the input bytes; it never writes through the value
         // pointer. Treating it as an unknown writer erased adjacent saved
@@ -800,7 +810,10 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
             }
             else if (helper is "il2cpp_codegen_initialize_runtime_metadata" or "il2cpp_codegen_initialize_method"
                 or "il2cpp_codegen_runtime_class_init")
+            {
+                InvalidateCallStorage(instruction, state, null);
                 Clobber(state);
+            }
             else if (instruction.Operands[0] is Immediate target && NativeBody(target.UnsignedValue) is { } nested)
             {
                 var child = state.Copy();
