@@ -974,6 +974,7 @@ public static class LocalVariables
             .ToDictionary(instruction => (LocalVariable)instruction.Operands[0],
                 instruction => (LocalVariable)((AddressOf)instruction.Operands[1]).Target);
 
+        var definedAt = DefinitionPositions(instructions);
         var hiddenReturns = new List<(Instruction Call, LocalVariable Buffer,
             MethodAnalysisContext Target, TypeAnalysisContext ResultType, int Index)>();
         foreach (var call in instructions)
@@ -1036,7 +1037,7 @@ public static class LocalVariables
                     if (ReferenceEquals(operand, destination))
                         continue;
                     if (RewriteHiddenReturnStackOperand(operand, buffer, result, resultType,
-                            next.NativeMemoryAccessSize ?? 0) is { } rewritten)
+                            next.NativeMemoryAccessSize ?? 0, local => StoredBetween(definedAt, local, callIndex, i)) is { } rewritten)
                         next.SetOperand(operandIndex, rewritten);
                 }
             }
@@ -1046,6 +1047,8 @@ public static class LocalVariables
     private static bool SharpenHiddenReturnBuffers(MethodAnalysisContext method)
     {
         var changed = false;
+        var instructions = method.ControlFlowGraph!.Instructions;
+        var definedAt = DefinitionPositions(instructions);
         foreach (var call in method.ControlFlowGraph!.Instructions)
         {
             if (call is not { OpCode: OpCode.Call,
@@ -1076,7 +1079,8 @@ public static class LocalVariables
                 IOperand? replacement = field == null
                     ? result.HiddenReturnBuffer == null || operandIndex == 0 && instruction.IsAssignment ? null
                         : RewriteHiddenReturnStackOperand(operand, result.HiddenReturnBuffer, result,
-                            resultType, instruction.NativeMemoryAccessSize ?? 0)
+                            resultType, instruction.NativeMemoryAccessSize ?? 0,
+                            local => StoredBetween(definedAt, local, instructions.IndexOf(call), instructions.IndexOf(instruction)))
                     : HiddenReturnField(resultType, result, field.Offset, field.AccessSize);
                 if (replacement == null)
                     continue;
@@ -1103,19 +1107,42 @@ public static class LocalVariables
     }
 
     private static IOperand? RewriteHiddenReturnStackOperand(IOperand operand, LocalVariable buffer,
-        LocalVariable result, TypeAnalysisContext returnType, int accessSize)
+        LocalVariable result, TypeAnalysisContext returnType, int accessSize, System.Func<LocalVariable, bool> overwritten)
     {
         if (operand is AddressOf address
-            && HiddenReturnStackStorage(address.Target, buffer, result, returnType, accessSize) is { } addressed)
+            && HiddenReturnStackStorage(address.Target, buffer, result, returnType, accessSize, null) is { } addressed)
             return new AddressOf(addressed);
 
-        return HiddenReturnStackStorage(operand, buffer, result, returnType, accessSize);
+        return HiddenReturnStackStorage(operand, buffer, result, returnType, accessSize, overwritten);
     }
 
+    // Where each local is defined in the instruction list; a local defined twice is absent.
+    private static Dictionary<LocalVariable, int> DefinitionPositions(List<Instruction> instructions)
+    {
+        var positions = new Dictionary<LocalVariable, int>();
+        var twice = new HashSet<LocalVariable>();
+        for (var i = 0; i < instructions.Count; i++)
+            if (instructions[i].IsAssignment && instructions[i].Operands is [LocalVariable defined, ..] && !positions.TryAdd(defined, i))
+                twice.Add(defined);
+        foreach (var local in twice)
+            positions.Remove(local);
+        return positions;
+    }
+
+    // A cell stored between the call and the read no longer holds the bytes the call returned
+    // into it: the frame slot was reused (`stp xzr, x9, [sp, #0x38]` after the enumerator moved
+    // out). A store before the call (the buffer's zeroing) is overwritten by the call, and one
+    // after the read has not happened yet.
+    private static bool StoredBetween(Dictionary<LocalVariable, int> definedAt, LocalVariable local, int callIndex, int readIndex)
+        => definedAt.TryGetValue(local, out var at) && at > callIndex && at < readIndex;
+
+    // A read of a buffer cell is the returned struct's field only while the cell still holds the
+    // returned bytes.
     private static IOperand? HiddenReturnStackStorage(IOperand operand, LocalVariable buffer,
-        LocalVariable result, TypeAnalysisContext returnType, int accessSize)
+        LocalVariable result, TypeAnalysisContext returnType, int accessSize, System.Func<LocalVariable, bool>? overwritten)
     {
         if (operand is not LocalVariable local
+            || overwritten != null && overwritten(local)
             || TryStackOffset(buffer.Register.Name) is not { } bufferOffset
             || TryStackOffset(local.Register.Name) is not { } localOffset)
             return null;
@@ -1474,6 +1501,12 @@ public static class LocalVariables
                     if (instruction.Destination is LocalVariable extended)
                         changed |= SetTypeIfUnknown(extended, method.AppContext.SystemTypes.SystemInt64Type);
                     break;
+                case OpCode.Convert:
+                    // The conversion's result type is its destination register's
+                    // width - never the converted operand's type.
+                    if (instruction.Destination is LocalVariable converted)
+                        changed |= SetTypeIfUnknown(converted, ConversionResultType(instruction, method));
+                    break;
                 case OpCode.Move:
                     changed |= PropagateMove(instruction, method, method.AppContext.Binary.PointerSizeBytes,
                         method.AppContext.SystemTypes.SystemInt32Type, definitions, allDefinitions);
@@ -1508,6 +1541,23 @@ public static class LocalVariables
         }
 
         return changed;
+    }
+
+    // A Convert's result type: its destination register's width, signed or unsigned
+    // as the instruction says. Never inferred from the converted operand - that is
+    // what separates a conversion from a move.
+    internal static TypeAnalysisContext ConversionResultType(Instruction instruction, MethodAnalysisContext method)
+    {
+        var systemTypes = method.AppContext.SystemTypes;
+        if (instruction.NativeFloatWidthBits == 32)
+            return systemTypes.SystemSingleType;
+        if (instruction.NativeFloatWidthBits == 64)
+            return systemTypes.SystemDoubleType;
+        if (instruction.NativeIntegerWidthBits == 64)
+            return instruction.ConversionUnsigned
+                ? systemTypes.SystemUInt64Type : systemTypes.SystemInt64Type;
+        return instruction.ConversionUnsigned
+            ? systemTypes.SystemUInt32Type : systemTypes.SystemInt32Type;
     }
 
     // Types that reach a Boolean slot as raw bits: the flag itself or a 4-byte integer the
@@ -2282,6 +2332,7 @@ public static class LocalVariables
         // A lea and the call it's passed to are still separate here. The address only gets folded into the
         // call later, so an argument's address-of has to be found through the local carrying it.
         var addressesOf = new Dictionary<LocalVariable, LocalVariable>();
+        var copiesOf = new Dictionary<LocalVariable, LocalVariable>();
         var defined = new HashSet<LocalVariable>(method.ParameterLocals);
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
@@ -2291,6 +2342,8 @@ public static class LocalVariables
                 && instruction.Operands[0] is LocalVariable pointer
                 && instruction.Operands[1] is AddressOf { Target: LocalVariable pointee })
                 addressesOf[pointer] = pointee;
+            else if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable copy, LocalVariable copied] })
+                copiesOf[copy] = copied;
         }
 
         LocalVariable? Addressed(IOperand operand) => operand switch
@@ -2299,6 +2352,20 @@ public static class LocalVariables
             LocalVariable local when addressesOf.TryGetValue(local, out var indirect) => indirect,
             _ => null
         };
+
+        // An address carried through copies, as a saved `&enumerator` reloaded for the finally's
+        // `Dispose` is (a register, a frame cell, a register again).
+        bool CarriesAddress(LocalVariable local)
+        {
+            for (var depth = 0; depth < 8; depth++)
+            {
+                if (addressesOf.ContainsKey(local))
+                    return true;
+                if (!copiesOf.TryGetValue(local, out local!))
+                    return false;
+            }
+            return false;
+        }
 
         var addressUses = new Dictionary<LocalVariable, int>();
         foreach (var call in method.ControlFlowGraph.Instructions.Where(instruction => instruction.IsCall))
@@ -2359,10 +2426,16 @@ public static class LocalVariables
             // 1. thisParam
             // ... parameters
             // 'this' param
+            // A value type's instance method takes the address of its receiver: a register that
+            // carries `&value` through copies is that address, not the value (`Dispose(&enumerator)`
+            // from a frame cell saved for the finally).
             if (!deferGenericSlots && !calledMethod.IsStatic
                 && instruction.Operands[thisParamIndex] is LocalVariable thisParam)
             {
-                changed |= SetTypeIfUnknown(thisParam, calledMethod.DeclaringType);
+                changed |= SetTypeIfUnknown(thisParam,
+                    calledMethod.DeclaringType is { IsValueType: true } receiverValue && CarriesAddress(thisParam)
+                        ? new ByRefTypeAnalysisContext(receiverValue)
+                        : calledMethod.DeclaringType);
             }
 
             // Value type instance method, first arg is address of value, but we need to type the value

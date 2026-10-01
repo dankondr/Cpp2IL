@@ -291,7 +291,11 @@ public static class IlGenerator
 
             if (instruction.OpCode == OpCode.Jump || instruction.OpCode == OpCode.ConditionalJump)
             {
-                var ilBranch = il.First(i => i.OpCode == CilOpCodes.Br || i.OpCode == CilOpCodes.Brtrue);
+                // The branch belonging to this instruction is the last branch in
+                // its emitted range: operand loads (select, inlined null tests)
+                // may emit internal branches earlier in the same range.
+                var ilBranch = il.Last(i => i.OpCode == CilOpCodes.Br || i.OpCode == CilOpCodes.Brtrue
+                    || i.OpCode == CilOpCodes.Brfalse);
 
                 if (instruction.Operands[0] is Block targetBlock)
                 {
@@ -803,6 +807,17 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Conv_I4);
                 instructions.Add(CilOpCodes.Conv_I8);
                 EmitStackCoerceOrDefault(context.AppContext.SystemTypes.SystemInt64Type,
+                    StoreContract(instruction.Operands[0], context), method, context);
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
+                break;
+
+            case OpCode.Convert:
+                LoadConversionSource(instruction, method, context, locals, writeLine);
+                instructions.Add(ConversionOpCode(instruction));
+                if (instruction.ConversionUnsigned && instruction.NativeFloatWidthBits == 32)
+                    // conv.r.un yields the native float; an f32 destination narrows it.
+                    instructions.Add(CilOpCodes.Conv_R4);
+                EmitStackCoerceOrDefault(Analysis.LocalVariables.ConversionResultType(instruction, context),
                     StoreContract(instruction.Operands[0], context), method, context);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 break;
@@ -1629,6 +1644,9 @@ public static class IlGenerator
                 break;
 
             case OpCode.ConditionalJump:
+                if (TryEmitInlinedBranchCondition(instruction, context, method, locals, writeLine, instructions))
+                    break;
+
                 var conditionType = EmittedOperandType(instruction.Operands[1], context);
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, null, context);
                 // brtrue won't pop an i64; the native branch tested the full register
@@ -2009,6 +2027,78 @@ public static class IlGenerator
         }
 
         return instructions.ToList().GetRange(startIndex, instructions.Count - startIndex); // Return added IL
+    }
+
+    // `flag = (x == null); if (flag)` - the lifter materializes every branch
+    // condition into a bool local, but a managed compiler feeds a null test to
+    // the branch directly. When the condition local's definition in the same
+    // block is a Check*Equal against a zero constant over a reference operand
+    // (optionally behind Not/Move flag locals), emit `load x; brtrue/brfalse`
+    // inline so the CIL keeps the shape ILSpy's `??` transforms recognize -
+    // e.g. `if (slot == null) { slot = new Delegate(...) }` fold.
+    // The flag's own instructions still emit normally; they are simply unused.
+    private static bool TryEmitInlinedBranchCondition(Instruction jump, MethodAnalysisContext context,
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals,
+        IMethodDescriptor writeLine, CilInstructionCollection instructions)
+    {
+        if (jump.Operands[1] is not LocalVariable condition)
+            return false;
+
+        var block = context.ControlFlowGraph!.FindBlockByInstruction(jump);
+        if (block == null)
+            return false;
+
+        var negated = false;
+        var current = condition;
+        Instruction? comparison = null;
+        for (var depth = 0; depth < 4; depth++)
+        {
+            var definition = block.Instructions
+                .TakeWhile(instruction => instruction != jump)
+                .LastOrDefault(instruction => ReferenceEquals(instruction.Destination, current));
+            if (definition == null)
+                return false;
+
+            if (definition.OpCode is OpCode.Not or OpCode.Move
+                && definition.Operands.Count == 2
+                && definition.Operands[1] is LocalVariable next)
+            {
+                negated ^= definition.OpCode == OpCode.Not;
+                current = next;
+                continue;
+            }
+
+            comparison = definition;
+            break;
+        }
+
+        if (comparison is not { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual }
+            || comparison.Operands.Count < 3)
+            return false;
+
+        // Only operands whose load is a straight-line sequence with no branches
+        // of its own can inline here: anything else (select, memory, casts) may
+        // emit internal branches the jump fixup would retarget.
+        var storage = IsZeroConstant(comparison.Operands[2]) ? comparison.Operands[1]
+            : IsZeroConstant(comparison.Operands[1]) ? comparison.Operands[2]
+            : null;
+        if (storage is not (LocalVariable or FieldReference)
+            || EmittedOperandType(storage, context) is not { IsValueType: false } emittedStorage)
+            return false;
+        if (storage is LocalVariable local && !locals.ContainsKey(local))
+            return false;
+
+        // The jump fires when the condition is true; the condition is the
+        // equality test, optionally negated. Jump on the raw operand: brfalse
+        // fires when the slot is null (the "equal" case), brtrue when non-null.
+        // A generic parameter cannot feed brtrue/brfalse directly - it is
+        // boxed first, matching the comparison's own reference-slot coercion.
+        var jumpWhenNull = (comparison.OpCode == OpCode.CheckEqual) != negated;
+        LoadOperand(storage, method, locals, writeLine, null, context);
+        if (emittedStorage is GenericParameterTypeAnalysisContext)
+            instructions.Add(CilOpCodes.Box, emittedStorage.ToTypeSignature().ToTypeDefOrRef());
+        instructions.Add(jumpWhenNull ? CilOpCodes.Brfalse : CilOpCodes.Brtrue, new CilInstructionLabel());
+        return true;
     }
 
     private static bool IsExceptionValueReturnedFromIncompatibleMethod(MethodAnalysisContext context, IOperand operand)
@@ -3137,7 +3227,7 @@ public static class IlGenerator
         or "System.Collections.Generic.IReadOnlyCollection`1"
         or "System.Collections.Generic.IReadOnlyList`1";
 
-    private static bool IsErasedSharedArgument(TypeAnalysisContext argument) =>
+    internal static bool IsErasedSharedArgument(TypeAnalysisContext argument) =>
         argument is GenericParameterTypeAnalysisContext
         || argument.FullName is "System.Object" or "System.ValueType"
         || IsSharedEnumMarker(argument);
@@ -6827,6 +6917,136 @@ public static class IlGenerator
         return fallback;
     }
 
+    // The slot a Convert's source is loaded through: the register content at the
+    // recorded width - a float value for the FCVT family, an integer for
+    // SCVTF/UCVTF (including integer bits held in an S/D register).
+    private static TypeAnalysisContext ConversionSourceContract(Instruction instruction, MethodAnalysisContext context)
+    {
+        var systemTypes = context.AppContext.SystemTypes;
+        var wide = instruction.ConversionSourceWidthBits != 32;
+        if (instruction.ConversionFromFloat)
+            return wide ? systemTypes.SystemDoubleType : systemTypes.SystemSingleType;
+        if (wide)
+            return instruction.ConversionUnsigned
+                ? systemTypes.SystemUInt64Type : systemTypes.SystemInt64Type;
+        return instruction.ConversionUnsigned
+            ? systemTypes.SystemUInt32Type : systemTypes.SystemInt32Type;
+    }
+
+    // The CIL conversion opcode - the numeric step only. The source arrives at
+    // its proven width and converts straight to the destination's kind:
+    // conv.i*/u* truncate a float to an integer, conv.r* size a float or take a
+    // signed integer to float, conv.r.un an unsigned one.
+    private static CilOpCode ConversionOpCode(Instruction instruction)
+    {
+        if (instruction.NativeFloatWidthBits is { } floatWidth)
+        {
+            if (instruction.ConversionFromFloat)
+                return floatWidth == 64 ? CilOpCodes.Conv_R8 : CilOpCodes.Conv_R4;
+            return instruction.ConversionUnsigned ? CilOpCodes.Conv_R_Un
+                : floatWidth == 64 ? CilOpCodes.Conv_R8 : CilOpCodes.Conv_R4;
+        }
+        var integerWidth = instruction.NativeIntegerWidthBits ?? 32;
+        if (instruction.ConversionUnsigned)
+            return integerWidth == 64 ? CilOpCodes.Conv_U8 : CilOpCodes.Conv_U4;
+        return integerWidth == 64 ? CilOpCodes.Conv_I8 : CilOpCodes.Conv_I4;
+    }
+
+    // Loads a Convert's source as the register content the hardware reads: the
+    // low ConversionSourceWidthBits of the register, read as a float for the
+    // FCVT family or an integer for SCVTF/UCVTF. The operand's own managed type
+    // only picks how the bits arrive on the stack - same-domain loads move the
+    // value, cross-domain loads reinterpret through BitConverter like the `fmov`
+    // between the integer and FP banks they mirror. A read wider than what the
+    // managed value proves is a diagnosed default, not a guess.
+    private static void LoadConversionSource(Instruction instruction, MethodDefinition method,
+        MethodAnalysisContext context, Dictionary<LocalVariable, CilLocalVariable> locals,
+        IMethodDescriptor writeLine)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        var operand = instruction.Operands[1];
+        var fromFloat = instruction.ConversionFromFloat;
+        var sourceBytes = instruction.ConversionSourceWidthBits == 32 ? 4 : 8;
+
+        switch (operand)
+        {
+            case DoubleLiteral doubleLiteral:
+                if (sourceBytes == 4)
+                    instructions.Add(CilOpCodes.Ldc_R4, (float)doubleLiteral.Value);
+                else
+                    instructions.Add(CilOpCodes.Ldc_R8, doubleLiteral.Value);
+                return;
+            case FloatLiteral floatLiteral:
+                instructions.Add(CilOpCodes.Ldc_R4, floatLiteral.Value);
+                return;
+            case Immediate immediate when fromFloat:
+                // The register's bits, not its integer value.
+                if (sourceBytes == 4)
+                    instructions.Add(CilOpCodes.Ldc_R4,
+                        System.BitConverter.Int32BitsToSingle(unchecked((int)immediate.Value)));
+                else
+                    instructions.Add(CilOpCodes.Ldc_R8, System.BitConverter.Int64BitsToDouble(immediate.Value));
+                return;
+            case Immediate immediate:
+                // An integer constant is the number itself, not its bit pattern.
+                if (immediate.Value is >= int.MinValue and <= int.MaxValue)
+                    instructions.Add(CilOpCodes.Ldc_I4, (int)immediate.Value);
+                else
+                    instructions.Add(CilOpCodes.Ldc_I8, immediate.Value);
+                return;
+        }
+
+        var emitted = EmittedOperandType(operand, context);
+        var emittedIsFloat = emitted?.FullName is "System.Single" or "System.Double";
+        var emittedBytes = emitted?.FullName switch
+        {
+            "System.Single" or "System.Int32" or "System.UInt32" => 4,
+            "System.Double" or "System.Int64" or "System.UInt64" => 8,
+            _ => 0,
+        };
+
+        if (emittedBytes == 0)
+        {
+            // Inference-only or non-numeric operand: load through the conversion's
+            // own contract so inference fills it; an uncoercible fill stays diagnosed.
+            LoadOperandIntoSlot(operand, ConversionSourceContract(instruction, context),
+                context, method, locals, writeLine);
+            return;
+        }
+        if (emittedBytes < sourceBytes)
+        {
+            EmitNullOrDefault(ConversionSourceContract(instruction, context), method, instructions, context,
+                $"Numeric conversion reads {sourceBytes * 8} bits of a register whose managed value proves only {emittedBytes * 8}.");
+            return;
+        }
+        if (emittedBytes == sourceBytes && emittedIsFloat == fromFloat)
+        {
+            // Same domain at the same width: the value loads unchanged.
+            LoadOperand(operand, method, locals, writeLine, emitted, context);
+            return;
+        }
+
+        var factory = method.DeclaringModule!.CorLibTypeFactory;
+        var bitConverter = factory.CorLibScope.CreateTypeReference("System", "BitConverter");
+        LoadOperand(operand, method, locals, writeLine, emitted, context);
+        if (emittedIsFloat)
+        {
+            var single = emitted!.FullName == "System.Single";
+            instructions.Add(CilOpCodes.Call, bitConverter.CreateMemberReference(
+                single ? "SingleToInt32Bits" : "DoubleToInt64Bits",
+                MethodSignature.CreateStatic(single ? factory.Int32 : factory.Int64,
+                    [single ? factory.Single : factory.Double])));
+        }
+        if (emittedBytes > sourceBytes)
+            // The S/W view of a wider register keeps only the low bits.
+            instructions.Add(CilOpCodes.Conv_I4);
+        if (fromFloat)
+            instructions.Add(CilOpCodes.Call, bitConverter.CreateMemberReference(
+                sourceBytes == 4 ? "Int32BitsToSingle" : "Int64BitsToDouble",
+                MethodSignature.CreateStatic(sourceBytes == 4 ? factory.Single : factory.Double,
+                    [sourceBytes == 4 ? factory.Int32 : factory.Int64])));
+    }
+
     // The interface instantiation a produced instance satisfies: its
     // definition's interface list still mentions the definition's parameters,
     // so each entry is rebound through the instance's own arguments. Returns
@@ -8234,7 +8454,7 @@ public static class IlGenerator
                 case OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
                     or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And or OpCode.Or or OpCode.Xor
                     or OpCode.Not or OpCode.Negate or OpCode.VectorMin or OpCode.VectorMax
-                    or OpCode.SignExtend32 or OpCode.Nop or OpCode.Return:
+                    or OpCode.SignExtend32 or OpCode.Convert or OpCode.Nop or OpCode.Return:
                     break;
                 default:
                     return false;
@@ -9168,6 +9388,11 @@ public static class IlGenerator
             case OpCode.Move or OpCode.Phi:
                 return (index == 0 ? null : StoreContract(instruction.Operands[0], context),
                     false);
+            case OpCode.Convert:
+                // The source position reads the register content the conversion
+                // consumes: a float for the FCVT family, an integer for
+                // SCVTF/UCVTF.
+                return (index == 0 ? null : ConversionSourceContract(instruction, context), false);
             case OpCode.Return:
                 return (context.ReturnType, false);
             case OpCode.Box:
@@ -11312,7 +11537,7 @@ public static class IlGenerator
         OpCode.Move or OpCode.Phi or OpCode.Add or OpCode.Subtract or OpCode.Multiply
             or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight
             or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
-            or OpCode.VectorMin or OpCode.VectorMax or OpCode.SignExtend32
+            or OpCode.VectorMin or OpCode.VectorMax or OpCode.SignExtend32 or OpCode.Convert
             or OpCode.CheckEqual or OpCode.CheckGreater or OpCode.CheckLess
             or OpCode.CheckNotEqual or OpCode.CheckGreaterOrEqual or OpCode.CheckLessOrEqual
             or OpCode.Newobj or OpCode.NewArr or OpCode.Box or OpCode.Unbox

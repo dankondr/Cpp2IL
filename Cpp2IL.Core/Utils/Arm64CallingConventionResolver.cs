@@ -88,6 +88,9 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
 
     protected override bool HiddenBufferConsumesArgumentSlot => false;
 
+    protected override IReadOnlyList<IOperand> ManagedArgumentRegisters(MethodAnalysisContext resolved)
+        => ResolveForManaged(resolved);
+
     public override IOperand[] ResolveForManaged(MethodAnalysisContext ctx)
     {
         var args = new List<IOperand>();
