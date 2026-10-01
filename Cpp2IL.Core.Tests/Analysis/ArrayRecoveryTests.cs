@@ -272,4 +272,66 @@ public class ArrayRecoveryTests
             Assert.That(((ArrayElementFieldReference)((AddressOf)call.Operands[1]).Target).Field, Is.SameAs(second));
         });
     }
+
+    // `ldr x8, [x0, #0x58]` (the array, kept in a local for its length check) then
+    // `add x8, x8, w9, sxtw #4`: copy forwarding writes the add as a re-read of the field.
+    private static (Instruction Load, LocalVariable Array, LocalVariable Index) ElementThroughFieldRead(
+        TypeAnalysisContext elementType, int shift, int accessSize)
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        var arrayType = new SzArrayTypeAnalysisContext(elementType);
+        var ownerType = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Owner",
+            app.SystemTypes.SystemObjectType, TypeAttributes.Public);
+        var itemsField = new InjectedFieldAnalysisContext("items", arrayType, FieldAttributes.Public, ownerType, 0x58);
+        ownerType.Fields.Add(itemsField);
+        var owner = new LocalVariable("owner", new Register(null, "owner"), ownerType);
+        var array = new LocalVariable("array", new Register(null, "array"), arrayType);
+        var length = new LocalVariable("length", new Register(null, "length"), app.SystemTypes.SystemInt32Type);
+        var index = new LocalVariable("index", new Register(null, "index"), app.SystemTypes.SystemInt32Type);
+        var extended = new LocalVariable("extended", new Register(null, "extended"));
+        var scaled = new LocalVariable("scaled", new Register(null, "scaled"));
+        var pointer = new LocalVariable("pointer", new Register(null, "pointer"));
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var load = new Instruction(5, OpCode.Move, result, new MemoryOperand(pointer, addend: 32, accessSize: accessSize));
+        var method = new InjectedMethodAnalysisContext(ownerType, "Read",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, []);
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, array, new FieldReference(itemsField, owner, 0x58)),
+            new(1, OpCode.Move, length, new ArrayLength(array)),
+            new(2, OpCode.SignExtend32, extended, index),
+            new(3, OpCode.ShiftLeft, scaled, extended, new Immediate(shift)),
+            new(4, OpCode.Add, pointer, new FieldReference(itemsField, owner, 0x58), scaled),
+            load,
+            new(6, OpCode.Return)]);
+
+        ArrayRecovery.Run(method);
+        return (load, array, index);
+    }
+
+    [Test]
+    public void ElementAddressBuiltFromAForwardedFieldReadIsAnElementOfTheLocalHoldingIt()
+    {
+        var (load, array, index) = ElementThroughFieldRead(
+            TestGameLoader.LoadSimple2019Game().SystemTypes.SystemStringType, 3, 8);
+
+        Assert.That(load.Operands[1], Is.TypeOf<ArrayAccess>());
+        Assert.That(((ArrayAccess)load.Operands[1]).Array, Is.SameAs(array));
+        Assert.That(((ArrayAccess)load.Operands[1]).Index, Is.SameAs(index));
+    }
+
+    [Test]
+    public void HalfOfAStructElementReadIntoALocalStaysUnresolved()
+    {
+        var app = TestGameLoader.LoadSimple2019Game();
+        var pair = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Pair",
+            app.AssembliesByName["mscorlib"].GetTypeByFullName("System.ValueType")!,
+            TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.SequentialLayout);
+        pair.Fields.Add(new InjectedFieldAnalysisContext("lo", app.SystemTypes.SystemInt64Type, FieldAttributes.Public, pair, 0));
+        pair.Fields.Add(new InjectedFieldAnalysisContext("hi", app.SystemTypes.SystemInt64Type, FieldAttributes.Public, pair, 8));
+
+        var (load, _, _) = ElementThroughFieldRead(pair, 4, 8);
+
+        Assert.That(load.Operands[1], Is.Not.TypeOf<ArrayAccess>());
+    }
 }
