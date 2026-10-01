@@ -369,14 +369,6 @@ public static class ArrayRecovery
         // Row-major: flat = (…(i·len1 + j)·len2 + k…). A dimension whose length never multiplies
         // in has index 0: the compiler folded 0·len away.
         // A struct passed whole to a call: the argument slot names its type.
-        static TypeAnalysisContext? ArgumentType(Instruction call, int operandIndex)
-        {
-            if (call.Operands[0] is not MethodAnalysisContext target || !call.IsCall)
-                return null;
-            var parameter = operandIndex - (call.OpCode == OpCode.Call ? 2 : 1) - (target.IsStatic ? 0 : 1);
-            return parameter >= 0 && parameter < target.Parameters.Count ? target.Parameters[parameter].ParameterType : null;
-        }
-
         List<IOperand>? Indices(IOperand flat, int dimensions, IOperand array)
         {
             if (dimensions == 1)
@@ -1000,7 +992,7 @@ public static class ArrayRecovery
                 };
                 if (array?.Type is not SzArrayTypeAnalysisContext arrayType)
                 {
-                    if (DerivedElementAccess(memory, pointerSize, definitions) is { } derived)
+                    if (DerivedElementAccess(memory, pointerSize, definitions, instruction, i) is { } derived)
                         instruction.SetOperand(i, derived);
                     else if (GuardedIndexAccess(method, instruction, i, memory, pointerSize, definitions,
                                  () => uses ??= CollectUses(method.ControlFlowGraph!), guardContext) is { } guardedDerived)
@@ -1034,8 +1026,17 @@ public static class ArrayRecovery
         }
     }
 
+    // The parameter type a call operand fills, when the operand is a resolved call's argument.
+    private static TypeAnalysisContext? ArgumentType(Instruction call, int operandIndex)
+    {
+        if (call.Operands[0] is not MethodAnalysisContext target || !call.IsCall)
+            return null;
+        var parameter = operandIndex - (call.OpCode == OpCode.Call ? 2 : 1) - (target.IsStatic ? 0 : 1);
+        return parameter >= 0 && parameter < target.Parameters.Count ? target.Parameters[parameter].ParameterType : null;
+    }
+
     private static ArrayAccess? DerivedElementAccess(MemoryOperand memory, int pointerSize,
-        Dictionary<LocalVariable, Instruction?> definitions)
+        Dictionary<LocalVariable, Instruction?> definitions, Instruction user, int operandIndex)
     {
         if (memory is not { Base: LocalVariable pointer, Index: null, Scale: 0 }
             || memory.Addend != ElementsOffset(pointerSize)
@@ -1050,8 +1051,15 @@ public static class ArrayRecovery
             if (ResolveArray(possibleArray, definitions, 0) is not { } array)
                 return null;
 
-            var elementSize = ElementSize(((SzArrayTypeAnalysisContext)array.Type!).ElementType, pointerSize);
-            return ScaledIndex(possibleIndex, elementSize, definitions, 0) is { } index
+            var elementType = ((SzArrayTypeAnalysisContext)array.Type!).ElementType;
+            var structElement = elementType.IsValueType && ElementSize(elementType, pointerSize) == 0;
+            var elementSize = structElement ? MetadataElementSize(elementType, pointerSize) : ElementSize(elementType, pointerSize);
+            // A struct element is the whole element only when the access covers it, or the operand
+            // fills a parameter of the element type (`ldp x0, x1` of a 16-byte element passed by value).
+            if (structElement && !(memory.AccessSize == 0 || memory.AccessSize >= elementSize
+                                   || ArgumentType(user, operandIndex)?.FullName == elementType.FullName))
+                return null;
+            return elementSize > 0 && ScaledIndex(possibleIndex, elementSize, definitions, 0) is { } index
                 ? new ArrayAccess(array, index)
                 : null;
         }
@@ -1060,6 +1068,14 @@ public static class ArrayRecovery
     private static LocalVariable? ResolveArray(IOperand operand,
         Dictionary<LocalVariable, Instruction?> definitions, int depth)
     {
+        // Copy forwarding can leave an element address built from a re-read of the field the
+        // array was loaded from (`add x8, x8, i lsl 4` after `ldr x8, [this, #0x58]` reads as
+        // `this.items + i·16`). The native base is the local that load went into: when exactly one
+        // local holds that field read, it is the array.
+        if (depth <= 8 && operand is FieldReference { Containers.Count: 0, Field.FieldType: SzArrayTypeAnalysisContext } read)
+            return FieldReadLocals.GetValue(definitions, Collect).TryGetValue((read.Field, read.Local, read.Offset), out var holder)
+                ? holder
+                : null;
         if (depth > 8 || operand is not LocalVariable local)
             return null;
         if (local.Type is SzArrayTypeAnalysisContext)
@@ -1068,6 +1084,24 @@ public static class ArrayRecovery
             && definition is { OpCode: OpCode.Move, Operands: [_, var source] }
                 ? ResolveArray(source, definitions, depth + 1)
                 : null;
+    }
+
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Dictionary<LocalVariable, Instruction?>,
+        Dictionary<(FieldAnalysisContext, LocalVariable?, int), LocalVariable?>> FieldReadLocals = new();
+
+    // Each direct field read held by exactly one local; a read two locals hold maps to null.
+    private static Dictionary<(FieldAnalysisContext, LocalVariable?, int), LocalVariable?> Collect(
+        Dictionary<LocalVariable, Instruction?> definitions)
+    {
+        var holders = new Dictionary<(FieldAnalysisContext, LocalVariable?, int), LocalVariable?>();
+        foreach (var (local, definition) in definitions)
+            if (local.Type is SzArrayTypeAnalysisContext
+                && definition is { OpCode: OpCode.Move, Operands: [_, FieldReference { Containers.Count: 0 } read] })
+            {
+                var key = (read.Field, read.Local, read.Offset);
+                holders[key] = holders.ContainsKey(key) ? null : local;
+            }
+        return holders;
     }
 
     // A read of the array header's length word through an address chain: the
