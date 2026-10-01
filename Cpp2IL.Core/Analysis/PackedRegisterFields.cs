@@ -245,6 +245,25 @@ internal static class PackedRegisterFields
                         }
                         return true;
                     }
+                    // A mask that covers no whole field can still sit inside the
+                    // offset-0 leaf alone: the pack's bits at mask positions are
+                    // that field's bits, so `packed & mask` spells `field & mask`
+                    // verbatim - a bit test on the field keeps the And.
+                    if (TopLevelLeafAt(masked, 0, pointerSize)
+                            is var (lowField, lowFieldOffset, lowFieldSize)
+                        && lowFieldOffset == 0
+                        && bitOffset + bitWidth <= 8 * lowFieldSize
+                        && ResolvedFieldType(masked, null, lowField) is { } lowLeafType
+                        && TypeSizes.MinimumUnboxedSize(lowLeafType, pointerSize)
+                                is var lowLeafWidth
+                        && lowLeafWidth == lowFieldSize
+                        && ProjectOperand(maskOperand, masked, 0, (int)lowLeafWidth,
+                                method, pointerSize, LeafKind.Integral)
+                            is var (lowLeaf, _))
+                    {
+                        instruction.SetOperand(ReferenceEquals(maskOperand, instruction.Operands[1]) ? 1 : 2, lowLeaf);
+                        return true;
+                    }
                     // Masked padding reads as zero; a mask over real field bits
                     // that is not a whole-field selection stays diagnosed.
                     if (!AnyFieldInRange(masked, bitOffset / 8, maskByteWidth,

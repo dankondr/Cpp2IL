@@ -1267,16 +1267,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 break;
             case Arm64Mnemonic.LSR:
             case Arm64Mnemonic.ASR:
-                AddInteger(address, OpCode.ShiftRight, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2))
-                    .NativeReadSignExtend = instruction.Mnemonic == Arm64Mnemonic.ASR;
+                AddInteger(address, OpCode.ShiftRight, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
             case Arm64Mnemonic.UBFX:
             case Arm64Mnemonic.SBFX:
                 {
                     // dest = (src >> lsb) & ((1 << width) - 1)
                     var dest = ConvertOperand(instruction, 0);
-                    AddInteger(address, OpCode.ShiftRight, dest, ConvertOperand(instruction, 1), Imm(instruction.Op2Imm))
-                        .NativeReadSignExtend = instruction.Mnemonic == Arm64Mnemonic.SBFX;
+                    AddInteger(address, OpCode.ShiftRight, dest, ConvertOperand(instruction, 1), Imm(instruction.Op2Imm));
                     AddInteger(address, OpCode.And, dest, dest, Imm((1L << (int)instruction.Op3Imm) - 1));
                     break;
                 }

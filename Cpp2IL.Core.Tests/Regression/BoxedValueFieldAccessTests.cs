@@ -109,17 +109,17 @@ public class BoxedValueFieldAccessTests
         IlGenerator.GenerateIl(caller, method);
 
         var il = method.CilMethodBody!.Instructions;
-        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Unbox_Any), Is.True,
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Unbox), Is.True,
             () => string.Join("\n", il.Select(i => i.ToString())));
 
         DecompilerMemberAccessRewrites.Apply(method);
 
         Assert.Multiple(() =>
         {
-            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Unbox_Any), Is.True,
-                "a store needs a mutable managed pointer - unbox.any into a scratch local");
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Unbox), Is.True,
+                "a store keeps the unboxed managed pointer - no unbox.any exists for it");
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stobj), Is.True,
-                "the value__ store survives on the managed pointer unbox.any produced");
+                "the value__ store survives on the managed pointer unbox produced");
             Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stfld
                     && i.Operand == null), Is.False);
         });

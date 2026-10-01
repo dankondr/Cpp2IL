@@ -16,9 +16,11 @@ shifts and extends those registers where IL reads fields.
   (`Instruction.NativeReadWidthBits`, `NativeReadSignExtend`) so the pass can
   tell `hasValue` (`UXTB`) from a 32-bit lane (`LSR #32`, `ASR #32`, `UBFX`,
   `SBFX`). A mask names a field only for a contiguous bit run over all the
-  leaf's bits: `0xFF` at offset 0 is `hasValue`, `0xFFFFFFFF` is `m_X`, a
-  discontiguous mask or a bit inside a leaf is not a field and stays
-  diagnosed.
+  leaf's bits: `0xFF` at offset 0 is `hasValue`, `0xFFFFFFFF` is `m_X`. A mask
+  whose set bits all sit inside the offset-zero leaf keeps the `And` but reads
+  the field instead of the pack (`pack & 0x80000000` is `m_X & 0x80000000`),
+  while a discontiguous mask, bits in any other field, or a run crossing a
+  field boundary stays diagnosed.
 - An offset-zero `And` reads the leaf verbatim when the destination stores no
   more than the leaf's width (an untyped local takes the leaf's own type); a
   wider destination sees the zero extension, so there the leaf must be
@@ -32,22 +34,22 @@ shifts and extends those registers where IL reads fields.
   unlocks field reads) and once more out of SSA (late passes surface new
   selections; `TypeAddressedLocals` gives stack locals their type late).
 
-## IL emission (`IlGenerator`, callers that take a managed address)
+## Emission boundaries (other lanes)
 
-- `EmitManagedAddress` gains `writable`: only a receiver consumed by `ldfld`
-  or `ldobj` alone keeps the readonly `&T` `unbox` yields. `ldflda` (including
-  container-chain hops on a read), `stfld`, `initobj` and call receivers need
-  a mutable address, so the boxed operand goes through `unbox.any` into a
-  scratch local whose `ldloca` is mutable; the `ref -> &T` coercion arm emits
-  the same mutable shape since the consumer is out of sight.
-- A local declared `T*` is unverifiable under `ldloc` no matter the use; the
-  declaration maps to `native int` at the locals-signature site. Analysis
-  (`IsScalarOperand`, write-barrier provenance) still sees the pointer.
+- A writable managed address of a boxed struct (`stfld`, `initobj`, a
+  mutating call receiver, `ldflda`) needs either proof the boxing is a copy
+  or the readonly `&T` `unbox` yields plus a diagnostic: routing the receiver
+  through `unbox.any` + a scratch local would verify the IL but drop the
+  store, so those receivers keep their diagnostic until `lane:memory` (#211)
+  models boxed-value addressability honestly.
+- A local declared `T*` stays a pointer through analysis and emission;
+  mapping it to `native int` in the locals signature is `lane:types-ssa`
+  (#249).
 
 ## Tests
 
 `Cpp2IL.Core.Tests/Regression/PackedRegisterFieldTests.cs`: `Nullable<int>`
 `hasValue` mask and `value` shift, `Nullable<bool>` bound check, a two-`int`
 tuple's high lane, `Vector2Int.y` (`ASR #32`) indexing `T[,]` through `Get`, a
-mask inside a field staying diagnosed, a top-half mask on a signed lane, and a
+partial-byte mask staying diagnosed, a top-half mask on a signed lane, and a
 low mask read into destinations of matching and wider width.

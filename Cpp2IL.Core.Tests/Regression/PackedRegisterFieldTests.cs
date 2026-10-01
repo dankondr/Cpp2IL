@@ -160,10 +160,7 @@ public class PackedRegisterFieldTests
 
         var packed = new LocalVariable("packed", new Register(null, "X0"), pair);
         var second = Local("second");
-        var shift = new Instruction(0, OpCode.ShiftRight, second, packed, new Immediate(32))
-        {
-            NativeReadSignExtend = true,
-        };
+        var shift = new Instruction(0, OpCode.ShiftRight, second, packed, new Immediate(32));
         var (caller, method) = ForeignCaller(app, module,
             [shift, new Instruction(1, OpCode.Return)], [packed, second]);
         caller.ParameterLocals = [packed];
@@ -210,7 +207,6 @@ public class PackedRegisterFieldTests
         var shift = new Instruction(0, OpCode.ShiftRight, y, packed, new Immediate(32))
         {
             NativeIntegerWidthBits = 32,
-            NativeReadSignExtend = false,
         };
         var access = new Instruction(8, OpCode.Move, value,
             new MemoryOperand(pointer, null, 0x20, 0, 4));

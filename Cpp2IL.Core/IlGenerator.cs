@@ -164,17 +164,7 @@ public static class IlGenerator
                 ? module.CorLibTypeFactory.Object
                 : emittedType == context.AppContext.SystemTypes.SystemBooleanType
                     ? module.CorLibTypeFactory.Boolean
-                    // A named unmanaged pointer cannot appear in a local
-                    // signature: ldloc on a T* slot is unverifiable no matter
-                    // how it is used. Native int is the same stack value -
-                    // pointer stores and pointer-typed call arguments both
-                    // accept it - so a pointer local declares native int. The
-                    // mapping lives here, not in EmittableLocalType: callers
-                    // there reason about the true type (write barriers, scalar
-                    // operands), which still needs the pointer.
-                    : emittedType is PointerTypeAnalysisContext
-                        ? module.CorLibTypeFactory.IntPtr
-                        : emittedType.ToTypeSignature();
+                    : emittedType.ToTypeSignature();
             var ilLocal = new CilLocalVariable(ilType);
             body.LocalVariables.Add(ilLocal);
             locals.Add(local, ilLocal);
@@ -4891,11 +4881,8 @@ public static class IlGenerator
             }
             if (contract is ByRefTypeAnalysisContext byRef)
             {
-                // ldflda hops in a container chain need a mutable address even
-                // on a read - only the container-less ldfld receiver may keep
-                // the readonly `unbox` address.
                 if (!EmitManagedAddress(field.Local, method, context, locals, writeLine,
-                        byRef.ElementType, writable: forWrite || field.Containers.Count > 0))
+                        byRef.ElementType))
                     PushDefaultOf(contract, method, method.CilMethodBody!.Instructions, context);
             }
             else
@@ -5143,8 +5130,7 @@ public static class IlGenerator
                 || !FieldUsableFrom(field.Field, context, receiverType: nestedReceiverType)
                 && nestedGetter == null))
             return false;
-        if (!EmitManagedAddress(field.Local, method, context, locals, writeLine, enumerator,
-                writable: true))
+        if (!EmitManagedAddress(field.Local, method, context, locals, writeLine, enumerator))
             return false;
 
         var instructions = method.CilMethodBody!.Instructions;
@@ -7542,16 +7528,8 @@ public static class IlGenerator
             {
                 if (!TypeTokenUsableFrom(pointee, context))
                     return false;
-                // `unbox` yields a readonly `&T`, legal only for loads. The
-                // coercion cannot see whether the consumer loads, calls or
-                // stores, so it takes the form that works for all three:
-                // unbox.any into a scratch local and its mutable address.
-                instructions.Add(CilOpCodes.Unbox_Any,
+                instructions.Add(CilOpCodes.Unbox,
                     pointee.ToTypeSignature().ToTypeDefOrRef());
-                var scratch = new CilLocalVariable(pointee.ToTypeSignature());
-                method.CilMethodBody!.LocalVariables.Add(scratch);
-                instructions.Add(CilOpCodes.Stloc, scratch);
-                instructions.Add(CilOpCodes.Ldloca, scratch);
                 return true;
             }
             return false;
@@ -10847,8 +10825,7 @@ public static class IlGenerator
     // honestly instead of leaving a bare reference where `&T` belongs.
     private static bool EmitManagedAddress(IOperand operand, MethodDefinition method,
         MethodAnalysisContext context, Dictionary<LocalVariable, CilLocalVariable> locals,
-        IMethodDescriptor writeLine, TypeAnalysisContext? pointeeType = null,
-        bool writable = false)
+        IMethodDescriptor writeLine, TypeAnalysisContext? pointeeType = null)
     {
         var instructions = method.CilMethodBody!.Instructions;
         switch (operand)
@@ -10873,23 +10850,8 @@ public static class IlGenerator
                     if (IsByRefLike(pointeeType)
                         || !TypeTokenUsableFrom(pointeeType, context))
                         return false;
-                    if (!writable)
-                    {
-                        // A read receiver (ldfld, ldobj, a call's `this`) is
-                        // legal on the readonly address `unbox` yields.
-                        instructions.Add(CilOpCodes.Unbox,
-                            pointeeType.ToTypeSignature().ToTypeDefOrRef());
-                        return true;
-                    }
-                    // ldflda, stfld and initobj need a mutable address: `unbox`
-                    // is readonly. unbox.any into a scratch local gives a
-                    // mutable &T instead.
-                    instructions.Add(CilOpCodes.Unbox_Any,
+                    instructions.Add(CilOpCodes.Unbox,
                         pointeeType.ToTypeSignature().ToTypeDefOrRef());
-                    var managedTemp = new CilLocalVariable(pointeeType.ToTypeSignature());
-                    method.CilMethodBody!.LocalVariables.Add(managedTemp);
-                    instructions.Add(CilOpCodes.Stloc, managedTemp);
-                    instructions.Add(CilOpCodes.Ldloca, managedTemp);
                     return true;
                 }
                 else if (parameter != null)
@@ -10908,7 +10870,7 @@ public static class IlGenerator
                 if (field.Containers.Count == 0)
                 {
                     if (!EmitManagedAddress(field.Local, method, context, locals, writeLine,
-                            field.Field.DeclaringType, writable: true))
+                            field.Field.DeclaringType))
                         return false;
                 }
                 else
@@ -10954,8 +10916,7 @@ public static class IlGenerator
                 context, method, locals, writeLine);
             return;
         }
-        if (EmitManagedAddress(operand, method, context, locals, writeLine, structType,
-                writable: true))
+        if (EmitManagedAddress(operand, method, context, locals, writeLine, structType))
             return;
         LoadOperandIntoSlot(operand, structType, context, method, locals, writeLine);
         var scratch = new CilLocalVariable(structType.ToTypeSignature());
