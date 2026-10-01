@@ -279,4 +279,53 @@ public class MultiDimensionalArrayTests
         Assert.That(load.OpCode, Is.EqualTo(OpCode.Call), () => string.Join("\n", Instructions(caller)));
         Assert.That(load.Operands.Skip(2), Is.EqualTo(new IOperand[] { grid, new Immediate(0), k }));
     }
+
+    [Test]
+    public void AllocationOfARankTwoArrayEmitsItsConstructor()
+    {
+        // new int[w, h]: the array type's own .ctor(int, int).
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("Grid.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemVoidType);
+        var gridType = new ArrayTypeAnalysisContext(app.SystemTypes.SystemInt32Type, 2);
+        var grid = Local("grid", gridType);
+        var w = Local("w", app.SystemTypes.SystemInt32Type);
+        var h = Local("h", app.SystemTypes.SystemInt32Type);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.NewArr, grid, gridType, w, h),
+            new(1, OpCode.Return)], [grid, w, h]);
+        caller.ParameterLocals = [w, h];
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var constructor = method.CilMethodBody!.Instructions.Single(i => i.OpCode == CilOpCodes.Newobj).Operand as IMethodDescriptor;
+        Assert.That(constructor?.Name?.ToString(), Is.EqualTo(".ctor"), () => Dump(method));
+        Assert.That(constructor!.DeclaringType?.FullName, Is.EqualTo("System.Int32[0..., 0...]"));
+        Assert.That(constructor.Signature!.ParameterTypes, Has.Count.EqualTo(2));
+    }
+
+    [Test]
+    public void StubPassingNoLowerBoundsToTheExportedNewFullIsProven()
+    {
+        // il2cpp_array_new_full @0x1000: b 0x2000. Stub @0x3000: mov x2, xzr; b 0x2000.
+        var words = new Dictionary<ulong, uint> { [0x1000] = 0x14000400, [0x3000] = 0xaa1f03e2, [0x3004] = 0x17fffbff };
+        uint? Read(ulong at) => words.TryGetValue(at, out var word) ? word : null;
+
+        Assert.That(ArrayRecovery.ProvesArrayNewWithoutBounds(0x1000, 0x3000, Read), Is.True);
+        words[0x3004] = 0x17fffc00; // b 0x2004: somewhere else
+        Assert.That(ArrayRecovery.ProvesArrayNewWithoutBounds(0x1000, 0x3000, Read), Is.False);
+    }
+
+    [Test]
+    public void ConstantLengthsStoredAsOneVectorAreItsTwoHalves()
+    {
+        // new int[20, 20]: `str q0, [sp]` of {20, 20} as 64-bit lanes.
+        var twenty = System.BitConverter.Int32BitsToSingle(20);
+        var lengths = new Vector128Literal(twenty, 0, twenty, 0);
+
+        Assert.That(ArrayRecovery.VectorLength(lengths, 0)?.Value, Is.EqualTo(20));
+        Assert.That(ArrayRecovery.VectorLength(lengths, 1)?.Value, Is.EqualTo(20));
+        Assert.That(ArrayRecovery.VectorLength(new Vector128Literal(0, -1, 0, 0), 0), Is.Null);
+    }
 }

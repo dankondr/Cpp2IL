@@ -104,7 +104,7 @@ internal static class FrameStructFieldReads
     }
 
     // The byte offset of a frame cell, from StackAnalyzer's `stack_N` / `stack_-N` names.
-    private static long? FrameOffset(LocalVariable local)
+    internal static long? FrameOffset(LocalVariable local)
     {
         var name = local.Register.Name;
         if (name == null || !name.StartsWith("stack_"))

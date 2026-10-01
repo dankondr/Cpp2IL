@@ -826,6 +826,19 @@ public static class IlGenerator
                             $"Inaccessible array element type: {newArrayElement.FullName}");
                     }
                 }
+                else if (instruction.Operands is [_, ArrayTypeAnalysisContext { Rank: > 1 } newGrid, ..]
+                         && instruction.Operands.Count == newGrid.Rank + 2 && TypeTokenUsableFrom(newGrid.ElementType, context))
+                {
+                    // `new T[w, h]` is the array type's own constructor taking one length per dimension.
+                    foreach (var newGridLength in instruction.Operands.Skip(2))
+                        LoadOperandIntoSlot(newGridLength, context.AppContext.SystemTypes.SystemInt32Type, context, method, locals, writeLine);
+                    instructions.Add(CilOpCodes.Newobj, new InjectedMethodAnalysisContext(newGrid, ".ctor",
+                        context.AppContext.SystemTypes.SystemVoidType,
+                        System.Reflection.MethodAttributes.Public | System.Reflection.MethodAttributes.SpecialName
+                        | System.Reflection.MethodAttributes.RTSpecialName,
+                        Enumerable.Repeat(context.AppContext.SystemTypes.SystemInt32Type, newGrid.Rank).ToArray()).ToMethodDescriptor());
+                    CoerceOrDefault(newGrid, newArrayDestination, method, context);
+                }
                 else if (newArrayDestination is { IsValueType: true } && CanEmitTypeToken(newArrayDestination))
                 {
                     instructions.Add(CilOpCodes.Ldstr, Diagnostic($"NewArr result cannot be stored into a {newArrayDestination.FullName} slot; substituting a synthetic default value."));
@@ -5212,7 +5225,7 @@ public static class IlGenerator
         return true;
     }
 
-    private static MethodAnalysisContext? PublicFieldGetter(TypeAnalysisContext receiver,
+    internal static MethodAnalysisContext? PublicFieldGetter(TypeAnalysisContext receiver,
         FieldAnalysisContext field)
     {
         var name = field.Name;
@@ -10964,7 +10977,7 @@ public static class IlGenerator
             _ => false,
         };
 
-    private static bool FieldUsableFrom(FieldAnalysisContext field, MethodAnalysisContext context,
+    internal static bool FieldUsableFrom(FieldAnalysisContext field, MethodAnalysisContext context,
         bool writeAccess = false, TypeAnalysisContext? receiverType = null, bool requireToken = true)
     {
         // Analysis passes ask about accessibility before any field gains its

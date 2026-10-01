@@ -75,6 +75,16 @@ public class Instruction : IOperand
     // their real width.
     public int? NativeStoreWidthBytes;
 
+    // Bits of the source register an extension or shift actually reads. The
+    // mnemonics (SXTB/SXTH/SXTW/UXTB/UXTH, LSR vs ASR, UBFX vs SBFX) all erase into
+    // Move/ShiftRight, but a packed-struct read still needs the width - and on an
+    // extension the signedness - to name the field at those bits.
+    public int? NativeReadWidthBits;
+
+    // Whether the read sign-extends into the destination (SXT*/ASR/SBFX) or
+    // zero-extends (UXT*/LSR/UBFX). Null when the lifting recorded neither.
+    public bool? NativeReadSignExtend;
+
     public bool IsFallThrough =>
         OpCode switch
         {

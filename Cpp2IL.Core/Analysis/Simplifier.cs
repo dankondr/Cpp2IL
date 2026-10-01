@@ -237,6 +237,7 @@ public static class Simplifier
             var definitionCounts = CountDefinitions();
 
             var visited = new HashSet<Block>();
+            var lengths = DeadCodeEliminator.StoresArrayNewLengths(_method, _graph.Instructions);
             var queue = new Queue<Block>(_method.ControlFlowGraph!.Blocks.Count);
 
 #if NET5_0_OR_GREATER
@@ -275,7 +276,8 @@ public static class Simplifier
 
                         // If the replacement stopped at a join merging another definition, the local is
                         // still live there - keep its defining move rather than dropping the value on this path.
-                        if (IsLocalUsedAfterInstruction(block, i + 1, local, out _))
+                        // A later length of `new T[w, h]` is read through the buffer's address.
+                        if (IsLocalUsedAfterInstruction(block, i + 1, local, out _) || lengths(instruction))
                             continue;
 
                         if (!_method.ParameterLocals.Contains(local))
