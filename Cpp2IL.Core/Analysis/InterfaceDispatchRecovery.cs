@@ -1720,7 +1720,7 @@ public static class InterfaceDispatchRecovery
                     OpCode.Nop or OpCode.Jump or OpCode.ConditionalJump or OpCode.Phi => true,
                     OpCode.Move or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
                         or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And or OpCode.Or or OpCode.Xor
-                        or OpCode.Not or OpCode.Negate or OpCode.SignExtend32
+                        or OpCode.Not or OpCode.Negate or OpCode.SignExtend32 or OpCode.Convert
                         or (>= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual)
                         => instruction.Destination is LocalVariable,
                     _ => false,

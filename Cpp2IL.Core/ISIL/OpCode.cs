@@ -160,5 +160,12 @@ public enum OpCode
     /// correct when the regions overlap. A 4th operand, when present, receives the
     /// destination pointer - memmove's return value.
     /// </summary>
-    MemoryMove
+    MemoryMove,
+
+    /// <summary>
+    /// Numeric conversion: op 2 is converted to a value of the destination's type and
+    /// stored in op 1. Not a copy - the result's type comes from the instruction's
+    /// destination register width and its conversion flags, never from the source.
+    /// </summary>
+    Convert
 }

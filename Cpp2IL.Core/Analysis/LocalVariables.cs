@@ -1501,6 +1501,12 @@ public static class LocalVariables
                     if (instruction.Destination is LocalVariable extended)
                         changed |= SetTypeIfUnknown(extended, method.AppContext.SystemTypes.SystemInt64Type);
                     break;
+                case OpCode.Convert:
+                    // The conversion's result type is its destination register's
+                    // width - never the converted operand's type.
+                    if (instruction.Destination is LocalVariable converted)
+                        changed |= SetTypeIfUnknown(converted, ConversionResultType(instruction, method));
+                    break;
                 case OpCode.Move:
                     changed |= PropagateMove(instruction, method, method.AppContext.Binary.PointerSizeBytes,
                         method.AppContext.SystemTypes.SystemInt32Type, definitions, allDefinitions);
@@ -1535,6 +1541,23 @@ public static class LocalVariables
         }
 
         return changed;
+    }
+
+    // A Convert's result type: its destination register's width, signed or unsigned
+    // as the instruction says. Never inferred from the converted operand - that is
+    // what separates a conversion from a move.
+    internal static TypeAnalysisContext ConversionResultType(Instruction instruction, MethodAnalysisContext method)
+    {
+        var systemTypes = method.AppContext.SystemTypes;
+        if (instruction.NativeFloatWidthBits == 32)
+            return systemTypes.SystemSingleType;
+        if (instruction.NativeFloatWidthBits == 64)
+            return systemTypes.SystemDoubleType;
+        if (instruction.NativeIntegerWidthBits == 64)
+            return instruction.ConversionUnsigned
+                ? systemTypes.SystemUInt64Type : systemTypes.SystemInt64Type;
+        return instruction.ConversionUnsigned
+            ? systemTypes.SystemUInt32Type : systemTypes.SystemInt32Type;
     }
 
     // Types that reach a Boolean slot as raw bits: the flag itself or a 4-byte integer the
