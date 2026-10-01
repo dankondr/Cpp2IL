@@ -6217,7 +6217,8 @@ public static class IlGenerator
                       receiverEvidence) ?? callee
                 : callee;
             var solved = SolveSharedGenericArguments(resolved, definition, context, 2, false);
-            var returnType = EffectiveCallReturnType(solved ?? resolved);
+            var returnType = MarkedNumericResultType(definition,
+                EffectiveCallReturnType(solved ?? resolved), context);
             if (!CanEmitTypeToken(returnType)
                 || produced != null && !ThisConstructorCallPlan.SameTypeIdentity(produced, returnType))
                 return null;
@@ -6276,13 +6277,36 @@ public static class IlGenerator
                           ? SharpenedReceiverEvidenceType(definition.Operands[2], context, visited)
                           : null)) ?? callee
                 : callee;
-            var returnType = EffectiveCallReturnType(resolved);
+            var returnType = MarkedNumericResultType(definition,
+                EffectiveCallReturnType(resolved), context);
             if (!CanEmitTypeToken(returnType)
                 || produced != null && !ThisConstructorCallPlan.SameTypeIdentity(produced, returnType))
                 return null;
             produced = returnType;
         }
         return produced;
+    }
+
+    // A width mark on the producing call proves the register write is narrower
+    // than the callee's declared return type - a single-precision libm intrinsic
+    // bridged onto a Double-declared Math.* method, or a 32-bit result register
+    // feeding an i64-returning stub - so the value produced fills only the
+    // marked width, matching how SeedNative*Widths types the destination local.
+    private static TypeAnalysisContext MarkedNumericResultType(Instruction definition,
+        TypeAnalysisContext returnType, MethodAnalysisContext context)
+    {
+        var systemTypes = context.AppContext.SystemTypes;
+        return definition.NativeFloatWidthBits switch
+        {
+            32 when returnType.FullName == "System.Double" => systemTypes.SystemSingleType,
+            64 when returnType.FullName == "System.Single" => systemTypes.SystemDoubleType,
+            _ => definition.NativeIntegerWidthBits switch
+            {
+                32 when returnType.FullName == "System.Int64" => systemTypes.SystemInt32Type,
+                64 when returnType.FullName == "System.Int32" => systemTypes.SystemInt64Type,
+                _ => returnType,
+            }
+        };
     }
 
     private static TypeAnalysisContext? ObjectDefinitionType(LocalVariable local,
@@ -6754,9 +6778,58 @@ public static class IlGenerator
             foreach (var member in group)
                 if (member.Type == null
                     || member.Type == systemTypes.SystemObjectType && hasTypes)
-                    result[member] = picked;
+                    result[member] = NarrowNumericPickToProvenWidth(picked, member, context);
         }
         return result;
+    }
+
+    // A member unioned with a wider-typed sibling may see a picked type wider
+    // than the writes its own defs prove: when every def is a literal store
+    // whose operand carries a decode-proven byte width, the member's slot is
+    // the proven-width sibling of the picked numeric, never the wider one.
+    private static TypeAnalysisContext NarrowNumericPickToProvenWidth(TypeAnalysisContext picked,
+        LocalVariable member, MethodAnalysisContext context)
+    {
+        var pickedWidthBytes = picked.FullName switch
+        {
+            "System.Single" or "System.Int32" or "System.UInt32" => 4,
+            "System.Double" or "System.Int64" or "System.UInt64" => 8,
+            _ => 0,
+        };
+        if (pickedWidthBytes <= 4)
+            return picked;
+
+        var provenWidthBytes = 0;
+        foreach (var definition in context.ControlFlowGraph!.Instructions
+                     .Where(instruction => ReferenceEquals(instruction.Destination, member)))
+        {
+            if (definition is not { OpCode: OpCode.Move or OpCode.Phi, Operands.Count: > 1 })
+                return picked;
+            foreach (var source in definition.Operands.Skip(1))
+            {
+                var sourceWidth = source switch
+                {
+                    Immediate { ProvenBytes: { } bytes } => bytes,
+                    FloatLiteral => 4,
+                    DoubleLiteral => 8,
+                    _ => -1,
+                };
+                if (sourceWidth <= 0)
+                    return picked;
+                provenWidthBytes = System.Math.Max(provenWidthBytes, sourceWidth);
+            }
+        }
+        if (provenWidthBytes <= 0 || provenWidthBytes >= pickedWidthBytes)
+            return picked;
+
+        var systemTypes = context.AppContext.SystemTypes;
+        return picked.FullName switch
+        {
+            "System.Double" when provenWidthBytes <= 4 => systemTypes.SystemSingleType,
+            "System.Int64" when provenWidthBytes <= 4 => systemTypes.SystemInt32Type,
+            "System.UInt64" when provenWidthBytes <= 4 => systemTypes.SystemUInt32Type,
+            _ => picked,
+        };
     }
 
     private static bool IsZeroConstant(IOperand operand) => operand is Immediate { Value: 0 };
