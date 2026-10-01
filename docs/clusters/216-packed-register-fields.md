@@ -48,6 +48,18 @@ shifts and extends those registers where IL reads fields.
   whose register was reused by a pointer-producing call is not a struct
   carrier: the whole method is skipped when operand and pointer slot locals
   overlap, and pointer-typed leaves are never projected.
+- The projection itself is gated on the emission contract
+  (`IlGenerator.FieldReferenceUsableFrom` with `requireToken: false` - the
+  emitted definition does not exist yet at analysis time): a member the
+  caller cannot name - a private corlib field like `System.Single.m_value`
+  reached through a restamped primitive slot, or a compiler-generated
+  backing field - would substitute a synthetic default at emission, so the
+  pass declines and the register read keeps its own diagnostic. The two
+  reads emission rewrites through an accessor - an enumerator's `_current`
+  via `get_Current` and a list's `_size` via `get_Count` - stay projectable
+  despite private accessibility (`EmissionRescuesFieldReference` mirrors
+  the checks `TryEmitInlinedEnumeratorCurrent`/`TryEmitInlinedListCount`
+  make).
 
 ## Emission boundaries (other lanes)
 
@@ -69,7 +81,8 @@ tuple's high lane, `Vector2Int.y` (`ASR #32`) indexing `T[,]` through `Get`, a
 partial-byte mask staying diagnosed, a top-half mask on a signed lane, a
 low mask read into destinations of matching and wider width, an awaiter
 chain whose root local's type is restamped after the early pass staying
-diagnosed until the final pass projects it, a whole-read of a
-`Single`-carrying field on an arithmetic-defined root staying the register
-operand until the slot settles (`FieldReadOnRestampedPrimitiveSlotStaysDiagnosed`),
-and a pointer-typed local keeping every read in its method diagnosed.
+diagnosed until the final pass projects it, a whole-read whose root
+settles to `System.Single` staying the register operand in both passes
+because the corlib member is unspellable
+(`FieldReadOnRestampedPrimitiveSlotStaysDiagnosed`), and a pointer-typed
+local keeping every read in its method diagnosed.
