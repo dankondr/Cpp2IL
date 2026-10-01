@@ -147,6 +147,7 @@ internal static class AggregateResultLanes
         // operands still name their registers.
         var changed = RebuildAggregateReturns(method, resolver, pointerSize);
         changed |= ProjectScalarReturns(method, resolver, pointerSize);
+        changed |= DropLaneStoresOfWholeStores(method, resolver, pointerSize);
 
         if (provenLanes.Count == 0 && lateLanes.Count == 0 && entryLanes.Count == 0)
             return created || changed;
@@ -377,6 +378,75 @@ internal static class AggregateResultLanes
                 continue;
             result.Type = aggregate;
             ret.SetOperand(0, new FieldReference(path.Field, result, 0, path.Containers, lanes[0].ByteOffset));
+            changed = true;
+        }
+        return changed;
+    }
+
+    // `stp x0, x1, [x19, #0x60]` after a call returning a 16-byte struct lifts to a store of the
+    // whole result (lane 0's local carries the struct) and a raw store of X1 eight bytes further.
+    // Once the first store writes the whole value, the lane stores rewrite bytes it already wrote
+    // with the same call's other lanes: they are part of it, not values of their own.
+    private static bool DropLaneStoresOfWholeStores(MethodAnalysisContext method, BaseCallingConventionResolver resolver,
+        int pointerSize)
+    {
+        var changed = false;
+        var calls = method.ControlFlowGraph!.Instructions
+            .Where(i => i is { OpCode: OpCode.Call, Destination: LocalVariable, Operands: [MethodAnalysisContext, ..] }
+                        && i.ImplicitDefinitions.Count > 0)
+            .ToDictionary(i => (LocalVariable)i.Destination!);
+        if (calls.Count == 0)
+            return false;
+
+        foreach (var block in method.ControlFlowGraph.Blocks)
+        for (var index = 0; index < block.Instructions.Count; index++)
+        {
+            if (block.Instructions[index] is not { OpCode: OpCode.Move, Operands: [var target, LocalVariable { Type: { } wholeType } whole] } store
+                || !calls.TryGetValue(whole, out var call))
+                continue;
+            var concrete = Concrete(call, (MethodAnalysisContext)call.Operands[0], method);
+            // Lanes that are each one field are projected onto those fields instead (`res.y`).
+            if (IlGenerator.EffectiveCallReturnType(concrete).FullName != wholeType.FullName
+                || resolver.ExtraLanes(wholeType, resolver.ReturnRegister(concrete)) is not { Count: > 0 } lanes
+                || lanes.All(lane => LaneField(wholeType, whole, lane, pointerSize) != null))
+                continue;
+            // The store must write the whole value: a field of the result's own type, or a raw cell
+            // the lane stores below are relative to.
+            var (holder, offset) = target switch
+            {
+                FieldReference { Local: { } fieldHolder, Field.FieldType: var fieldType } field
+                    when fieldType.FullName == wholeType.FullName => (fieldHolder, field.Offset),
+                MemoryOperand { Base: LocalVariable memoryBase, Index: null } memory => (memoryBase, memory.Addend),
+                _ => ((LocalVariable?)null, 0L),
+            };
+            if (holder == null)
+                continue;
+
+            var laneStores = new List<Instruction>();
+            for (var next = index + 1; next < block.Instructions.Count && laneStores.Count < lanes.Count; next++)
+            {
+                var candidate = block.Instructions[next];
+                var lane = lanes[laneStores.Count];
+                if (candidate is { OpCode: OpCode.Move, Operands: [MemoryOperand { Base: LocalVariable laneBase, Index: null } laneCell, LocalVariable laneValue] }
+                    && ReferenceEquals(laneBase, holder) && laneCell.Addend == offset + lane.ByteOffset
+                    && laneValue.Register is { Version: > 0 } laneRegister && laneRegister.Name == lane.Register.Name
+                    && call.ImplicitDefinitions.Contains(laneRegister))
+                    laneStores.Add(candidate);
+                else if (candidate is not ({ OpCode: OpCode.Nop } or { OpCode: OpCode.Move, Operands: [LocalVariable, _] }))
+                    break;
+            }
+            if (laneStores.Count != lanes.Count)
+                continue;
+
+            foreach (var laneStore in laneStores)
+            {
+                laneStore.OpCode = OpCode.Nop;
+                laneStore.SetOperands();
+            }
+            var width = lanes[^1].ByteOffset + lanes[^1].AccessSize;
+            store.NativeMemoryAccessSize = width;
+            if (target is MemoryOperand cell)
+                store.SetOperand(0, new MemoryOperand(cell.Base, cell.Index, cell.Addend, cell.Scale, width));
             changed = true;
         }
         return changed;

@@ -85,7 +85,7 @@ internal static class NonReturningHelperRecovery
         }
     }
 
-    private static ulong BranchTarget(ulong pc, uint word)
+    internal static ulong BranchTarget(ulong pc, uint word)
         => unchecked((ulong)((long)pc + ((int)(word << 6) >> 4)));
 
     internal static HashSet<Block> Select(ISILControlFlowGraph graph, Func<ulong, bool> proven)

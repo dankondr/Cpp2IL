@@ -502,4 +502,47 @@ public class AggregateResultLaneTests
 
         Assert.That(ret.Operands[0], Is.InstanceOf<LocalVariable>());
     }
+
+    private static (Instruction Whole, Instruction High, InjectedMethodAnalysisContext Caller, TypeAnalysisContext Quad,
+        InjectedTypeAnalysisContext CallerType) StoreQuad(long highOffset)
+    {
+        // this.q = GetQuad(): `bl GetQuad; stp x0, x1, [x19, #0x80]`. No lane is one field of the
+        // four ints, so the X1 store cannot be projected; it is the upper half of the whole store.
+        var quad = FourInts();
+        var callerType = CallerTypeWithField("q", quad, 0x80);
+        var getQuad = callerType.InjectMethodContext("GetQuad", quad,
+            R.MethodAttributes.Public | R.MethodAttributes.Static);
+        var call = new Instruction(0x14, OpCode.Call, getQuad, Reg("X0"));
+        call.ImplicitDefinitions.Add(Reg("X1"));
+        Instruction whole = new(0x18, OpCode.Move, new MemoryOperand(Reg("X19"), addend: 0x80, accessSize: 8), Reg("X0")) { NativeMemoryAccessSize = 8 };
+        Instruction high = new(0x1c, OpCode.Move, new MemoryOperand(Reg("X19"), addend: highOffset, accessSize: 8), Reg("X1")) { NativeMemoryAccessSize = 8 };
+        var caller = Drive(callerType, [
+            new Instruction(0x10, OpCode.Move, Reg("X19"), Reg("X0")),
+            call, whole, high, new Instruction(0x20, OpCode.Return)]);
+        return (whole, high, caller, quad, callerType);
+    }
+
+    [Test]
+    public void UpperLaneStoreOfAWholeStoredResultIsPartOfThatStore()
+    {
+        var (whole, high, caller, quad, callerType) = StoreQuad(0x88);
+
+        Assert.That(high.OpCode, Is.EqualTo(OpCode.Nop));
+        Assert.That(whole.Operands[1], Is.InstanceOf<LocalVariable>());
+        Assert.That(((LocalVariable)whole.Operands[1]).Type, Is.SameAs(quad));
+
+        var module = new ModuleDefinition("Lanes.dll");
+        SeedCallee(caller.ControlFlowGraph!.Instructions.First(i => i.OpCode == OpCode.Call).Operands[0] as MethodAnalysisContext
+                   ?? throw new System.InvalidOperationException(), module, quad);
+        var il = Emit(caller, module, callerType, quad).CilMethodBody!.Instructions;
+        Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldstr), Is.EqualTo(0));
+    }
+
+    [Test]
+    public void UpperLaneStoredElsewhereStaysItsOwnStore()
+    {
+        var (_, high, _, _, _) = StoreQuad(0x90);
+
+        Assert.That(high.OpCode, Is.EqualTo(OpCode.Move));
+    }
 }
