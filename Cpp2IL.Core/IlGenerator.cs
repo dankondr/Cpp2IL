@@ -5278,7 +5278,7 @@ public static class IlGenerator
         return true;
     }
 
-    private static MethodAnalysisContext? PublicFieldGetter(TypeAnalysisContext receiver,
+    internal static MethodAnalysisContext? PublicFieldGetter(TypeAnalysisContext receiver,
         FieldAnalysisContext field)
     {
         var name = field.Name;
@@ -11030,7 +11030,7 @@ public static class IlGenerator
             _ => false,
         };
 
-    private static bool FieldUsableFrom(FieldAnalysisContext field, MethodAnalysisContext context,
+    internal static bool FieldUsableFrom(FieldAnalysisContext field, MethodAnalysisContext context,
         bool writeAccess = false, TypeAnalysisContext? receiverType = null, bool requireToken = true)
     {
         // Analysis passes ask about accessibility before any field gains its

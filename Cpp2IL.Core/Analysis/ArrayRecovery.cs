@@ -460,11 +460,24 @@ public static class ArrayRecovery
                 || !IsArrayNewWithoutBounds(method.AppContext, target.UnsignedValue))
                 continue;
 
-            var lengths = Enumerable.Range(0, arrayType.Rank)
-                .Select(dimension => block.Instructions.Take(index).LastOrDefault(i =>
-                    i is { OpCode: OpCode.Move, Operands: [LocalVariable cell, _] }
-                    && FrameStructFieldReads.FrameOffset(cell) == start + dimension * 8)?.Operands[1])
+            var stores = block.Instructions.Take(index)
+                .Where(i => i is { OpCode: OpCode.Move, Operands: [LocalVariable cell, _] } && FrameStructFieldReads.FrameOffset(cell) != null)
                 .ToList();
+            var lengths = Enumerable.Range(0, arrayType.Rank).Select(dimension => Length(start + dimension * 8)).ToList();
+            // The latest store covering the cell: an 8-byte length, or a constant vector whose
+            // 64-bit halves are two lengths (`new int[20, 20]` is one `str q0` of {20, 20}).
+            IOperand? Length(long cell)
+            {
+                for (var i = stores.Count - 1; i >= 0; i--)
+                {
+                    var at = FrameStructFieldReads.FrameOffset((LocalVariable)stores[i].Operands[0])!.Value;
+                    if (at == cell)
+                        return stores[i].Operands[1] is Vector128Literal vector ? VectorLength(vector, 0) : stores[i].Operands[1];
+                    if (at == cell - 8 && stores[i].Operands[1] is Vector128Literal low)
+                        return VectorLength(low, 1);
+                }
+                return null;
+            }
             if (lengths.Any(length => length == null))
                 continue;
 
@@ -473,6 +486,14 @@ public static class ArrayRecovery
             if (result.Type is not ArrayTypeAnalysisContext)
                 result.Type = arrayType;
         }
+    }
+
+    // One 64-bit half of a constant vector, as a length.
+    internal static Immediate? VectorLength(Vector128Literal vector, int half)
+    {
+        var (lo, hi) = half == 0 ? (vector.X, vector.Y) : (vector.Z, vector.W);
+        var value = (long)(uint)BitConverter.SingleToInt32Bits(lo) | (long)(uint)BitConverter.SingleToInt32Bits(hi) << 32;
+        return value is >= 0 and <= int.MaxValue ? new Immediate(value) : null;
     }
 
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<ApplicationAnalysisContext,
