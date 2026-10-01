@@ -68,18 +68,47 @@ public static class SwitchLookupTableRecovery
         Block table, Dictionary<LocalVariable, List<Instruction>> definitions,
         Func<ulong, int, byte[]?> readStaticBytes)
     {
-        // The lookup is the block's last real work before its terminator:
-        // `Move result, [base + addend + selector*elementSize]`.
-        if (table.Instructions.Count < 2)
+        // The lookup is the block's last real work before its terminator. Two
+        // spellings of the same lowering survive lifting: `Move result, [tbl]
+        // ; Jump|Return` when the read feeds a local, and `Return [tbl]` when
+        // the method returns the element in place. The return spelling gets a
+        // synthesized result local so both emit the same case blocks.
+        if (table.Instructions.Count == 0)
             return false;
-        var load = table.Instructions[^2];
-        var terminator = table.Instructions[^1];
-        if (load.OpCode != OpCode.Move
-            || load.Operands is not [LocalVariable result, MemoryOperand memory]
+        var last = table.Instructions[^1];
+        Instruction load;
+        Instruction terminator;
+        LocalVariable result;
+        var consumed = 2;
+        if (last.OpCode == OpCode.Return
+            && last.Operands.Count >= 1
+            && last.Operands[0] is MemoryOperand)
+        {
+            if (method.ReturnType is not { } returnType)
+                return false;
+            load = last;
+            result = new LocalVariable($"switchTable{load.Index}", new Register(null, $"switchTable{load.Index}"), returnType);
+            method.Locals.Add(result);
+            terminator = new Instruction(-1, OpCode.Return, new List<IOperand> { result });
+            consumed = 1;
+        }
+        else
+        {
+            if (table.Instructions.Count < 2)
+                return false;
+            load = table.Instructions[^2];
+            terminator = last;
+            if (load.OpCode != OpCode.Move
+                || load.Operands is not [LocalVariable moveResult, MemoryOperand]
+                || terminator.OpCode is not (OpCode.Jump or OpCode.Return))
+                return false;
+            result = moveResult;
+        }
+
+        if (load.Operands[^1] is not MemoryOperand memory
             || memory.Index is not LocalVariable selector
             || memory.Scale is not (> 0 and <= 8)
-            || memory.AccessSize != memory.Scale
-            || terminator.OpCode is not (OpCode.Jump or OpCode.Return))
+            || memory.AccessSize != memory.Scale)
             return false;
         var elementSize = memory.Scale;
 
@@ -170,8 +199,8 @@ public static class SwitchLookupTableRecovery
             switchOperands.Add(caseMove);
         }
 
-        table.Instructions.RemoveAt(table.Instructions.Count - 1);
-        table.Instructions.RemoveAt(table.Instructions.Count - 1);
+        for (var i = 0; i < consumed; i++)
+            table.Instructions.RemoveAt(table.Instructions.Count - 1);
         table.AddInstruction(new Instruction(load.Index, OpCode.Switch, switchOperands) { NativeAddress = load.NativeAddress });
 
         foreach (var oldSuccessor in table.Successors.ToList())
@@ -280,7 +309,7 @@ public static class SwitchLookupTableRecovery
         selector = null;
         bound = 0;
         if (definition.Operands.Count < 3
-            || definition.Operands[1] is not LocalVariable sel
+            || SelectorLocal(definition.Operands[1]) is not { } sel
             || definition.Operands[2] is not Immediate immediate)
             return false;
         selector = sel;
@@ -305,14 +334,14 @@ public static class SwitchLookupTableRecovery
             && definition.Operands[1] is LocalVariable subLocal
             && UnderlyingDefinition(subLocal, definitions) is { OpCode: OpCode.Subtract } sub
             && sub.Operands.Count >= 3
-            && sub.Operands[1] is LocalVariable subSelector
+            && SelectorLocal(sub.Operands[1]) is { } subSelector
             && sub.Operands[2] is Immediate subBound)
         {
             selector = subSelector;
             bound = subBound.Value;
             return true;
         }
-        if (definition.Operands[1] is LocalVariable eqSelector
+        if (SelectorLocal(definition.Operands[1]) is { } eqSelector
             && definition.Operands[2] is Immediate eqBound)
         {
             selector = eqSelector;
@@ -321,6 +350,16 @@ public static class SwitchLookupTableRecovery
         }
         return false;
     }
+
+    // The operand an unsigned bound compares: the selector local itself, or a
+    // `sel.value__` read through an enum's backing field - the same bits in a
+    // different spelling.
+    private static LocalVariable? SelectorLocal(IOperand operand) => operand switch
+    {
+        LocalVariable local => local,
+        FieldReference { Field.Name: "value__", Containers.Count: 0, Offset: 0 } field => field.Local,
+        _ => null,
+    };
 
     // The two sides of an unsigned bound composite: the flagC form
     // `sel <u imm` and the flagZ form `sel == imm`, each read through its flag

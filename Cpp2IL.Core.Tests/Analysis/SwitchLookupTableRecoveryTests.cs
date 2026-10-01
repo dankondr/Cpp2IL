@@ -30,11 +30,20 @@ public class SwitchLookupTableRecoveryTests
         return bytes;
     }
 
+    private enum Shape
+    {
+        Jump,
+        ReturnLocal,
+        ReturnDirect,
+    }
+
     // The LLVM SwitchToLookupTable shape lifted to ISIL: an adrp-fused table
     // base, an unsigned bounds check on the selector, then the indexed load.
-    // jumpTerminator picks the `ldr; b merge` form over the `ldr; ret` form.
+    // Shape picks between `Move res,[tbl]; b merge`, `Move res,[tbl]; ret res`
+    // and the direct `Return [tbl]` spelling (which also lifts the b.hi
+    // flagC/flagZ composite bound rather than a single flagC test).
     private static (InjectedMethodAnalysisContext context, Instruction load) BuildGraph(
-        ApplicationAnalysisContext app, bool jumpTerminator)
+        ApplicationAnalysisContext app, Shape shape)
     {
         var ownerType = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Owner",
             app.SystemTypes.SystemObjectType, System.Reflection.TypeAttributes.Public);
@@ -47,41 +56,65 @@ public class SwitchLookupTableRecoveryTests
         var tbl = new LocalVariable("tbl", new Register(null, "tbl"), int64);
         var flagC = new LocalVariable("flagC", new Register(null, "flagC"), boolean);
         var flagCRaw = new LocalVariable("flagCRaw", new Register(null, "flagCRaw"), boolean);
+        var flagZ = new LocalVariable("flagZ", new Register(null, "flagZ"), boolean);
+        var flagZNeg = new LocalVariable("flagZNeg", new Register(null, "flagZNeg"), boolean);
+        var subTemp = new LocalVariable("subTemp", new Register(null, "subTemp"), int32);
+        var cond = new LocalVariable("cond", new Register(null, "cond"), boolean);
 
-        var defaultHead = new Instruction(6, OpCode.Move, res, new Immediate(-1));
-        var mergeHead = new Instruction(8, OpCode.Return, res);
-        var load = new Instruction(4, OpCode.Move, res,
-            new MemoryOperand(tbl, sel, addend: 0, scale: 4, accessSize: 4));
+        var defaultHead = new Instruction(16, OpCode.Move, res, new Immediate(-1));
+        var mergeHead = new Instruction(18, OpCode.Return, res);
+        var load = shape == Shape.ReturnDirect
+            ? new Instruction(14, OpCode.Return,
+                new MemoryOperand(tbl, sel, addend: 0, scale: 4, accessSize: 4))
+            : new Instruction(14, OpCode.Move, res,
+                new MemoryOperand(tbl, sel, addend: 0, scale: 4, accessSize: 4));
 
         var context = new InjectedMethodAnalysisContext(ownerType, "Read",
             int32, ReflectionMethodAttributes.Static, []);
 
-        context.ControlFlowGraph = new ISILControlFlowGraph(jumpTerminator
-            ?
+        context.ControlFlowGraph = new ISILControlFlowGraph(shape switch
+        {
+            Shape.ReturnDirect =>
+            [
+                // b.hi composite: sel >u Constants.Length-1 jumps to default.
+                new Instruction(0, OpCode.CheckLess, flagCRaw, sel, new Immediate(Constants.Length - 1)),
+                new Instruction(1, OpCode.Not, flagC, flagCRaw),
+                new Instruction(2, OpCode.Subtract, subTemp, sel, new Immediate(Constants.Length - 1)),
+                new Instruction(3, OpCode.CheckEqual, flagZ, subTemp, new Immediate(0)),
+                new Instruction(4, OpCode.Not, flagZNeg, flagZ),
+                new Instruction(5, OpCode.And, cond, flagC, flagZNeg),
+                new Instruction(6, OpCode.ConditionalJump, defaultHead, cond),
+                new Instruction(7, OpCode.Move, tbl, new Immediate((long)TableAddress)),
+                load,
+                defaultHead,
+                new Instruction(17, OpCode.Return, res),
+            ],
+            Shape.ReturnLocal =>
             [
                 new Instruction(0, OpCode.Move, tbl, new Immediate((long)TableAddress)),
                 new Instruction(1, OpCode.CheckLess, flagCRaw, sel, new Immediate(Constants.Length)),
                 new Instruction(2, OpCode.Not, flagC, flagCRaw),
                 new Instruction(3, OpCode.ConditionalJump, defaultHead, flagC),
                 load,
-                new Instruction(5, OpCode.Jump, mergeHead),
+                new Instruction(15, OpCode.Return, res),
                 defaultHead,
-                new Instruction(7, OpCode.Jump, mergeHead),
+                new Instruction(17, OpCode.Return, res),
+            ],
+            _ =>
+            [
+                new Instruction(0, OpCode.Move, tbl, new Immediate((long)TableAddress)),
+                new Instruction(1, OpCode.CheckLess, flagCRaw, sel, new Immediate(Constants.Length)),
+                new Instruction(2, OpCode.Not, flagC, flagCRaw),
+                new Instruction(3, OpCode.ConditionalJump, defaultHead, flagC),
+                load,
+                new Instruction(15, OpCode.Jump, mergeHead),
+                defaultHead,
+                new Instruction(17, OpCode.Jump, mergeHead),
                 mergeHead,
-            ]
-            :
-            [
-                new Instruction(0, OpCode.Move, tbl, new Immediate((long)TableAddress)),
-                new Instruction(1, OpCode.CheckLess, flagCRaw, sel, new Immediate(Constants.Length)),
-                new Instruction(2, OpCode.Not, flagC, flagCRaw),
-                new Instruction(3, OpCode.ConditionalJump, defaultHead, flagC),
-                load,
-                new Instruction(5, OpCode.Return, res),
-                defaultHead,
-                new Instruction(7, OpCode.Return, res),
-            ]);
+            ],
+        });
 
-        context.Locals = [sel, res, tbl, flagC, flagCRaw];
+        context.Locals = [sel, res, tbl, flagC, flagCRaw, flagZ, flagZNeg, subTemp, cond];
         context.ParameterLocals = [];
         context.AnalysisWarnings = [];
 
@@ -148,7 +181,7 @@ public class SwitchLookupTableRecoveryTests
     {
         Cpp2IlApi.ResetInternalState();
         var app = TestGameLoader.LoadSimple2019Game();
-        var (context, load) = BuildGraph(app, jumpTerminator: true);
+        var (context, load) = BuildGraph(app, Shape.Jump);
 
         var recovered = SwitchLookupTableRecovery.Run(context,
             (va, size) => va == TableAddress && size == Constants.Length * 4 ? TableBytes() : null);
@@ -172,7 +205,7 @@ public class SwitchLookupTableRecoveryTests
     {
         Cpp2IlApi.ResetInternalState();
         var app = TestGameLoader.LoadSimple2019Game();
-        var (context, _) = BuildGraph(app, jumpTerminator: false);
+        var (context, _) = BuildGraph(app, Shape.ReturnLocal);
 
         var recovered = SwitchLookupTableRecovery.Run(context,
             (va, size) => va == TableAddress && size == Constants.Length * 4 ? TableBytes() : null);
@@ -183,11 +216,31 @@ public class SwitchLookupTableRecoveryTests
     }
 
     [Test]
+    public void DirectTableReturnWithCompositeBoundBecomesSwitch()
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        var (context, load) = BuildGraph(app, Shape.ReturnDirect);
+
+        var recovered = SwitchLookupTableRecovery.Run(context,
+            (va, size) => va == TableAddress && size == Constants.Length * 4 ? TableBytes() : null);
+
+        var method = EmitMethod(context, app, "SwitchTableDirect");
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Is.EqualTo(1));
+            Assert.That(context.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions),
+                Has.None.SameAs(load));
+        });
+        AssertSwitchHoldsTable(method);
+    }
+
+    [Test]
     public void UnprovenTableBytesStayDiagnosed()
     {
         Cpp2IlApi.ResetInternalState();
         var app = TestGameLoader.LoadSimple2019Game();
-        var (context, load) = BuildGraph(app, jumpTerminator: true);
+        var (context, load) = BuildGraph(app, Shape.Jump);
 
         // A range that cannot be proven static-and-never-patched must keep its
         // load and its diagnostic: any value read at this address is a guess.

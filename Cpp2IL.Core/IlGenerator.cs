@@ -1729,11 +1729,12 @@ public static class IlGenerator
             case OpCode.Switch:
                 // Operand 0 is the default target and operands past 1 the case
                 // entry instructions; the labels are attached in the fixup pass.
-                // The selector must be the int32 a switch pops, so a 64-bit or
-                // native-int selector is narrowed - the bound that gated this
-                // recovery already proved it in range.
+                // The selector must be the int32 a switch pops: anything wider
+                // or spelled differently (i64, native int, enum) narrows -
+                // the bound that gated this recovery already proved it in range.
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, null, context);
-                if (IntegralStackWidth(EmittedOperandType(instruction.Operands[1], context)) != 4)
+                if (EmittedOperandType(instruction.Operands[1], context)?.FullName
+                        is not ("System.Int32" or "System.UInt32"))
                     instructions.Add(CilOpCodes.Conv_U4);
                 instructions.Add(CilOpCodes.Switch, new List<ICilLabel>());
                 break;
