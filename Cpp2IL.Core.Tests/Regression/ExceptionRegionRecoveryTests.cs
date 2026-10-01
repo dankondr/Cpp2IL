@@ -116,11 +116,14 @@ public class ExceptionRegionRecoveryTests
         Assert.That(caller.AnalysisWarnings, Is.Empty);
         Assert.That(body.ComputeMaxStack(), Is.EqualTo(0));
     }
-    [TestCase(8, true, false, false)]
-    [TestCase(16, false, false, false)]
-    [TestCase(8, true, true, true)]
-    [TestCase(8, false, false, true)]
-    public void CallInvalidationRespectsTheWidthOfAnAdjacentSavedFramePointer(int width, bool proven, bool boxesValue, bool earlierArgument)
+    [TestCase(8, true, null, false)]
+    [TestCase(16, false, null, false)]
+    [TestCase(8, true, "il2cpp_value_box", true)]
+    [TestCase(8, false, null, true)]
+    [TestCase(8, true, "il2cpp_codegen_write_barrier", true)]
+    [TestCase(8, false, "il2cpp_gc_wbarrier_set_field", true)]
+    [TestCase(8, true, "barrier-alias", true)]
+    public void CallInvalidationRespectsTheWidthOfAnAdjacentSavedFramePointer(int width, bool proven, string? helper, bool earlierArgument)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Frame",
@@ -138,8 +141,12 @@ public class ExceptionRegionRecoveryTests
             => new(0, op, operands.ToList()) { NativeAddress = address };
         var store = At(0x1000, OpCode.Move, saved, storage);
         store.NativeStoreWidthBytes = width;
+        var keys = app.GetOrCreateKeyFunctionAddresses();
+        const ulong alias = 0xABCDEF;
+        if (helper == "barrier-alias") keys.WriteBarrierAliases.Add(alias);
         caller.ConvertedIsil = [store,
-            At(0x1004, OpCode.CallVoid, boxesValue ? new StringLiteral("il2cpp_value_box") : work,
+            At(0x1004, OpCode.CallVoid, helper == "barrier-alias" ? new Immediate((long)alias)
+                : helper != null ? new StringLiteral(helper) : work,
                 earlierArgument ? new AddressOf(new StackOffset(4)) : storage),
             At(0x1008, OpCode.CallVoid, cleanup, storage), At(0x100C, OpCode.Return),
             At(0x2000, OpCode.Move, exception, new Register(null, "X0")),
@@ -150,7 +157,8 @@ public class ExceptionRegionRecoveryTests
         caller.UnwindInfo.CallSites.Add(new EhCallSiteInfo(0x1004, 4, 0x2000, 0)
             { Actions = [new EhActionInfo(0, null)] });
         EhRegionPartition.Partition(caller);
-        Assert.That(new NativeExceptionRegionProof(caller).Find().Count, Is.EqualTo(proven ? 1 : 0));
+        try { Assert.That(new NativeExceptionRegionProof(caller).Find().Count, Is.EqualTo(proven ? 1 : 0)); }
+        finally { if (helper == "barrier-alias") keys.WriteBarrierAliases.Remove(alias); }
     }
 
     [TestCase(false)]

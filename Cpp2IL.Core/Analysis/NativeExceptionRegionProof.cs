@@ -688,12 +688,12 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
         foreach (var cell in state.Memory.Keys.Where(k => !k.StartsWith("f", StringComparison.Ordinal)).ToArray())
             state.Memory.Remove(cell);
         var arguments = instruction.Operands.Skip(instruction.OpCode == OpCode.CallVoid ? 1 : 2);
-        // Boxing copies the input bytes; it never writes through the value
-        // pointer. Treating it as an unknown writer erased adjacent saved
-        // cleanup receivers even on the exceptional edge.
-        var boxesValue = Helper(instruction.Operands[0]) is nameof(BaseKeyFunctionAddresses.il2cpp_value_box)
-            or nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_box);
-        var writes = arguments.Where(_ => !boxesValue)
+        // Boxing reads the value bytes; the barrier-only helper performs GC
+        // bookkeeping after a separate store. Neither writes the frame slot.
+        // Unknown calls and the exported write-barrier setter still invalidate it.
+        var readOnlyStorage = Helper(instruction.Operands[0]) is nameof(BaseKeyFunctionAddresses.il2cpp_value_box)
+            or nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_box) or nameof(BaseKeyFunctionAddresses.il2cpp_codegen_write_barrier);
+        var writes = arguments.Where(_ => !readOnlyStorage)
             .Select(o => (Address: Value(o, state), Size: ArgumentStorageSize(callee, o))).ToList();
         if (instruction.Destination is MemoryOperand result)
             writes.Add((Address(result, state), StorageSize(callee?.ReturnType)));
@@ -917,7 +917,10 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
         var address = target.UnsignedValue;
         if (helperNames.TryGetValue(address, out var name)) return name;
         var binary = context.AppContext.Binary;
-        name = context.AppContext.GetOrCreateKeyFunctionAddresses().Pairs.FirstOrDefault(p => p.Value == address).Key;
+        var keys = context.AppContext.GetOrCreateKeyFunctionAddresses();
+        name = keys.Pairs.FirstOrDefault(p => p.Value == address).Key;
+        if (name == null && keys.WriteBarrierAliases.Contains(address))
+            name = nameof(BaseKeyFunctionAddresses.il2cpp_codegen_write_barrier);
         if (name == null && !binary.TryGetExportedFunctionName(address, out name))
             NewArm64KeyFunctionAddresses.TryResolveGotVeneerImportName(binary, address, out name!);
         if (string.IsNullOrEmpty(name) && KeyFunctionRecovery.IsClassIsAssignableFrom(binary, address))
