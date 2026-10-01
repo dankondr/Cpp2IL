@@ -5,6 +5,7 @@ using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using LibCpp2IL;
 
 namespace Cpp2IL.Core.Tests.Analysis;
 
@@ -112,6 +113,76 @@ public class InjectedExceptionGuardTests
             Assert.That(method.ControlFlowGraph.Instructions.Any(instruction => instruction.OpCode == OpCode.Throw), Is.True);
             Assert.That(method.ControlFlowGraph.Instructions.Any(instruction => instruction.OpCode == OpCode.ConditionalJump), Is.True);
         });
+    }
+
+    // Phi operands are positional on the predecessor list: removing the edge a
+    // folded branch can never take must drop that edge's phi slot too, or every
+    // predecessor after it reads the next edge's value out of SSA.
+    [Test]
+    public void DroppedImpossibleEdgeKeepsPhiOperandAlignment()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, []);
+        var allocated = Local("allocated");
+        var flag = Local("flag");
+        var fromEntry = Local("fromEntry");
+        var fromMiddle = Local("fromMiddle");
+        var fromTail = Local("fromTail");
+        var merged = Local("merged");
+        var phi = new Instruction(7, OpCode.Phi, merged, fromEntry, fromMiddle, fromTail);
+        method.ControlFlowGraph = new([
+            new Instruction(0, OpCode.Newobj, allocated, app.SystemTypes.SystemObjectType),
+            new Instruction(1, OpCode.CheckEqual, flag, allocated, new Immediate(0)),
+            new Instruction(2, OpCode.ConditionalJump, phi, flag),
+            new Instruction(3, OpCode.CheckEqual, Local("unknown"), Local("mystery"), new Immediate(0)),
+            new Instruction(4, OpCode.ConditionalJump, phi, Local("unknown")),
+            new Instruction(5, OpCode.Move, fromTail, new Immediate(3)),
+            new Instruction(6, OpCode.Jump, phi),
+            phi,
+            new Instruction(8, OpCode.Return, merged),
+        ]);
+
+        InjectedCheckRemover.Run(method.ControlFlowGraph);
+
+        var join = method.ControlFlowGraph.Blocks.Single(block => block.Instructions.Contains(phi));
+        Assert.Multiple(() =>
+        {
+            Assert.That(join.Predecessors.Count, Is.EqualTo(2));
+            Assert.That(phi.Operands.Count, Is.EqualTo(3));
+            Assert.That(phi.Operands[1], Is.SameAs(fromMiddle));
+            Assert.That(phi.Operands[2], Is.SameAs(fromTail));
+        });
+    }
+
+    // A folded edge may be a landing pad's only proven entry: deleting the
+    // unreachable block behind it strips the call-site coverage a pad's region
+    // proof needs. The edge is kept instead.
+    [Test]
+    public void ImpossibleEdgeInsideCallSiteRangeIsKept()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Static, []);
+        var allocated = Local("allocated");
+        var flag = Local("flag");
+        var result = Local("result");
+        var throwInstruction = new Instruction(5, OpCode.Throw) { NativeAddress = 0x204 };
+        var region = new LandingPadRegion { PadAddress = 0xF00 };
+        region.CallSites.Add(new EhCallSiteInfo(0x200, 0x10, 0xF00, 0));
+        method.LandingPadRegions.Add(region);
+        method.ControlFlowGraph = new([
+            new Instruction(0, OpCode.Newobj, allocated, app.SystemTypes.SystemObjectType),
+            new Instruction(1, OpCode.CheckEqual, flag, allocated, new Immediate(0)),
+            new Instruction(2, OpCode.ConditionalJump, throwInstruction, flag),
+            new Instruction(3, OpCode.Move, result, new Immediate(1)),
+            new Instruction(4, OpCode.Return, result),
+            throwInstruction,
+        ]);
+
+        InjectedCheckRemover.Run(method);
+
+        Assert.That(method.ControlFlowGraph.Instructions.Any(instruction => instruction.OpCode == OpCode.ConditionalJump), Is.True);
     }
 
     private static bool Matches(string exception, IOperand checkedValue, Instruction implicitFailure,

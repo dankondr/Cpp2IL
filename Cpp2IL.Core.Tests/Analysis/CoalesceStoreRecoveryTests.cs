@@ -81,6 +81,61 @@ public class CoalesceStoreRecoveryTests
     }
 
     [Test]
+    public void EmptiedCopyTrampolineIsRetargeted()
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Owner",
+            app.SystemTypes.SystemObjectType, System.Reflection.TypeAttributes.Public);
+        var cache = new InjectedFieldAnalysisContext("cache", app.SystemTypes.SystemObjectType,
+            System.Reflection.FieldAttributes.Public | System.Reflection.FieldAttributes.Static, owner, 0);
+        var holder = new LocalVariable("holder", new Register(null, "holder"), owner);
+        var flag = new LocalVariable("flag", new Register(null, "flag"), app.SystemTypes.SystemBooleanType);
+        var flag2 = new LocalVariable("flag2", new Register(null, "flag2"), app.SystemTypes.SystemBooleanType);
+        var merged = new LocalVariable("merged", new Register(null, "merged"), app.SystemTypes.SystemObjectType);
+        var stored = new LocalVariable("stored", new Register(null, "stored"), app.SystemTypes.SystemObjectType);
+        var field = new FieldReference(cache, holder, 0);
+        var joinHead = new Instruction(9, OpCode.Move, stored, stored);
+        var copyTrampoline = new Instruction(7, OpCode.Move, merged, stored);
+        var cfg = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.CheckEqual, flag, field, new Immediate(0)),
+            new Instruction(1, OpCode.Not, flag2, flag),
+            new Instruction(2, OpCode.Move, merged, field),
+            new Instruction(3, OpCode.ConditionalJump, joinHead, flag2),
+            new Instruction(4, OpCode.Move, stored, new Immediate(1)),
+            new Instruction(5, OpCode.Move, field, stored),
+            new Instruction(6, OpCode.Jump, copyTrampoline),
+            copyTrampoline,
+            joinHead,
+            new Instruction(10, OpCode.Return, merged),
+        ]);
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Run",
+            app.SystemTypes.SystemObjectType, ReflectionMethodAttributes.Static, []);
+        context.ControlFlowGraph = cfg;
+        var join = cfg.FindBlockByInstruction(joinHead)!;
+
+        CoalesceStoreRecovery.Run(context);
+
+        Assert.Multiple(() =>
+        {
+            // Removing the edge's merge copy empties the trampoline; leaving it
+            // keeps a Jump operand aimed at an instruction-less block, which
+            // emits "Branch target block not in cfg" and nop's the branch.
+            Assert.That(cfg.Blocks.Where(block => block != cfg.EntryBlock && block != cfg.ExitBlock),
+                Has.None.Matches<Block>(block => block.Instructions.Count == 0));
+            Assert.That(cfg.Blocks.SelectMany(block => block.Instructions),
+                Has.None.SameAs(copyTrampoline));
+            Assert.That(cfg.Blocks.SelectMany(block => block.Instructions)
+                    .Where(instruction => instruction.OpCode is OpCode.Jump or OpCode.ConditionalJump)
+                    .All(instruction => instruction.Operands[0] is Block target && target.Instructions.Count > 0),
+                Is.True);
+            Assert.That(join.Instructions[0].OpCode, Is.EqualTo(OpCode.Move));
+            Assert.That(join.Instructions[0].Operands[0], Is.SameAs(merged));
+            Assert.That(join.Instructions[0].Operands[1], Is.SameAs((IOperand)field));
+        });
+    }
+
+    [Test]
     public void NullCheckedBranchReadsTheFieldInline()
     {
         Cpp2IlApi.ResetInternalState();

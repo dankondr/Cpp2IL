@@ -10,9 +10,11 @@ namespace Cpp2IL.Core.Analysis;
 // Remove null and bounds checks which are explicit in il2cpp but implicit in IL
 public static class InjectedCheckRemover
 {
-    public static void Run(MethodAnalysisContext method) => Run(method.ControlFlowGraph!);
+    public static void Run(MethodAnalysisContext method) => Run(method, method.ControlFlowGraph!);
 
-    public static void Run(ISILControlFlowGraph cfg)
+    public static void Run(ISILControlFlowGraph cfg) => Run(null, cfg);
+
+    private static void Run(MethodAnalysisContext? method, ISILControlFlowGraph cfg)
     {
         var defOf = BuildDefMap(cfg);
         var removedAny = false;
@@ -36,7 +38,7 @@ public static class InjectedCheckRemover
             if (terminator.Operands[1] is LocalVariable guarded
                 && defOf.TryGetValue(guarded, out var guardCheck)
                 && AllocatedNullCheckValue(guardCheck, defOf) is { } folded
-                && DropImpossibleEdge(block, terminator, target, cfg, folded))
+                && DropImpossibleEdge(method, block, terminator, target, cfg, folded))
             {
                 removedAny = true;
                 continue;
@@ -57,7 +59,7 @@ public static class InjectedCheckRemover
             terminator.SetOperands();
 
             block.Successors.Remove(target);
-            target.Predecessors.Remove(block);
+            cfg.RemovePredecessor(target, block);
             block.CalculateBlockType();
             removedAny = true;
         }
@@ -93,23 +95,62 @@ public static class InjectedCheckRemover
     }
 
     // Removes the edge a constant-folded branch can never take and nops the
-    // terminator. Returns false when the surviving layout is ambiguous.
-    private static bool DropImpossibleEdge(Block block, Instruction terminator, Block target,
+    // terminator. Returns false when the surviving layout is ambiguous, or when
+    // the drop would orphan instructions inside a landing pad's call-site
+    // range — their deletion would cost the pad its proven region shape.
+    private static bool DropImpossibleEdge(MethodAnalysisContext? method, Block block, Instruction terminator, Block target,
         ISILControlFlowGraph cfg, long foldedValue)
     {
         var dead = foldedValue != 0
             ? block.Successors.FirstOrDefault(successor => successor != target && successor != cfg.ExitBlock)
             : target;
-        if (dead == null)
+        if (dead == null || OrphansCoveredInstructions(method, cfg, dead, block))
             return false;
 
         terminator.OpCode = OpCode.Nop;
         terminator.SetOperands();
 
         block.Successors.Remove(dead);
-        dead.Predecessors.Remove(block);
+        cfg.RemovePredecessor(dead, block);
         block.CalculateBlockType();
         return true;
+    }
+
+    // The dropped edge can be a landing pad's only proven entry: without it the
+    // dead block and everything reachable only through it become unreachable,
+    // and deleting them strips the call-site ranges a pad's region proof
+    // needs. The check must stay folded-safe, so the edge is kept instead.
+    private static bool OrphansCoveredInstructions(MethodAnalysisContext? method, ISILControlFlowGraph cfg, Block dead, Block pred)
+    {
+        if (method?.LandingPadRegions is not { Count: > 0 } regions)
+            return false;
+
+        var orphaned = new HashSet<Block>();
+        var work = new Queue<Block>();
+        if (dead != cfg.ExitBlock && dead.Predecessors.Count == 1 && ReferenceEquals(dead.Predecessors[0], pred))
+        {
+            orphaned.Add(dead);
+            work.Enqueue(dead);
+        }
+
+        while (work.Count > 0)
+        {
+            var block = work.Dequeue();
+            foreach (var instruction in block.Instructions)
+                if (regions.Any(region => region.CallSites.Any(site =>
+                        instruction.NativeAddress >= site.Start && instruction.NativeAddress < site.Start + site.Length)))
+                    return true;
+
+            foreach (var successor in block.Successors)
+                if (successor != cfg.ExitBlock && !orphaned.Contains(successor)
+                    && successor.Predecessors.All(orphaned.Contains))
+                {
+                    orphaned.Add(successor);
+                    work.Enqueue(successor);
+                }
+        }
+
+        return false;
     }
 
     private static bool IsInjectedCheck(Instruction definition, string thrownType) =>

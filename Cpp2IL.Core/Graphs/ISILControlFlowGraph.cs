@@ -123,7 +123,7 @@ public class ISILControlFlowGraph
             // (A reachable block can have an unreachable predecessor; leaving that reference
             // behind makes later passes such as dominator computation throw.)
             foreach (var successor in block.Successors)
-                successor.Predecessors.Remove(block);
+                RemovePredecessor(successor, block);
             foreach (var predecessor in block.Predecessors)
                 predecessor.Successors.Remove(block);
 
@@ -226,7 +226,7 @@ public class ISILControlFlowGraph
                 // Redirect successors to predecessors
                 foreach (var succ in block.Successors)
                 {
-                    succ.Predecessors.Remove(block);
+                    RemovePredecessor(succ, block);
                     foreach (var pred in block.Predecessors)
                     {
                         if (!succ.Predecessors.Contains(pred))
@@ -246,6 +246,25 @@ public class ISILControlFlowGraph
         block.Predecessors.Any(pred => pred.Instructions.Count > 0
             && pred.Instructions[^1] is { OpCode: OpCode.Jump or OpCode.ConditionalJump } jump
             && ReferenceEquals(jump.Operands[0], block));
+
+    /// <summary>
+    /// Removes <paramref name="predecessor"/> from <paramref name="successor"/>'s predecessor list
+    /// and drops the matching operand slot from each phi in the block. Phi operands are positional
+    /// on the predecessor list — phi.Operands[1+i] is the value arriving on the edge from
+    /// Predecessors[i] — so a plain list removal would misalign every phi past that index.
+    /// </summary>
+    public void RemovePredecessor(Block successor, Block predecessor)
+    {
+        var index = successor.Predecessors.IndexOf(predecessor);
+        if (index < 0)
+            return;
+
+        foreach (var instruction in successor.Instructions)
+            if (instruction.OpCode == OpCode.Phi && 1 + index < instruction.Operands.Count)
+                instruction.RemoveOperandAt(1 + index);
+
+        successor.Predecessors.RemoveAt(index);
+    }
 
     public void BuildUseDefLists(HashSet<Instruction>? clobberingAddressTakes = null)
     {

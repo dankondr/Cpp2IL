@@ -34,6 +34,7 @@ public static class CoalesceStoreRecovery
     public static void Run(MethodAnalysisContext method)
     {
         var cfg = method.ControlFlowGraph!;
+        var emptiedAny = false;
         foreach (var block in cfg.Blocks)
         {
             if (block.Instructions.LastOrDefault() is not { OpCode: OpCode.ConditionalJump } jump
@@ -114,13 +115,17 @@ public static class CoalesceStoreRecovery
 
                     block.Instructions.Remove(preMerge);
                     foreach (var mergeBlock in edge.Append(join))
+                    {
                         mergeBlock.Instructions.Remove(initMerge);
+                        emptiedAny |= mergeBlock.Instructions.Count == 0;
+                    }
                     join.Instructions.Insert(0,
                         new Instruction(-1, OpCode.Move, merged, store.Operands[0]));
                     collapsedAny = true;
                 }
 
                 TryRetargetAllocationStore(cfg, edgeBlock, store, storedValue);
+                emptiedAny |= edgeBlock.Instructions.Count == 0;
             }
 
             // The collapse left a `brtrue storage` shape: when the flag chain was
@@ -134,6 +139,12 @@ public static class CoalesceStoreRecovery
                     block.Instructions.Remove(instruction);
             }
         }
+
+        // Removing a merge copy can leave a dedicated copy-trampoline block
+        // empty; retarget the jumps into it and drop it so no branch operand
+        // keeps pointing at a block that holds nothing.
+        if (emptiedAny)
+            cfg.RemoveEmptyBlocks();
     }
 
     // A `Newobj v` result used only as the stored value can write the slot
