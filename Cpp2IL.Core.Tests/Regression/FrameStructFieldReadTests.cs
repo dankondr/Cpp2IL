@@ -73,4 +73,51 @@ public class FrameStructFieldReadTests
 
         Assert.That(reload.Operands[1], Is.InstanceOf<LocalVariable>());
     }
+
+    // `var t = new (int, int, int, int)(…); return t;`: the tuple is zeroed in its frame slot,
+    // filled by the constructor through &slot, then reloaded as `ldp x0, x1, [slot]; ret`.
+    private static Instruction BuildReturn(int highCellOffset)
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        app.InstructionSet = new Cpp2IL.Core.InstructionSets.NewArmV8InstructionSet();
+        var quad = InjectStruct(app, "Quad");
+        foreach (var (name, offset) in new[] { ("a", 0), ("b", 4), ("c", 8), ("d", 12) })
+            InjectField(name, app.SystemTypes.SystemInt32Type, quad, offset);
+
+        var slot = new LocalVariable("slot", new Register(null, "stack_-58"), quad);
+        var high = new LocalVariable("high", new Register(null, $"stack_-{0x58 - highCellOffset:X}"), app.SystemTypes.SystemInt64Type);
+        var x0 = Local("x0", quad);
+        var x1 = Local("x1", app.SystemTypes.SystemInt64Type);
+        var ret = new Instruction(4, OpCode.Return, x0, x1);
+        var callerType = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Prices",
+            app.SystemTypes.SystemObjectType, System.Reflection.TypeAttributes.Public | System.Reflection.TypeAttributes.Class);
+        var caller = callerType.InjectMethodContext("Get", quad,
+            System.Reflection.MethodAttributes.Public | System.Reflection.MethodAttributes.Static);
+        caller.ControlFlowGraph = new Cpp2IL.Core.Graphs.ISILControlFlowGraph([
+            new(0, OpCode.Move, high, new Immediate(0)),
+            new(1, OpCode.CallVoid, new Immediate(0x1234), new AddressOf(slot)),
+            new(2, OpCode.Move, x0, slot),
+            new(3, OpCode.Move, x1, high),
+            ret]);
+        caller.Locals = [slot, high, x0, x1];
+        FrameStructFieldReads.Run(caller);
+        return ret;
+    }
+
+    [Test]
+    public void StructReturnedFromItsFrameSlotReturnsTheSlot()
+    {
+        var ret = BuildReturn(highCellOffset: 8);
+
+        Assert.That(ret.Operands, Has.Count.EqualTo(1));
+        Assert.That(((LocalVariable)ret.Operands[0]).Name, Is.EqualTo("x0"));
+    }
+
+    [Test]
+    public void HighLaneFromOutsideTheSlotKeepsBothLanes()
+    {
+        Assert.That(BuildReturn(highCellOffset: 0x10).Operands, Has.Count.EqualTo(2));
+    }
 }

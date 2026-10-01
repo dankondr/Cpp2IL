@@ -52,10 +52,7 @@ internal static class AggregateResultLanes
                 || call.Destination is not LocalVariable result)
                 continue;
 
-            var concrete = !callee.IsStatic && call.Operands.Count > 2
-                ? IlGenerator.RetargetToReceiverInstantiation(callee,
-                    IlGenerator.SharedGenericEvidenceType(call.Operands[2], method))
-                : callee;
+            var concrete = Concrete(call, callee, method);
             var resultType = IlGenerator.EffectiveCallReturnType(concrete);
             var lanes = resolver.ExtraLanes(resultType, resolver.ReturnRegister(concrete));
             if (lanes.Count == 0)
@@ -149,6 +146,8 @@ internal static class AggregateResultLanes
         // the fields its bytes hold - before the projection loop below so the
         // operands still name their registers.
         var changed = RebuildAggregateReturns(method, resolver, pointerSize);
+        changed |= ProjectScalarReturns(method, resolver, pointerSize);
+        changed |= DropLaneStoresOfWholeStores(method, resolver, pointerSize);
 
         if (provenLanes.Count == 0 && lateLanes.Count == 0 && entryLanes.Count == 0)
             return created || changed;
@@ -296,6 +295,22 @@ internal static class AggregateResultLanes
                 if (!proven)
                     continue;
 
+                // Lane 0 holding a call's whole result of the return type, with every other
+                // lane that call's own lane register, is the value passed through unchanged,
+                // however its fields straddle the lanes (`Nullable<DateTime>`, `UniTask`).
+                if (lane0 is LocalVariable { Type: { } wholeType } whole
+                    && wholeType.FullName == method.ReturnType.FullName
+                    && method.ControlFlowGraph.Instructions.FirstOrDefault(i => ReferenceEquals(i.Destination, whole)) is
+                        { OpCode: OpCode.Call } call
+                    && CallResultType(call, method)?.FullName == wholeType.FullName
+                    && sources.Skip(1).All(source => source.Operand is LocalVariable { Register: { Version: > 0 } register }
+                                                     && call.ImplicitDefinitions.Contains(register)))
+                {
+                    instruction.SetOperands(whole);
+                    changed = true;
+                    continue;
+                }
+
                 var fields = new List<(FieldAnalysisContext Field, int Offset,
                     IReadOnlyList<FieldAnalysisContext> Containers, int Width)>();
                 foreach (var (_, offset, width) in sources)
@@ -336,6 +351,117 @@ internal static class AggregateResultLanes
 
         return changed;
     }
+
+    // A method returning one scalar can hand back lane 0 of an aggregate call result as is:
+    // `float X(Transform t) => t.position.x` is `b Transform.get_position`, and the caller's S0
+    // is the callee's `x`. The value returned is that lane's field, not the whole aggregate.
+    private static bool ProjectScalarReturns(MethodAnalysisContext method, BaseCallingConventionResolver resolver,
+        int pointerSize)
+    {
+        if (method.IsVoid || resolver.ExtraLanes(method.ReturnType, resolver.ReturnRegister(method)).Count > 0)
+            return false;
+        var changed = false;
+        var instructions = method.ControlFlowGraph!.Instructions;
+        foreach (var ret in instructions.Where(i => i.OpCode == OpCode.Return))
+        {
+            if (ret.Operands is not [LocalVariable result]
+                || instructions.FirstOrDefault(i => ReferenceEquals(i.Destination, result)) is not
+                    { OpCode: OpCode.Call, Operands: [MethodAnalysisContext callee, ..] } call
+                || resolver.ReturnRegister(Concrete(call, callee, method)) is var laneZero
+                   && laneZero.Name != resolver.ReturnRegister(method).Name
+                || CallResultType(call, method) is not { IsValueType: true } aggregate
+                || resolver.ExtraLanes(aggregate, laneZero) is not { Count: > 0 } lanes
+                || MetadataResolver.FindInstanceFieldPathAtOffset(aggregate, 0, lanes[0].ByteOffset) is not { } path
+                || path.Field.FieldType.FullName != method.ReturnType.FullName
+                || TypeSizes.MinimumUnboxedSize(path.Field.FieldType, pointerSize) != lanes[0].ByteOffset
+                || instructions.Any(i => i != ret && i != call && DeadCodeEliminator.UsedLocals(i).Contains(result)))
+                continue;
+            result.Type = aggregate;
+            ret.SetOperand(0, new FieldReference(path.Field, result, 0, path.Containers, lanes[0].ByteOffset));
+            changed = true;
+        }
+        return changed;
+    }
+
+    // `stp x0, x1, [x19, #0x60]` after a call returning a 16-byte struct lifts to a store of the
+    // whole result (lane 0's local carries the struct) and a raw store of X1 eight bytes further.
+    // Once the first store writes the whole value, the lane stores rewrite bytes it already wrote
+    // with the same call's other lanes: they are part of it, not values of their own.
+    private static bool DropLaneStoresOfWholeStores(MethodAnalysisContext method, BaseCallingConventionResolver resolver,
+        int pointerSize)
+    {
+        var changed = false;
+        var calls = method.ControlFlowGraph!.Instructions
+            .Where(i => i is { OpCode: OpCode.Call, Destination: LocalVariable, Operands: [MethodAnalysisContext, ..] }
+                        && i.ImplicitDefinitions.Count > 0)
+            .ToDictionary(i => (LocalVariable)i.Destination!);
+        if (calls.Count == 0)
+            return false;
+
+        foreach (var block in method.ControlFlowGraph.Blocks)
+        for (var index = 0; index < block.Instructions.Count; index++)
+        {
+            if (block.Instructions[index] is not { OpCode: OpCode.Move, Operands: [var target, LocalVariable { Type: { } wholeType } whole] } store
+                || !calls.TryGetValue(whole, out var call))
+                continue;
+            var concrete = Concrete(call, (MethodAnalysisContext)call.Operands[0], method);
+            // Lanes that are each one field are projected onto those fields instead (`res.y`).
+            if (IlGenerator.EffectiveCallReturnType(concrete).FullName != wholeType.FullName
+                || resolver.ExtraLanes(wholeType, resolver.ReturnRegister(concrete)) is not { Count: > 0 } lanes
+                || lanes.All(lane => LaneField(wholeType, whole, lane, pointerSize) != null))
+                continue;
+            // The store must write the whole value: a field of the result's own type, or a raw cell
+            // the lane stores below are relative to.
+            var (holder, offset) = target switch
+            {
+                FieldReference { Local: { } fieldHolder, Field.FieldType: var fieldType } field
+                    when fieldType.FullName == wholeType.FullName => (fieldHolder, field.Offset),
+                MemoryOperand { Base: LocalVariable memoryBase, Index: null } memory => (memoryBase, memory.Addend),
+                _ => ((LocalVariable?)null, 0L),
+            };
+            if (holder == null)
+                continue;
+
+            var laneStores = new List<Instruction>();
+            for (var next = index + 1; next < block.Instructions.Count && laneStores.Count < lanes.Count; next++)
+            {
+                var candidate = block.Instructions[next];
+                var lane = lanes[laneStores.Count];
+                if (candidate is { OpCode: OpCode.Move, Operands: [MemoryOperand { Base: LocalVariable laneBase, Index: null } laneCell, LocalVariable laneValue] }
+                    && ReferenceEquals(laneBase, holder) && laneCell.Addend == offset + lane.ByteOffset
+                    && laneValue.Register is { Version: > 0 } laneRegister && laneRegister.Name == lane.Register.Name
+                    && call.ImplicitDefinitions.Contains(laneRegister))
+                    laneStores.Add(candidate);
+                else if (candidate is not ({ OpCode: OpCode.Nop } or { OpCode: OpCode.Move, Operands: [LocalVariable, _] }))
+                    break;
+            }
+            if (laneStores.Count != lanes.Count)
+                continue;
+
+            foreach (var laneStore in laneStores)
+            {
+                laneStore.OpCode = OpCode.Nop;
+                laneStore.SetOperands();
+            }
+            var width = lanes[^1].ByteOffset + lanes[^1].AccessSize;
+            store.NativeMemoryAccessSize = width;
+            if (target is MemoryOperand cell)
+                store.SetOperand(0, new MemoryOperand(cell.Base, cell.Index, cell.Addend, cell.Scale, width));
+            changed = true;
+        }
+        return changed;
+    }
+
+    private static MethodAnalysisContext Concrete(Instruction call, MethodAnalysisContext callee, MethodAnalysisContext method)
+        => !callee.IsStatic && call.Operands.Count > 2
+            ? IlGenerator.RetargetToReceiverInstantiation(callee,
+                IlGenerator.SharedGenericEvidenceType(call.Operands[2], method))
+            : callee;
+
+    private static TypeAnalysisContext? CallResultType(Instruction call, MethodAnalysisContext method)
+        => call.Operands[0] is MethodAnalysisContext callee
+            ? IlGenerator.EffectiveCallReturnType(Concrete(call, callee, method))
+            : null;
 
     private static IOperand? LaneOperand(IOperand operand, string? registerName) => operand switch
     {

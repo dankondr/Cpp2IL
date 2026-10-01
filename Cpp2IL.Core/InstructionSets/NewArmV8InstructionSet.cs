@@ -874,7 +874,31 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     break;
                 }
 
-                Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                var move = Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                if (instruction is { Mnemonic: Arm64Mnemonic.MOV or Arm64Mnemonic.MOVZ,
+                        Op1Kind: Arm64OperandKind.Immediate }
+                    && move.Operands[1] is Immediate wideImmediate)
+                    // A wide-immediate move (movz/movn/orr-zr-imm, all aliased to
+                    // MOV here) proves as many bytes as its destination register
+                    // is wide: an X write covers the whole value, a W write four.
+                    move.SetOperand(1, wideImmediate with { ProvenBytes = RegisterWidthBytes(instruction.Op0Reg) });
+                else if (instruction is { Mnemonic: Arm64Mnemonic.FMOV, Op0Kind: Arm64OperandKind.Register }
+                    && IsScalarFloatRegister(instruction.Op0Reg))
+                {
+                    // Record the S/D write's width on the Move: it is what the
+                    // emitted immediate was proven against. NativeFloatWriteBits,
+                    // not NativeFloatWidthBits: the local may be read back as a
+                    // wider vector, so the write must not seed its managed type.
+                    move.NativeFloatWriteBits =
+                        instruction.Op0Reg is >= Arm64Register.S0 and <= Arm64Register.S31 ? 32 : 64;
+                    if (instruction.Op1Kind == Arm64OperandKind.FloatingPointImmediate
+                        && move.Operands[1] is DoubleLiteral scalarFp
+                        && move.NativeFloatWriteBits == 32)
+                        // fmov s0, #imm writes a 4-byte single-precision pattern:
+                        // record the bit pattern with its four proven bytes, not a
+                        // typed float literal that a wider slot could silently take.
+                        move.SetOperand(1, new Immediate(BitConverter.SingleToInt32Bits((float)scalarFp.Value), 4));
+                }
                 break;
             case Arm64Mnemonic.MOVI:
             case Arm64Mnemonic.MVNI when instruction.Op1Kind == Arm64OperandKind.Immediate:
@@ -895,7 +919,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         break;
                     }
                     var value = instruction.Mnemonic == Arm64Mnemonic.MVNI ? ~instruction.Op1Imm : instruction.Op1Imm;
-                    Add(address, OpCode.Move, ConvertOperand(instruction, 0), Imm(value));
+                    Add(address, OpCode.Move, ConvertOperand(instruction, 0), new Immediate(value, 8));
                     break;
                 }
             case Arm64Mnemonic.MOVK:

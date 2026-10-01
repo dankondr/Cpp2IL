@@ -4217,12 +4217,14 @@ public static class IlGenerator
                     System.BitConverter.Int32BitsToSingle(unchecked((int)immediate.Value)));
                 break;
             case Immediate immediate when literalType?.FullName == "System.Double"
-                    && (immediate.Value == 0 || (ulong)immediate.Value > uint.MaxValue):
-                // An 8-byte bit pattern needs an X-register write: only a value
-                // too wide for W proves one (ImmediateProvenBytes); a folded
-                // movk may have hidden the high half, so a narrow immediate
-                // falls through to the diagnosed default below. Zero is the
-                // all-zero value under either width, so it still emits.
+                    && (immediate.Value == 0 || ImmediateProvenBytes(immediate) >= 8):
+                // An 8-byte bit pattern needs all eight bytes proven: the lifter
+                // records how wide a write the immediate actually came through,
+                // and only a D/X-width write (or a movz/movk chain that proves
+                // all eight) may fill the slot. A folded movk may have hidden
+                // the high half, so a narrower write falls through to the
+                // diagnosed default below. Zero is the all-zero value under
+                // either width, so it still emits.
                 instructions.Add(CilOpCodes.Ldc_R8,
                     System.BitConverter.Int64BitsToDouble(immediate.Value));
                 break;
@@ -6787,12 +6789,10 @@ public static class IlGenerator
         return PlainContractFieldSlices(contract, provenBytes, context) is { Count: > 0 };
     }
 
-    // The register width an `Immediate`'s materialization proves: a value a
-    // W register could not have produced means an X-register write, eight
-    // bytes; anything narrower is ambiguous (the collapse may have folded a
-    // movk's high bits away) and proves only four.
-    private static int ImmediateProvenBytes(Immediate immediate) =>
-        (ulong)immediate.Value > uint.MaxValue ? 8 : 4;
+    // The register width an `Immediate`'s materialization proves, recorded at
+    // decoding where the write is visible; the operand's own fallback covers
+    // unannotated immediates the way it always has.
+    private static int ImmediateProvenBytes(Immediate immediate) => immediate.EffectiveProvenBytes;
 
     private static TypeAnalysisContext? NullComparisonType(Instruction instruction, int operandIndex, MethodAnalysisContext context)
     {

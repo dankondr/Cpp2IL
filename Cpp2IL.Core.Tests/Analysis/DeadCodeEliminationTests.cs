@@ -127,4 +127,40 @@ public class DeadCodeEliminationTests
         Assert.That(Live(graph).Any(i => i.OpCode == OpCode.Move && ReferenceEquals(i.Operands[0], index)), Is.True,
             "index definition is used inside the array operands and must survive");
     }
+
+    [Test]
+    public void ReturnAfterACallThatBecameAThrowIsSplicedOut()
+    {
+        // `bl raise_null_reference` was the method's last instruction, so the lifter appended a
+        // Return of whatever V0 held; recovery later proved the call throws.
+        var v0 = new LocalVariable("v0", new Register(null, "V0"));
+        var helper = new Instruction(1, OpCode.Call, Imm(0x37C2D20));
+        var graph = new ISILControlFlowGraph(new List<Instruction>
+        {
+            new(0, OpCode.Move, v0, Imm(1)),
+            helper,
+            new(2, OpCode.Return, v0),
+        });
+        helper.OpCode = OpCode.Throw;
+
+        DeadCodeEliminator.RemoveReturnsAfterThrow(graph);
+
+        Assert.That(Live(graph).Any(i => i.OpCode == OpCode.Return), Is.False);
+    }
+
+    [Test]
+    public void ReturnAfterAnOrdinaryCallStays()
+    {
+        var v0 = new LocalVariable("v0", new Register(null, "V0"));
+        var graph = new ISILControlFlowGraph(new List<Instruction>
+        {
+            new(0, OpCode.Move, v0, Imm(1)),
+            new(1, OpCode.CallVoid, Imm(0x1234)),
+            new(2, OpCode.Return, v0),
+        });
+
+        DeadCodeEliminator.RemoveReturnsAfterThrow(graph);
+
+        Assert.That(Live(graph).Last().OpCode, Is.EqualTo(OpCode.Return));
+    }
 }
