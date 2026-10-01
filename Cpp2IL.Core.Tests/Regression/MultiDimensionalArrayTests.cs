@@ -316,4 +316,16 @@ public class MultiDimensionalArrayTests
         words[0x3004] = 0x17fffc00; // b 0x2004: somewhere else
         Assert.That(ArrayRecovery.ProvesArrayNewWithoutBounds(0x1000, 0x3000, Read), Is.False);
     }
+
+    [Test]
+    public void ConstantLengthsStoredAsOneVectorAreItsTwoHalves()
+    {
+        // new int[20, 20]: `str q0, [sp]` of {20, 20} as 64-bit lanes.
+        var twenty = System.BitConverter.Int32BitsToSingle(20);
+        var lengths = new Vector128Literal(twenty, 0, twenty, 0);
+
+        Assert.That(ArrayRecovery.VectorLength(lengths, 0)?.Value, Is.EqualTo(20));
+        Assert.That(ArrayRecovery.VectorLength(lengths, 1)?.Value, Is.EqualTo(20));
+        Assert.That(ArrayRecovery.VectorLength(new Vector128Literal(0, -1, 0, 0), 0), Is.Null);
+    }
 }
