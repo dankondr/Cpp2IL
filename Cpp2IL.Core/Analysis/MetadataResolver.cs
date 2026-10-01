@@ -526,8 +526,7 @@ public static class MetadataResolver
         foreach (var phi in block.Instructions.Where(i => i.OpCode == OpCode.Phi).ToList())
         {
             if (phi.Operands[0] is not LocalVariable address
-                || phi.Operands.Count - 1 != block.Predecessors.Count
-                || block.Predecessors.Any(p => p.Successors.Count != 1))
+                || phi.Operands.Count - 1 != block.Predecessors.Count)
                 continue;
 
             var loads = new List<(Instruction User, int Index)>();
@@ -548,13 +547,44 @@ public static class MetadataResolver
 
             var accessSize = ((MemoryOperand)loads[0].User.Operands[loads[0].Index]).AccessSize;
             var cells = phi.Operands.Skip(1).Select(source => Cell(source, accessSize)).ToList();
+
+            // A struct passed whole to a call reads the whole struct at the cell, whose address
+            // upstream names its first field: `set_FillColor(c ? fullColor : notFullColor)`.
+            // A load into a struct-typed local reads the whole struct too, but its lanes are split
+            // downstream: that merge is refused rather than reading one field and dropping the rest.
+            var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+            bool IsStruct(TypeAnalysisContext? t) => t is { IsValueType: true } && PrimitiveStorageSize(t, pointerSize) == null;
+            if (loads.Any(l => l is { Index: 1, User: { OpCode: OpCode.Move, Operands: [LocalVariable { Type: var target }, _] } }
+                               && IsStruct(target)))
+                continue;
+            var consumed = loads.Select(l => ArgumentType(l.User, l.Index)).ToList();
+            TypeAnalysisContext? whole = null;
+            if (consumed.Any(IsStruct))
+            {
+                if (!consumed.All(IsStruct) || consumed.Select(t => t!.FullName).Distinct().Count() != 1)
+                    continue;
+                whole = consumed[0];
+                cells = cells.Select(c => c is { Field: { } f } ? Widened(f, whole!) is { } w ? (w, whole!) : null : c).ToList();
+            }
+
             if (cells.Any(c => c == null) || cells.Select(c => c!.Value.Type.FullName).Distinct().Count() != 1)
                 continue;
 
-            // A load of a struct cell reads only the bytes it covers, not the value.
+            // An edge's read runs at the end of its block, so on a block with another exit it also
+            // runs where the join is not reached: only a read that cannot fault may go there - a
+            // literal slot, or a field of `this`.
+            if (cells.Where((c, k) => block.Predecessors[k].Successors.Count != 1)
+                .Any(c => c!.Value.Field is { } edgeRead && !IsThisValue(edgeRead.Local)))
+                continue;
+
+            // A load of a struct cell reads only the bytes it covers, not the value; a primitive cell
+            // must be as wide as the load (the operand's width, else the native one).
             var type = cells[0]!.Value.Type;
-            if (type.IsValueType && (PrimitiveStorageSize(type, method.AppContext.Binary.PointerSizeBytes) is not { } size
-                                     || accessSize != 0 && size != accessSize))
+            if (type.IsValueType && whole == null
+                && (PrimitiveStorageSize(type, pointerSize) is not { } size
+                    || loads.Any(l => (((MemoryOperand)l.User.Operands[l.Index]).AccessSize is > 0 and var width
+                                          ? width : l.User.NativeMemoryAccessSize ?? 0) is > 0 and var known
+                                      && known != size)))
                 continue;
             var values = new List<IOperand> { NewLocal(type) };
             for (var k = 0; k < cells.Count; k++)
@@ -607,6 +637,44 @@ public static class MetadataResolver
             AddressOf { Target: { } target } => Mentions(target, local),
             _ => ReferencesLocal(operand, local),
         };
+
+        // `this`, or a copy of it (kept in a callee-saved register).
+        bool IsThisValue(LocalVariable? local)
+        {
+            for (var depth = 0; local != null && depth < 8; depth++)
+            {
+                if (local.IsThis)
+                    return true;
+                local = definitions.TryGetValue(local, out var copy)
+                        && copy is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] } ? source : null;
+            }
+            return false;
+        }
+
+        // The parameter type a call argument fills.
+        static TypeAnalysisContext? ArgumentType(Instruction call, int operandIndex)
+        {
+            if (!call.IsCall || call.Operands[0] is not MethodAnalysisContext target)
+                return null;
+            var parameter = operandIndex - (call.OpCode == OpCode.Call ? 2 : 1) - (target.IsStatic ? 0 : 1);
+            return parameter >= 0 && parameter < target.Parameters.Count ? target.Parameters[parameter].ParameterType : null;
+        }
+
+        // The field of type `whole` whose address is the cell: the cell itself, or the container
+        // the cell is the first field of.
+        static FieldReference? Widened(FieldReference cell, TypeAnalysisContext whole)
+        {
+            var containers = cell.Containers.ToList();
+            var field = cell.Field;
+            while (field.FieldType.FullName != whole.FullName)
+            {
+                if (containers.Count == 0 || containers[^1].FieldType.Fields.FirstOrDefault(f => !f.IsStatic) != field)
+                    return null;
+                field = containers[^1];
+                containers.RemoveAt(containers.Count - 1);
+            }
+            return new FieldReference(field, cell.Local, cell.Offset, containers, 0);
+        }
 
         static bool MayWriteMemory(Instruction instruction) => instruction.OpCode switch
         {

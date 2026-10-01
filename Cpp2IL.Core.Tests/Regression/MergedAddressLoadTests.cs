@@ -157,4 +157,116 @@ public class MergedAddressLoadTests
 
         Assert.That(shape.Load.Operands[1], Is.InstanceOf<MemoryOperand>());
     }
+
+    // entry: if (cond) goto join (edge from a block with two exits)   next: nop   join: use([p])
+    private static (MethodAnalysisContext Caller, Instruction Load, LocalVariable Holder) Branching(
+        bool branchReadsThis, System.Func<LocalVariable, MemoryOperand, TypeAnalysisContext, Instruction> use,
+        string field = "name")
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var type = InjectClass(app, "Holder");
+        InjectField("name", app.SystemTypes.SystemStringType, type, 0x10);
+        var point = InjectStruct(app, "Point2");
+        InjectField("x", app.SystemTypes.SystemSingleType, point, 0);
+        InjectField("y", app.SystemTypes.SystemSingleType, point, 4);
+        InjectField("start", point, type, 0x18);
+        InjectField("end", point, type, 0x20);
+        var module = new ModuleDefinition("Merged.dll");
+        Seed(module, app, type, point);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemStringType, app.SystemTypes.SystemSingleType,
+            app.SystemTypes.SystemObjectType);
+
+        var self = Local("self", type);
+        self.IsThis = branchReadsThis;
+        var other = Local("other", type);
+        var address = Local("address");
+        var cond = Local("cond", app.SystemTypes.SystemBooleanType);
+        var load = use(address, new MemoryOperand(address, null, 0, 0, 8), point);
+        var (caller, _) = ForeignCaller(app, module, [
+            new(0, OpCode.ConditionalJump, load, cond),
+            new(1, OpCode.Nop),
+            load,
+            new(3, OpCode.Return)], [self, other, address, cond]);
+
+        IOperand Cell(LocalVariable owner)
+        {
+            var f = type.Fields.Single(candidate => candidate.Name == field);
+            var target = field == "name" ? f : point.Fields.Single(candidate => candidate.Name == "x");
+            return new AddressOf(field == "name"
+                ? new FieldReference(f, owner, f.Offset)
+                : new FieldReference(target, owner, f.Offset, [f]));
+        }
+        var join = caller.ControlFlowGraph!.Blocks.Single(b => b.Instructions.Contains(load));
+        join.Instructions.Insert(0, new Instruction(-1, OpCode.Phi,
+            [address, .. join.Predecessors.Select(p => Cell(p.Instructions.Any(i => i.Index == 0) ? self : other))]));
+        return (caller, load, self);
+    }
+
+    [Test]
+    public void EdgeFromABranchingBlockMayReadAFieldOfThis()
+    {
+        var (caller, load, _) = Branching(branchReadsThis: true,
+            (address, memory, _) => new Instruction(2, OpCode.Move, Local("dst"), memory));
+
+        MetadataResolver.LoadThroughMergedAddresses(caller);
+
+        Assert.That(load.Operands[1], Is.InstanceOf<LocalVariable>());
+    }
+
+    [Test]
+    public void EdgeFromABranchingBlockKeepsTheLoadForAnotherObject()
+    {
+        // `other` may be null where the join is not reached; reading its field there could throw.
+        var (caller, load, _) = Branching(branchReadsThis: false,
+            (address, memory, _) => new Instruction(2, OpCode.Move, Local("dst"), memory));
+
+        MetadataResolver.LoadThroughMergedAddresses(caller);
+
+        Assert.That(load.Operands[1], Is.InstanceOf<MemoryOperand>());
+    }
+
+    [Test]
+    public void StructPassedWholeMergesTheWholeStructs()
+    {
+        // Take(c ? start : end): each cell names the struct's first field upstream.
+        InjectedMethodAnalysisContext? take = null;
+        var (caller, load, _) = Branching(branchReadsThis: true, (address, memory, point) =>
+        {
+            var app = Cpp2IlApi.CurrentAppContext!;
+            take = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Take",
+                app.SystemTypes.SystemVoidType, System.Reflection.MethodAttributes.Static, [point]);
+            return new Instruction(2, OpCode.CallVoid, take, memory);
+        }, field: "start");
+
+        MetadataResolver.LoadThroughMergedAddresses(caller);
+
+        Assert.That(load.Operands[1], Is.InstanceOf<LocalVariable>());
+        Assert.That(((LocalVariable)load.Operands[1]).Type?.Name, Is.EqualTo("Point2"));
+    }
+
+    [Test]
+    public void LoadIntoAStructLocalKeepsTheLoad()
+    {
+        var (caller, load, _) = Branching(branchReadsThis: true,
+            (address, memory, point) => new Instruction(2, OpCode.Move, Local("dst", point), memory), field: "start");
+
+        MetadataResolver.LoadThroughMergedAddresses(caller);
+
+        Assert.That(load.Operands[1], Is.InstanceOf<MemoryOperand>());
+    }
+
+    [Test]
+    public void LoadWiderThanTheCellKeepsTheLoad()
+    {
+        // A 16-byte vector load at `&start.x` is not the float `start.x`.
+        var (caller, load, _) = Branching(branchReadsThis: true, (address, memory, _) =>
+            new Instruction(2, OpCode.Move, Local("dst"), new MemoryOperand(address, null, 0, 0, 0)) { NativeMemoryAccessSize = 16 },
+            field: "start");
+
+        MetadataResolver.LoadThroughMergedAddresses(caller);
+
+        Assert.That(load.Operands[1], Is.InstanceOf<MemoryOperand>());
+    }
 }
