@@ -227,6 +227,11 @@ public static class MetadataResolver
                     ? byRef.ElementType : null;
                 var owner = staticOwner ?? byRefElement ?? localType;
                 var genericOwner = owner as GenericInstanceTypeAnalysisContext;
+                // A static loaded into a whole SIMD register (not a `V0.S1` lane) is a float
+                // aggregate's lane-0 view (ResolveField).
+                var laneView = staticOwner != null && i == 1 && instruction.OpCode == OpCode.Move
+                    && instruction.Operands[0] is LocalVariable { Register.Name: ['V', ..] simd }
+                    && !simd.Contains('.');
 
                 if (memory.Index is LocalVariable selector
                     && TryResolveFiniteConstants(selector, definitions, [], out var selectorValues))
@@ -240,7 +245,7 @@ public static class MetadataResolver
                         catch (System.OverflowException) { choices.Clear(); break; }
 
                         if (ResolveField(owner, staticOwner, offset, memory.AccessSize,
-                                byRefElement != null) is not { } selectedField
+                                byRefElement != null, laneView) is not { } selectedField
                             || MemberPathUnspellable(selectedField, method,
                                 instruction.OpCode == OpCode.Move && i == 0, addressed: false)
                             || (staticOwner == null
@@ -320,7 +325,7 @@ public static class MetadataResolver
                 }
 
                 var resolved = ResolveField(owner, staticOwner, memory.Addend, memory.AccessSize,
-                    byRefElement != null);
+                    byRefElement != null, laneView);
                 var field = resolved?.Field;
 
                 if (field == null // TODO: Support nested fields (Field1.Field2.Field3)
@@ -1210,15 +1215,23 @@ public static class MetadataResolver
 
     private static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)? ResolveField(
         TypeAnalysisContext owner, TypeAnalysisContext? staticOwner, long offset, int accessSize,
-        bool sizeMatchedLeaf = false)
+        bool sizeMatchedLeaf = false, bool laneView = false)
     {
         if (staticOwner != null)
         {
-            if (FindStaticFieldAtOffset(owner, offset) is { } staticField)
-                return (staticField, []);
-            if (FindNestedStaticFieldAtOffset(owner, offset, accessSize) is { } nestedStatic)
+            // An access narrower than a struct-typed static reaches the member at that offset
+            // (`point.X`), not the whole struct that happens to start there. A load into a SIMD
+            // register is the exception: `ldp s0, s1, [statics]` is how a float aggregate
+            // argument is loaded, and V0 stands for the whole struct (its lane-0 view) until
+            // lane packing or the packed-register split decides which it is.
+            var pointerSize = owner.AppContext.Binary.PointerSizeBytes;
+            var staticField = FindStaticFieldAtOffset(owner, offset);
+            if ((staticField == null || accessSize > 0 && !laneView
+                    && PrimitiveStorageSize(staticField.FieldType, pointerSize) == null
+                    && LeafStorageSize(staticField.FieldType, pointerSize) != accessSize)
+                && FindNestedStaticFieldAtOffset(owner, offset, accessSize) is { } nestedStatic)
                 return (nestedStatic.Field, [nestedStatic.Container]);
-            return null;
+            return staticField == null ? null : (staticField, []);
         }
 
         return ResolveFieldPath(owner, offset, accessSize, sizeMatchedLeaf);
