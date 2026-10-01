@@ -33,6 +33,10 @@ public abstract class BaseCallingConventionResolver
 
     protected abstract (string[] Integer, string[] Float) RawRegisters(ApplicationAnalysisContext app);
 
+    // The registers of the receiver, each parameter and the MethodInfo argument, in order, when
+    // the ABI places aggregates itself; null keeps the one-register-per-parameter walk.
+    protected virtual IReadOnlyList<IOperand>? ManagedArgumentRegisters(MethodAnalysisContext resolved) => null;
+
     // MSVC style: argument slot n is integer register n or float register n, not both
     protected virtual bool UsesShadowedArgumentSlots(ApplicationAnalysisContext app) => false;
 
@@ -87,6 +91,30 @@ public abstract class BaseCallingConventionResolver
 
         var (integerRegisters, floatRegisters) = RawRegisters(app);
         var argBase = ArgBase(call);
+
+        // Where the callee's own ABI places each argument, when it knows: a struct argument can
+        // take a register pair or one float register per lane, which a one-register-per-
+        // parameter walk would shift every later argument past.
+        if (ManagedArgumentRegisters(resolved) is { } managed)
+        {
+            var mapped = new List<IOperand>(argBase + managed.Count);
+            for (var i = 0; i < argBase; i++)
+                mapped.Add(call.Operands[i]);
+            foreach (var location in managed)
+            {
+                // Arguments past the registers go on the stack, which the raw layout does not carry.
+                if (location is not Register { Name: var name })
+                    break;
+                var index = System.Array.IndexOf(integerRegisters, name);
+                if (index < 0 && System.Array.IndexOf(floatRegisters, name) is >= 0 and var floatIndex)
+                    index = integerRegisters.Length + floatIndex;
+                if (index < 0)
+                    break;
+                mapped.Add(call.Operands[argBase + index]);
+            }
+            call.SetOperands(mapped);
+            return;
+        }
 
         var slots = new List<(bool IsFloat, bool Emit)>();
         if (ReturnsViaHiddenBuffer(resolved) && HiddenBufferConsumesArgumentSlot)

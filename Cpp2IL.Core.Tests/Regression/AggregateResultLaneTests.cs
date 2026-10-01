@@ -545,4 +545,25 @@ public class AggregateResultLaneTests
 
         Assert.That(high.OpCode, Is.EqualTo(OpCode.Move));
     }
+
+    [Test]
+    public void LateResolvedCallTakesEachArgumentFromItsAbiRegister()
+    {
+        // A tail or virtual call resolved after lifting carries every argument register:
+        // M(Vector3 v, float f) has v in S0..S2 and f in S3, so f is V3, not the next V register,
+        // and v is no integer register at all.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector3 = Vector3();
+        var callerType = CallerTypeWithField("pos", vector3, 0x80);
+        var callee = callerType.InjectMethodContext("Move", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public | R.MethodAttributes.Static, vector3, app.SystemTypes.SystemSingleType);
+        var integers = new[] { "X0", "X1", "X2", "X3", "X4", "X5", "X6", "X7" };
+        var floats = new[] { "V0", "V1", "V2", "V3", "V4", "V5", "V6", "V7" };
+        var call = new Instruction(0x10, OpCode.CallVoid,
+            [new Immediate(0x1234), .. integers.Concat(floats).Select(name => (IOperand)Reg(name))]);
+
+        new Cpp2IL.Core.Utils.Arm64CallingConventionResolver().RemapRawArguments(call, callee);
+
+        Assert.That(call.Operands.Skip(1).Select(o => ((Register)o).Name), Is.EqualTo(new[] { "V0", "V3", "X0" }));
+    }
 }
