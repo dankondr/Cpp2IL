@@ -3201,7 +3201,7 @@ public static class IlGenerator
         or "System.Collections.Generic.IReadOnlyCollection`1"
         or "System.Collections.Generic.IReadOnlyList`1";
 
-    private static bool IsErasedSharedArgument(TypeAnalysisContext argument) =>
+    internal static bool IsErasedSharedArgument(TypeAnalysisContext argument) =>
         argument is GenericParameterTypeAnalysisContext
         || argument.FullName is "System.Object" or "System.ValueType"
         || IsSharedEnumMarker(argument);
