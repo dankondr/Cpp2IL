@@ -328,6 +328,18 @@ public static class MetadataResolver
                         instruction.OpCode == OpCode.Move && i == 0, addressed: false))
                     continue;
 
+                // A store writes every byte of its register (a SIMD store's width is only on
+                // the instruction): when those bytes cover the next field too, naming the one
+                // field it starts at would drop the rest of the value. A struct value's copy
+                // is regrouped into whole-field stores by the aggregate passes instead.
+                if (i == 0 && instruction.OpCode == OpCode.Move && storeWidth > 0
+                    && !(instruction.Operands[1] is LocalVariable { Type: { IsValueType: true } storedType }
+                         && PrimitiveStorageSize(storedType, method.AppContext.Binary.PointerSizeBytes) == null)
+                    && PrimitiveStorageSize(field.FieldType, method.AppContext.Binary.PointerSizeBytes) < storeWidth
+                    && CoveredFields(owner, memory.Addend, storeWidth, wholeStructs: true, staticOwner != null)
+                        is { Count: > 1 })
+                    continue;
+
                 // The produced reference pushes `local` as its ldfld/stfld base.
                 // When the local's declared type supplies neither `&host` nor a
                 // host-assignable reference the emission is invalid IL - keep the
@@ -767,6 +779,11 @@ public static class MetadataResolver
                     var by = (int)amount.Value;
                     return (source.Low >> by | source.High << (64 - by), source.High >> by, source.FromLiteral);
                 }
+                // `movz x8, #0xe; movk x8, #0x4020, lsl #48` builds one constant in halves.
+                if (definition is { OpCode: OpCode.Or, Operands: [_, var left, var right] }
+                    && ConstantBits(left, definitions, depth + 1) is { } low
+                    && ConstantBits(right, definitions, depth + 1) is { } high)
+                    return (low.Low | high.Low, low.High | high.High, low.FromLiteral || high.FromLiteral);
                 return null;
             default:
                 return null;

@@ -602,7 +602,7 @@ public static class IlGenerator
                 {
                     FieldReference directField => directField,
                     MemoryOperand storeOperand when TryRecoverFieldStore(storeOperand,
-                        instruction.Operands[1], context, out var recovered) => recovered,
+                        instruction.Operands[1], instruction.NativeStoreWidthBytes ?? 0, context, out var recovered) => recovered,
                     _ => null,
                 };
                 if (storeField is { } field)
@@ -8728,7 +8728,7 @@ public static class IlGenerator
     // generic layouts). Unbound frame slots with no type evidence, indexed or
     // scaled forms, absolute addresses, and offsets that hit no field keep
     // the explicit drop diagnostic.
-    private static bool TryRecoverFieldStore(MemoryOperand memory, IOperand source,
+    private static bool TryRecoverFieldStore(MemoryOperand memory, IOperand source, int nativeWidth,
         MethodAnalysisContext context, out FieldReference field)
     {
         field = null!;
@@ -8755,13 +8755,20 @@ public static class IlGenerator
         // leaves inside reference-typed members, which interior never descends.
         var candidates = Analysis.MetadataResolver.FindInteriorInstanceFieldPaths(owner,
             memory.Addend, memory.AccessSize) ?? [];
+        // A SIMD store keeps width 0 on its operand; the register it wrote is the width.
+        // Covering several fields, it is no store of the one it starts at.
+        var coversSeveral = memory.AccessSize == 0 && nativeWidth > 0
+            && Analysis.MetadataResolver.CoveredFields(owner, memory.Addend, nativeWidth, wholeStructs: true)
+                is { Count: > 1 };
         if (Analysis.MetadataResolver.FindInstanceFieldPathAtOffset(owner, memory.Addend,
                 memory.AccessSize) is { } flat
             && candidates.All(c => c.Field != flat.Field))
             candidates.Add(flat);
         foreach (var found in candidates)
         {
-            if (found.Containers.Count == 0 && !FieldStoreWidthMatches(memory, source, found.Field, context))
+            if (found.Containers.Count == 0 && !FieldStoreWidthMatches(memory, source, found.Field, context)
+                || coversSeveral && TypeSizes.MinimumUnboxedSize(found.Field.FieldType,
+                    context.AppContext.Binary.PointerSizeBytes) < nativeWidth)
                 continue;
             // A nested store spells `receiver.c1...cN.leaf = v`: the first
             // ldflda reads `receiver.c1`, so the receiver itself must already
