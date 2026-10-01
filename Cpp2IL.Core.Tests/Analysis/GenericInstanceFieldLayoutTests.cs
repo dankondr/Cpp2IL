@@ -523,4 +523,30 @@ public class GenericInstanceFieldLayoutTests
             Assert.That((GenericInstanceFieldLayout.FindStaticFieldAtOffset(instance, 8) as ConcreteGenericFieldAnalysisContext)!.BaseFieldContext, Is.SameAs(second));
         });
     }
+
+    [Test]
+    public void LaidOutSizeOfAGenericStructFollowsNaturalAlignment()
+    {
+        // il2cpp lays a generic instance out with C struct rules; metadata has no size for it.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var mscorlib = app.AssembliesByName["mscorlib"];
+        var pairDefinition = mscorlib.GetTypeByFullName("System.Collections.Generic.KeyValuePair`2")!;
+        var list = mscorlib.GetTypeByFullName("System.Collections.Generic.List`1")!;
+        TypeAnalysisContext Pair(TypeAnalysisContext key, TypeAnalysisContext value)
+            => new GenericInstanceTypeAnalysisContext(pairDefinition, [key, value]);
+        var types = app.SystemTypes;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(Cpp2IL.Core.Utils.TypeSizes.LaidOutSize(Pair(types.SystemInt32Type, types.SystemInt64Type), 8), Is.EqualTo(16));
+            Assert.That(Cpp2IL.Core.Utils.TypeSizes.LaidOutSize(Pair(types.SystemInt64Type, types.SystemInt32Type), 8), Is.EqualTo(16));
+            Assert.That(Cpp2IL.Core.Utils.TypeSizes.LaidOutSize(Pair(types.SystemBooleanType, types.SystemBooleanType), 8), Is.EqualTo(2));
+            // List<KeyValuePair<string, object>>.Enumerator: _list, _index, _version, _current.
+            Assert.That(Cpp2IL.Core.Utils.TypeSizes.LaidOutSize(new GenericInstanceTypeAnalysisContext(
+                list.NestedTypes.Single(type => type.Name == "Enumerator"),
+                [Pair(types.SystemStringType, types.SystemObjectType)]), 8), Is.EqualTo(32));
+        });
+    }
 }

@@ -38,6 +38,10 @@ public static class IlGenerator
     }
 
     public static void GenerateIl(MethodAnalysisContext context, MethodDefinition definition)
+        => GenerateIl(context, definition, null);
+
+    internal static void GenerateIl(MethodAnalysisContext context, MethodDefinition definition,
+        List<Analysis.NativeExceptionRegionProof.CatchResult>? provenCatches)
     {
         var assembly = context.DeclaringType!.DeclaringAssembly;
         var module = definition.DeclaringModule!;
@@ -51,6 +55,12 @@ public static class IlGenerator
             : factory.CorLibScope
                 .CreateTypeReference("System", "Console")
                 .CreateMemberReference("WriteLine", MethodSignature.CreateStatic(factory.Void, [factory.String]));
+
+        // Un-inline proven inlined event raises (E?.Invoke() in foreign bodies)
+        // while branch operands are still blocks, so the guard can be folded
+        // back into the raiser call and the private backing field loses its
+        // foreign reference.
+        Analysis.InlinedEventRaiseRecovery.Run(context);
 
         // Change branch targets to instructions
         foreach (var instruction in context.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))
@@ -146,6 +156,9 @@ public static class IlGenerator
         // call arguments, comparisons, returns) emits a plain ldloc. Slots no
         // store typed and width-mismatched loads keep the load diagnostic.
         RewriteFrameSlotLoads(context, frameSlotLocals);
+
+        var catchProofs = provenCatches ?? new Analysis.NativeExceptionRegionProof(context).FindCatches();
+        foreach (var proof in catchProofs) context.Locals.Add(proof.ExceptionLocal);
 
         // Map ISIL locals to IL. The declared type joins the method body's locals
         // signature, so a local whose recovered type cannot be named here is
@@ -318,6 +331,25 @@ public static class IlGenerator
         // it was compiled from: exit copies of the base call become leaves out of the
         // try, and the handler carries base.Finalize + endfinally.
         Analysis.FinalizerEhRecovery.Apply(context, definition, instructionMap);
+        var catchHandlers = new Dictionary<Analysis.NativeExceptionRegionProof.CatchResult, List<CilInstruction>>();
+        foreach (var proof in catchProofs)
+        {
+            var start = body.Instructions.Count;
+            body.Instructions.Add(CilOpCodes.Stloc, locals[proof.ExceptionLocal]);
+            // The CLI supplies this value on handler entry; its defining stloc
+            // is emitted here rather than in the normal-path ISIL graph.
+            DefinedLocalRegisters(context).Add(proof.ExceptionLocal.Register);
+            foreach (var instruction in proof.Handler)
+                GenerateInstructions(instruction, context, definition, locals, writeLine, constructorPairs, thisConstructorCalls, frameSlotLocals);
+            var handler = body.Instructions.Skip(start).ToList();
+            while (body.Instructions.Count > start) body.Instructions.RemoveAt(start);
+            if (handler.Count(i => i.OpCode.FlowControl == CilFlowControl.Call) == proof.Handler.Count(i => i.IsCall)
+                && !handler.Any(i => i.Operand is string diagnostic && diagnostic.Length > 0
+                    || i.OpCode.FlowControl is CilFlowControl.Branch or CilFlowControl.ConditionalBranch
+                        or CilFlowControl.Return or CilFlowControl.Throw))
+                catchHandlers[proof] = handler;
+        }
+        Analysis.ExceptionRegionRecovery.Apply(context, definition, instructionMap, catchHandlers);
 
         RemoveDiscardedDefaults(definition, writeLine);
 
@@ -387,6 +419,24 @@ public static class IlGenerator
     // Limit so we don't run into the 16mb limit (see AsmResolver issue #775)
     private static string Diagnostic(string message) 
         => message.Length <= 250 ? message : message[..250] + "…";
+
+    // A load off a class pointer that matches no recovered idiom still gets its field named in the
+    // diagnostic, so the string names `initialized` or `vtable slot n` rather than a raw offset.
+    private static string ClassStructureReadName(MemoryOperand memory, MethodAnalysisContext? callingContext)
+    {
+        if (callingContext == null
+            || memory is not { Index: null, Scale: 0, Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext } }
+            || memory.Addend is < 0 or > uint.MaxValue)
+            return "";
+
+        var metadataVersion = callingContext.AppContext.MetadataVersion;
+        var is32Bit = callingContext.AppContext.Binary.is32Bit;
+        if (Il2CppClassUsefulOffsets.TryGetField((uint)memory.Addend, metadataVersion, is32Bit, out var field, out var name))
+            return $" ({name})";
+        return Il2CppClassUsefulOffsets.GetVTableSlot(memory.Addend, metadataVersion, is32Bit) is { } slot
+            ? $" (vtable slot {slot})"
+            : "";
+    }
 
     // Replaces a call the verifier could never resolve with the standard diagnostic stub:
     // note the unnameable callee, then throw. The ISIL operands are never loaded, so the
@@ -697,17 +747,20 @@ public static class IlGenerator
                 var moveDestinationType = StoreContract(instruction.Operands[0], context);
                 // A pass-inserted copy (Index < 0) is an SSA phi-edge write: the
                 // edge carries the all-zero value of the one register it covers.
-                // When the destination slot's whole value fits that register the
-                // edge proves default(T); on a wider or unsized slot the binary
-                // only cleared the register, so the implicit default keeps a
-                // named note.
-                if (instruction.Index < 0 && instruction.Operands[0] is LocalVariable
+                // When the destination slot's whole value fits that register's
+                // storage — a Vector3's 12 bytes live inside one 16-byte V
+                // register — the edge proves default(T); on a wider or unsized
+                // slot the binary only cleared the register, so the implicit
+                // default keeps a named note.
+                if (instruction.Index < 0 && instruction.Operands[0] is LocalVariable phiEdgeLocal
                     && moveDestinationType is { IsValueType: true }
                     && IsZeroConstant(instruction.Operands[1]))
                 {
                     var phiEdgeSlotSize = TypeSizes.MinimumUnboxedSize(moveDestinationType,
                         context.AppContext.Binary.PointerSizeBytes);
-                    if (phiEdgeSlotSize > 0 && phiEdgeSlotSize <= context.AppContext.Binary.PointerSizeBytes)
+                    var phiEdgeCoverage = Analysis.LocalVariables.RegisterCoverageBytes(
+                        phiEdgeLocal.Register.Name, context.AppContext.Binary.PointerSizeBytes);
+                    if (phiEdgeSlotSize > 0 && phiEdgeSlotSize <= phiEdgeCoverage)
                         PushDefaultValue(moveDestinationType, method, instructions, context);
                     else
                         EmitNullOrDefault(moveDestinationType, method, instructions, context,
@@ -4427,12 +4480,13 @@ public static class IlGenerator
                     });
                     break;
                 }
-                instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand));
+                var readName = ClassStructureReadName(memory, callingContext);
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand + readName));
                 instructions.Add(CilOpCodes.Call, writeLine);
                 var exceptionCtor = module.CorLibTypeFactory.CorLibScope
                     .CreateTypeReference("System", "Exception")
                     .CreateMemberReference(".ctor", MethodSignature.CreateInstance(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.String]));
-                instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand));
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand + readName));
                 instructions.Add(CilOpCodes.Newobj, exceptionCtor);
                 instructions.Add(CilOpCodes.Throw);
                 return false;
@@ -5767,6 +5821,12 @@ public static class IlGenerator
         // register-reuse leftover and the slot contract is the only proven type.
         if (local.Type != null && UsedOnlyAsCastSource(local, context))
             return context.AppContext.SystemTypes.SystemObjectType;
+        // The klass-hierarchy walk il2cpp emits for castclass<T> ([v] loads the
+        // klass, the mismatch branch throws InvalidCastException) proves the
+        // surviving value is a T no matter what its erased producer declared.
+        if ((local.Type == null || local.Type == context.AppContext.SystemTypes.SystemObjectType)
+            && CastCheckedLocalType(local, context) is { } castCheckedType)
+            return castCheckedType;
         // System.Object is also the lifter's fallback for a register whose real
         // numeric type was lost. Do not guess from arithmetic alone; a concrete
         // numeric mate (array length, typed field/parameter, etc.) must prove it.
@@ -5799,6 +5859,11 @@ public static class IlGenerator
             if (local.Type == context.AppContext.SystemTypes.SystemObjectType
                 && SharpenedObjectAllocationType(local, context) is { } allocatedType)
                 return allocatedType;
+            // An Object-tagged local whose definitions all produce 0/1 (check results,
+            // boolean copies) holds a bool the erased producer could not name.
+            if (local.Type == context.AppContext.SystemTypes.SystemObjectType
+                && IsBooleanEmissionLocal(local, context))
+                return context.AppContext.SystemTypes.SystemBooleanType;
             // A cast source (isinst/castclass) must verify as a managed reference and
             // no stack operation bridges native int into that operand, so a
             // handle-typed local that feeds one emits object instead of IntPtr.
@@ -5890,6 +5955,95 @@ public static class IlGenerator
         ArrayLength length => CastReferencesLocal(length.Array, local),
         _ => false,
     };
+
+    // The klass-hierarchy walk il2cpp emits for castclass<T>: [v] loads the
+    // object's klass, [klass+tabOff+depth*8] reads the hierarchy entry, and a
+    // mismatch throws InvalidCastException - the path past the check provably
+    // holds a T. Returns the proven reference type when the local was checked
+    // that way, else null.
+    private static TypeAnalysisContext? CastCheckedLocalType(LocalVariable local, MethodAnalysisContext context)
+    {
+        // `&v` is raw storage (a memset/memcpy destination); typing the slot
+        // would emit `ldloca`/`initblk` over a managed local. The `[v]` base
+        // use is the klass walk itself and must stay legal.
+        if (RawAddressLocals(context).Contains(local))
+            return null;
+        foreach (var instruction in context.ControlFlowGraph!.Instructions)
+        {
+            if (instruction is not { OpCode: OpCode.CheckNotEqual, Operands: [_, var left, var right] })
+                continue;
+            var (memory, target) = (left, right) switch
+            {
+                (MemoryOperand m, TypeAnalysisContext t) => (m, t),
+                (TypeAnalysisContext t, MemoryOperand m) => (m, t),
+                _ => (default, null)
+            };
+            if (target == null || target.IsValueType
+                || !KlassDerivedFromLocal(memory, local, context)
+                || !CheckBranchesToInvalidCast(instruction, context))
+                continue;
+            return target;
+        }
+        return null;
+    }
+
+    // Whether the memory operand's address chain is rooted at the local's own
+    // +0 read - the klass pointer - reached through the hierarchy-entry address
+    // arithmetic ([klass+tabOff] + scaled depth). Depth-capped; field reads
+    // (nonzero addend at the local hop) do not prove a type check.
+    private static bool KlassDerivedFromLocal(MemoryOperand memory, LocalVariable local, MethodAnalysisContext context)
+    {
+        var pending = new Stack<MemoryOperand>();
+        var seen = new HashSet<LocalVariable>();
+        pending.Push(memory);
+        while (pending.Count > 0)
+        {
+            var current = pending.Pop();
+            if (current.Base is not LocalVariable memBase)
+                continue;
+            if (ReferenceEquals(memBase, local))
+            {
+                if (current.Addend == 0)
+                    return true;
+                continue;
+            }
+            if (!seen.Add(memBase))
+                continue;
+            foreach (var definition in context.ControlFlowGraph!.Instructions)
+            {
+                if (!ReferenceEquals(definition.Destination, memBase))
+                    continue;
+                foreach (var operand in definition.Operands.Skip(1))
+                    if (operand is MemoryOperand defMemory)
+                        pending.Push(defMemory);
+            }
+        }
+        return false;
+    }
+
+    // Whether the comparison's nonzero branch lands on a block that just throws
+    // InvalidCastException - the mismatch exit of castclass<T>, which is what
+    // makes the surviving path a proof rather than a hint.
+    private static bool CheckBranchesToInvalidCast(Instruction check, MethodAnalysisContext context)
+    {
+        foreach (var instruction in context.ControlFlowGraph!.Instructions)
+        {
+            if (instruction is not { OpCode: OpCode.ConditionalJump,
+                    Operands: [Block branchTarget, LocalVariable branchCondition] }
+                || !ReferenceEquals(branchCondition, check.Destination))
+                continue;
+            var nonNop = branchTarget.Instructions.Where(i => i.OpCode != OpCode.Nop).ToArray();
+            // Only the block head matters: il2cpp merges every exception raise
+            // into shared tails, so InvalidCastException may be followed by
+            // NullReferenceException throws other paths use. A branch that
+            // lands on Throw InvalidCast throws it regardless of what follows.
+            if (nonNop.Length >= 1
+                && nonNop[0] is { OpCode: OpCode.Throw,
+                    Operands: [TypeAnalysisContext { FullName: "System.InvalidCastException" }] })
+                return true;
+        }
+        return false;
+    }
 
     private static bool OperandReferencesLocal(IOperand? operand, LocalVariable local) => operand switch
     {
@@ -6142,18 +6296,28 @@ public static class IlGenerator
     private static bool IsBooleanEmissionLocal(LocalVariable local, MethodAnalysisContext context,
         HashSet<LocalVariable> active)
     {
-        if (!active.Add(local))
+        if (!active.Add(local)
+            || RawAddressLocals(context).Contains(local)
+            || MemoryBaseLocals(context).Contains(local))
             return false;
         var definitions = context.ControlFlowGraph!.Instructions
             .Where(instruction => ReferenceEquals(instruction.Destination, local))
             .ToList();
-        var result = definitions.Count > 0 && definitions.All(instruction =>
+        var allBoolean = definitions.Count > 0 && definitions.All(instruction =>
             instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual
             || instruction.OpCode == OpCode.Not && IsBooleanEmissionOperand(instruction.Operands[1], context, active)
+            || instruction.OpCode is OpCode.Move or OpCode.Phi
+                && instruction.Operands.Skip(1).All(operand => IsBooleanEmissionOperand(operand, context, active))
             || instruction.OpCode is OpCode.And or OpCode.Or or OpCode.Xor
                 && instruction.Operands.Skip(1).All(operand => IsBooleanEmissionOperand(operand, context, active)));
+        // All-0 copy merges are also the null-slot idiom; a flag needs one source
+        // that can actually be a 1 - a check result, a nonzero literal, or a copy
+        // of an already-provable boolean.
+        var hasNonzeroSource = definitions.Any(instruction =>
+            instruction.OpCode is not (OpCode.Move or OpCode.Phi)
+            || instruction.Operands.Skip(1).Any(operand => operand is not Immediate { Value: 0 }));
         active.Remove(local);
-        return result;
+        return allBoolean && hasNonzeroSource;
     }
 
     private static bool IsBooleanEmissionOperand(IOperand operand, MethodAnalysisContext context,
@@ -6164,6 +6328,38 @@ public static class IlGenerator
         LocalVariable local when local.Type == null => IsBooleanEmissionLocal(local, context, active),
         _ => false,
     };
+
+    // Locals whose slot is handled as raw memory can never carry an inferred
+    // type: `&v` marks a memset/memcpy destination and `[v]` a dereferenced
+    // pointer, and emitting a managed or 1-byte type there would produce
+    // `ldloca`/`initblk` sequences the verifier rejects. Their slots stay
+    // untyped so the address emission keeps its named diagnostic. Mirror of
+    // the numeric union's hard disqualifiers.
+    private static HashSet<LocalVariable> RawAddressLocals(MethodAnalysisContext context)
+    {
+        if (context.GetExtraData<HashSet<LocalVariable>>("RawAddressLocals") is { } cached)
+            return cached;
+        var locals = new HashSet<LocalVariable>();
+        foreach (var instruction in context.ControlFlowGraph!.Instructions)
+            foreach (var operand in instruction.Operands)
+                if (operand is AddressOf { Target: LocalVariable target })
+                    locals.Add(target);
+        context.PutExtraData("RawAddressLocals", locals);
+        return locals;
+    }
+
+    private static HashSet<LocalVariable> MemoryBaseLocals(MethodAnalysisContext context)
+    {
+        if (context.GetExtraData<HashSet<LocalVariable>>("MemoryBaseLocals") is { } cached)
+            return cached;
+        var locals = new HashSet<LocalVariable>();
+        foreach (var instruction in context.ControlFlowGraph!.Instructions)
+            foreach (var operand in instruction.Operands)
+                if (operand is MemoryOperand { Base: LocalVariable memoryBase })
+                    locals.Add(memoryBase);
+        context.PutExtraData("MemoryBaseLocals", locals);
+        return locals;
+    }
 
     // Untyped locals that only ever flow through numeric operations get a numeric
     // CIL type instead of System.Object: union-find merges locals across Move/Phi/
@@ -6188,6 +6384,9 @@ public static class IlGenerator
         // Locals that must be numeric because they feed an op with no non-numeric
         // stack form (add/sub/mul/bitwise/shift — unlike ceq, which refs also take).
         var numericOpUse = new HashSet<LocalVariable>();
+        // Locals read by a brtrue-family jump - a use that proves nothing about
+        // the value kind and can still hide a reference in a seedless class.
+        var ambiguousFlagUse = new HashSet<LocalVariable>();
 
         LocalVariable Find(LocalVariable local)
         {
@@ -6375,7 +6574,10 @@ public static class IlGenerator
                 AddOperandConstraint(instruction.Operands[0], context.ReturnType);
             else if (op == OpCode.ConditionalJump && instruction.Operands.Count > 1)
                 // brtrue accepts refs and ints alike; too ambiguous to seed a type.
-                Disqualify(instruction.Operands[1]);
+                // It still cannot veto a class a typed mate already proves - only
+                // the seedless int fallback needs the doubt.
+                if (instruction.Operands[1] is LocalVariable flagLocal)
+                    ambiguousFlagUse.Add(Find(flagLocal));
             else if (op == OpCode.NewArr)
             {
                 Disqualify(instruction.Operands[0]);
@@ -6399,6 +6601,7 @@ public static class IlGenerator
         var rootDisqualified = new HashSet<LocalVariable>(disqualified.Select(Find));
 
         var rootNumericOpUse = new HashSet<LocalVariable>(numericOpUse.Select(Find));
+        var rootAmbiguousFlagUse = new HashSet<LocalVariable>(ambiguousFlagUse.Select(Find));
         var systemTypes = context.AppContext.SystemTypes;
 
         var result = new Dictionary<LocalVariable, TypeAnalysisContext>();
@@ -6409,7 +6612,7 @@ public static class IlGenerator
             if (rootDisqualified.Contains(root))
                 continue;
             var hasTypes = rootConstraints.TryGetValue(root, out var types) && types.Count > 0;
-            if (!hasTypes && !rootNumericOpUse.Contains(root))
+            if (!hasTypes && (!rootNumericOpUse.Contains(root) || rootAmbiguousFlagUse.Contains(root)))
                 continue;
             var picked = hasTypes
                 ? types!.FirstOrDefault(t => t.FullName == "System.Double")
@@ -9760,10 +9963,22 @@ public static class IlGenerator
         IOperand content, IOperand count, MethodAnalysisContext context, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
     {
+        // `&local.first` of a struct local is `&local` when that makes the two sides one type:
+        // value-type field addresses are canonicalized to the first field upstream.
+        if (instruction.OpCode is OpCode.MemoryCopy or OpCode.MemoryMove)
+        {
+            destination = WholeStorage(destination, BlockCopyPointee(content, context));
+            content = WholeStorage(content, BlockCopyPointee(destination, context));
+        }
+        // A fill that covers the whole struct local clears the local, not its first field.
+        else if (count is Immediate { Value: > 0 } fillCount
+                 && destination is AddressOf { Target: FieldReference { Local.Type: { IsValueType: true } filled } }
+                 && ManagedSize(filled, context) == fillCount.Value)
+            destination = WholeStorage(destination, filled);
         if (count is not Immediate { Value: > 0 } byteCount
             || BlockCopyPointee(destination, context) is not { IsValueType: true } pointee
-            || pointee is GenericInstanceTypeAnalysisContext or GenericParameterTypeAnalysisContext
-            || pointee.Definition?.Size is not { } pointeeSize
+            || pointee is GenericParameterTypeAnalysisContext
+            || ManagedSize(pointee, context) is not { } pointeeSize
             || byteCount.Value != pointeeSize
             || !TypeTokenUsableFrom(pointee, context))
             return false;
@@ -9787,6 +10002,24 @@ public static class IlGenerator
                 return false;
         }
     }
+
+    // The managed size (instance size less the object header), not the marshaled native size,
+    // which is -1 for a struct holding references. A generic instance has no metadata size.
+    private static long? ManagedSize(TypeAnalysisContext type, MethodAnalysisContext context)
+    {
+        var pointerSize = context.AppContext.Binary.PointerSizeBytes;
+        if (type is not GenericInstanceTypeAnalysisContext && TypeSizes.UnboxedSize(type, pointerSize) is > 0 and var exact)
+            return exact;
+        return TypeSizes.LaidOutSize(type, pointerSize) is > 0 and var laidOut ? laidOut : null;
+    }
+
+    private static IOperand WholeStorage(IOperand operand, TypeAnalysisContext? other)
+        => other != null
+           && operand is AddressOf { Target: FieldReference { Offset: 0, Containers.Count: 0, Field.IsStatic: false,
+               Local: { Type: { IsValueType: true } whole } local } }
+           && ThisConstructorCallPlan.SameTypeIdentity(whole, other)
+            ? new AddressOf(local)
+            : operand;
 
     // The element type a block-op address provably holds when it emits `&T`:
     // only a managed pointer carries a referent the type system can name - a
@@ -9903,34 +10136,86 @@ public static class IlGenerator
         var isShift = instruction.OpCode is OpCode.ShiftLeft or OpCode.ShiftRight;
         var operands = instruction.Operands.Skip(1).ToArray();
 
-        // The carrier width is the single width the op's value operands provably
-        // share: a float operand contributes the width of its bit pattern, an
-        // integral operand its stack width, a native int or pointer its register
-        // width. Literals adapt to the carrier but one that does not fit it is a
-        // width disagreement of its own. A shift's amount joins no consensus —
-        // the CIL ops take an i32/n-int count regardless.
+        // The register lane an `and`-family op ran on: the destination's scalar
+        // width pins it — an ARM64 W write reads each operand register's low 32
+        // bits and zero-extends the result into X, an X write is 64-bit end to
+        // end. Every operand then coerces to that lane: a declared float
+        // reinterprets through BitConverter at its own width then narrows or
+        // zero-extends (`fmov w,s` keeps a D register's low dword; a W write
+        // always zeroes the X high half), a declared integer truncates or
+        // zero-extends, a literal adapts within it, and an undeclared local —
+        // inference only — loads adaptively instead of vetoing the lane the
+        // binary proved. When the destination carries no scalar contract the
+        // proven operands must agree on one width. A shift is different: its
+        // lane is the *value's* width (`lsr x8,x9,#32` keeps the high dword in
+        // a narrow destination), and its count joins no consensus — the CIL
+        // ops take an i32 count regardless.
+        var storeContract = StoreContract(instruction.Operands[0], context);
+        TypeAnalysisContext? fpConsumer = null;
         var carrierWidth = 0;
+        if (storeContract != null)
+        {
+            if (storeContract is ByRefTypeAnalysisContext)
+                return false;
+            if (storeContract.FullName is "System.Single" or "System.Double")
+            {
+                fpConsumer = storeContract;
+                if (!isShift)
+                    carrierWidth = storeContract.FullName == "System.Single" ? 4 : 8;
+            }
+            else
+            {
+                var destinationWidth = IntegralStackWidth(storeContract);
+                if (destinationWidth == 0)
+                    return false;
+                if (!isShift)
+                    carrierWidth = destinationWidth < 0 ? 8 : destinationWidth;
+            }
+        }
+
         var sawFloat = false;
+        var consensusWidth = 0;
         for (var i = 0; i < operands.Length; i++)
         {
             var joinsCarrier = !(isShift && i == 1);
             if (operands[i] is Immediate immediate)
             {
-                if (joinsCarrier && carrierWidth == 4
+                if (joinsCarrier && (carrierWidth == 4 || carrierWidth == 0)
                     && unchecked((long)(int)immediate.Value) != immediate.Value
                     && unchecked((long)(uint)immediate.Value) != immediate.Value)
                     return false;
                 continue;
             }
             var emitted = EmittedOperandType(operands[i], context);
+            if (emitted is ByRefTypeAnalysisContext)
+                return false; // `&x` is a managed pointer, not bits a carrier can hold
+            if (operands[i] is LocalVariable { Type: null })
+            {
+                // Inference-only operand: a float guess still marks the carrier
+                // and contributes its emitted width to consensus (the emitted
+                // stack type is what the IL will compute on) — what it does
+                // not do is veto a destination-pinned lane, since a guessed
+                // width adapts there. A reference or struct guess can never
+                // enter a carrier and keeps the op diagnosed.
+                if (emitted?.FullName is "System.Single" or "System.Double")
+                {
+                    sawFloat = true;
+                    var inferredWidth = emitted.FullName == "System.Single" ? 4 : 8;
+                    if (joinsCarrier && consensusWidth == 0)
+                        consensusWidth = inferredWidth;
+                    else if (joinsCarrier && consensusWidth != inferredWidth)
+                        consensusWidth = -1;
+                }
+                else if (IntegralStackWidth(emitted) == 0)
+                    return false;
+                continue;
+            }
             int width;
             if (emitted?.FullName is "System.Single" or "System.Double")
             {
                 sawFloat = true;
                 width = emitted.FullName == "System.Single" ? 4 : 8;
             }
-            else if (emitted is ByRefTypeAnalysisContext)
-                return false; // `&x` is a managed pointer, not bits a carrier can hold
             else
             {
                 var integral = IntegralStackWidth(emitted);
@@ -9938,41 +10223,25 @@ public static class IlGenerator
                     return false;
                 width = integral < 0 ? 8 : integral;
             }
-            if (joinsCarrier && carrierWidth != 0 && carrierWidth != width)
-                return false;
-            if (joinsCarrier)
-                carrierWidth = width;
+            if (joinsCarrier && consensusWidth == 0)
+                consensusWidth = width;
+            else if (joinsCarrier && consensusWidth != width)
+                consensusWidth = -1;
         }
-        if (!sawFloat || carrierWidth == 0)
+        if (!sawFloat)
             return false;
-
-        // A float result comes back only at a proven FP consumer — a destination
-        // of the carrier's own float type (`fmov` into a V register after the
-        // integer op). An integral destination of any width is an honest
-        // consumer: a narrower slot truncates exactly like a W-register read of
-        // the X result, a wider one sees the zero-extension every ARM64 W-write
-        // performs. Everything else — a `&` slot the carrier cannot enter, a
-        // struct/reference destination no stack coercion can satisfy, or a float
-        // of the wrong width — has no honest store and stays unrecoverable.
-        // These checks run before any instruction is emitted.
-        var storeContract = StoreContract(instruction.Operands[0], context);
-        TypeAnalysisContext? fpConsumer = null;
-        if (storeContract != null)
+        if (carrierWidth == 0)
         {
-            if (storeContract is ByRefTypeAnalysisContext)
+            // No scalar destination (or a shift, whose lane is the shifted
+            // value): the proven operands must all name the same lane, or the
+            // register width is unproven and the op stays diagnosed.
+            if (consensusWidth <= 0)
                 return false;
-            var destinationWidth = storeContract.FullName == "System.Single" ? 4
-                : storeContract.FullName == "System.Double" ? 8
-                : IntegralStackWidth(storeContract);
-            if (destinationWidth == 0)
-                return false;
-            if (storeContract.FullName is "System.Single" or "System.Double")
-            {
-                if (destinationWidth != carrierWidth)
-                    return false;
-                fpConsumer = storeContract;
-            }
+            carrierWidth = consensusWidth;
         }
+        if (fpConsumer != null
+            && (fpConsumer.FullName == "System.Single" ? 4 : 8) != carrierWidth)
+            return false;
 
         var instructions = method.CilMethodBody!.Instructions;
         var module = method.DeclaringModule!;
@@ -9988,21 +10257,53 @@ public static class IlGenerator
             {
                 // `fmov` between the banks: the float's own bits at its own
                 // width, reinterpreted through BitConverter — the only legal
-                // float → integer sequence.
+                // float → integer sequence. A wider pattern narrows to the lane
+                // (`fmov w,s` keeps the D register's low dword), a narrower one
+                // zero-extends (a W write zeroes the X high half).
                 LoadOperand(operand, method, locals, writeLine, emitted, context);
                 var single = emitted.FullName == "System.Single";
                 instructions.Add(CilOpCodes.Call, bitConverter.CreateMemberReference(
                     single ? "SingleToInt32Bits" : "DoubleToInt64Bits",
                     MethodSignature.CreateStatic(single ? factory.Int32 : factory.Int64,
                         [single ? factory.Single : factory.Double])));
+                var floatWidth = single ? 4 : 8;
                 if (isShift && i == 1 && !single)
                     // the count is i32-shaped: keep the carrier's low bits
                     EmitStackCoerceOrDefault(systemTypes.SystemInt64Type, systemTypes.SystemInt32Type, method, context);
+                else if (!isShift && floatWidth > carrierWidth)
+                    instructions.Add(CilOpCodes.Conv_I4);
+                else if (!isShift && floatWidth < carrierWidth)
+                    instructions.Add(CilOpCodes.Conv_U8);
+            }
+            else if (operand is LocalVariable { Type: null })
+            {
+                // Inference-only integral operand: the lane it adapts to is the
+                // type it takes (the check pass already bailed on anything a
+                // carrier cannot hold).
+                LoadOperandIntoSlot(operand, isShift && i == 1
+                    ? systemTypes.SystemInt32Type
+                    : carrierType, context, method, locals, writeLine);
             }
             else if (isShift && i == 1)
                 LoadOperandIntoSlot(operand, systemTypes.SystemInt32Type, context, method, locals, writeLine);
             else
-                LoadOperandIntoSlot(operand, carrierType, context, method, locals, writeLine);
+            {
+                var operandWidth = IntegralStackWidth(emitted);
+                if (operandWidth < 0)
+                    operandWidth = 8;
+                if (operandWidth != 0 && operandWidth < carrierWidth)
+                {
+                    // A W write's operand contributes its 32 bits; into an X
+                    // lane they zero-extend, never sign-extend.
+                    LoadOperandIntoSlot(operand, systemTypes.SystemInt32Type, context, method, locals, writeLine);
+                    instructions.Add(CilOpCodes.Conv_U8);
+                }
+                else if (operandWidth != 0 && operandWidth > carrierWidth)
+                    // An X register read as W keeps only the low dword.
+                    LoadOperandIntoSlot(operand, systemTypes.SystemInt32Type, context, method, locals, writeLine);
+                else
+                    LoadOperandIntoSlot(operand, carrierType, context, method, locals, writeLine);
+            }
         }
 
         instructions.Add(instruction.OpCode switch

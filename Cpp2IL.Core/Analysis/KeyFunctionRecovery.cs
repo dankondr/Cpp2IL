@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.Il2CppApiFunctions;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using LibCpp2IL;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -13,6 +15,42 @@ namespace Cpp2IL.Core.Analysis;
 /// </summary>
 public static class KeyFunctionRecovery
 {
+    // EH needs only this predicate's ABI. Do not add aliases to the general
+    // key-function rewrite table: a class predicate is not Object::IsInst.
+    internal static bool IsClassIsAssignableFrom(Il2CppBinary binary, ulong target)
+    {
+        if (binary.InstructionSetId != DefaultInstructionSets.ARM_V8) return false;
+        try
+        {
+            var export = binary.GetVirtualAddressOfExportedFunctionByName("il2cpp_class_is_assignable_from");
+            return MatchClassIsAssignableFrom(export, target, address => BitConverter.ToUInt32(
+                binary.GetRawBinaryContent().Slice((int)binary.MapVirtualAddressToRaw(address), 4).ToArray(), 0));
+        }
+        catch (Exception) { return false; }
+    }
+
+    internal static bool MatchClassIsAssignableFrom(ulong export, ulong target, Func<ulong, uint> read)
+    {
+        if (export == 0 || target == 0) return false;
+        var body = Follow(export);
+        return body != 0 && body == Follow(target);
+
+        ulong Follow(ulong address)
+        {
+            // ponytail: only bounded pure B veneers preserve the exported ABI;
+            // argument shuffles or indirect wrappers need their own proof.
+            var seen = new HashSet<ulong>();
+            while (seen.Count < 8 && seen.Add(address))
+            {
+                var word = read(address);
+                if ((word & 0xfc000000) != 0x14000000) return address;
+                var delta = (long)((int)(word << 6) >> 4);
+                address = unchecked((ulong)((long)address + delta));
+            }
+            return 0;
+        }
+    }
+
     //All of these have the same params in the same order so we treat them as equal.
     private static readonly HashSet<string> ObjectNewFunctions =
     [
@@ -90,33 +128,39 @@ public static class KeyFunctionRecovery
             return;
 
         var cfg = method.ControlFlowGraph!;
+        var index = new DefUseIndex(cfg);
         var home = cfg.Blocks.SelectMany(block => block.Instructions.Select(instruction => (instruction, block)))
             .ToDictionary(pair => pair.instruction, pair => pair.block);
-        var definitions = new Dictionary<LocalVariable, Instruction>();
-        var ambiguous = new HashSet<LocalVariable>();
-        foreach (var instruction in cfg.Instructions)
-            if (instruction.Destination is LocalVariable destination
-                && (!definitions.TryAdd(destination, instruction) || ambiguous.Contains(destination)))
-            {
-                definitions.Remove(destination);
-                ambiguous.Add(destination);
-            }
+
+        var metadataVersion = method.AppContext.MetadataVersion;
 
         foreach (var instruction in cfg.Instructions)
         {
-            if (instruction is not { OpCode: OpCode.CheckEqual, Operands: [var result, var left, var right] })
+            // depth(klass) >= depth(K) && hierarchy(klass)[depth(K) - 1] == K. The compiler emits
+            // the last comparison as either `==` (result true means "is K") or `!=` (result true
+            // means "is not K") - recognise the term, not the polarity.
+            if (instruction is not { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual,
+                    Operands: [var result, var left, var right] })
                 continue;
 
-            if (!TryMatch(left, right, out var value, out var target, out var runtimeClass, out var targetClass)
-                && !TryMatch(right, left, out value, out target, out runtimeClass, out targetClass))
+            if (!TryMatch(instruction, left, right, out var value, out var target, out var runtimeClass, out var targetClass)
+                && !TryMatch(instruction, right, left, out value, out target, out runtimeClass, out targetClass))
                 continue;
 
-            instruction.OpCode = OpCode.CheckNotEqual;
-            instruction.SetOperands(result, new ReferenceCast(value, target, nullOnFailure: true), new Immediate(0));
+            // When the not-an-instance edge throws InvalidCastException the check is a castclass:
+            // the cast raises it itself, and the surviving edge is the pass edge.
+            var castClass = FailingEdgeIsInvalidCastThrow(instruction, result,
+                out var passingTarget);
+            var resultIsInstance = instruction.OpCode == OpCode.CheckEqual;
+            instruction.OpCode = resultIsInstance ? OpCode.CheckNotEqual : OpCode.CheckEqual;
+            instruction.SetOperands(result, new ReferenceCast(value, target, nullOnFailure: !castClass),
+                new Immediate(0));
+            if (castClass && passingTarget != null)
+                FoldFailingBranch(instruction, result, passingTarget);
             RemoveDepthPrecheck(instruction, runtimeClass, targetClass);
         }
 
-        bool TryMatch(IOperand hierarchyEntry, IOperand targetOperand,
+        bool TryMatch(Instruction use, IOperand hierarchyEntry, IOperand targetOperand,
             out LocalVariable value, out TypeAnalysisContext target,
             out LocalVariable runtimeClass, out LocalVariable targetClass)
         {
@@ -127,21 +171,21 @@ public static class KeyFunctionRecovery
                 {
                     Base: LocalVariable address, Index: null, Scale: 0, Addend: -8
                 }
-                || !definitions.TryGetValue(address, out var addressDefinition)
-                || addressDefinition is not { OpCode: OpCode.Add, Operands: [_, var addLeft, var addRight] }
+                || index.ReachingDef(address, use) is not
+                    { OpCode: OpCode.Add, Operands: [_, var addLeft, var addRight] } addressDefinition
                 || !TrySplitHierarchyAdd(addLeft, addRight, out runtimeClass, out var shiftedDepth)
-                || !definitions.TryGetValue(shiftedDepth, out var shiftDefinition)
-                || shiftDefinition is not
+                || index.ReachingDef(shiftedDepth, addressDefinition) is not
                 {
                     OpCode: OpCode.ShiftLeft,
                     Operands:
                     [_, MemoryOperand
                         {
-                            Base: LocalVariable indexedClass, Index: null, Scale: 0, Addend: 0x130
+                            Base: LocalVariable indexedClass, Index: null, Scale: 0
                         }, Immediate { Value: 3 }]
-                }
-                || !definitions.TryGetValue(runtimeClass, out var classDefinition)
-                || classDefinition is not
+                } shiftDefinition
+                || shiftDefinition.Operands[1] is not MemoryOperand depthLoad
+                || !IsFieldRead(depthLoad, Il2CppClassUsefulOffsets.Il2CppClassField.TypeHierarchyDepth)
+                || index.ReachingDef(runtimeClass, addressDefinition) is not
                 {
                     OpCode: OpCode.Move,
                     Operands: [_, MemoryOperand
@@ -152,7 +196,8 @@ public static class KeyFunctionRecovery
                 return false;
 
             var comparedTarget = IsInstTarget(ResolveMoveSource(cfg, targetOperand), cfg, false);
-            var indexedTarget = IsInstTarget(ResolveMoveSource(cfg, indexedClass), cfg, false);
+            var indexedTarget = IsInstTarget(ResolveMoveSource(cfg, indexedClass), cfg, false)
+                ?? RuntimeClassTerms.RepresentedClass(indexedClass, index, use);
             if (comparedTarget == null || indexedTarget == null || comparedTarget.IsInterface
                 || !SameType(comparedTarget, indexedTarget))
                 return false;
@@ -161,6 +206,122 @@ public static class KeyFunctionRecovery
             target = comparedTarget;
             targetClass = indexedClass;
             return true;
+        }
+
+        // A plain cast check emits `castclass`: the branch that fires when the value is not an
+        // instance goes straight to a Throw InvalidCastException. Find the conditional in the
+        // check's block that consumes the result (through Not/Move/Check* projections), work out
+        // which successor is the not-instance edge, and confirm it lands on the shared throw.
+        bool FailingEdgeIsInvalidCastThrow(Instruction check, IOperand checkResult,
+            out Block? passingTarget)
+        {
+            passingTarget = null;
+            if (!home.TryGetValue(check, out var checkBlock)
+                || checkBlock.Instructions[^1] is not
+                    { OpCode: OpCode.ConditionalJump, Operands: [Block jumpTarget, var condition] }
+                || checkBlock.Successors.Count != 2
+                || BooleanParity(condition, checkResult, check) is not { } parity
+                || checkBlock.Successors.FirstOrDefault(s => !ReferenceEquals(s, jumpTarget)) is not { } other)
+                return false;
+
+            // CheckEqual produced "is instance" so the not-instance edge jumps when condition is
+            // !result; CheckNotEqual produced "is not instance", so it jumps when condition is
+            // result. Parity counts the Not's between the result local and the branch condition.
+            var jumpOnInstance = (check.OpCode == OpCode.CheckEqual) == (parity % 2 == 0);
+            var failingEdge = jumpOnInstance ? other : jumpTarget;
+            var passingEdge = jumpOnInstance ? jumpTarget : other;
+            if (!ThrowTailIsInvalidCast(failingEdge))
+                return false;
+
+            passingTarget = passingEdge;
+            return true;
+        }
+
+        // Fold the just-rewritten branch: castclass throws on failure, so the surviving edge is
+        // always taken.
+        void FoldFailingBranch(Instruction check, IOperand checkResult, Block passingTarget)
+        {
+            if (!home.TryGetValue(check, out var checkBlock)
+                || checkBlock.Instructions[^1].OpCode != OpCode.ConditionalJump)
+                return;
+
+            var target = checkBlock.Successors.FirstOrDefault(s => !ReferenceEquals(s, passingTarget));
+            if (target != null)
+                target.Predecessors.Remove(checkBlock);
+            checkBlock.Successors.Clear();
+            checkBlock.Successors.Add(passingTarget);
+
+            var terminator = checkBlock.Instructions[^1];
+            terminator.OpCode = OpCode.Jump;
+            terminator.SetOperands(passingTarget);
+            checkBlock.CalculateBlockType();
+        }
+
+        // How many Not-equivalences sit between `value` and `source`: even means the branch tests
+        // the result as-is, odd means it tests its negation. null when not a boolean projection.
+        int? BooleanParity(IOperand value, IOperand source, Instruction use)
+        {
+            var parity = 0;
+            var visited = new HashSet<LocalVariable>();
+            while (true)
+            {
+                if (ReferenceEquals(value, source))
+                    return parity;
+                if (value is not LocalVariable local || !visited.Add(local)
+                    || index.ReachingDef(local, use) is not { } definition)
+                    return null;
+                switch (definition)
+                {
+                    case { OpCode: OpCode.Move, Operands: [_, var input] }:
+                        value = input;
+                        break;
+                    case { OpCode: OpCode.Not, Operands: [_, var input] }:
+                        parity ^= 1;
+                        value = input;
+                        break;
+                    case { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual,
+                            Operands: [_, var input, Immediate { Value: 0 or 1 } compareTo] }:
+                        var inverted = (definition.OpCode == OpCode.CheckEqual) == (compareTo.Value == 0);
+                        if (inverted)
+                            parity ^= 1;
+                        value = input;
+                        break;
+                    default:
+                        return null;
+                }
+            }
+        }
+
+        bool IsFieldRead(MemoryOperand load, Il2CppClassUsefulOffsets.Il2CppClassField expected) =>
+            load.Addend is >= 0 and <= uint.MaxValue
+            && Il2CppClassUsefulOffsets.TryGetField((uint)load.Addend, metadataVersion,
+                method.AppContext.Binary.is32Bit, out var field, out _)
+            && field == expected;
+
+        bool ThrowTailIsInvalidCast(Block block, int depth = 0)
+        {
+            if (depth > 8)
+                return false;
+            var significant = block.Instructions.Where(i => i.OpCode != OpCode.Nop).ToList();
+            if (significant is [{ OpCode: OpCode.Jump }] && block.Successors.Count == 1)
+                return ThrowTailIsInvalidCast(block.Successors[0], depth + 1);
+            return significant.LastOrDefault() is { OpCode: OpCode.Throw } thrown
+                && thrown.Operands.Any(ThrowsInvalidCast);
+        }
+
+        bool ThrowsInvalidCast(IOperand operand)
+        {
+            operand = ResolveMoveSource(cfg, operand);
+            return operand switch
+            {
+                TypeAnalysisContext type => type.FullName == "System.InvalidCastException",
+                LocalVariable { Type: { } type } => type.FullName == "System.InvalidCastException",
+                LocalVariable local => index.DefinitionsOf(local).Any(definition =>
+                    definition is { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext t] }
+                        && t.FullName == "System.InvalidCastException"
+                    || definition is { OpCode: OpCode.Newobj, Operands: [_, TypeAnalysisContext { FullName: "System.InvalidCastException" }, ..] }),
+                _ => false,
+            };
         }
 
         void RemoveDepthPrecheck(Instruction hierarchyCheck, LocalVariable runtimeClass,
@@ -176,7 +337,7 @@ public static class KeyFunctionRecovery
                     {
                         OpCode: OpCode.ConditionalJump,
                         Operands: [_, LocalVariable branchCondition]
-                    })
+                    } branchJump)
                     continue;
 
                 var depthCheck = guardBlock.Instructions.LastOrDefault(candidate => candidate is
@@ -186,17 +347,19 @@ public static class KeyFunctionRecovery
                     [LocalVariable,
                         MemoryOperand
                         {
-                            Base: var runtimeDepthClass, Index: null, Scale: 0, Addend: 0x130
-                        },
+                            Base: var runtimeDepthClass, Index: null, Scale: 0
+                        } runtimeDepthLoad,
                         MemoryOperand
                         {
-                            Base: var targetDepthClass, Index: null, Scale: 0, Addend: 0x130
-                        }]
+                            Base: var targetDepthClass, Index: null, Scale: 0
+                        } targetDepthLoad]
                 }
-                && ReferenceEquals(runtimeDepthClass, runtimeClass)
-                && ReferenceEquals(targetDepthClass, targetClass));
+                && IsFieldRead(runtimeDepthLoad, Il2CppClassUsefulOffsets.Il2CppClassField.TypeHierarchyDepth)
+                && IsFieldRead(targetDepthLoad, Il2CppClassUsefulOffsets.Il2CppClassField.TypeHierarchyDepth)
+                && SameClassLocal(runtimeDepthClass, runtimeClass)
+                && SameClassLocal(targetDepthClass, targetClass));
                 if (depthCheck?.Destination is not LocalVariable depthCondition
-                    || !IsBooleanProjection(branchCondition, depthCondition, []))
+                    || !IsBooleanProjection(branchCondition, depthCondition, branchJump, []))
                     continue;
 
                 depthCheck.OpCode = OpCode.Move;
@@ -205,19 +368,39 @@ public static class KeyFunctionRecovery
             }
         }
 
-        bool IsBooleanProjection(LocalVariable value, LocalVariable source, HashSet<LocalVariable> visited)
+        // The class pointer used in the depth precheck and the hierarchy lookup may be loaded into
+        // different locals (two `Move k, [instance]` defs of the same instance) - treat them as the
+        // same term when both read [x + 0] of the same instance or carry the same Il2CppClass<K>.
+        bool SameClassLocal(IOperand? left, IOperand? right)
+        {
+            if (ReferenceEquals(left, right))
+                return true;
+            if (left is not LocalVariable leftLocal || right is not LocalVariable rightLocal)
+                return false;
+
+            var leftClass = RuntimeClassTerms.RepresentedClass(leftLocal, index);
+            var rightClass = RuntimeClassTerms.RepresentedClass(rightLocal, index);
+            if (leftClass != null && rightClass != null)
+                return RuntimeClassTerms.SameType(leftClass, rightClass);
+
+            return index.DefinitionsOf(leftLocal) is [{ OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: LocalVariable leftBase, Addend: 0 }] }]
+                && index.DefinitionsOf(rightLocal) is [{ OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: LocalVariable rightBase, Addend: 0 }] }]
+                && ReferenceEquals(leftBase, rightBase);
+        }
+
+        bool IsBooleanProjection(LocalVariable value, LocalVariable source, Instruction use, HashSet<LocalVariable> visited)
         {
             if (ReferenceEquals(value, source))
                 return true;
-            if (!visited.Add(value) || !definitions.TryGetValue(value, out var definition))
+            if (!visited.Add(value) || index.ReachingDef(value, use) is not { } definition)
                 return false;
             return definition switch
             {
                 { OpCode: OpCode.Move or OpCode.Not, Operands: [_, LocalVariable input] }
-                    => IsBooleanProjection(input, source, visited),
+                    => IsBooleanProjection(input, source, definition, visited),
                 { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual,
                     Operands: [_, LocalVariable input, Immediate { Value: 0 or 1 }] }
-                    => IsBooleanProjection(input, source, visited),
+                    => IsBooleanProjection(input, source, definition, visited),
                 _ => false,
             };
         }
@@ -473,7 +656,7 @@ public static class KeyFunctionRecovery
         _ => false,
     };
 
-    private static bool IsExceptionWrapperTypeInfo(MethodAnalysisContext method, IOperand operand)
+    internal static bool IsExceptionWrapperTypeInfo(MethodAnalysisContext method, IOperand operand)
     {
         if (operand is not Immediate typeInfo)
             return false;

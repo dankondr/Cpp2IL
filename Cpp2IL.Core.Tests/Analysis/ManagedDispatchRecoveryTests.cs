@@ -1136,4 +1136,101 @@ public class ManagedDispatchRecoveryTests
         Assert.That(method.ControlFlowGraph.Instructions.Any(i => i.OpCode == OpCode.Phi
             && i.Operands[0] is LocalVariable), Is.True);
     }
+
+    // ===== merged tail-call dispatch =====
+
+    // `return a.X();` / `return b.Y();` emitted as one shared `BR`: each edge loads its own
+    // [klass_i + vtable + 16*slot_i], the merge block holds a single IndirectJump on the
+    // multiply-defined target. VTExclusionManager::GetEffectiveType's shared B/BR tail.
+    [Test]
+    public void MergedTailCallDispatchSplitsPerEdge()
+    {
+        var stream = CorLib("System.IO.MemoryStream");
+        var int64 = App.SystemTypes.SystemInt64Type;
+        var positionSlot = VTableSlotOf(stream, "get_Position");
+        var lengthSlot = VTableSlotOf(stream, "get_Length");
+
+        var receiverA = L("receiverA", stream);
+        var receiverB = L("receiverB", stream);
+        var klassA = L("klassA");
+        var klassB = L("klassB");
+        var target = L("target");
+        var callArg = L("callArg");
+        var methodInfo = L("methodInfo");
+        var addendA = VTableOffset + positionSlot * InvokeDataSize;
+        var addendB = VTableOffset + lengthSlot * InvokeDataSize;
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.CheckNotEqual, L("cond"), L("selector"), new Immediate(0)),
+            new(1, OpCode.ConditionalJump, new Immediate(7)),
+            new(2, OpCode.Move, klassA, Load(receiverA, 0)),
+            new(3, OpCode.Move, target, Load(klassA, addendA)),
+            new(4, OpCode.Move, methodInfo, Load(klassA, addendA + 8)),
+            new(5, OpCode.Move, callArg, receiverA),
+            new(6, OpCode.Jump, new Immediate(11)),
+            new(7, OpCode.Move, klassB, Load(receiverB, 0)),
+            new(8, OpCode.Move, target, Load(klassB, addendB)),
+            new(9, OpCode.Move, methodInfo, Load(klassB, addendB + 8)),
+            new(10, OpCode.Move, callArg, receiverB),
+            new(11, OpCode.IndirectJump, target, L("stale"), callArg, methodInfo),
+        };
+        var method = Caller(int64, instructions);
+
+        InterfaceDispatchRecovery.Run(method);
+
+        var blocks = method.ControlFlowGraph!.Blocks
+            .Where(b => b.Instructions.Count > 0).ToList();
+        Assert.That(blocks, Has.Count.EqualTo(3),
+            () => string.Join("\n", blocks.Select(b =>
+                $"{b.Instructions.FirstOrDefault()?.Index}: {b.BlockType} preds={b.Predecessors.Count} succs={b.Successors.Count}")));
+
+        // Each edge now ends in its own resolved call + return.
+        var calls = blocks.SelectMany(b => b.Instructions)
+            .Where(i => i.OpCode == OpCode.Call && i.IsVirtualDispatch)
+            .ToList();
+        Assert.That(calls, Has.Count.EqualTo(2),
+            () => string.Join("\n", method.ControlFlowGraph.Instructions));
+        Assert.That(calls.Select(c => ((MethodAnalysisContext)c.Operands[0]).Name),
+            Is.EquivalentTo(new[] { "get_Position", "get_Length" }));
+
+        foreach (var call in calls)
+        {
+            var home = blocks.First(b => b.Instructions.Contains(call));
+            Assert.That(home.Instructions[^1].OpCode, Is.EqualTo(OpCode.Return));
+            // the receiver argument is that edge's own receiver
+            Assert.That(call.Operands.Skip(2).Any(o =>
+                    o is LocalVariable arg && (ReferenceEquals(arg, receiverA) || ReferenceEquals(arg, receiverB))),
+                Is.True);
+            // the hidden MethodInfo names the same resolved method
+            Assert.That(call.Operands.OfType<RuntimeMethodInfoAnalysisContext>()
+                .Any(m => ReferenceEquals(m.RepresentedMethod, call.Operands[0])), Is.True);
+        }
+    }
+
+    // A shared jump whose target merge sources are not vtable loads stays an IndirectJump.
+    [Test]
+    public void MergedTailCallWithoutVTableLoadsStaysIndirect()
+    {
+        var stream = CorLib("System.IO.MemoryStream");
+        var int64 = App.SystemTypes.SystemInt64Type;
+        var target = L("target");
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.CheckNotEqual, L("cond"), L("selector"), new Immediate(0)),
+            new(1, OpCode.ConditionalJump, new Immediate(4)),
+            new(2, OpCode.Move, target, new Immediate(0x6000)),
+            new(3, OpCode.Jump, new Immediate(6)),
+            new(4, OpCode.Move, target, new Immediate(0x7000)),
+            new(5, OpCode.Jump, new Immediate(6)),
+            new(6, OpCode.IndirectJump, target, L("stale"), L("arg", stream)),
+        };
+        var method = Caller(int64, instructions);
+
+        InterfaceDispatchRecovery.Run(method);
+
+        Assert.That(method.ControlFlowGraph!.Instructions.Any(i => i.OpCode == OpCode.IndirectJump),
+            Is.True);
+        Assert.That(method.ControlFlowGraph.Instructions
+            .Count(i => i.OpCode is OpCode.Call or OpCode.CallVoid), Is.Zero);
+    }
 }

@@ -332,6 +332,7 @@ public static class LocalVariables
             changed |= MetadataResolver.ResolveVirtualCalls(method);
             changed |= PropagateFromCallParameters(method, allowCanonicalCallTypes);
             changed |= AggregateResultLanes.Run(method);
+            changed |= MetadataResolver.LoadThroughMergedAddresses(method);
             changed |= MetadataResolver.ResolveFieldOffsets(method);
             changed |= ResolveSharpenedFieldOwners(method);
             changed |= RgctxResolver.Run(method);
@@ -1185,6 +1186,28 @@ public static class LocalVariables
             : null;
     }
 
+    /// <summary>
+    /// The storage one register name provably covers: a B/H/S/W/D/X/V/Q
+    /// register-shaped name (`letter + digits`) covers its named width — a
+    /// whole Vector3 or Quaternion lives inside one V register's 16 bytes —
+    /// while a stack-slot, frame or virtual register name only covers a
+    /// pointer-sized cell.
+    /// </summary>
+    internal static int RegisterCoverageBytes(string registerName, int pointerSize)
+    {
+        if (registerName.Length > 1 && char.IsAsciiDigit(registerName[1]))
+            return registerName[0] switch
+            {
+                'B' or 'b' => 1,
+                'H' or 'h' => 2,
+                'S' or 's' or 'W' or 'w' => 4,
+                'D' or 'd' or 'X' or 'x' => 8,
+                'V' or 'v' or 'Q' or 'q' => 16,
+                _ => pointerSize
+            };
+        return pointerSize;
+    }
+
     // A type-metadata global load (Move local, typeof(T)) puts the runtime class pointer for T into
     // the local - an Il2CppClass*, not an instance of T. That is known exactly from the instruction,
     // so it is seeded as ground truth (overriding any prior guess) before the inference fixpoint,
@@ -1886,6 +1909,23 @@ public static class LocalVariables
                 destination.Type = binopVectorType;
                 return true;
             }
+        }
+
+        // `Int32 = Int32 op x`: an integer result whose other operand has that same type fixes an
+        // untyped operand to it (the native op ran at that width). This is what types a loop
+        // counter that only ever meets immediates and a typed division.
+        if (instruction.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
+            && IntegerResultType(destination, method) is { } resultType)
+        {
+            var typed = false;
+            if (left is LocalVariable { Type: null } untypedLeft && !ReferenceEquals(untypedLeft, destination)
+                && (IntegerResultType(right, method) ?? IntegerImmediateType(right, method)) == resultType)
+                typed |= SetTypeIfUnknown(untypedLeft, resultType);
+            if (right is LocalVariable { Type: null } untypedRight && !ReferenceEquals(untypedRight, destination)
+                && (IntegerResultType(left, method) ?? IntegerImmediateType(left, method)) == resultType)
+                typed |= SetTypeIfUnknown(untypedRight, resultType);
+            if (typed)
+                return true;
         }
 
         if (destination.Type != null)

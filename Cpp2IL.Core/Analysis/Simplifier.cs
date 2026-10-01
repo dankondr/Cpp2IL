@@ -132,7 +132,7 @@ public static class Simplifier
                             var stopAtJoins = definitionCounts.TryGetValue(local, out var defs) && defs > 1;
 
                             // Replace local
-                            ReplaceLocalsUntilReassignment(block, i + 1, local, instruction.Operands[1], stopAtJoins);
+                            ReplaceLocalsUntilReassignment(block, i + 1, local, instruction.Operands[1], stopAtJoins, definitionCounts);
 
                             // Only drop the defining move once the local has no remaining uses; if the
                             // replacement stopped at a join, the local is still live past it so the move stays.
@@ -157,6 +157,37 @@ public static class Simplifier
             }
 
             return changed;
+        }
+
+        // Whether the instruction can write the location a forwarded read came from. A field is
+        // one location per field (whatever the receiver); raw memory and block writes can reach
+        // any. Calls are left to MustPreserveFieldSnapshot, except for a raw memory read, which
+        // any call may change.
+        private static bool MayOverwrite(Instruction instruction, IOperand read)
+        {
+            if (read is not (FieldReference or SelectedFieldReference or MemoryOperand or ArrayAccess
+                or ArrayElementFieldReference))
+                return false;
+            if (instruction.OpCode is OpCode.MemoryCopy or OpCode.MemorySet or OpCode.MemoryMove
+                or OpCode.Interrupt or OpCode.NotImplemented)
+                return true;
+            if (instruction.IsCall || instruction.OpCode is OpCode.IndirectCall)
+                return read is MemoryOperand;
+            if (instruction.OpCode != OpCode.Move || instruction.Operands.Count == 0
+                || instruction.Operands[0] is LocalVariable)
+                return false;
+            var written = instruction.Operands[0];
+            return written is MemoryOperand || read is MemoryOperand
+                || FieldsOf(written).Intersect(FieldsOf(read)).Any()
+                || written is ArrayAccess && read is ArrayAccess;
+
+            static IEnumerable<FieldAnalysisContext> FieldsOf(IOperand operand) => operand switch
+            {
+                FieldReference field => [field.Field, .. field.Containers],
+                SelectedFieldReference selected => selected.Choices.SelectMany(c => (IEnumerable<FieldAnalysisContext>)[c.Field.Field, .. c.Field.Containers]),
+                ArrayElementFieldReference element => [element.Field],
+                _ => [],
+            };
         }
 
         private bool MustPreserveFieldSnapshot(Block block, int startIndex, LocalVariable value,
@@ -240,7 +271,7 @@ public static class Simplifier
                         var stopAtJoins = definitionCounts.TryGetValue(local, out var defs) && defs > 1;
 
                         // Replace local with source
-                        ReplaceLocalsUntilReassignment(block, i + 1, local, source, stopAtJoins);
+                        ReplaceLocalsUntilReassignment(block, i + 1, local, source, stopAtJoins, definitionCounts);
 
                         // If the replacement stopped at a join merging another definition, the local is
                         // still live there - keep its defining move rather than dropping the value on this path.
@@ -282,8 +313,16 @@ public static class Simplifier
         }
 
         private void ReplaceLocalsUntilReassignment(Block startBlock, int startIndex, LocalVariable local,
-            IOperand replacement, bool stopAtJoins)
+            IOperand replacement, bool stopAtJoins, IReadOnlyDictionary<LocalVariable, int> definitionCounts)
         {
+            // The replacement is only the same value while the locals it reads are: `x = [p]` forwarded
+            // past `p = p + 4` would read the next element. A path ends where one of them is written,
+            // and a join that merges another definition of one of them ends it too.
+            var replacementLocals = LocalVariables.OperandLocals(replacement).ToHashSet();
+            stopAtJoins |= replacementLocals.Any(read => definitionCounts.TryGetValue(read, out var count) && count > 1);
+            // A value read from memory is only that value until a write that can reach the same
+            // location: `x = o.f; o.f = 5; return x` must not become `return o.f`.
+
             var visited = new HashSet<Block>();
             var remaining = new Stack<(Block, int)>(_graph.Blocks.Count);
 
@@ -299,13 +338,18 @@ public static class Simplifier
                 var (currentBlock, index) = remaining.Pop();
 
                 // Process instructions starting at the given index
-                for (var i = index; i < currentBlock.Instructions.Count; i++)
+                var pathEnds = false;
+                for (var i = index; i < currentBlock.Instructions.Count && !pathEnds; i++)
                 {
                     var instruction = currentBlock.Instructions[i];
 
                     // Stop on this branch when reassigned
                     if (instruction.Destination is LocalVariable destLocal && destLocal == local)
                         return;
+
+                    // The instruction still reads the old value; what follows it does not.
+                    pathEnds = instruction.Destination is LocalVariable written && replacementLocals.Contains(written)
+                               || MayOverwrite(instruction, replacement);
 
                     // Replace operands
                     for (var j = 0; j < instruction.Operands.Count; j++)
@@ -385,6 +429,9 @@ public static class Simplifier
                         }
                     }
                 }
+
+                if (pathEnds)
+                    continue;
 
                 // Process successors
                 foreach (var successor in currentBlock.Successors)
@@ -482,10 +529,13 @@ public static class Simplifier
             visited.EnsureCapacity(_graph.Blocks.Count);
 #endif
 
-            visited.Add(startBlock);
+            // The start block is not marked visited: a loop back into it reaches the reads before
+            // `startIndex` too. A copy at the end of a loop body is read at the top of the next
+            // iteration (`p = p + 4` feeding the load of `[p]`), and dropping it freezes the loop.
             remaining.Push((startBlock, startIndex));
 
             usedByMemory = false;
+            var reassigned = false;
 
             while (remaining.Count > 0)
             {
@@ -574,6 +624,19 @@ public static class Simplifier
                             }
                         }
                     }
+
+                    // Reassigned before any read: this path no longer carries the value.
+                    if (instruction.Destination is LocalVariable redefined && redefined == local)
+                    {
+                        reassigned = true;
+                        break;
+                    }
+                }
+
+                if (reassigned)
+                {
+                    reassigned = false;
+                    continue;
                 }
 
                 // Process successors

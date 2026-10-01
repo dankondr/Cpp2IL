@@ -81,6 +81,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     /// </summary>
     public List<LandingPadRegion> LandingPadRegions = [];
 
+    internal List<Instruction>? ExceptionRegionInstructions;
+
     public List<string> AnalysisWarnings = [];
 
     public static int MaxMethodSizeBytes = 30000; // 30KB
@@ -705,6 +707,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         DeadCodeEliminator.Run(this);
         finishInterfaceDispatchRecovery?.Invoke();
 
+        // A frame cell holding a copy of an address-taken struct's field is that field's storage;
+        // read it as the field before copies are forwarded.
+        FrameStructFieldReads.Run(this);
+
         // Copy/constant propagation belongs in SSA, where one definition dominates all uses and phis
         // make joins explicit, so forwarding a value is an unconditional global substitution.
         SsaSimplifier.Run(this);
@@ -795,6 +801,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     public void ReleaseAnalysisData()
     {
         ConvertedIsil = null;
+        ExceptionRegionInstructions = null;
         ControlFlowGraph = null;
         DominatorInfo = null;
     }

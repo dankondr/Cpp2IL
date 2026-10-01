@@ -1,3 +1,4 @@
+using System.Linq;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
@@ -7,6 +8,28 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class KeyFunctionRecoveryTests
 {
+    [Test]
+    public void ClassPredicateRequiresTheExportBodyThroughPureBranches()
+    {
+        var words = new System.Collections.Generic.Dictionary<ulong, uint>
+        {
+            [0x1000] = 0x14000400, // B 0x2000
+            [0x2000] = 0xd65f03c0, // body (RET)
+            [0x3000] = 0x17fffc00, // B backwards to 0x2000
+            [0x4000] = 0x94000000, // BL is not a veneer
+            [0x5000] = 0x14000000, // cycle
+            [0x6000] = 0xaa0003e1  // argument shuffle is not a veneer
+        };
+        bool Match(ulong export, ulong target) => KeyFunctionRecovery.MatchClassIsAssignableFrom(export, target, a => words[a]);
+        Assert.That(Match(0x1000, 0x3000), Is.True);
+        Assert.That(Match(0x1000, 0x2000), Is.True);
+        Assert.That(Match(0x1000, 0x4000), Is.False);
+        Assert.That(Match(0x1000, 0x5000), Is.False);
+        Assert.That(Match(0x1000, 0x6000), Is.False);
+        Assert.That(Match(0, 0x3000), Is.False);
+        Assert.That(Match(0x5000, 0x5000), Is.False);
+    }
+
     [SetUp]
     public void Setup()
     {
@@ -428,5 +451,68 @@ public class KeyFunctionRecoveryTests
         ]);
 
         Assert.That(KeyFunctionRecovery.ResolveMoveSource(graph, classPointer), Is.EqualTo(source));
+    }
+
+    // The plain inlined cast check - depth(klass) >= depth(K) and hierarchy(klass)[depth(K)-1] == K
+    // - where the K pointer is itself an [instance + 0] class load (the ProcessScriptableObjectField
+    // shape): the term survives the load's register, so the check folds to castclass when the
+    // not-instance edge throws InvalidCastException.
+    [Test]
+    public void InlinedCastCheckOnClassTermsBecomesCastclass()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var stream = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.IO.MemoryStream")!;
+        var invalidCast = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.InvalidCastException")!;
+
+        var obj = new LocalVariable("obj", new Register(null, "x8"))
+            { Type = app.SystemTypes.SystemObjectType };
+        var klass = new LocalVariable("klass", new Register(null, "x0"));
+        var kInstance = new LocalVariable("kInstance", new Register(null, "x1")) { Type = stream };
+        var k = new LocalVariable("k", new Register(null, "x2"));
+        var kCompare = new LocalVariable("kCompare", new Register(null, "x3"));
+        var depthCond = new LocalVariable("depthCond", new Register(null, "d0"));
+        var shifted = new LocalVariable("shifted", new Register(null, "s"));
+        var address = new LocalVariable("address", new Register(null, "a"));
+        var result = new LocalVariable("result", new Register(null, "r"));
+
+        var throwInstr = new Instruction(10, OpCode.Throw, invalidCast);
+        var compare = new Instruction(7, OpCode.CheckNotEqual, result,
+            new MemoryOperand(address, null, -8, 0), kCompare);
+        var check = new Instruction(8, OpCode.ConditionalJump, throwInstr, result);
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Fixture",
+            app.SystemTypes.SystemBooleanType, System.Reflection.MethodAttributes.Static,
+            [app.SystemTypes.SystemObjectType]);
+        method.ControlFlowGraph = new ISILControlFlowGraph(
+        [
+            new(0, OpCode.Move, klass, new MemoryOperand(obj, null, 0, 0)),
+            new(1, OpCode.Move, k, new MemoryOperand(kInstance, null, 0, 0)),
+            new(2, OpCode.Move, kCompare, stream),
+            new(3, OpCode.CheckLess, depthCond,
+                new MemoryOperand(klass, null, 0x130, 0), new MemoryOperand(k, null, 0x130, 0)),
+            new(4, OpCode.ConditionalJump, throwInstr, depthCond),
+            new(5, OpCode.ShiftLeft, shifted, new MemoryOperand(k, null, 0x130, 0), new Immediate(3)),
+            new(6, OpCode.Add, address, new MemoryOperand(klass, null, 0xC8, 0), shifted),
+            compare,
+            check,
+            new(9, OpCode.Return, result),
+            throwInstr,
+        ]);
+
+        KeyFunctionRecovery.Run(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(compare.OpCode, Is.EqualTo(OpCode.CheckEqual));
+            Assert.That(compare.Operands[1], Is.TypeOf<ReferenceCast>());
+            var cast = (ReferenceCast)compare.Operands[1];
+            Assert.That(cast.Value, Is.SameAs(obj));
+            Assert.That(cast.Type, Is.SameAs(stream));
+            Assert.That(cast.NullOnFailure, Is.False);
+            // castclass throws on the failing edge, so the conditional folds to the passing edge.
+            Assert.That(check.OpCode, Is.EqualTo(OpCode.Jump));
+            // the depth precheck is folded away once the hierarchy compare is proven
+            Assert.That(method.ControlFlowGraph!.Instructions.Any(i =>
+                i.OpCode == OpCode.CheckLess), Is.False);
+        });
     }
 }

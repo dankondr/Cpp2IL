@@ -12,10 +12,10 @@ namespace Cpp2IL.Core.Analysis;
 /// <c>cmp</c>/<c>test</c> produces all of CF/OF/SF/ZF/PF plus scratch temporaries, but the branch
 /// that follows only consumes one of them.
 ///
-/// Must run while the graph is still in SSA form (every local is assigned exactly once), so that a
-/// global use count of zero is sufficient to prove a definition dead. Instructions are turned into
-/// nops rather than spliced out; the structural cleanup happens later, out of SSA, where it is safe
-/// for phi nodes.
+/// Liveness is marked from the instructions with an effect, per local, so it holds in and out of
+/// SSA form: a local with several definitions stays whole while any reader needs it. Instructions
+/// are turned into nops rather than spliced out; the structural cleanup happens later, out of SSA,
+/// where it is safe for phi nodes.
 /// </summary>
 public static class DeadCodeEliminator
 {
@@ -23,49 +23,45 @@ public static class DeadCodeEliminator
 
     public static void Run(ISILControlFlowGraph cfg)
     {
-        // Removing a dead definition can make its operands dead in turn, so iterate to a fixpoint.
-        // This is monotonic (each pass only nops instructions) and therefore always terminates.
-        var changed = true;
-        while (changed)
+        // A local is live when an instruction with an effect (a call, store, branch, return)
+        // reads it, or a pure definition of a live local does. Marking from the effects, rather
+        // than counting uses, also removes copies that only feed each other around a loop
+        // (`a = b; b = a`), which a use count keeps alive forever.
+        var instructions = cfg.Blocks.SelectMany(block => block.Instructions).ToList();
+        var live = new HashSet<LocalVariable>();
+        var work = new Stack<LocalVariable>();
+        var definitions = new Dictionary<LocalVariable, List<Instruction>>();
+        foreach (var instruction in instructions)
         {
-            changed = false;
-
-            var useCounts = CountUses(cfg);
-
-            foreach (var block in cfg.Blocks)
+            if (Pure(instruction) is { } destination)
             {
-                foreach (var instruction in block.Instructions)
-                {
-                    if (!IsRemovable(instruction.OpCode))
-                        continue;
-
-                    // Only definitions of a register local are candidates. Stores have a memory or
-                    // field destination (Destination is not a local) and are never dead.
-                    if (instruction.Destination is not LocalVariable destination)
-                        continue;
-
-                    if (useCounts.TryGetValue(destination, out var count) && count > 0)
-                        continue;
-
-                    instruction.OpCode = OpCode.Nop;
-                    instruction.SetOperands();
-                    changed = true;
-                }
+                (definitions.TryGetValue(destination, out var list) ? list : definitions[destination] = []).Add(instruction);
+                continue;
             }
+            foreach (var used in UsedLocals(instruction))
+                if (live.Add(used))
+                    work.Push(used);
         }
+
+        while (work.Count > 0)
+            if (definitions.TryGetValue(work.Pop(), out var defs))
+                foreach (var definition in defs)
+                    foreach (var used in UsedLocals(definition))
+                        if (live.Add(used))
+                            work.Push(used);
+
+        foreach (var instruction in instructions)
+            if (Pure(instruction) is { } destination && !live.Contains(destination))
+            {
+                instruction.OpCode = OpCode.Nop;
+                instruction.SetOperands();
+            }
     }
 
-    private static Dictionary<LocalVariable, int> CountUses(ISILControlFlowGraph cfg)
-    {
-        var counts = new Dictionary<LocalVariable, int>();
-
-        foreach (var block in cfg.Blocks)
-            foreach (var instruction in block.Instructions)
-                foreach (var used in UsedLocals(instruction))
-                    counts[used] = counts.TryGetValue(used, out var c) ? c + 1 : 1;
-
-        return counts;
-    }
+    // The local a pure instruction defines. Stores have a memory or field destination
+    // (Destination is not a local) and are never dead.
+    private static LocalVariable? Pure(Instruction instruction)
+        => IsRemovable(instruction.OpCode) && instruction.Destination is LocalVariable destination ? destination : null;
 
     /// <summary>
     /// Every local read by the instruction. The single write position - a plain local destination -
