@@ -152,6 +152,10 @@ public static class LocalVariables
         {
             bufferLocal.Name = "returnBuffer";
             bufferLocal.Type = method.ReturnType;
+            // The result is what the method built in the buffer; x0 at `ret` holds nothing of it.
+            foreach (var ret in method.ControlFlowGraph!.Instructions)
+                if (ret is { OpCode: OpCode.Return, Operands.Count: > 0 })
+                    ret.SetOperands([bufferLocal]);
         }
 
         // Runs here, not with the rest of type resolution: the sibling
