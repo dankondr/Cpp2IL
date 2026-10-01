@@ -566,4 +566,24 @@ public class AggregateResultLaneTests
 
         Assert.That(call.Operands.Skip(1).Select(o => ((Register)o).Name), Is.EqualTo(new[] { "V0", "V3", "X0" }));
     }
+
+    [Test]
+    public void UpperLaneStoredThroughARegisterCopyIsPartOfTheWholeStore()
+    {
+        // `bl GetQuad; mov x8, x1; stp x0, x8, [x19, #0x80]`
+        var quad = FourInts();
+        var callerType = CallerTypeWithField("q", quad, 0x80);
+        var getQuad = callerType.InjectMethodContext("GetQuad", quad,
+            R.MethodAttributes.Public | R.MethodAttributes.Static);
+        var call = new Instruction(0x14, OpCode.Call, getQuad, Reg("X0"));
+        call.ImplicitDefinitions.Add(Reg("X1"));
+        Instruction whole = new(0x1c, OpCode.Move, new MemoryOperand(Reg("X19"), addend: 0x80, accessSize: 8), Reg("X0")) { NativeMemoryAccessSize = 8 };
+        Instruction high = new(0x1c, OpCode.Move, new MemoryOperand(Reg("X19"), addend: 0x88, accessSize: 8), Reg("X8")) { NativeMemoryAccessSize = 8 };
+        Drive(callerType, [
+            new Instruction(0x10, OpCode.Move, Reg("X19"), Reg("X0")),
+            call, new Instruction(0x18, OpCode.Move, Reg("X8"), Reg("X1")), whole, high,
+            new Instruction(0x20, OpCode.Return)]);
+
+        Assert.That(high.OpCode, Is.EqualTo(OpCode.Nop));
+    }
 }

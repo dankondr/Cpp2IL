@@ -397,6 +397,18 @@ internal static class AggregateResultLanes
             .ToDictionary(i => (LocalVariable)i.Destination!);
         if (calls.Count == 0)
             return false;
+        // The lane often reaches the store through a register copy (`mov x8, x1; stp x0, x8, [x19]`).
+        var copies = method.ControlFlowGraph.Instructions
+            .Where(i => i is { OpCode: OpCode.Move, Operands: [LocalVariable, LocalVariable] })
+            .GroupBy(i => (LocalVariable)i.Operands[0])
+            .Where(g => g.Count() == 1)
+            .ToDictionary(g => g.Key, g => (LocalVariable)g.Single().Operands[1]);
+        LocalVariable Copied(LocalVariable local)
+        {
+            for (var depth = 0; depth < 4 && copies.TryGetValue(local, out var source); depth++)
+                local = source;
+            return local;
+        }
 
         foreach (var block in method.ControlFlowGraph.Blocks)
         for (var index = 0; index < block.Instructions.Count; index++)
@@ -429,7 +441,7 @@ internal static class AggregateResultLanes
                 var lane = lanes[laneStores.Count];
                 if (candidate is { OpCode: OpCode.Move, Operands: [MemoryOperand { Base: LocalVariable laneBase, Index: null } laneCell, LocalVariable laneValue] }
                     && ReferenceEquals(laneBase, holder) && laneCell.Addend == offset + lane.ByteOffset
-                    && laneValue.Register is { Version: > 0 } laneRegister && laneRegister.Name == lane.Register.Name
+                    && Copied(laneValue).Register is { Version: > 0 } laneRegister && laneRegister.Name == lane.Register.Name
                     && call.ImplicitDefinitions.Contains(laneRegister))
                     laneStores.Add(candidate);
                 else if (candidate is not ({ OpCode: OpCode.Nop } or { OpCode: OpCode.Move, Operands: [LocalVariable, _] }))
