@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
+using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Logging;
@@ -65,13 +66,84 @@ internal static class InlinedMemberRecovery
         public BodySummary? Summary;
     }
 
-    private static readonly object SummaryLock = new();
     private static readonly ConcurrentDictionary<MethodAnalysisContext, SummaryResult> Summaries = new();
 
-    // Members whose summary is mid-build on this thread: the nested body.Analyze
-    // a summary triggers re-enters this pass, so recursive asks return nothing.
+    // Members whose summary is mid-build on this thread: recursive asks through
+    // an inner .ctor return nothing, so member cycles cannot recurse forever.
     [ThreadStatic]
     private static HashSet<MethodAnalysisContext>? s_summarizing;
+
+    // What the pass-1 extraction of a member body captured, at the fixed
+    // pipeline point where AnalyzeCore calls CaptureBodyFacts. Summaries are
+    // built from these facts, never from the live block list, so a body read
+    // mid-recovery cannot yield a different summary than one read later.
+    internal sealed class BodyFacts
+    {
+        public LocalVariable? ThisLocal;
+        public readonly Dictionary<LocalVariable, int> ParamIndex = new();
+        public readonly Dictionary<LocalVariable, IOperand> Definitions = new();
+        public readonly List<(FieldReference Destination, IOperand Source)> RawStores = new();
+        public readonly List<(LocalVariable Receiver, List<IOperand> Args,
+            MethodAnalysisContext Ctor)> CtorCalls = new();
+        public readonly List<IOperand> Returns = new();
+        public bool Rejected;
+    }
+
+    // Snapshot the body's summary inputs. AnalyzeCore calls this at a fixed
+    // point for every method, suppressed (forced) or not, so fact content
+    // cannot depend on which thread lifted the body.
+    internal static void CaptureBodyFacts(MethodAnalysisContext body)
+    {
+        if (body.MemberBodyFacts != null || body.ControlFlowGraph == null)
+            return;
+        var facts = new BodyFacts
+        {
+            ThisLocal = body.ParameterLocals.FirstOrDefault(p => p.IsThis),
+        };
+        foreach (var (l, i) in body.ParameterLocals.Where(p => !p.IsThis && !p.IsMethodInfo)
+                     .Select((l, i) => (l, i)))
+            facts.ParamIndex[l] = i;
+
+        foreach (var instruction in body.ControlFlowGraph.Blocks.SelectMany(b => b.Instructions))
+        {
+            switch (instruction.OpCode)
+            {
+                case OpCode.Nop or OpCode.Jump or OpCode.ShiftStack:
+                    break;
+                case OpCode.Return:
+                    if (instruction.Operands.Count > 0)
+                        facts.Returns.Add(instruction.Operands[0]);
+                    break;
+                case OpCode.Newobj when instruction.Operands is [LocalVariable allocated, ..]:
+                    facts.Definitions[allocated] = allocated;
+                    break;
+                case OpCode.Move when instruction.Operands is [LocalVariable d, var s]:
+                    facts.Definitions[d] = s;
+                    break;
+                case OpCode.Move when instruction.Operands is [FieldReference f, var s2]:
+                    facts.RawStores.Add((f, s2));
+                    break;
+                case OpCode.CallVoid when instruction.Operands is
+                    [MethodAnalysisContext { Name: ".ctor" }, ..]:
+                case OpCode.Call when instruction.Operands is
+                    [MethodAnalysisContext { Name: ".ctor" }, ..]:
+                {
+                    var target = (MethodAnalysisContext)instruction.Operands[0];
+                    var receiverIndex = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
+                    var args = instruction.Operands.Skip(receiverIndex + 1).ToList();
+                    if (Unwrap(instruction.Operands[receiverIndex]) is LocalVariable receiver)
+                        facts.CtorCalls.Add((receiver, args, target));
+                    else
+                        facts.Rejected = true;
+                    break;
+                }
+                default:
+                    facts.Rejected = true;
+                    break;
+            }
+        }
+        body.MemberBodyFacts = facts;
+    }
 
     public static int Run(MethodAnalysisContext method)
     {
@@ -353,7 +425,7 @@ internal static class InlinedMemberRecovery
 
         // Every store zero, transitively covering the accessed type's fields.
         if (group.All(g => IsZero(g.Instruction.Operands[1]))
-            && CoversAllFields(leafType, group, prefix))
+            && CoversAllFields(leafType, group.Select(g => g.Destination).ToList(), prefix))
         {
             var destination = PrefixOperand(local, prefix, group[0].Destination);
             if (!IsAddressSlot(destination, context)
@@ -430,19 +502,19 @@ internal static class InlinedMemberRecovery
             : destination.Field);
 
     private static bool CoversAllFields(TypeAnalysisContext type,
-        List<(Instruction Instruction, FieldReference Destination)> group,
+        IReadOnlyList<FieldReference> destinations,
         IReadOnlyList<FieldAnalysisContext> prefix)
     {
         foreach (var field in type.Fields.Where(f => !f.IsStatic))
         {
-            if (group.Any(g => g.Destination.Containers.Count == prefix.Count
-                    && SameField(g.Destination.Field, field)))
+            if (destinations.Any(d => d.Containers.Count == prefix.Count
+                    && SameField(d.Field, field)))
                 continue;
             var deeper = prefix.Append(field).ToList();
             if (!field.FieldType.IsValueType
-                || !group.Any(g => Prefixes(g.Destination.Containers, deeper))
-                || !CoversAllFields(FieldKey.GenericDef(field.FieldType) ?? field.FieldType, group,
-                    deeper))
+                || !destinations.Any(d => Prefixes(d.Containers, deeper))
+                || !CoversAllFields(FieldKey.GenericDef(field.FieldType) ?? field.FieldType,
+                    destinations, deeper))
                 return false;
         }
         return true;
@@ -812,9 +884,22 @@ internal static class InlinedMemberRecovery
     // A literal only flows into a parameter slot when the slot is numeric or
     // boolean - `new ObscuredInt(0)`, not `new Rect(0)` - or when it is the
     // null literal into a reference slot.
-    private static bool ImmediateCompatible(TypeAnalysisContext? parameterType, IOperand operand) =>
-        operand is not (Immediate or FloatLiteral or DoubleLiteral)
-        || (operand is Immediate { Value: 0 } && parameterType?.IsValueType == false)
+    private static bool ImmediateCompatible(TypeAnalysisContext? parameterType, IOperand operand)
+    {
+        if (operand is not (Immediate or FloatLiteral or DoubleLiteral))
+        {
+            // A bound operand lands in the member's parameter slot verbatim:
+            // it must already be of the slot's type family, not just not a
+            // literal. `OperandObjectType` follows casts and `&` targets.
+            var sourceType = OperandObjectType(operand);
+            if (parameterType == null || sourceType == null)
+                return true;
+            return SameDef(sourceType, parameterType)
+                || sourceType.IsAssignableTo(parameterType)
+                || sourceType.IsValueType && parameterType.IsValueType
+                    && sourceType.Type == parameterType.Type;
+        }
+        return (operand is Immediate { Value: 0 } && parameterType?.IsValueType == false)
         || parameterType?.Type is LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_I1
             or LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_U1
             or LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_I2
@@ -828,6 +913,7 @@ internal static class InlinedMemberRecovery
             or LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_BOOLEAN
             or LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_CHAR
             or LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_ENUM;
+    }
 
     private static bool ConstEquals(IOperand operand, object? value) =>
         (operand, value) switch
@@ -893,14 +979,8 @@ internal static class InlinedMemberRecovery
 
         try
         {
-            lock (SummaryLock)
-            {
-                if (Summaries.TryGetValue(candidate, out cached))
-                    return cached.Summary;
-                var result = new SummaryResult { Summary = BuildSummary(candidate, context, 0) };
-                Summaries[candidate] = result;
-                return result.Summary;
-            }
+            return Summaries.GetOrAdd(candidate,
+                new SummaryResult { Summary = BuildSummary(candidate, context) }).Summary;
         }
         catch
         {
@@ -912,7 +992,11 @@ internal static class InlinedMemberRecovery
         }
     }
 
-    private static MethodAnalysisContext? BodyOf(MethodAnalysisContext candidate,
+    // The body the summary reads, with facts present. Only method monitors
+    // acquired through Monitor.TryEnter are ever held by a caller of this -
+    // waiting on one is what would let two workers hold-and-wait each other,
+    // so a mid-analysis body is a pending ask, not a blocking one.
+    private static MethodAnalysisContext? EnsureBody(MethodAnalysisContext candidate,
         MethodAnalysisContext context)
     {
         var body = candidate;
@@ -933,98 +1017,53 @@ internal static class InlinedMemberRecovery
         {
         }
 
-        if (body.ControlFlowGraph == null && body.UnderlyingPointer != 0)
+        if (body.MemberBodyFacts != null)
+            return body;
+        if (body.ControlFlowGraph == null && body.UnderlyingPointer == 0)
+            return null;
+
+        // Facts only exist once the body's AnalyzeCore ends, so reaching the
+        // monitor means the body is still inside it - and a body inside
+        // AnalyzeCore never runs this pass, so it can never be waiting on this
+        // worker. Waiting out that lift cannot wait-cycle, and once it lands
+        // every asker sees the same facts in the same state.
+        Monitor.Enter(body);
+        try
         {
-            // Never wait on a method lock a parallel analysis may hold - that
-            // thread can itself need a summary. Analyze() locks on the method
-            // itself, so whoever enters first performs it once.
-            if (!Monitor.TryEnter(body))
-                return null;
-            try
-            {
-                body.Analyze();
-            }
-            catch
-            {
-                return null;
-            }
-            finally
-            {
-                Monitor.Exit(body);
-            }
+            if (body.ControlFlowGraph == null)
+                body.AnalyzeForMemberSummary();
+            // Bodies never lifted through AnalyzeCore - test fixtures and
+            // other synthetic contexts - still get their facts, on this same
+            // thread where the live block list cannot be mutating.
+            if (body.MemberBodyFacts == null)
+                CaptureBodyFacts(body);
         }
-        return body.ControlFlowGraph != null ? body : null;
+        catch
+        {
+            return null;
+        }
+        finally
+        {
+            Monitor.Exit(body);
+        }
+        return body.MemberBodyFacts != null ? body : null;
     }
 
     private static BodySummary? BuildSummary(MethodAnalysisContext candidate,
-        MethodAnalysisContext context, int depth)
+        MethodAnalysisContext context)
     {
-        var body = BodyOf(candidate, context);
-        if (body == null || depth > 3)
+        var facts = EnsureBody(candidate, context)?.MemberBodyFacts;
+        if (facts == null || facts.Rejected)
             return null;
 
-        var instructions = body.ControlFlowGraph!.Blocks
-            .SelectMany(b => b.Instructions).ToList();
-        Logger.VerboseNewline(
-            $"Inlined member recovery: summarizing {candidate.FullName}: "
-            + string.Join("; ", instructions.Select(i => i.ToString())),
-            "Analysis");
-
-        var thisLocal = body.ParameterLocals.FirstOrDefault(p => p.IsThis);
+        var thisLocal = facts.ThisLocal;
         if (thisLocal == null)
             Logger.VerboseNewline(
-                $"Inlined member recovery: {candidate.FullName}: no this-local in [{string.Join(",", body.ParameterLocals.Select(p => p.Name))}]",
+                $"Inlined member recovery: {candidate.FullName}: no this-local",
                 "Analysis");
-        var paramIndex = body.ParameterLocals.Where(p => !p.IsThis && !p.IsMethodInfo)
-            .Select((l, i) => (l, i)).ToDictionary(x => x.l, x => x.i);
-
-        // Pass 1: accept the simple bodies - defs, raw stores, calls to inline.
-        var definitions = new Dictionary<LocalVariable, IOperand>();
-        var rawStores = new List<(FieldReference Destination, IOperand Source)>();
-        var ctorCalls = new List<(LocalVariable Receiver, List<IOperand> Args, MethodAnalysisContext Ctor)>();
-        var returns = new List<IOperand>();
-        var rejected = false;
-        foreach (var instruction in instructions)
-        {
-            switch (instruction.OpCode)
-            {
-                case OpCode.Nop or OpCode.Jump or OpCode.ShiftStack:
-                    break;
-                case OpCode.Return:
-                    if (instruction.Operands.Count > 0)
-                        returns.Add(instruction.Operands[0]);
-                    break;
-                case OpCode.Newobj when instruction.Operands is [LocalVariable allocated, ..]:
-                    definitions[allocated] = allocated;
-                    break;
-                case OpCode.Move when instruction.Operands is [LocalVariable d, var s]:
-                    definitions[d] = s;
-                    break;
-                case OpCode.Move when instruction.Operands is [FieldReference f, var s2]:
-                    rawStores.Add((f, s2));
-                    break;
-                case OpCode.CallVoid when instruction.Operands is
-                    [MethodAnalysisContext { Name: ".ctor" }, ..]:
-                case OpCode.Call when instruction.Operands is
-                    [MethodAnalysisContext { Name: ".ctor" }, ..]:
-                {
-                    var target = (MethodAnalysisContext)instruction.Operands[0];
-                    var receiverIndex = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
-                    var args = instruction.Operands.Skip(receiverIndex + 1).ToList();
-                    if (Unwrap(instruction.Operands[receiverIndex]) is LocalVariable receiver)
-                        ctorCalls.Add((receiver, args, target));
-                    else
-                        rejected = true;
-                    break;
-                }
-                default:
-                    rejected = true;
-                    break;
-            }
-        }
-
-        if (rejected)
-            return null;
+        var paramIndex = facts.ParamIndex;
+        var definitions = facts.Definitions;
+        var returns = facts.Returns;
 
         // Produced roots: `this` for a ctor/writer, the returned value for a
         // producer; a freshly allocated local counts as produced too.
@@ -1041,7 +1080,7 @@ internal static class InlinedMemberRecovery
 
         var summary = new BodySummary();
         var okay = true;
-        foreach (var (destination, source) in rawStores)
+        foreach (var (destination, source) in facts.RawStores)
         {
             if (!roots.Contains(destination.Local) || destination.Containers.Count != 0)
             {
@@ -1051,7 +1090,7 @@ internal static class InlinedMemberRecovery
             summary.Stores[FieldKey.Of(destination.Field)] =
                 (destination.Field, Classify(source, definitions, paramIndex, thisLocal, 0));
         }
-        foreach (var (receiver, args, ctor) in ctorCalls)
+        foreach (var (receiver, args, ctor) in facts.CtorCalls)
         {
             if (!roots.Contains(receiver))
             {
@@ -1088,7 +1127,98 @@ internal static class InlinedMemberRecovery
                     ? staticRead.Field
                     : staticRead.Containers.Count > 0 ? staticRead.Containers[0] : staticRead.Field;
         }
+
+        // A struct result is also assembled lane-wise into the return
+        // aggregate: `ret.x <- tmp.x; ret.y <- statics.sf.y` returns the whole
+        // `root.prefix` value when every store into the returned local copies
+        // one lane of a shared field path on a shared root.
+        if (summary.ReturnsInstanceField == null && summary.ReturnsStaticField == null
+            && returns.Count == 1 && returns[0] is LocalVariable returnedLocal
+            && returnedLocal.Type?.IsValueType == true
+            && TraceReturnedValue(facts, returnedLocal, thisLocal) is { } trace)
+        {
+            var (root, prefix) = trace;
+            if (thisLocal != null && ReferenceEquals(root, thisLocal))
+                summary.ReturnsInstanceField = prefix[^1];
+            else if (root.Type is StaticFieldStorageTypeAnalysisContext)
+                summary.ReturnsStaticField = prefix[^1];
+        }
         return summary;
+    }
+
+    // Resolve every raw store into `returned` to `(root, prefix + lane)` and
+    // keep the common `(root, prefix)`: all lanes of the returned value must
+    // come from the same field path on the same root. A lane that stops at a
+    // different root, skips a field, or has no field source is not a
+    // whole-value return and yields null.
+    private static (LocalVariable Root, List<FieldAnalysisContext> Prefix)? TraceReturnedValue(
+        BodyFacts facts, LocalVariable returned, LocalVariable? thisLocal)
+    {
+        LocalVariable? root = null;
+        List<FieldAnalysisContext>? prefix = null;
+        var lanes = new List<FieldReference>();
+        foreach (var (destination, source) in facts.RawStores)
+        {
+            if (!ReferenceEquals(destination.Local, returned))
+                continue;
+            lanes.Add(destination);
+            var resolved = TraceFieldPath(source, facts.Definitions);
+            if (resolved == null)
+                return null;
+            var (resolvedRoot, path) = resolved.Value;
+            var lanePath = destination.Containers.Append(destination.Field).ToList();
+            if (path.Count <= lanePath.Count
+                || !lanePath.Select((f, i) => (f, i)).All(pair =>
+                    SameField(path[path.Count - lanePath.Count + pair.i], pair.f)))
+                return null;
+            var candidatePrefix = path.Take(path.Count - lanePath.Count).ToList();
+            if (candidatePrefix.Count == 0)
+                return null; // `return <root>` is not a member access
+            if (root == null)
+            {
+                root = resolvedRoot;
+                prefix = candidatePrefix;
+            }
+            else if (!ReferenceEquals(root, resolvedRoot)
+                     || !SamePath(candidatePrefix, prefix!))
+                return null;
+        }
+        if (root == null || prefix == null)
+            return null;
+        var leafType = FieldKey.GenericDef(prefix[^1].FieldType) ?? prefix[^1].FieldType;
+        if (leafType == null || !CoversAllFields(leafType, lanes, []))
+            return null;
+        return (root, prefix);
+    }
+
+    // Walk a store's source down to `(rootLocal, fieldPath)` by folding a
+    // `local.field` read into the field path `local` was defined by. A local
+    // whose definition is not a field path is the root itself (a statics
+    // block, `this`, a parameter).
+    private static (LocalVariable Root, List<FieldAnalysisContext> Path)? TraceFieldPath(
+        IOperand source, Dictionary<LocalVariable, IOperand> definitions)
+    {
+        var path = new List<FieldAnalysisContext>();
+        var current = source;
+        for (var guard = 0; guard < 16; guard++)
+        {
+            switch (current)
+            {
+                case FieldReference field:
+                    path.InsertRange(0, field.Containers.Append(field.Field));
+                    current = field.Local;
+                    break;
+                case LocalVariable local when definitions.TryGetValue(local, out var def)
+                    && def is LocalVariable or FieldReference:
+                    current = def;
+                    break;
+                case LocalVariable local:
+                    return (local, path);
+                default:
+                    return null;
+            }
+        }
+        return null;
     }
 
     private static IOperand Unwrap(IOperand operand) =>

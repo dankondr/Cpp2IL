@@ -1,5 +1,8 @@
+using System;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
@@ -241,6 +244,78 @@ public class InlinedMemberRecoveryTests
         });
     }
 
+    // A struct getter assembles its result lane-wise into the return
+    // aggregate (`ret.x <- tmp.x`, `ret.y <- statics.sf.y`) - the real
+    // `Vector2.zero` codegen shape. Reads of the whole field and of single
+    // lanes both map to the accessible getter.
+    [Test]
+    public void PerLaneStructReturnCallsGetter()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+
+        var vector = InjectedStruct("Vec");
+        var fx = Field(vector, "x", App.SystemTypes.SystemInt32Type, FieldAttributes.Public);
+        var fy = Field(vector, "y", App.SystemTypes.SystemInt32Type, FieldAttributes.Public);
+        var hidden = Field(vector, "hidden", vector,
+            FieldAttributes.Private | FieldAttributes.Static);
+        vector.Fields.Add(fx);
+        vector.Fields.Add(fy);
+        vector.Fields.Add(hidden);
+
+        var getter = Member(vector, "get_P", vector,
+            MethodAttributes.Public | MethodAttributes.Static);
+        vector.Methods.Add(getter);
+        var getterStatics = Local("statics",
+            new StaticFieldStorageTypeAnalysisContext(vector, Mscorlib));
+        var tmp = Local("tmp", vector);
+        var result = Local("result", vector);
+        GiveBody(getter,
+            new Instruction(0, OpCode.Move, tmp,
+                new FieldReference(hidden, getterStatics, 0)),
+            new Instruction(1, OpCode.Move, new FieldReference(fx, result, 0),
+                new FieldReference(fx, tmp, 0)),
+            new Instruction(2, OpCode.Move, new FieldReference(fy, result, 0),
+                new FieldReference(fy, getterStatics, 0, [hidden])),
+            new Instruction(3, OpCode.Return, result));
+
+        var caller = CallerIn(OtherAssembly);
+        var statics = Local("statics",
+            new StaticFieldStorageTypeAnalysisContext(vector, Mscorlib));
+        var whole = Local("d", vector);
+        var lane = Local("e", vector);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, whole,
+                new FieldReference(hidden, statics, 0)),
+            new Instruction(1, OpCode.Move, new FieldReference(fy, lane, 0),
+                new FieldReference(fy, statics, 0, [hidden])),
+            new Instruction(2, OpCode.Return),
+        ]);
+
+        InlinedMemberRecovery.Run(caller);
+
+        var block = caller.ControlFlowGraph.Blocks.First(b => b.Instructions.Count > 0);
+        var calls = block.Instructions.Where(i => i.OpCode == OpCode.Call).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(calls, Has.Count.EqualTo(1));
+            Assert.That(calls[0].Operands[0], Is.SameAs((IOperand)getter));
+            var produced = calls[0].Operands[1];
+            var wholeMove = block.Instructions.First(i => i.OpCode == OpCode.Move
+                && i.Operands[0] == whole);
+            Assert.That(wholeMove.Operands[1], Is.SameAs(produced));
+            var laneSource = block.Instructions
+                .SelectMany(i => i.Operands).OfType<FieldReference>()
+                .FirstOrDefault(f => f.Containers.Count == 0
+                    && ReferenceEquals(f.Local, produced));
+            Assert.That(laneSource, Is.Not.Null);
+            Assert.That(laneSource!.Field, Is.SameAs((FieldAnalysisContext)fy));
+            Assert.That(block.Instructions.SelectMany(i => i.Operands)
+                .OfType<FieldReference>().Count(f => ReferenceEquals(f.Local, statics)),
+                Is.Zero);
+        });
+    }
+
     // Consecutive stores into different fields of the same object are
     // separate accesses: each maps to its own accessible setter.
     [Test]
@@ -382,6 +457,125 @@ public class InlinedMemberRecoveryTests
             Assert.That(store.OpCode, Is.EqualTo(OpCode.Move));
             Assert.That(block.Instructions.Any(i => i.OpCode is OpCode.Call or OpCode.CallVoid),
                 Is.False);
+        });
+    }
+
+    // A member force-lifted for a summary runs the pipeline with this pass
+    // suppressed, so a forced body can never itself force another - two
+    // workers then never wait on each other. The body's own Analyze() runs
+    // the pass once.
+    [Test]
+    public void ForcedBodyRunsMemberRecoveryOnItsOwnAnalyze()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+
+        var owner = new InjectedTypeAnalysisContext(Mscorlib, "Tests", "Box",
+            App.SystemTypes.SystemObjectType, TypeAttributes.Public);
+        var hidden = Field(owner, "hidden", App.SystemTypes.SystemInt32Type,
+            FieldAttributes.Private);
+        owner.Fields.Add(hidden);
+
+        var setter = Member(owner, "set_Value", App.SystemTypes.SystemVoidType,
+            MethodAttributes.Public, App.SystemTypes.SystemInt32Type);
+        owner.Methods.Add(setter);
+        var setterThis = Local("this", owner);
+        var setterParam = Local("value", App.SystemTypes.SystemInt32Type);
+        GiveBody(setter, setterThis, [setterParam],
+            new Instruction(0, OpCode.Move, new FieldReference(hidden, setterThis, 0),
+                setterParam),
+            new Instruction(1, OpCode.Return));
+
+        var carrier = new InjectedTypeAnalysisContext(OtherAssembly, "Tests", "Carrier",
+            App.SystemTypes.SystemObjectType, TypeAttributes.Public);
+        var forced = Member(carrier, "Write", App.SystemTypes.SystemVoidType,
+            MethodAttributes.Public, App.SystemTypes.SystemInt32Type);
+        carrier.Methods.Add(forced);
+        var forcedThis = Local("this", carrier);
+        var obj = Local("obj", owner);
+        var value = Local("value", App.SystemTypes.SystemInt32Type);
+        GiveBody(forced, forcedThis, [value],
+            new Instruction(0, OpCode.Move, new FieldReference(hidden, obj, 0), value),
+            new Instruction(1, OpCode.Return));
+
+        // The summary-forced lift does not run this pass on the body's own
+        // diagnosed store.
+        forced.AnalyzeForMemberSummary();
+        var block = forced.ControlFlowGraph.Blocks.First(b => b.Instructions.Count > 0);
+        Assert.That(block.Instructions.FirstOrDefault(i => i.OpCode == OpCode.CallVoid),
+            Is.Null);
+
+        forced.Analyze();
+        var call = block.Instructions.FirstOrDefault(i => i.OpCode == OpCode.CallVoid);
+        Assert.Multiple(() =>
+        {
+            Assert.That(call, Is.Not.Null);
+            Assert.That(call!.Operands[0], Is.SameAs((IOperand)setter));
+            Assert.That(call.Operands[1], Is.SameAs((IOperand)obj));
+            Assert.That(call.Operands[2], Is.SameAs((IOperand)value));
+        });
+        forced.Analyze(); // pending consumed: a second Analyze does not re-run
+        Assert.That(block.Instructions.Count(i => i.OpCode == OpCode.CallVoid),
+            Is.EqualTo(1));
+    }
+
+    // A body another worker holds the method monitor on cannot be read yet:
+    // the ask waits that lift out - a body still inside AnalyzeCore never runs
+    // this pass, so the wait cannot cycle - then recovers once the body lands.
+    [Test]
+    public void InFlightMemberWaitsForBodyThenRecovers()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+
+        var owner = new InjectedTypeAnalysisContext(Mscorlib, "Tests", "Box",
+            App.SystemTypes.SystemObjectType, TypeAttributes.Public);
+        var hidden = Field(owner, "hidden", App.SystemTypes.SystemInt32Type,
+            FieldAttributes.Private);
+        owner.Fields.Add(hidden);
+
+        var setter = Member(owner, "set_Value", App.SystemTypes.SystemVoidType,
+            MethodAttributes.Public, App.SystemTypes.SystemInt32Type);
+        owner.Methods.Add(setter);
+        var setterThis = Local("this", owner);
+        var setterParam = Local("value", App.SystemTypes.SystemInt32Type);
+        GiveBody(setter, setterThis, [setterParam],
+            new Instruction(0, OpCode.Move, new FieldReference(hidden, setterThis, 0),
+                setterParam),
+            new Instruction(1, OpCode.Return));
+
+        var caller = CallerIn(OtherAssembly);
+        var obj = Local("obj", owner);
+        var value = Local("value", App.SystemTypes.SystemInt32Type);
+        var store = new Instruction(0, OpCode.Move,
+            new FieldReference(hidden, obj, 0), value);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            store,
+            new Instruction(1, OpCode.Return),
+        ]);
+
+        // The member's monitor stands in for a parallel worker mid-analysis:
+        // the ask waits for it instead of settling for a diagnosis.
+        Monitor.Enter(setter);
+        Task<int> task;
+        try
+        {
+            task = Task.Run(() => InlinedMemberRecovery.Run(caller));
+            Assert.That(task.Wait(TimeSpan.FromMilliseconds(500)), Is.False,
+                "the pass finished while the member body was still in flight");
+        }
+        finally
+        {
+            Monitor.Exit(setter);
+        }
+        Assert.That(task.Wait(TimeSpan.FromSeconds(30)), Is.True);
+
+        var block = caller.ControlFlowGraph.Blocks.First(b => b.Instructions.Count > 0);
+        var call = block.Instructions.FirstOrDefault(i => i.OpCode == OpCode.CallVoid);
+        Assert.Multiple(() =>
+        {
+            Assert.That(call, Is.Not.Null);
+            Assert.That(call!.Operands[0], Is.SameAs((IOperand)setter));
         });
     }
 }
