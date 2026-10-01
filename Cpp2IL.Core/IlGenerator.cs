@@ -721,17 +721,20 @@ public static class IlGenerator
                 var moveDestinationType = StoreContract(instruction.Operands[0], context);
                 // A pass-inserted copy (Index < 0) is an SSA phi-edge write: the
                 // edge carries the all-zero value of the one register it covers.
-                // When the destination slot's whole value fits that register the
-                // edge proves default(T); on a wider or unsized slot the binary
-                // only cleared the register, so the implicit default keeps a
-                // named note.
-                if (instruction.Index < 0 && instruction.Operands[0] is LocalVariable
+                // When the destination slot's whole value fits that register's
+                // storage — a Vector3's 12 bytes live inside one 16-byte V
+                // register — the edge proves default(T); on a wider or unsized
+                // slot the binary only cleared the register, so the implicit
+                // default keeps a named note.
+                if (instruction.Index < 0 && instruction.Operands[0] is LocalVariable phiEdgeLocal
                     && moveDestinationType is { IsValueType: true }
                     && IsZeroConstant(instruction.Operands[1]))
                 {
                     var phiEdgeSlotSize = TypeSizes.MinimumUnboxedSize(moveDestinationType,
                         context.AppContext.Binary.PointerSizeBytes);
-                    if (phiEdgeSlotSize > 0 && phiEdgeSlotSize <= context.AppContext.Binary.PointerSizeBytes)
+                    var phiEdgeCoverage = Analysis.LocalVariables.RegisterCoverageBytes(
+                        phiEdgeLocal.Register.Name, context.AppContext.Binary.PointerSizeBytes);
+                    if (phiEdgeSlotSize > 0 && phiEdgeSlotSize <= phiEdgeCoverage)
                         PushDefaultValue(moveDestinationType, method, instructions, context);
                     else
                         EmitNullOrDefault(moveDestinationType, method, instructions, context,
@@ -10107,34 +10110,78 @@ public static class IlGenerator
         var isShift = instruction.OpCode is OpCode.ShiftLeft or OpCode.ShiftRight;
         var operands = instruction.Operands.Skip(1).ToArray();
 
-        // The carrier width is the single width the op's value operands provably
-        // share: a float operand contributes the width of its bit pattern, an
-        // integral operand its stack width, a native int or pointer its register
-        // width. Literals adapt to the carrier but one that does not fit it is a
-        // width disagreement of its own. A shift's amount joins no consensus —
-        // the CIL ops take an i32/n-int count regardless.
+        // The register lane an `and`-family op ran on: the destination's scalar
+        // width pins it — an ARM64 W write reads each operand register's low 32
+        // bits and zero-extends the result into X, an X write is 64-bit end to
+        // end. Every operand then coerces to that lane: a declared float
+        // reinterprets through BitConverter at its own width then narrows or
+        // zero-extends (`fmov w,s` keeps a D register's low dword; a W write
+        // always zeroes the X high half), a declared integer truncates or
+        // zero-extends, a literal adapts within it, and an undeclared local —
+        // inference only — loads adaptively instead of vetoing the lane the
+        // binary proved. When the destination carries no scalar contract the
+        // proven operands must agree on one width. A shift is different: its
+        // lane is the *value's* width (`lsr x8,x9,#32` keeps the high dword in
+        // a narrow destination), and its count joins no consensus — the CIL
+        // ops take an i32 count regardless.
+        var storeContract = StoreContract(instruction.Operands[0], context);
+        TypeAnalysisContext? fpConsumer = null;
         var carrierWidth = 0;
+        if (storeContract != null)
+        {
+            if (storeContract is ByRefTypeAnalysisContext)
+                return false;
+            if (storeContract.FullName is "System.Single" or "System.Double")
+            {
+                fpConsumer = storeContract;
+                if (!isShift)
+                    carrierWidth = storeContract.FullName == "System.Single" ? 4 : 8;
+            }
+            else
+            {
+                var destinationWidth = IntegralStackWidth(storeContract);
+                if (destinationWidth == 0)
+                    return false;
+                if (!isShift)
+                    carrierWidth = destinationWidth < 0 ? 8 : destinationWidth;
+            }
+        }
+
         var sawFloat = false;
+        var consensusWidth = 0;
         for (var i = 0; i < operands.Length; i++)
         {
             var joinsCarrier = !(isShift && i == 1);
             if (operands[i] is Immediate immediate)
             {
-                if (joinsCarrier && carrierWidth == 4
+                if (joinsCarrier && (carrierWidth == 4 || carrierWidth == 0)
                     && unchecked((long)(int)immediate.Value) != immediate.Value
                     && unchecked((long)(uint)immediate.Value) != immediate.Value)
                     return false;
                 continue;
             }
             var emitted = EmittedOperandType(operands[i], context);
+            if (emitted is ByRefTypeAnalysisContext)
+                return false; // `&x` is a managed pointer, not bits a carrier can hold
+            if (operands[i] is LocalVariable { Type: null })
+            {
+                // Inference-only operand: the emitted stack type is a guess, so
+                // it adapts to the lane instead of pinning one — but a float
+                // guess still marks the carrier (its bits reinterpret like a
+                // declared float's), while a reference or struct guess can
+                // never enter a carrier and keeps the op diagnosed.
+                if (emitted?.FullName is "System.Single" or "System.Double")
+                    sawFloat = true;
+                else if (IntegralStackWidth(emitted) == 0)
+                    return false;
+                continue;
+            }
             int width;
             if (emitted?.FullName is "System.Single" or "System.Double")
             {
                 sawFloat = true;
                 width = emitted.FullName == "System.Single" ? 4 : 8;
             }
-            else if (emitted is ByRefTypeAnalysisContext)
-                return false; // `&x` is a managed pointer, not bits a carrier can hold
             else
             {
                 var integral = IntegralStackWidth(emitted);
@@ -10142,41 +10189,25 @@ public static class IlGenerator
                     return false;
                 width = integral < 0 ? 8 : integral;
             }
-            if (joinsCarrier && carrierWidth != 0 && carrierWidth != width)
-                return false;
-            if (joinsCarrier)
-                carrierWidth = width;
+            if (joinsCarrier && consensusWidth == 0)
+                consensusWidth = width;
+            else if (joinsCarrier && consensusWidth != width)
+                consensusWidth = -1;
         }
-        if (!sawFloat || carrierWidth == 0)
+        if (!sawFloat)
             return false;
-
-        // A float result comes back only at a proven FP consumer — a destination
-        // of the carrier's own float type (`fmov` into a V register after the
-        // integer op). An integral destination of any width is an honest
-        // consumer: a narrower slot truncates exactly like a W-register read of
-        // the X result, a wider one sees the zero-extension every ARM64 W-write
-        // performs. Everything else — a `&` slot the carrier cannot enter, a
-        // struct/reference destination no stack coercion can satisfy, or a float
-        // of the wrong width — has no honest store and stays unrecoverable.
-        // These checks run before any instruction is emitted.
-        var storeContract = StoreContract(instruction.Operands[0], context);
-        TypeAnalysisContext? fpConsumer = null;
-        if (storeContract != null)
+        if (carrierWidth == 0)
         {
-            if (storeContract is ByRefTypeAnalysisContext)
+            // No scalar destination (or a shift, whose lane is the shifted
+            // value): the proven operands must all name the same lane, or the
+            // register width is unproven and the op stays diagnosed.
+            if (consensusWidth <= 0)
                 return false;
-            var destinationWidth = storeContract.FullName == "System.Single" ? 4
-                : storeContract.FullName == "System.Double" ? 8
-                : IntegralStackWidth(storeContract);
-            if (destinationWidth == 0)
-                return false;
-            if (storeContract.FullName is "System.Single" or "System.Double")
-            {
-                if (destinationWidth != carrierWidth)
-                    return false;
-                fpConsumer = storeContract;
-            }
+            carrierWidth = consensusWidth;
         }
+        if (fpConsumer != null
+            && (fpConsumer.FullName == "System.Single" ? 4 : 8) != carrierWidth)
+            return false;
 
         var instructions = method.CilMethodBody!.Instructions;
         var module = method.DeclaringModule!;
@@ -10192,21 +10223,53 @@ public static class IlGenerator
             {
                 // `fmov` between the banks: the float's own bits at its own
                 // width, reinterpreted through BitConverter — the only legal
-                // float → integer sequence.
+                // float → integer sequence. A wider pattern narrows to the lane
+                // (`fmov w,s` keeps the D register's low dword), a narrower one
+                // zero-extends (a W write zeroes the X high half).
                 LoadOperand(operand, method, locals, writeLine, emitted, context);
                 var single = emitted.FullName == "System.Single";
                 instructions.Add(CilOpCodes.Call, bitConverter.CreateMemberReference(
                     single ? "SingleToInt32Bits" : "DoubleToInt64Bits",
                     MethodSignature.CreateStatic(single ? factory.Int32 : factory.Int64,
                         [single ? factory.Single : factory.Double])));
+                var floatWidth = single ? 4 : 8;
                 if (isShift && i == 1 && !single)
                     // the count is i32-shaped: keep the carrier's low bits
                     EmitStackCoerceOrDefault(systemTypes.SystemInt64Type, systemTypes.SystemInt32Type, method, context);
+                else if (!isShift && floatWidth > carrierWidth)
+                    instructions.Add(CilOpCodes.Conv_I4);
+                else if (!isShift && floatWidth < carrierWidth)
+                    instructions.Add(CilOpCodes.Conv_U8);
+            }
+            else if (operand is LocalVariable { Type: null })
+            {
+                // Inference-only integral operand: the lane it adapts to is the
+                // type it takes (the check pass already bailed on anything a
+                // carrier cannot hold).
+                LoadOperandIntoSlot(operand, isShift && i == 1
+                    ? systemTypes.SystemInt32Type
+                    : carrierType, context, method, locals, writeLine);
             }
             else if (isShift && i == 1)
                 LoadOperandIntoSlot(operand, systemTypes.SystemInt32Type, context, method, locals, writeLine);
             else
-                LoadOperandIntoSlot(operand, carrierType, context, method, locals, writeLine);
+            {
+                var operandWidth = IntegralStackWidth(emitted);
+                if (operandWidth < 0)
+                    operandWidth = 8;
+                if (operandWidth != 0 && operandWidth < carrierWidth)
+                {
+                    // A W write's operand contributes its 32 bits; into an X
+                    // lane they zero-extend, never sign-extend.
+                    LoadOperandIntoSlot(operand, systemTypes.SystemInt32Type, context, method, locals, writeLine);
+                    instructions.Add(CilOpCodes.Conv_U8);
+                }
+                else if (operandWidth != 0 && operandWidth > carrierWidth)
+                    // An X register read as W keeps only the low dword.
+                    LoadOperandIntoSlot(operand, systemTypes.SystemInt32Type, context, method, locals, writeLine);
+                else
+                    LoadOperandIntoSlot(operand, carrierType, context, method, locals, writeLine);
+            }
         }
 
         instructions.Add(instruction.OpCode switch
