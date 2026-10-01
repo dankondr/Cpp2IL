@@ -2,6 +2,383 @@
 
 Task: dankondr/castle-recovery#206. Continues slice 1 and addresses dankondr/Cpp2IL#80.
 
+## Slice 2b: handler calls and disjoint regions (2026-10-01)
+
+Task: dankondr/castle-recovery#206. Follow-up to merged Cpp2IL#175; continues
+Cpp2IL#80. **Draft: the >50% reduction target remains unmet.**
+
+Control is `9a7cd59582e69f927b68e5ed62dd59553ec38602`, the #175 merge.
+Its tree is identical to #175's measured `ad80dde37966f903be4712221e8c59d8b73483f4`
+(`git diff` is empty), so the complete `astra206-r6-branch` sweep and audit are
+reused as the control. The new full sweep is `astra206-r7-stage4`: 69,982 native
+methods, 183 assemblies, 178,274 reported methods. The denominator for the task's
+cumulative target remains the original **15,537 owned pads**.
+
+### Changes
+
+- A catch can call a parameterless virtual member on the caught exception when
+  its function pointer and hidden MethodInfo are the two halves of the same
+  proven vtable entry. Emission uses `callvirt` and preserves overrides.
+- Reference-valued handler calls define real locals used by later calls. Metadata
+  string literals are retained. Scalar/aggregate returns remain unsupported.
+- A proven `cctor_finished` guard with exactly one recognized class-init call
+  becomes `RuntimeHelpers.RunClassConstructor`. Initialization effects and
+  exceptions are preserved; extra effects or a different class reject the proof.
+- Unreachable predecessors no longer veto region entry or cleanup sharing.
+  Their branches are redirected to legal entry anchors. Live entries still
+  require a valid boundary.
+- When one enclosing catch would cross an uncovered call, disjoint protected
+  units get separate clauses with the same returning handler. Uncovered calls
+  remain outside the try. Overlap/nesting and handler exit checks still apply.
+
+### Verification
+
+| Scope | Methods | Diagnosed control → branch | Newly clean | Clean regressions | Pads control → branch |
+|---|---:|---:|---:|---:|---:|
+| All | 178,274 | 16,228 → 16,228 | 0 | 0 | 47,263 → 42,027 |
+| Game-owned | 25,348 | 3,944 → 3,944 | 0 | 0 | 10,816 → 9,623 |
+| CastleClashers.Game | 14,423 | 2,442 → 2,442 | 0 | 0 | 6,659 → 6,207 |
+| Castle-building owners + nested types | 280 | 87 → 87 | 0 | 0 | 684 → 684 |
+
+This slice removes **1,193 owned pad messages across 80 methods**. Eight methods
+lose all pads but retain other diagnostics. No method becomes entirely diagnostic-free,
+and no method gains any diagnostic. The castle-building scope is unchanged; its
+newly clean list is empty. Including merged #175, the cumulative reduction is
+**5,914 / 15,537 = 38.1%**. **9,623 remain**, versus the target of at most **7,768**
+(another 1,855 must be removed).
+
+Measured steps against the same control:
+
+| Step | Owned pads remaining |
+|---|---:|
+| Merged #175 | 10,816 |
+| Handler calls/results, literals and class initialization | 10,481 |
+| Reachable-entry checks | 9,804 |
+| Disjoint catch clauses | 9,623 |
+
+The fixed 133-method state-machine cohort improves **3,878 → 3,162 pads**.
+Native typed-catch proofs increase from 19 to 50 cohort methods, covering
+**392 → 811 native pads**. This slice clears no whole state-machine method.
+
+ILVerify: **170,144 valid / 416 invalid / 7,714 partial** in both control and branch;
+**zero status transitions**, including zero valid→invalid. The separate Bootstrap
+reachability gate remains 29/29 blocked in both; its nonzero audit exit is not
+reported as a passed gate.
+
+Tests: Core **1,214/1,214**, LibCpp2IL **12/12**, JitOracle **9/9**.
+Focused EH tests: **45/45**. Running those same tests against the pre-change
+production source gives **41 pass / 4 fail**: both positive virtual-result cases,
+the unreachable-entry case, and the disjoint-range case. The new negative cases
+continue to reject mismatched receiver/MethodInfo, a wrong cctor flag/class, and
+an extra store. CLR execution checks virtual override dispatch, the string result,
+once-only class initialization, and exceptions at both protected calls and at
+an uncovered intervening call.
+
+Commands used (with `NUGET_PACKAGES=/private/tmp/astra204-nuget`):
+
+```sh
+dotnet build Cpp2IL/Cpp2IL.csproj -c Release -f net10.0
+dotnet test --project Cpp2IL.Core.Tests
+dotnet test --project LibCpp2ILTests
+dotnet test --project Cpp2IL.JitOracle.Tests
+~/castle-evidence/r241/run-cpp2il.sh /private/tmp/astra206-r7-stage4-bin /private/tmp/astra206-r7-stage4
+```
+
+### Native/IL review of this slice
+
+No newly diagnostic-free methods exist in this slice. Instead, these ten methods
+with newly materialized clauses were checked against the retained native ISIL and
+LSDA ranges. This is a review of the EH changes, not a claim that their remaining
+normal-body diagnostics are harmless.
+
+| Method | Pads before → after | Checked handler |
+|---|---:|---|
+| `CastleClashers.HumanLikeBots.PlayerProfileFetcher::ParsePlayerProfileData` | 55 → 2 | get_Message via callvirt → literal + String.Concat → explicit EpiLog class init → LogError(this) |
+| `QuestController::AddQuestsByDifficulty` | 45 → 0 | Dispose of the same List<QuestDefinition> enumerator |
+| `Voodoo.Sauce.Privacy.PrivacyManager+<RequestAccessToData>d__48::MoveNext` | 43 → 2 | state = -2; address of the same AsyncVoidMethodBuilder; SetException; return |
+| `CastleClashers.HumanLikeBots.PlayerProfileFetcher::ParseUnitsData` | 49 → 10 | separate catch clauses, preserved inner Dispose and log-error handler |
+| `Voodoo.Sauce.Privacy.PrivacyManager+<SynchronizeWithServer>d__51::MoveNext` | 41 → 2 | state = -2; same AsyncVoidMethodBuilder.SetException |
+| `Voodoo.Sauce.Core.VoodooSauceBehaviour+<Awake>d__31::MoveNext` | 37 → 2 | state = -2; same AsyncVoidMethodBuilder.SetException |
+| `Voodoo.Sauce.Tools.AccessButton.HidePanel+<UIAppear>d__15::MoveNext` | 36 → 2 | state = -2; same AsyncVoidMethodBuilder.SetException |
+| `MatchTelemetryTrackerController::BuildDefenderUnitsWithDamage` | 52 → 20 | Dispose of the same List<Agent> enumerator |
+| `NoInternetController+<ResumeGame>d__27::MoveNext` | 33 → 2 | separate protected ranges; same AsyncVoidMethodBuilder.SetException |
+| `Voodoo.Live.VoodooLive+<Initialize>d__48::MoveNext` | 32 → 2 | state = -2; explicit AsyncTaskMethodBuilder class init; SetException |
+
+The two logging handlers preserve the original literal, virtual exception Message
+and cached call result. The six async handlers store -2 before SetException and
+leave to the existing return. The two newly emitted finally clauses dispose the
+same normal-path enumerator address. Uncovered calls remain outside split ranges;
+unproven auxiliary pads keep their original warning text.
+
+### Remaining proof boundaries
+
+| Remaining coverage | Methods | Remaining pads |
+|---|---:|---:|
+| No native proof | 342 | 6,081 |
+| All native pads proven; IL still refused | 70 | 1,321 |
+| Mixed proven/unproven | 137 | 2,221 |
+
+Native proofs cover **7,084 finally + 1,146 catch = 8,230 distinct pads**;
+**2,316 proven pads remain unmaterialized**. A native proof does not create a
+missing emitted protected unit or repair a diagnosed cleanup receiver.
+
+- `CastleMaker.Build` still lacks a reachable emitted seed; `StoreController.OpenSection`
+  still has a diagnosed/defaulted Dispose receiver. Normal-body fixes belong to the
+  reserved dataflow/memory lane. The prior 1,209/713-pad refusal cohorts below are
+  historical measurements, not new independent gains available from one guard.
+- Async handlers still have native builder targets absent from MethodsByAddress
+  and null MethodInfo, unknown exception-stack values, and cached owner/return
+  values that join live normal code. A field reload after a throwing call would
+  not prove the original cached receiver. A non-void or live-local merge needs an
+  explicit SSA agreement; this slice still accepts a void epilogue only.
+- Consuming the existing write-barrier/boxing alias contracts and tracking saved
+  normal-path field locals were investigated separately. The write-barrier probe
+  removes 169 non-owned pads but no owned pads; the state-machine catch count stays
+  811. These probes are not included in the delivered change.
+- The offset-16 defaults-table class still has no type from existing seeding.
+  No new guessed Object-class recognizer, game-specific address, filter or fault
+  interpretation is introduced. Across the 1,019-method cohort there are no
+  negative selectors or undecoded action chains.
+
+The remaining warning text is unchanged. The <50%-remaining objective is still
+open; this PR stays a draft rather than treating missing native/SSA evidence as proof.
+
+### Diagnostic-family output
+
+#### Control: all game-owned
+
+```text
+scope: Assembly-CSharp, CastleClashers.Core, CastleClashers.Game, CastleClashers.Internal.Services, CastleClashers.Internal.UI, CastleClashers.Rules, CastleClashers.Rules.Client, CastleClashers.SDKGlue, CastleClashers.VoodooTune, Ranked
+game-owned methods with diagnostics: 3944
+methods naming a canonical shared-generic type: 170
+
+| family | methods | sole | occurrences |
+|---|---:|---:|---:|
+| type: no legal conversion | 1581 | 577 | 6452 |
+| memory: unmanaged load | 1230 | 322 | 6246 |
+| dataflow: undefined local | 976 | 176 | 2459 |
+| other | 936 | 225 | 11701 |
+| type: synthetic default in operand slot | 709 | 170 | 1762 |
+| lift: unimplemented or unrecoverable op | 660 | 108 | 2284 |
+| call: unresolved target | 619 | 40 | 1122 |
+| memory: unmanaged store dropped | 535 | 120 | 2610 |
+| meta: native metadata pointer as value | 280 | 15 | 1102 |
+| access: inaccessible member | 205 | 30 | 560 |
+| call: indirect call | 179 | 8 | 293 |
+| dataflow: zero on phi edge | 133 | 2 | 415 |
+| call: hidden generic argument | 127 | 59 | 187 |
+| dataflow: non-empty stack at end | 70 | 1 | 70 |
+| dataflow: receiver not recovered | 55 | 12 | 106 |
+| dataflow: undefined local, float lane V1-V7 | 32 | 2 | 49 |
+| /Exception landing pad at/ | 557 | 111 | 10816 |
+
+greedy fix order (methods cleared at each step):
+  +  577 ->   577  type: no legal conversion
+  +  351 ->   928  memory: unmanaged load
+  +  409 ->  1337  other
+  +  301 ->  1638  lift: unimplemented or unrecoverable op
+  +  364 ->  2002  type: synthetic default in operand slot
+  +  383 ->  2385  dataflow: undefined local
+  +  383 ->  2768  memory: unmanaged store dropped
+  +  324 ->  3092  call: unresolved target
+  +  177 ->  3269  meta: native metadata pointer as value
+  +  150 ->  3419  access: inaccessible member
+
+top unresolved call targets (of 157):
+    259  0x37C2D44
+    171  0x37FC3B0
+     69  0x32D69D0
+     55  0x3C29C4C
+     48  0x37C2A9C
+     37  0x32D7C3C
+     35  0x3988F84
+     29  0x50921DC
+     21  0x38E44AC
+     15  0x37C2AA0
+     15  0x52BD3BC
+     14  0x3C29C08
+     13  0x32D50FC
+     13  0x37C2B6C
+     12  0x39295B4
+```
+
+#### Control: CastleClashers.Game
+
+```text
+scope: CastleClashers.Game
+game-owned methods with diagnostics: 2442
+methods naming a canonical shared-generic type: 105
+
+| family | methods | sole | occurrences |
+|---|---:|---:|---:|
+| type: no legal conversion | 1180 | 387 | 5423 |
+| memory: unmanaged load | 707 | 204 | 3708 |
+| dataflow: undefined local | 638 | 83 | 1677 |
+| lift: unimplemented or unrecoverable op | 502 | 67 | 1786 |
+| type: synthetic default in operand slot | 480 | 88 | 1355 |
+| memory: unmanaged store dropped | 446 | 107 | 2214 |
+| other | 433 | 65 | 7150 |
+| call: unresolved target | 375 | 18 | 672 |
+| access: inaccessible member | 140 | 22 | 457 |
+| meta: native metadata pointer as value | 137 | 4 | 585 |
+| dataflow: zero on phi edge | 102 | 1 | 369 |
+| call: indirect call | 82 | 1 | 123 |
+| call: hidden generic argument | 70 | 22 | 97 |
+| dataflow: receiver not recovered | 44 | 9 | 73 |
+| dataflow: non-empty stack at end | 28 | 0 | 28 |
+| dataflow: undefined local, float lane V1-V7 | 22 | 2 | 30 |
+| /Exception landing pad at/ | 247 | 29 | 6659 |
+
+greedy fix order (methods cleared at each step):
+  +  387 ->   387  type: no legal conversion
+  +  221 ->   608  memory: unmanaged load
+  +  199 ->   807  lift: unimplemented or unrecoverable op
+  +  212 ->  1019  type: synthetic default in operand slot
+  +  186 ->  1205  other
+  +  219 ->  1424  dataflow: undefined local
+  +  324 ->  1748  memory: unmanaged store dropped
+  +  208 ->  1956  call: unresolved target
+  +   90 ->  2046  access: inaccessible member
+  +   83 ->  2129  meta: native metadata pointer as value
+
+top unresolved call targets (of 112):
+    177  0x37C2D44
+     72  0x37FC3B0
+     53  0x32D69D0
+     33  0x3988F84
+     29  0x50921DC
+     21  0x32D7C3C
+     15  0x52BD3BC
+     14  0x3C29C08
+     13  0x38E44AC
+     13  0x37C2B6C
+     10  0x446DFD4
+     10  0x398925C
+      9  0x446E560
+      9  0x3BAD7C4
+      7  0x3C01928
+```
+
+#### Branch: all game-owned
+
+```text
+scope: Assembly-CSharp, CastleClashers.Core, CastleClashers.Game, CastleClashers.Internal.Services, CastleClashers.Internal.UI, CastleClashers.Rules, CastleClashers.Rules.Client, CastleClashers.SDKGlue, CastleClashers.VoodooTune, Ranked
+game-owned methods with diagnostics: 3944
+methods naming a canonical shared-generic type: 170
+
+| family | methods | sole | occurrences |
+|---|---:|---:|---:|
+| type: no legal conversion | 1580 | 577 | 6451 |
+| memory: unmanaged load | 1230 | 322 | 6245 |
+| dataflow: undefined local | 976 | 176 | 2459 |
+| other | 928 | 225 | 10508 |
+| type: synthetic default in operand slot | 709 | 170 | 1762 |
+| lift: unimplemented or unrecoverable op | 660 | 108 | 2284 |
+| call: unresolved target | 619 | 40 | 1122 |
+| memory: unmanaged store dropped | 535 | 120 | 2610 |
+| meta: native metadata pointer as value | 278 | 15 | 1099 |
+| access: inaccessible member | 205 | 30 | 560 |
+| call: indirect call | 179 | 8 | 293 |
+| dataflow: zero on phi edge | 133 | 2 | 415 |
+| call: hidden generic argument | 127 | 59 | 187 |
+| dataflow: non-empty stack at end | 70 | 1 | 70 |
+| dataflow: receiver not recovered | 55 | 12 | 106 |
+| dataflow: undefined local, float lane V1-V7 | 32 | 2 | 49 |
+| /Exception landing pad at/ | 549 | 111 | 9623 |
+
+greedy fix order (methods cleared at each step):
+  +  577 ->   577  type: no legal conversion
+  +  351 ->   928  memory: unmanaged load
+  +  409 ->  1337  other
+  +  301 ->  1638  lift: unimplemented or unrecoverable op
+  +  364 ->  2002  type: synthetic default in operand slot
+  +  383 ->  2385  dataflow: undefined local
+  +  383 ->  2768  memory: unmanaged store dropped
+  +  324 ->  3092  call: unresolved target
+  +  177 ->  3269  meta: native metadata pointer as value
+  +  150 ->  3419  access: inaccessible member
+
+top unresolved call targets (of 157):
+    259  0x37C2D44
+    171  0x37FC3B0
+     69  0x32D69D0
+     55  0x3C29C4C
+     48  0x37C2A9C
+     37  0x32D7C3C
+     35  0x3988F84
+     29  0x50921DC
+     21  0x38E44AC
+     15  0x37C2AA0
+     15  0x52BD3BC
+     14  0x3C29C08
+     13  0x32D50FC
+     13  0x37C2B6C
+     12  0x39295B4
+```
+
+#### Branch: CastleClashers.Game
+
+```text
+scope: CastleClashers.Game
+game-owned methods with diagnostics: 2442
+methods naming a canonical shared-generic type: 105
+
+| family | methods | sole | occurrences |
+|---|---:|---:|---:|
+| type: no legal conversion | 1179 | 387 | 5422 |
+| memory: unmanaged load | 707 | 204 | 3708 |
+| dataflow: undefined local | 638 | 83 | 1677 |
+| lift: unimplemented or unrecoverable op | 502 | 67 | 1786 |
+| type: synthetic default in operand slot | 480 | 88 | 1355 |
+| memory: unmanaged store dropped | 446 | 107 | 2214 |
+| other | 428 | 65 | 6698 |
+| call: unresolved target | 375 | 18 | 672 |
+| access: inaccessible member | 140 | 22 | 457 |
+| meta: native metadata pointer as value | 135 | 4 | 582 |
+| dataflow: zero on phi edge | 102 | 1 | 369 |
+| call: indirect call | 82 | 1 | 123 |
+| call: hidden generic argument | 70 | 22 | 97 |
+| dataflow: receiver not recovered | 44 | 9 | 73 |
+| dataflow: non-empty stack at end | 28 | 0 | 28 |
+| dataflow: undefined local, float lane V1-V7 | 22 | 2 | 30 |
+| /Exception landing pad at/ | 242 | 29 | 6207 |
+
+greedy fix order (methods cleared at each step):
+  +  387 ->   387  type: no legal conversion
+  +  221 ->   608  memory: unmanaged load
+  +  200 ->   808  lift: unimplemented or unrecoverable op
+  +  214 ->  1022  type: synthetic default in operand slot
+  +  183 ->  1205  other
+  +  219 ->  1424  dataflow: undefined local
+  +  324 ->  1748  memory: unmanaged store dropped
+  +  208 ->  1956  call: unresolved target
+  +   90 ->  2046  access: inaccessible member
+  +   83 ->  2129  meta: native metadata pointer as value
+
+top unresolved call targets (of 112):
+    177  0x37C2D44
+     72  0x37FC3B0
+     53  0x32D69D0
+     33  0x3988F84
+     29  0x50921DC
+     21  0x32D7C3C
+     15  0x52BD3BC
+     14  0x3C29C08
+     13  0x38E44AC
+     13  0x37C2B6C
+     10  0x446DFD4
+     10  0x398925C
+      9  0x446E560
+      9  0x3BAD7C4
+      7  0x3C01928
+```
+
+---
+
+## Merged slice 2: retained evidence
+
+The following sections describe merged #175 and its historical control.
+
 ## Rule
 
 An LSDA landing pad is evidence of native unwinding, not by itself evidence of a

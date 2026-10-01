@@ -455,7 +455,8 @@ public class ExceptionRegionRecoveryTests
     [TestCase(true, true, true, false)]
     [TestCase(true, true, true, true)]
     [TestCase(true, true, false, false, true)]
-    public void RecognizedTypeTestProducesCatchAndLeavesToNormalMerge(bool recognizedTypeTest, bool classTest, bool multipleCalls, bool returningHandler, bool normalTail = false)
+    [TestCase(true, true, true, false, false, true)]
+    public void RecognizedTypeTestProducesCatchAndLeavesToNormalMerge(bool recognizedTypeTest, bool classTest, bool multipleCalls, bool returningHandler, bool normalTail = false, bool deadIncoming = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "CatchOwner",
@@ -487,6 +488,8 @@ public class ExceptionRegionRecoveryTests
             At(0x2014, OpCode.CallVoid, report, exception),
             At(0x2018, OpCode.CallVoid, new StringLiteral("__cxa_end_catch")),
             returningHandler ? At(0x201C, OpCode.Return) : At(0x201C, OpCode.Jump, merge), mismatch];
+        var deadJump = At(0x1010, OpCode.Jump, secondCall);
+        if (deadIncoming) caller.ConvertedIsil.Insert(2, deadJump);
         if (multipleCalls || normalTail) caller.ConvertedIsil.Insert(1, secondCall);
         caller.UnwindInfo = new EhFunctionInfo { Start = 0x1000, Size = 0x1030 };
         caller.UnwindInfo.CallSites.Add(new EhCallSiteInfo(0x1000, multipleCalls ? 8UL : 4UL, 0x2000, 1)
@@ -529,6 +532,11 @@ public class ExceptionRegionRecoveryTests
             map[merge] = [new(CilOpCodes.Ret)];
         }
         foreach (var instruction in map.Values.SelectMany(x => x)) definition.CilMethodBody.Instructions.Add(instruction);
+        if (deadIncoming)
+        {
+            map[deadJump] = [new(CilOpCodes.Br, new CilInstructionLabel(map[secondCall][0]))];
+            definition.CilMethodBody.Instructions.Add(map[deadJump][0]);
+        }
         ExceptionRegionRecovery.Apply(caller, definition, map, new()
         {
             [proof] = [new(CilOpCodes.Stloc, local), new(CilOpCodes.Ldloc, local), new(CilOpCodes.Call, reportDefinition)]
@@ -580,6 +588,7 @@ public class ExceptionRegionRecoveryTests
         report.PutExtraData("AsmResolverMethod", reportDefinition);
         caller.ControlFlowGraph = new Cpp2IL.Core.Graphs.ISILControlFlowGraph(
             multipleCalls || normalTail ? [protectedCall, secondCall, merge] : [protectedCall, merge]);
+        if (deadIncoming) caller.ControlFlowGraph = new Cpp2IL.Core.Graphs.ISILControlFlowGraph([protectedCall, secondCall, merge, deadJump]);
         caller.Locals = [];
         IlGenerator.GenerateIl(caller, definition, proofs);
         Assert.That(definition.CilMethodBody.ExceptionHandlers.Count, Is.EqualTo(1));
@@ -588,6 +597,223 @@ public class ExceptionRegionRecoveryTests
         var runtimeType = Load(module).GetType("Tests.CatchOwner")!;
         Assert.DoesNotThrow(() => runtimeType.GetMethod("M")!.Invoke(null, null));
         Assert.That(runtimeType.GetField("Captured")!.GetValue(null)!.GetType().FullName, Is.EqualTo("Tests.SpecificException"));
+    }
+
+    [Test]
+    public void DisjointCatchRangesLeaveInterveningCallUnprotected()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "SplitCatch",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public);
+        var caller = owner.InjectMethodContext("M", app.SystemTypes.SystemVoidType, R.MethodAttributes.Public | R.MethodAttributes.Static, []);
+        var work = owner.InjectMethodContext("Work", app.SystemTypes.SystemVoidType, R.MethodAttributes.Public | R.MethodAttributes.Static, [app.SystemTypes.SystemInt32Type]);
+        var report = owner.InjectMethodContext("Report", app.SystemTypes.SystemVoidType, R.MethodAttributes.Public | R.MethodAttributes.Static, [app.SystemTypes.SystemExceptionType]);
+        Instruction At(ulong address, OpCode op, params IOperand[] operands) => new(0, op, operands.ToList()) { NativeAddress = address };
+        var first = At(0x1000, OpCode.CallVoid, work, new Immediate(1));
+        var uncovered = At(0x1004, OpCode.CallVoid, work, new Immediate(2));
+        var last = At(0x1008, OpCode.CallVoid, work, new Immediate(3));
+        var ret = At(0x100C, OpCode.Return);
+        var x0 = new Register(null, "X0"); var exception = new Register(null, "X19"); var flag = new Register(null, "flag");
+        var mismatch = At(0x2100, OpCode.CallVoid, new StringLiteral("il2cpp_raise_exception"), exception);
+        caller.ConvertedIsil = [first, uncovered, last, ret,
+            At(0x2000, OpCode.Call, new StringLiteral("__cxa_begin_catch"), x0, x0),
+            At(0x2004, OpCode.Move, exception, new MemoryOperand(x0)),
+            At(0x2008, OpCode.Call, new StringLiteral("il2cpp_class_is_assignable_from"), x0, app.SystemTypes.SystemExceptionType, new MemoryOperand(exception)),
+            At(0x200C, OpCode.CheckEqual, flag, x0, new Immediate(0)),
+            At(0x2010, OpCode.ConditionalJump, mismatch, flag),
+            At(0x2014, OpCode.CallVoid, report, exception),
+            At(0x2018, OpCode.CallVoid, new StringLiteral("__cxa_end_catch")), At(0x201C, OpCode.Jump, ret), mismatch];
+        caller.UnwindInfo = new EhFunctionInfo { Start = 0x1000, Size = 0x1104 };
+        foreach (var address in new ulong[] { 0x1000, 0x1008 })
+            caller.UnwindInfo.CallSites.Add(new EhCallSiteInfo(address, 4, 0x2000, 1) { Actions = [new EhActionInfo(1, 0xABC)] });
+        EhRegionPartition.Partition(caller);
+        var proofs = new NativeExceptionRegionProof(caller).FindCatches(a => a == 0xABC);
+        Assert.That(proofs, Has.Count.EqualTo(1));
+        var module = new ModuleDefinition("SplitCatch.dll");
+        var runtimeOwner = new TypeDefinition("Tests", "SplitCatch", AsmResolver.PE.DotNet.Metadata.Tables.TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(runtimeOwner);
+        var exceptionType = new TypeDefinition("Tests", "SplitException", AsmResolver.PE.DotNet.Metadata.Tables.TypeAttributes.Public, module.DefaultImporter.ImportType(typeof(Exception)));
+        module.TopLevelTypes.Add(exceptionType);
+        var ctor = new MethodDefinition(".ctor", AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Public
+            | AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.SpecialName | AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.RuntimeSpecialName,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void)) { CilMethodBody = new() };
+        exceptionType.Methods.Add(ctor);
+        ctor.CilMethodBody.Instructions.Add(CilOpCodes.Ldarg_0);
+        ctor.CilMethodBody.Instructions.Add(CilOpCodes.Call, module.DefaultImporter.ImportMethod(typeof(Exception).GetConstructor(Type.EmptyTypes)!));
+        ctor.CilMethodBody.Instructions.Add(CilOpCodes.Ret);
+        var throwAt = new FieldDefinition("ThrowAt", AsmResolver.PE.DotNet.Metadata.Tables.FieldAttributes.Public | AsmResolver.PE.DotNet.Metadata.Tables.FieldAttributes.Static, module.CorLibTypeFactory.Int32);
+        var caught = new FieldDefinition("Caught", throwAt.Attributes, module.CorLibTypeFactory.Int32);
+        runtimeOwner.Fields.Add(throwAt); runtimeOwner.Fields.Add(caught);
+        MethodDefinition Method(string name, params TypeSignature[] parameters)
+        {
+            var method = new MethodDefinition(name, AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Public | AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Static,
+                MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, parameters)) { CilMethodBody = new() };
+            runtimeOwner.Methods.Add(method); return method;
+        }
+        var workDefinition = Method("Work", module.CorLibTypeFactory.Int32);
+        var workRet = new CilInstruction(CilOpCodes.Ret);
+        var body = workDefinition.CilMethodBody!.Instructions;
+        body.Add(CilOpCodes.Ldarg_0); body.Add(CilOpCodes.Ldsfld, throwAt); body.Add(CilOpCodes.Bne_Un, new CilInstructionLabel(workRet));
+        body.Add(CilOpCodes.Newobj, ctor); body.Add(CilOpCodes.Throw); body.Add(workRet);
+        var reportDefinition = Method("Report", module.DefaultImporter.ImportTypeSignature(typeof(Exception)));
+        reportDefinition.CilMethodBody!.Instructions.Add(CilOpCodes.Ldc_I4_1); reportDefinition.CilMethodBody.Instructions.Add(CilOpCodes.Stsfld, caught); reportDefinition.CilMethodBody.Instructions.Add(CilOpCodes.Ret);
+        work.PutExtraData("AsmResolverMethod", workDefinition); report.PutExtraData("AsmResolverMethod", reportDefinition);
+        SyntheticFixture.SeedCorLibTypes(app, module, app.SystemTypes.SystemVoidType, app.SystemTypes.SystemObjectType, app.SystemTypes.SystemStringType, app.SystemTypes.SystemInt32Type);
+        app.SystemTypes.SystemExceptionType.PutExtraData("AsmResolverType", exceptionType);
+        caller.ControlFlowGraph = new Cpp2IL.Core.Graphs.ISILControlFlowGraph([first, uncovered, last, ret]); caller.Locals = [];
+        var definition = Method("M"); IlGenerator.GenerateIl(caller, definition, proofs);
+        Assert.That(definition.CilMethodBody!.ExceptionHandlers, Has.Count.EqualTo(2));
+        var runtime = Load(module).GetType("Tests.SplitCatch")!;
+        foreach (var index in new[] { 0, 1, 2, 3 })
+        {
+            runtime.GetField("ThrowAt")!.SetValue(null, index); runtime.GetField("Caught")!.SetValue(null, 0);
+            if (index == 2) Assert.Throws<R.TargetInvocationException>(() => runtime.GetMethod("M")!.Invoke(null, null));
+            else Assert.DoesNotThrow(() => runtime.GetMethod("M")!.Invoke(null, null));
+            Assert.That(runtime.GetField("Caught")!.GetValue(null), Is.EqualTo(index is 1 or 3 ? 1 : 0));
+        }
+    }
+
+    [TestCase(false, false, false)]
+    [TestCase(true, false, false)]
+    [TestCase(false, true, false)]
+    [TestCase(false, false, true)]
+    [TestCase(true, false, false, 1)]
+    [TestCase(true, false, false, 2)]
+    [TestCase(true, false, false, 3)]
+    public void CatchVirtualResultAndClassInitializationExecute(bool initializeClass, bool wrongMethodInfo, bool wrongReceiver, int badGuard = 0)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "VirtualCatchOwner",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public);
+        var caughtType = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "DerivedException",
+            app.SystemTypes.SystemExceptionType, R.TypeAttributes.Public);
+        var marker = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Initialized",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public);
+        var caller = owner.InjectMethodContext("M", app.SystemTypes.SystemVoidType, R.MethodAttributes.Public | R.MethodAttributes.Static, []);
+        var work = owner.InjectMethodContext("Work", app.SystemTypes.SystemVoidType, R.MethodAttributes.Public | R.MethodAttributes.Static, []);
+        var report = owner.InjectMethodContext("Report", app.SystemTypes.SystemVoidType, R.MethodAttributes.Public | R.MethodAttributes.Static,
+            [app.SystemTypes.SystemStringType, app.SystemTypes.SystemStringType]);
+        if (initializeClass)
+        {
+            // This fixture strips the public helper; seed the normal BCL contract.
+            var core = app.SystemTypes.SystemObjectType.DeclaringAssembly;
+            var helpers = core.Types.FirstOrDefault(t => t.FullName == "System.Runtime.CompilerServices.RuntimeHelpers");
+            if (helpers == null)
+            {
+                helpers = new InjectedTypeAnalysisContext(core, "System.Runtime.CompilerServices", "RuntimeHelpers", app.SystemTypes.SystemObjectType, R.TypeAttributes.Public);
+                core.Types.Add(helpers);
+            }
+            var handle = core.Types.Single(t => t.FullName == "System.RuntimeTypeHandle");
+            helpers.Methods.Add(new InjectedMethodAnalysisContext(helpers, "RunClassConstructor", app.SystemTypes.SystemVoidType,
+                R.MethodAttributes.Public | R.MethodAttributes.Static, [handle]));
+        }
+        var getter = app.SystemTypes.SystemExceptionType.Methods.Single(m => m.Name == "get_Message");
+        var slotOffset = Il2CppClassUsefulOffsets.GetVtableOffset(app.MetadataVersion, false) + 16 * getter.Definition!.slot;
+        var x0 = new Register(null, "X0");
+        var x1 = new Register(null, "X1");
+        var exception = new Register(null, "X19");
+        var savedResult = new Register(null, "X20");
+        var klass = new Register(null, "X8");
+        var target = new Register(null, "X9");
+        var condition = new Register(null, "condition");
+        Instruction At(ulong address, OpCode op, params IOperand[] operands) => new(0, op, operands.ToList()) { NativeAddress = address };
+        var protectedCall = At(0x1000, OpCode.CallVoid, work);
+        var ret = At(0x1004, OpCode.Return);
+        var mismatch = At(0x2100, OpCode.CallVoid, new StringLiteral("il2cpp_raise_exception"), exception);
+        var reportCall = At(0x2040, OpCode.CallVoid, report, savedResult, new StringLiteral(" suffix"));
+        caller.ConvertedIsil = [protectedCall, ret,
+            At(0x2000, OpCode.Call, new StringLiteral("__cxa_begin_catch"), x0, x0),
+            At(0x2004, OpCode.Move, exception, new MemoryOperand(x0)),
+            At(0x2008, OpCode.Call, new StringLiteral("il2cpp_class_is_assignable_from"), x0, caughtType, new MemoryOperand(exception)),
+            At(0x200C, OpCode.CheckEqual, condition, x0, new Immediate(0)),
+            At(0x2010, OpCode.ConditionalJump, mismatch, condition),
+            At(0x2014, OpCode.Move, klass, new MemoryOperand(exception)),
+            At(0x2018, OpCode.Move, target, new MemoryOperand(klass, addend: slotOffset)),
+            At(0x201C, OpCode.Move, x1, new MemoryOperand(klass, addend: slotOffset + (wrongMethodInfo ? 24 : 8))),
+            At(0x2020, OpCode.Move, x0, wrongReceiver ? new Immediate(0) : exception),
+            At(0x2024, OpCode.IndirectCall, target, x0, x0, x1),
+            At(0x2028, OpCode.Move, savedResult, x0)];
+        if (initializeClass)
+            caller.ConvertedIsil.AddRange([
+                At(0x202C, OpCode.Move, x0, marker),
+                At(0x2030, OpCode.Move, klass, new MemoryOperand(x0, addend: (app.MetadataVersion >= 29 ? 0xE4 : 0xE0) + (badGuard == 1 ? 4 : 0))),
+                At(0x2034, OpCode.CheckEqual, condition, klass, new Immediate(0)),
+                At(0x2034, OpCode.Not, condition, condition),
+                At(0x2034, OpCode.ConditionalJump, reportCall, condition),
+                At(0x2038, OpCode.CallVoid, new StringLiteral("il2cpp_codegen_runtime_class_init"), badGuard == 2 ? owner : x0)]);
+        if (badGuard == 3) caller.ConvertedIsil.Add(At(0x203C, OpCode.Move, new MemoryOperand(exception), new Immediate(0)));
+        caller.ConvertedIsil.AddRange([reportCall,
+            At(0x2044, OpCode.CallVoid, new StringLiteral("__cxa_end_catch")), At(0x2048, OpCode.Jump, ret), mismatch]);
+        caller.UnwindInfo = new EhFunctionInfo { Start = 0x1000, Size = 0x1104 };
+        caller.UnwindInfo.CallSites.Add(new EhCallSiteInfo(0x1000, 4, 0x2000, 1) { Actions = [new EhActionInfo(1, 0xABC)] });
+        EhRegionPartition.Partition(caller);
+        var proofs = new NativeExceptionRegionProof(caller).FindCatches(a => a == 0xABC);
+        if (wrongMethodInfo || wrongReceiver || badGuard != 0) { Assert.That(proofs, Is.Empty); return; }
+        Assert.That(proofs, Has.Count.EqualTo(1));
+
+        var module = new ModuleDefinition("VirtualCatch.dll");
+        const AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes publicMethod = AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Public;
+        var runtimeOwner = new TypeDefinition("Tests", "VirtualCatchOwner", AsmResolver.PE.DotNet.Metadata.Tables.TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        var baseException = new TypeDefinition("Tests", "BaseException", AsmResolver.PE.DotNet.Metadata.Tables.TypeAttributes.Public, module.DefaultImporter.ImportType(typeof(Exception)));
+        var derivedException = new TypeDefinition("Tests", "DerivedException", AsmResolver.PE.DotNet.Metadata.Tables.TypeAttributes.Public, baseException);
+        var initializedType = new TypeDefinition("Tests", "Initialized", AsmResolver.PE.DotNet.Metadata.Tables.TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        foreach (var type in new[] { runtimeOwner, baseException, derivedException, initializedType }) module.TopLevelTypes.Add(type);
+        caughtType.PutExtraData("AsmResolverType", derivedException);
+        marker.PutExtraData("AsmResolverType", initializedType);
+        var captured = new FieldDefinition("Captured", AsmResolver.PE.DotNet.Metadata.Tables.FieldAttributes.Public | AsmResolver.PE.DotNet.Metadata.Tables.FieldAttributes.Static, module.CorLibTypeFactory.String);
+        var initCount = new FieldDefinition("InitCount", captured.Attributes, module.CorLibTypeFactory.Int32);
+        runtimeOwner.Fields.Add(captured); runtimeOwner.Fields.Add(initCount);
+        MethodDefinition Method(TypeDefinition type, string name, MethodSignature signature, AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes attributes = publicMethod)
+        {
+            var method = new MethodDefinition(name, attributes, signature) { CilMethodBody = new() };
+            type.Methods.Add(method); return method;
+        }
+        MethodDefinition Constructor(TypeDefinition type, IMethodDescriptor parent)
+        {
+            var constructor = Method(type, ".ctor", MethodSignature.CreateInstance(module.CorLibTypeFactory.Void), publicMethod
+                | AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.SpecialName | AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.RuntimeSpecialName);
+            constructor.CilMethodBody!.Instructions.Add(CilOpCodes.Ldarg_0);
+            constructor.CilMethodBody.Instructions.Add(CilOpCodes.Call, parent);
+            constructor.CilMethodBody.Instructions.Add(CilOpCodes.Ret); return constructor;
+        }
+        var ctor = Constructor(derivedException, Constructor(baseException, module.DefaultImporter.ImportMethod(typeof(Exception).GetConstructor(Type.EmptyTypes)!)));
+        var virtualGetter = Method(baseException, "get_Message", MethodSignature.CreateInstance(module.CorLibTypeFactory.String), publicMethod
+            | AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Virtual | AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.NewSlot);
+        virtualGetter.CilMethodBody!.Instructions.Add(CilOpCodes.Ldstr, "base"); virtualGetter.CilMethodBody.Instructions.Add(CilOpCodes.Ret);
+        var overrideGetter = Method(derivedException, "get_Message", virtualGetter.Signature!, publicMethod | AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Virtual);
+        overrideGetter.CilMethodBody!.Instructions.Add(CilOpCodes.Ldstr, "derived"); overrideGetter.CilMethodBody.Instructions.Add(CilOpCodes.Ret);
+        getter.PutExtraData("AsmResolverMethod", virtualGetter);
+        var workDefinition = Method(runtimeOwner, "Work", MethodSignature.CreateStatic(module.CorLibTypeFactory.Void), publicMethod | AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Static);
+        workDefinition.CilMethodBody!.Instructions.Add(CilOpCodes.Newobj, ctor); workDefinition.CilMethodBody.Instructions.Add(CilOpCodes.Throw);
+        var reportDefinition = Method(runtimeOwner, "Report", MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.String, module.CorLibTypeFactory.String]), workDefinition.Attributes);
+        reportDefinition.CilMethodBody!.Instructions.Add(CilOpCodes.Ldarg_0); reportDefinition.CilMethodBody.Instructions.Add(CilOpCodes.Ldarg_1);
+        reportDefinition.CilMethodBody.Instructions.Add(CilOpCodes.Call, module.DefaultImporter.ImportMethod(typeof(string).GetMethod("Concat", [typeof(string), typeof(string)])!));
+        reportDefinition.CilMethodBody.Instructions.Add(CilOpCodes.Stsfld, captured); reportDefinition.CilMethodBody.Instructions.Add(CilOpCodes.Ret);
+        work.PutExtraData("AsmResolverMethod", workDefinition); report.PutExtraData("AsmResolverMethod", reportDefinition);
+        var initializer = Method(initializedType, ".cctor", MethodSignature.CreateStatic(module.CorLibTypeFactory.Void), AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Static
+            | AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.SpecialName | AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.RuntimeSpecialName);
+        initializer.CilMethodBody!.Instructions.Add(CilOpCodes.Ldsfld, initCount); initializer.CilMethodBody.Instructions.Add(CilOpCodes.Ldc_I4_1); initializer.CilMethodBody.Instructions.Add(CilOpCodes.Add); initializer.CilMethodBody.Instructions.Add(CilOpCodes.Stsfld, initCount); initializer.CilMethodBody.Instructions.Add(CilOpCodes.Ret);
+        if (initializeClass)
+        {
+            var run = proofs[0].Handler.Select(i => i.Operands[0]).OfType<MethodAnalysisContext>().Single(m => m.Name == "RunClassConstructor");
+            var wrapper = Method(runtimeOwner, "RunClassConstructor", MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [module.DefaultImporter.ImportTypeSignature(typeof(RuntimeTypeHandle))]), workDefinition.Attributes);
+            wrapper.CilMethodBody!.Instructions.Add(CilOpCodes.Ldarg_0);
+            wrapper.CilMethodBody.Instructions.Add(CilOpCodes.Call, module.DefaultImporter.ImportMethod(typeof(System.Runtime.CompilerServices.RuntimeHelpers).GetMethod("RunClassConstructor")!));
+            wrapper.CilMethodBody.Instructions.Add(CilOpCodes.Ret); run.PutExtraData("AsmResolverMethod", wrapper);
+        }
+        SyntheticFixture.SeedCorLibTypes(app, module, app.SystemTypes.SystemVoidType, app.SystemTypes.SystemStringType, app.SystemTypes.SystemObjectType);
+        caller.ControlFlowGraph = new Cpp2IL.Core.Graphs.ISILControlFlowGraph([protectedCall, ret]); caller.Locals = [];
+        var definition = Method(runtimeOwner, "M", workDefinition.Signature!, workDefinition.Attributes);
+        IlGenerator.GenerateIl(caller, definition, proofs);
+        Assert.That(definition.CilMethodBody!.ExceptionHandlers, Has.Count.EqualTo(1));
+        // Fixture type definitions are detached; bind reference-result locals to corlib.
+        foreach (var local in definition.CilMethodBody.LocalVariables.Where(l => l.VariableType.FullName == "System.String"))
+            local.VariableType = module.CorLibTypeFactory.String;
+        var runtime = Load(module).GetType("Tests.VirtualCatchOwner")!;
+        runtime.GetMethod("M")!.Invoke(null, null);
+        runtime.GetMethod("M")!.Invoke(null, null);
+        Assert.That(runtime.GetField("Captured")!.GetValue(null), Is.EqualTo("derived suffix"));
+        Assert.That(runtime.GetField("InitCount")!.GetValue(null), Is.EqualTo(initializeClass ? 1 : 0));
     }
 
     [TestCase(4, false, true)]

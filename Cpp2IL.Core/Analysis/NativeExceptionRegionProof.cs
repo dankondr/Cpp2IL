@@ -200,6 +200,7 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
             if (type == null) continue;
             var exceptionLocal = new LocalVariable("caughtException", new Register(null, "EH_EXCEPTION"), type);
             var handler = new List<Instruction>();
+            var handlerValues = new Dictionary<string, LocalVariable>();
             var endedCatch = false;
             var merge = -1;
             visited.Clear();
@@ -214,7 +215,7 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
                     merge = states.Keys.Where(i => code[i].OpCode == OpCode.Return && code[i].Operands.Count == 0).DefaultIfEmpty(-1).First();
                     break;
                 }
-                if (instruction.IsCall)
+                if (instruction.IsCall || instruction.OpCode == OpCode.IndirectCall)
                 {
                     if (Helper(instruction.Operands[0]) == nameof(BaseKeyFunctionAddresses.il2cpp_codegen_initialize_runtime_metadata_inline))
                     {
@@ -227,30 +228,58 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
                     { endedCatch = true; Clobber(state); }
                     else
                     {
-                        var callee = instruction.Operands[0] as MethodAnalysisContext;
+                        var virtualCall = instruction.OpCode == OpCode.IndirectCall;
+                        var callee = virtualCall ? CatchVirtualCallee(instruction, state, type)
+                            : instruction.Operands[0] as MethodAnalysisContext;
                         if (callee == null && instruction.Operands[0] is Immediate address
                             && context.AppContext.MethodsByAddress.TryGetValue(address.UnsignedValue, out var methods) && methods.Count == 1)
                             callee = methods[0];
                         callee ??= CatchCallee(instruction, state);
-                        if (callee == null || !callee.IsVoid || callee.Name == ".ctor") break;
+                        if (callee == null || callee.Name == ".ctor") break;
+                        // Raw indirect calls reserve operand 1 for the result, even for void.
+                        // Reference results use one register; aggregate and scalar ABI lowering stays outside this proof.
+                        if (!callee.IsVoid && (instruction.Destination is not Register || callee.ReturnType.IsValueType
+                            || callee.Parameters.Any(p => p.ParameterType.IsValueType))) break;
                         var count = callee.Parameters.Count + (callee.IsStatic ? 0 : 1);
                         var arguments = instruction.Operands.Skip(instruction.OpCode == OpCode.CallVoid ? 1 : 2).Take(count)
-                            .Select(o => CatchArgument(o, state, exceptionLocal)).ToArray();
+                            .Select(o => CatchArgument(o, state, exceptionLocal, handlerValues)).ToArray();
                         if (arguments.Length != count || arguments.Any(a => a == null)) break;
-                        handler.Add(new Instruction(handler.Count, OpCode.CallVoid, new List<IOperand> { callee }.Concat(arguments!).ToList()!)
-                            { NativeAddress = instruction.NativeAddress });
+                        var operands = new List<IOperand> { callee };
+                        LocalVariable? resultLocal = null;
+                        if (!callee.IsVoid)
+                        {
+                            resultLocal = new LocalVariable("catchResult" + handler.Count,
+                                new Register(null, "EH_RESULT_" + handler.Count), callee.ReturnType);
+                            operands.Add(resultLocal);
+                        }
+                        operands.AddRange(arguments!);
+                        handler.Add(new Instruction(handler.Count, callee.IsVoid ? OpCode.CallVoid : OpCode.Call, operands)
+                            { NativeAddress = instruction.NativeAddress, IsVirtualDispatch = virtualCall });
                         InvalidateCallStorage(instruction, state, callee);
                         Clobber(state);
+                        if (resultLocal != null)
+                        {
+                            var value = "catch-result:" + handler.Count;
+                            handlerValues[value] = resultLocal;
+                            Set(instruction.Destination, value, state);
+                        }
                     }
                 }
                 else if (instruction is { OpCode: OpCode.Move, Destination: MemoryOperand memory }
                     && (instruction.NativeStoreWidthBytes ?? memory.AccessSize) is > 0 and var width
                     && ThisField(Address(memory, state), width) is { } field)
                 {
-                    var value = CatchArgument(instruction.Operands[1], state, exceptionLocal);
+                    var value = CatchArgument(instruction.Operands[1], state, exceptionLocal, handlerValues);
                     if (value == null) break;
                     handler.Add(new Instruction(handler.Count, OpCode.Move, [field, value]) { NativeAddress = instruction.NativeAddress });
                     Transfer(instruction, state);
+                }
+                else if (TryClassInitGuard(index, state, out var initialized, out var afterInit, out var join))
+                {
+                    handler.Add(initialized!);
+                    state = afterInit!;
+                    index = join;
+                    continue;
                 }
                 else if (!TransferScaffolding(instruction, state, false)) break;
                 var next = Successors(code, index, state).ToList();
@@ -262,7 +291,8 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
             if (merge < 0 || !endedCatch || !VoidEpilogue(merge, out var mergeAddress)) continue;
             var existing = result.FirstOrDefault(r => r.Type == type && r.MergeAddress == mergeAddress
                 && r.Handler.Count == handler.Count && r.Handler.Zip(handler).All(p =>
-                    p.First.OpCode == p.Second.OpCode && p.First.Operands.Select(HandlerOperandKey)
+                    p.First.OpCode == p.Second.OpCode && p.First.IsVirtualDispatch == p.Second.IsVirtualDispatch
+                    && p.First.Operands.Select(HandlerOperandKey)
                         .SequenceEqual(p.Second.Operands.Select(HandlerOperandKey))));
             if (existing != null) { existing.Sites.Add(site); existing.Pads.UnionWith(state.Pads); }
             else result.Add(new(type, exceptionLocal, handler, [site], state.Pads, mergeAddress));
@@ -315,10 +345,19 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
         return false;
     }
 
-    private IOperand? CatchArgument(IOperand operand, State state, LocalVariable exceptionLocal)
+    private IOperand? CatchArgument(IOperand operand, State state, LocalVariable exceptionLocal,
+        Dictionary<string, LocalVariable> handlerValues)
     {
         var value = Value(operand, state);
         if (value == Exception) return exceptionLocal;
+        if (value != null && handlerValues.TryGetValue(value, out var result)) return result;
+        try
+        {
+            if (MetadataAddress(value) is { } literalAddress
+                && context.AppContext.LibCpp2IlContext.GetLiteralByAddress(literalAddress) is { } literalValue)
+                return new StringLiteral(literalValue);
+        }
+        catch (Exception) { return null; }
         if (TryNumber(value, out var number)) return new Immediate(number);
         if (operand is StringLiteral literal) return literal;
         if (context.ParameterOperands.FirstOrDefault() is Register parameter && !context.IsStatic)
@@ -344,6 +383,88 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
             return null;
         if (width != 0 && StorageSize(path.Field.FieldType) != width) return null;
         return new FieldReference(path.Field, self, (int)offset, path.Containers, width);
+    }
+
+    private bool TryClassInitGuard(int index, State state, out Instruction? initialized, out State? after, out int join)
+    {
+        initialized = null;
+        after = null;
+        join = -1;
+        if (index == 0 || code[index] is not { OpCode: OpCode.ConditionalJump } branch
+            || branch.Operands[0] is not Instruction target) return false;
+        var test = index - 1;
+        var flag = branch.Operands[1];
+        var negated = code[test] is { OpCode: OpCode.Not, Operands: [var destination, var input] }
+            && Equals(destination, flag) && Equals(input, flag);
+        if (negated) test--;
+        if (test < 0 || code[test] is not { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual,
+                Operands: [var compared, var loaded, Immediate { Value: 0 }] } comparison
+            || !Equals(compared, flag) || (comparison.OpCode == OpCode.CheckEqual) != negated)
+            return false;
+        var read = Value(loaded, state);
+        if (read == null || !read.StartsWith("m((", StringComparison.Ordinal) || !read.EndsWith("))", StringComparison.Ordinal)) return false;
+        var plus = read.LastIndexOf('+');
+        if (plus < 3 || !uint.TryParse(read[(plus + 1)..^2], out var offset)
+            || !Il2CppClassUsefulOffsets.TryGetField(offset, context.AppContext.MetadataVersion, context.AppContext.Binary.is32Bit,
+                out var field, out _) || field != Il2CppClassUsefulOffsets.Il2CppClassField.CctorFinished)
+            return false;
+        var klass = read[3..plus];
+        if (ResolveClassType(klass) is not { } type) return false;
+        join = code.IndexOf(target);
+        if (join <= index + 1 || join > index + 12) return false;
+        var initializedState = state.Copy();
+        var called = false;
+        for (var n = index + 1; n < join; n++)
+        {
+            var instruction = code[n];
+            if (instruction.IsCall)
+            {
+                if (called || Helper(instruction.Operands[0]) is not ("il2cpp_runtime_class_init_export"
+                        or "il2cpp_runtime_class_init_actual" or "il2cpp_codegen_runtime_class_init")
+                    || instruction.Operands.Count <= (instruction.OpCode == OpCode.CallVoid ? 1 : 2) || Value(instruction.Operands[instruction.OpCode == OpCode.CallVoid ? 1 : 2], initializedState) != klass)
+                    return false;
+                called = true;
+                Clobber(initializedState);
+            }
+            else if (instruction.OpCode != OpCode.Nop
+                && (instruction.OpCode is not (OpCode.Move or OpCode.Add) || instruction.Destination is not Register
+                    || !TransferScaffolding(instruction, initializedState, false))) return false;
+        }
+        if (!called) return false;
+        var runInitializer = context.AppContext.SystemTypes.SystemObjectType.DeclaringAssembly.Types
+            .FirstOrDefault(t => t.FullName == "System.Runtime.CompilerServices.RuntimeHelpers")?.Methods
+            .FirstOrDefault(m => m.Name == "RunClassConstructor" && m.IsStatic && m.IsVoid
+                && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.FullName == "System.RuntimeTypeHandle");
+        if (runInitializer == null) return false;
+        // Preserve initializer effects explicitly. A completed class initializer is
+        // a no-op in the CLR; the native guard's slow path performs the same action.
+        initialized = new Instruction(index, OpCode.CallVoid, [runInitializer, type]) { NativeAddress = code[index + 1].NativeAddress };
+        after = state.Copy();
+        Intersect(after.Registers, initializedState.Registers);
+        return true;
+    }
+
+    private MethodAnalysisContext? CatchVirtualCallee(Instruction instruction, State state, TypeAnalysisContext type)
+    {
+        // The function pointer and hidden MethodInfo must be the two halves of the
+        // same virtual entry on the caught object's class. Keep callvirt dispatch.
+        var target = Value(instruction.Operands[0], state);
+        const string prefix = "m((m(exception)+";
+        if (context.AppContext.Binary.is32Bit || target == null || !target.StartsWith(prefix, StringComparison.Ordinal)
+            || !target.EndsWith("))", StringComparison.Ordinal) || !long.TryParse(target[prefix.Length..^2], out var offset)
+            || Il2CppClassUsefulOffsets.GetVTableSlot(offset, context.AppContext.MetadataVersion, false) is not { } slot)
+            return null;
+        for (var declarer = type; declarer != null; declarer = declarer.DefaultBaseType)
+        {
+            var callee = declarer.Methods.FirstOrDefault(m => m.Definition?.slot == slot);
+            if (callee == null) continue;
+            var args = instruction.Operands.Skip(2).Select(o => Value(o, state)).ToArray();
+            if (callee.IsStatic || callee.Parameters.Count != 0 || args.Length <= 1 || args[0] != Exception
+                || args[callee.Parameters.Count + 1] != prefix + (offset + context.AppContext.Binary.PointerSizeBytes) + "))")
+                return null;
+            return callee;
+        }
+        return null;
     }
 
     private MethodAnalysisContext? CatchCallee(Instruction instruction, State state)
@@ -380,7 +501,7 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
         catch (Exception) { return null; }
     }
 
-    private TypeAnalysisContext? ResolveCatchType(string? value)
+    private TypeAnalysisContext? ResolveClassType(string? value)
     {
         var type = code.SelectMany(i => i.Operands).OfType<TypeAnalysisContext>().FirstOrDefault(t => value == "type:" + t.FullName);
         if (type == null && value != null)
@@ -400,6 +521,12 @@ internal sealed class NativeExceptionRegionProof(MethodAnalysisContext context,
                 catch (Exception) { return null; }
             }
         }
+        return type;
+    }
+
+    private TypeAnalysisContext? ResolveCatchType(string? value)
+    {
+        var type = ResolveClassType(value);
         for (var parent = type; parent != null; parent = parent.DefaultBaseType)
             if (parent == context.AppContext.SystemTypes.SystemExceptionType) return type;
         return null;
