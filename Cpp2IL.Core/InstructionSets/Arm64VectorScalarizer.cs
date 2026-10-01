@@ -3542,10 +3542,14 @@ internal sealed class Arm64VectorScalarizer
                 var op = SlotOperand(state, slot);
                 if (op == null)
                     continue;
+                // accessSize stays unset: the window's 4-byte width goes on
+                // NativeStoreWidthBytes instead, matching the base lifter's
+                // pair-store shape so an address-taken local can still widen
+                // into the aggregate the two windows compose.
                 IOperand mem = insn.MemBase == Arm64Register.X31
                     ? new StackOffset((int)(insn.MemOffset + r * bytes + slot * 4))
-                    : new MemoryOperand(Reg(insn.MemBase), addend: insn.MemOffset + r * bytes + slot * 4, accessSize: 4);
-                _add(_address, OpCode.Move, [mem, op]).NativeMemoryAccessSize = 4;
+                    : new MemoryOperand(Reg(insn.MemBase), addend: insn.MemOffset + r * bytes + slot * 4);
+                _add(_address, OpCode.Move, [mem, op]).NativeStoreWidthBytes = 4;
                 _emitted = true;
             }
         }
