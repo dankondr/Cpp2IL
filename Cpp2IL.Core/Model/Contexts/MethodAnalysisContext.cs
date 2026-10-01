@@ -81,6 +81,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     /// </summary>
     public List<LandingPadRegion> LandingPadRegions = [];
 
+    internal List<Instruction>? ExceptionRegionInstructions;
+
     public List<string> AnalysisWarnings = [];
 
     public static int MaxMethodSizeBytes = 30000; // 30KB
@@ -765,6 +767,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     public void ReleaseAnalysisData()
     {
         ConvertedIsil = null;
+        ExceptionRegionInstructions = null;
         ControlFlowGraph = null;
         DominatorInfo = null;
     }
