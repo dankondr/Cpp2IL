@@ -54,8 +54,11 @@ public static class FinalizerEhRecovery
         {
             emitted![0].OpCode = CilOpCodes.Leave;
             emitted[0].Operand = postLabel;
+            // By identity: Remove matches opcode and operand, so it could take an
+            // earlier identical instruction instead of this exit's own.
             for (var i = 1; i < emitted.Count; i++)
-                instructions.Remove(emitted[i]);
+                if (instructions.ToList().FindIndex(x => ReferenceEquals(x, emitted[i])) is >= 0 and var at)
+                    instructions.RemoveAt(at);
         }
 
         var handlerStart = new CilInstruction(CilOpCodes.Ldarg_0);

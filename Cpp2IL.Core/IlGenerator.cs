@@ -7810,12 +7810,14 @@ public static class IlGenerator
     // A label or handler boundary landing on a removed instruction is
     // redirected to the first kept instruction after it: the removed pushes
     // are dead, so jumping to one is jumping past them. Returns false when a
-    // removed instruction has no kept successor to land on.
+    // removed instruction has no kept successor to land on. Keyed by identity:
+    // CilInstruction equality is opcode, operand and offset, so a label on a
+    // kept `ldnull` would otherwise follow a removed one.
     private static bool RetargetRemoved(MethodDefinition? method,
         CilInstructionCollection instructions, List<int> remove)
     {
         var removeSet = new HashSet<int>(remove);
-        var afterOf = new Dictionary<CilInstruction, CilInstruction>();
+        var afterOf = new Dictionary<CilInstruction, CilInstruction>(ReferenceEqualityComparer.Instance);
         foreach (var k in remove)
         {
             var next = k + 1;
