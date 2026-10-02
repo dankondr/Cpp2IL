@@ -31,4 +31,28 @@ public class LocalVariablesTests
             Assert.That(method.ParameterLocals.Any(local => local.IsThis), Is.False);
         });
     }
+
+    [Test]
+    public void HiddenBufferReturnReturnsTheBufferItBuilt()
+    {
+        // The struct is built in the caller's buffer (`str x0, [x8]; …; ret`); the return register
+        // at `ret` holds nothing of it.
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        var guid = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Guid")!;
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Build", guid,
+            MethodAttributes.Public | MethodAttributes.Static, []);
+        var resolver = app.InstructionSet.CallingConventionResolver!;
+        var ret = new Instruction(1, OpCode.Return, resolver.ReturnRegister(method));
+        method.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, new MemoryOperand(resolver.HiddenReturnBufferRegister(method)!.Value), new Immediate(1)),
+            ret
+        ]);
+        method.ParameterOperands = [];
+        method.AnalysisWarnings = [];
+
+        LocalVariables.CreateAll(method);
+
+        Assert.That(ret.Operands, Is.EqualTo(new IOperand[] { method.Locals.Single(local => local.Name == "returnBuffer") }));
+    }
 }

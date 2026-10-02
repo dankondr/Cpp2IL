@@ -48,25 +48,31 @@ public static class BlockMemoryImportRecovery
             return;
 
         var binary = method.AppContext.Binary;
-        var unresolvedOther = 0;
+        var imports = new List<(Instruction Call, string Name)>();
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             if (!instruction.IsCall)
                 continue;
-
-            ulong? immediateTarget = instruction.Operands[0] is Immediate target
-                ? target.UnsignedValue
-                : null;
             var name = instruction.Operands[0] switch
             {
-                Immediate => importNameResolver != null
-                    ? importNameResolver(immediateTarget!.Value)
-                    : ResolveImportName(binary, immediateTarget!.Value),
+                Immediate target => importNameResolver != null
+                    ? importNameResolver(target.UnsignedValue)
+                    : ResolveImportName(binary, target.UnsignedValue),
                 StringLiteral { Value: { Length: > 0 } value } => value,
                 _ => null,
             };
-            if (name == null)
-                continue;
+            if (name != null)
+                imports.Add((instruction, name));
+        }
+
+        TypeCopiedFrameSlots(method, imports);
+
+        var unresolvedOther = 0;
+        foreach (var (instruction, name) in imports)
+        {
+            ulong? immediateTarget = instruction.Operands[0] is Immediate target
+                ? target.UnsignedValue
+                : null;
 
             var detail = "";
             var rewritten = name is "memcpy" or "memset" or "memmove"
@@ -93,6 +99,52 @@ public static class BlockMemoryImportRecovery
             lock (DiagnosticsLock)
                 System.IO.File.AppendAllText(DiagnosticsPath,
                     $"other\t{method.UnderlyingPointer:x}\t-\t-\tunresolved-call\t{unresolvedOther}\n");
+    }
+
+    /// <summary>
+    /// Names GOT-veneer import calls before metadata resolution runs. An import is
+    /// never a managed method body, but an unresolved immediate target is open to
+    /// <see cref="MetadataResolver.ResolveCallsViaMethodInfo"/>: a MethodInfo* an
+    /// earlier call left in the hidden-argument register makes it resolve
+    /// `bl __stack_chk_fail@plt` (or memcpy) as that managed method. Key functions
+    /// keep their address - KeyFunctionRecovery identifies them by it.
+    /// </summary>
+    internal static void NameImports(MethodAnalysisContext method, Func<ulong, string?>? importNameResolver = null)
+    {
+        if (method.AppContext.InstructionSet is not NewArmV8InstructionSet)
+            return;
+
+        var binary = method.AppContext.Binary;
+        BaseKeyFunctionAddresses? keyFunctions = null;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (!instruction.IsCall || instruction.Operands[0] is not Immediate target)
+                continue;
+            keyFunctions ??= method.AppContext.GetOrCreateKeyFunctionAddresses();
+            if (keyFunctions.IsKeyFunctionAddress(target.UnsignedValue))
+                continue;
+            var name = importNameResolver != null
+                ? importNameResolver(target.UnsignedValue)
+                : ResolveImportName(binary, target.UnsignedValue);
+            if (name is not { Length: > 0 })
+                continue;
+            instruction.SetOperand(0, new StringLiteral(name));
+
+            // In SSA a returned dst nothing reads is provably dead. Copy coalescing
+            // later folds that X0 def into whatever X0 local is live around the
+            // call (often `this`), where it would read as a use and block the
+            // block-op rewrite, so the dead def gets its own local now.
+            if (name is "memcpy" or "memset" or "memmove"
+                && instruction.Operands.Count > 1 && instruction.Operands[1] is LocalVariable result
+                && !method.ControlFlowGraph.Instructions.Any(reader => !ReferenceEquals(reader, instruction)
+                    && reader.Operands.Any(operand => LocalVariables.OperandLocals(operand).Contains(result))))
+            {
+                var discarded = new LocalVariable($"discarded_{instruction.Index}",
+                    new Register(null, $"DISCARDED_{instruction.Index}"), null);
+                method.Locals.Add(discarded);
+                instruction.SetOperand(1, discarded);
+            }
+        }
     }
 
     private static void Record(MethodAnalysisContext method, Instruction instruction, ulong target,
@@ -180,11 +232,50 @@ public static class BlockMemoryImportRecovery
         var content = call.Operands[3];
         var count = call.Operands[4];
 
+        if (count is Immediate { Value: > 0 } extent)
+        {
+            if (opcode == OpCode.MemorySet && content is Immediate { Value: 0 }
+                && destination is AddressOf { Target: FieldReference { Field.IsStatic: false } first }
+                && TrySplitFieldZeroFill(method, call, first, extent.Value))
+            {
+                detail = $"fields dst={Describe(destination, method)} n={extent.Value}";
+                return true;
+            }
+            var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+            destination = WholeMemberAddress(destination, extent.Value, pointerSize);
+            if (opcode != OpCode.MemorySet)
+                content = WholeMemberAddress(content, extent.Value, pointerSize);
+        }
+
+        // A copy out of a local nothing else in the method writes or addresses reads
+        // bytes the lift lost track of (a by-reference struct argument mapped to the
+        // wrong frame slot); spelling it as a copy would read an unassigned local.
+        if (opcode != OpCode.MemorySet && content is AddressOf { Target: LocalVariable source }
+            && !source.IsThis && !method.ParameterLocals.Contains(source)
+            && !method.ControlFlowGraph!.Instructions.Any(other => !ReferenceEquals(other, call)
+                && other.Operands.Any(operand => LocalVariables.OperandLocals(operand).Contains(source))))
+        {
+            detail = $"src-unwritten={Describe(content, method)}";
+            return false;
+        }
+
+        // The hidden return buffer local is typed as the value it points at, so a
+        // block op through it writes the returned value: its storage is the address.
+        var returnBuffer = ReturnBufferLocal(method);
+        var intoReturnBuffer = returnBuffer != null && ReferenceEquals(destination, returnBuffer);
+        if (intoReturnBuffer)
+            destination = new AddressOf(returnBuffer!);
+
+        // A block op that assigns one value type whole is emitted typed (initobj,
+        // ldobj/stobj), which keeps the GC barriers a reference field needs.
+        IOperand typedDestination = destination, typedContent = content;
+        var typed = IlGenerator.TypedBlockPointee(opcode, ref typedDestination, ref typedContent, count, method) != null;
+
         // Raw block ops write bytes without write barriers, so the destination's region
         // must provably hold no managed references. memset's fill byte and every size
         // argument need an integral shape; a memcpy/memmove source only has to produce
         // a pointer - reading a managed region through it needs no barrier.
-        if (!IsProvablyReferenceFreeRegion(destination, count, method, []))
+        if (!typed && (intoReturnBuffer || !IsProvablyReferenceFreeRegion(destination, count, method, [])))
         {
             detail = $"dst={Describe(destination, method)}";
             return false;
@@ -206,21 +297,166 @@ public static class BlockMemoryImportRecovery
         if (result != null && method.ControlFlowGraph!.Instructions
                 .Any(consumer => consumer.Sources.Contains(result)))
         {
-            if (!CanMaterializeReturn(result, method))
+            if (intoReturnBuffer)
             {
-                detail = $"result={Describe(result, method)}";
-                return false;
+                // The returned dst is the return buffer: the value it now holds.
+                if (method.ControlFlowGraph.FindBlockByInstruction(call) is not { } block)
+                {
+                    detail = "block";
+                    return false;
+                }
+                call.SetOperands(destination, content, count);
+                block.Instructions.Insert(block.Instructions.IndexOf(call) + 1,
+                    new Instruction(-1, OpCode.Move, result, returnBuffer!));
             }
+            else
+            {
+                if (!CanMaterializeReturn(result, method))
+                {
+                    detail = $"result={Describe(result, method)}";
+                    return false;
+                }
 
-            // The native functions return dst: materialize it as a native int so the
-            // result keeps a pointer value no matter what the destination operand was.
-            call.SetOperands(destination, content, count, result);
+                // The native functions return dst: materialize it as a native int so the
+                // result keeps a pointer value no matter what the destination operand was.
+                call.SetOperands(destination, content, count, result);
+            }
         }
         else
             call.SetOperands(destination, content, count);
 
         call.OpCode = opcode;
         detail = $"dst={Describe(destination, method)} src={Describe(content, method)} n={Describe(count, method)}";
+        return true;
+    }
+
+    // The hidden return-buffer parameter local (X8 on ARM64), which LocalVariables
+    // types as the returned value type.
+    private static LocalVariable? ReturnBufferLocal(MethodAnalysisContext method) =>
+        method.AppContext.InstructionSet.CallingConventionResolver?.HiddenReturnBufferRegister(method) is { } register
+            ? method.Locals.FirstOrDefault(local => local.Register.Number == register.Number
+                && local.Register.Version == -1 && local.Type is { IsValueType: true })
+            : null;
+
+    // IL2CPP copies struct temporaries between frame slots with memcpy, and those
+    // slots carry no type of their own. A copy of exactly sizeof(T) bytes between
+    // an untyped slot and storage proven to hold a T gives the slot T, in either
+    // direction and to a fixpoint, so a chain of temporaries types from one
+    // anchor. A slot that another frame local overlaps is left alone: those bytes
+    // have a second name.
+    private static void TypeCopiedFrameSlots(MethodAnalysisContext method,
+        List<(Instruction Call, string Name)> imports)
+    {
+        for (var changed = true; changed;)
+        {
+            changed = false;
+            foreach (var (call, name) in imports)
+                if (name is "memcpy" or "memmove" && call is { OpCode: OpCode.Call, Operands.Count: >= 5 }
+                    && call.Operands[4] is Immediate { Value: > 0 } count)
+                    changed |= TypeSlotFromPartner(call.Operands[2], call.Operands[3], count.Value, method)
+                        | TypeSlotFromPartner(call.Operands[3], call.Operands[2], count.Value, method);
+        }
+    }
+
+    private static bool TypeSlotFromPartner(IOperand slotAddress, IOperand partner, long count,
+        MethodAnalysisContext method)
+    {
+        if (slotAddress is not AddressOf { Target: LocalVariable { Type: null } slot }
+            || LocalVariables.TryStackOffset(slot.Register.Name) is not { } start
+            || IlGenerator.EmittedOperandType(partner, method) is not ByRefTypeAnalysisContext
+                { ElementType: { IsValueType: true } type }
+            || type is GenericParameterTypeAnalysisContext
+            || TypeSizes.MinimumUnboxedSize(type, method.AppContext.Binary.PointerSizeBytes) != count
+            || method.Locals.Any(other => !ReferenceEquals(other, slot)
+                && LocalVariables.TryStackOffset(other.Register.Name) is { } offset
+                && offset > start && offset < start + count))
+            return false;
+        slot.Type = type;
+        return true;
+    }
+
+    // `&obj.Last.Root` is how field resolution spells `obj + 0x10`: the first leaf at
+    // that offset. A block op of `count` bytes there addresses the outermost member
+    // that starts at the same byte and spans exactly `count` - `&obj.Last` for a
+    // 320-byte struct. Any other pointer, or a path whose offsets do not add up to
+    // the reference's own, is returned unchanged.
+    private static IOperand WholeMemberAddress(IOperand pointer, long count, int pointerSize)
+    {
+        if (pointer is not AddressOf { Target: FieldReference { Field.IsStatic: false } leaf })
+            return pointer;
+        var path = leaf.Containers.Append(leaf.Field).ToList();
+        if (path.Sum(FieldOffset) != leaf.Offset)
+            return pointer;
+        for (var depth = 0; depth < path.Count; depth++)
+        {
+            if (path.Skip(depth + 1).Any(member => FieldOffset(member) != 0)
+                || FieldStorageSize(path[depth], pointerSize) != count)
+                continue;
+            return depth == path.Count - 1
+                ? pointer
+                : new AddressOf(new FieldReference(path[depth], leaf.Local, leaf.Offset, path.Take(depth).ToList()));
+        }
+        return pointer;
+    }
+
+    // A zero fill over a managed object's fields is each covered field's default:
+    // clang merges `Last = new Pose(); Frames = 0;` into one memset over both. Every
+    // covered field must lie wholly inside the range (padding between them is
+    // unobservable); a struct field becomes a typed MemorySet (initobj), a scalar or
+    // reference field a store of its zero. The call becomes the first of those and
+    // the rest follow it. Anything not covered whole, unspellable, or whose returned
+    // dst is still read keeps the call.
+    private static bool TrySplitFieldZeroFill(MethodAnalysisContext method, Instruction call, FieldReference first,
+        long count)
+    {
+        if (call.Operands[1] is LocalVariable result
+            && method.ControlFlowGraph!.Instructions.Any(consumer => consumer.Sources.Contains(result)))
+            return false;
+
+        var root = first.Local;
+        var owner = IlGenerator.EmittedOperandType(root, method) is ByRefTypeAnalysisContext byRef
+            ? byRef.ElementType
+            : IlGenerator.EmittedOperandType(root, method);
+        if (owner is null or PointerTypeAnalysisContext or GenericParameterTypeAnalysisContext
+            || owner.FullName == "System.Object"
+            || first.Containers.Append(first.Field).Sum(FieldOffset) != first.Offset
+            || count > int.MaxValue
+            || MetadataResolver.CoveredFields(owner, first.Offset, (int)count, wholeStructs: true)
+                is not { Count: > 0 } parts
+            || method.ControlFlowGraph!.FindBlockByInstruction(call) is not { } block)
+            return false;
+
+        var stores = new List<Instruction>();
+        foreach (var part in parts)
+        {
+            var type = part.Field.FieldType;
+            var scalar = !type.IsValueType || IlGenerator.IntegralStackWidth(type) != 0
+                || type.FullName is "System.Single" or "System.Double";
+            if (MetadataResolver.MemberPathUnspellable((part.Field, part.Containers), method,
+                    store: true, addressed: !scalar))
+                return false;
+            var field = new FieldReference(part.Field, root, (int)part.Offset, part.Containers, part.Size);
+            if (scalar)
+            {
+                stores.Add(new Instruction(-1, OpCode.Move, field, type.FullName switch
+                {
+                    "System.Single" => new FloatLiteral(0f),
+                    "System.Double" => new DoubleLiteral(0d),
+                    _ => new Immediate(0),
+                }));
+                continue;
+            }
+            IOperand address = new AddressOf(field), zero = new Immediate(0);
+            if (IlGenerator.TypedBlockPointee(OpCode.MemorySet, ref address, ref zero, new Immediate(part.Size),
+                    method) == null)
+                return false;
+            stores.Add(new Instruction(-1, OpCode.MemorySet, new AddressOf(field), new Immediate(0),
+                new Immediate(part.Size)));
+        }
+
+        call.OpCode = stores[0].OpCode;
+        call.SetOperands([.. stores[0].Operands]);
+        block.Instructions.InsertRange(block.Instructions.IndexOf(call) + 1, stores.Skip(1));
         return true;
     }
 
@@ -277,7 +513,13 @@ public static class BlockMemoryImportRecovery
             case Immediate:
                 return true;
             case AddressOf { Target: LocalVariable local }:
-                return IsReferenceFree(IlGenerator.EmittedLocalType(local, context));
+                // A local's storage ends with its own type: a longer block op would
+                // write past it (a frame slot typed by its first field is the usual case).
+                var localType = IlGenerator.EmittedLocalType(local, context);
+                return IsReferenceFree(localType)
+                    && count is Immediate { Value: >= 0 } extent
+                    && extent.Value <= TypeSizes.MinimumUnboxedSize(localType,
+                        context.AppContext.Binary.PointerSizeBytes);
             case AddressOf { Target: FieldReference field }:
                 // A pointer into a nested member or a byref referent's field resolves
                 // only through interior-field provenance; the & it emits cannot spell

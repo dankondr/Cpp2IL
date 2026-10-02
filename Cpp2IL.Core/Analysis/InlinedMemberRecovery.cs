@@ -657,8 +657,11 @@ internal static class InlinedMemberRecovery
     {
         var wanted = leaves.ToDictionary(p => p.Key, p => (p.Value.Field, p.Value.Source));
         var candidates = new List<Match>();
+        // A method is never its own inlined member: a factory that builds its result in place
+        // matches its own stores, and that rewrite is a self-call.
         foreach (var member in MembersOn(accessedType))
-            if (TryBind(member, wanted, prefix, local, leafType, context) is { } bound)
+            if (DefinitionOf(member) != DefinitionOf(context)
+                && TryBind(member, wanted, prefix, local, leafType, context) is { } bound)
                 candidates.Add(bound);
 
         // Factories: a member on a stored operand's own type returning the
@@ -669,7 +672,7 @@ internal static class InlinedMemberRecovery
             var sourceType = OperandObjectType(wanted.Values.First().Source);
             if (sourceType != null)
                 foreach (var member in MembersOn(sourceType))
-                    if (!member.IsStatic
+                    if (!member.IsStatic && DefinitionOf(member) != DefinitionOf(context)
                         && TryBind(member, wanted, prefix, local, leafType, context) is { } bound)
                         candidates.Add(bound);
         }

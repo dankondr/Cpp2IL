@@ -717,6 +717,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         FlagConditionRecovery.Run(this);
         DeadCodeEliminator.Run(this);
 
+        // PLT imports are named before call resolution can mistake one for a managed method.
+        BlockMemoryImportRecovery.NameImports(this);
+
         // Resolve call targets, strings and getters, then run the combined type-propagation and
         // field-resolution fixpoint - all while still in SSA form, so every local is
         // single-assignment and a type, once known, is stable for that value.
@@ -793,6 +796,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Runs late so array and runtime-class operands reach their helpers after copy propagation has inlined them.
         ArrayRecovery.Run(this);
+        // Needs the array accesses recovered, and a T[,] index is only recovered while its bounds check proves it.
+        Il2CppCheckRecovery.Run(this);
         LocalVariables.ResolveLateGeneratedTypes(this);
         KeyFunctionRecovery.Run(this);
 

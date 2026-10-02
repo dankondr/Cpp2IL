@@ -105,6 +105,47 @@ public class AccessWidthTests
     }
 
     [Test]
+    public void ConstantBuiltInHalvesOverTwoFieldsGivesEachItsOwnBytes()
+    {
+        // `movz x8, #1; movk x8, #2, lsl #32; stur x8, [x0, #0x10]`: the or of the halves
+        // is one constant, first = 1 and second = 2.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var holder = InjectClass(app, "Holder");
+        InjectField("first", app.SystemTypes.SystemInt32Type, holder, 0x10);
+        InjectField("second", app.SystemTypes.SystemInt32Type, holder, 0x14);
+        var module = new ModuleDefinition("Width.dll");
+        Seed(module, app, holder);
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemObjectType);
+
+        var receiver = Local("holder", holder);
+        var low = Local("low");
+        var packed = Local("packed");
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, low, new Immediate(1)),
+            new(1, OpCode.Or, packed, low, new Immediate(0x0000000200000000)),
+            new(2, OpCode.Move, new MemoryOperand(receiver, null, 0x10, 0, 8), packed),
+            new(3, OpCode.Return)], [receiver, low, packed]);
+
+        MetadataResolver.ResolveFieldOffsets(caller);
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        int Stored(string field)
+        {
+            var store = il.First(i => i.OpCode == CilOpCodes.Stfld && i.Operand is IFieldDescriptor f && f.Name == field);
+            return il[il.IndexOf(store) - 1].GetLdcI4Constant();
+        }
+        Assert.Multiple(() =>
+        {
+            Assert.That(Stores(method, "first") && Stores(method, "second"), Is.True, () => Dump(method));
+            Assert.That(Stored("first"), Is.EqualTo(1), () => Dump(method));
+            Assert.That(Stored("second"), Is.EqualTo(2), () => Dump(method));
+        });
+    }
+
+    [Test]
     public void StoreCuttingAFieldInHalfKeepsDiagnostic()
     {
         // Four bytes at 0x12 are the upper half of `first` and the lower half of
@@ -350,6 +391,28 @@ public class AccessWidthTests
         {
             Assert.That(Stores(method, "level"), Is.True, () => Dump(method));
             Assert.That(Diagnoses(method, "m_value"), Is.False, () => Dump(method));
+        });
+    }
+
+    [Test]
+    public void WideRegisterStoreOverTwoFieldsKeepsDiagnostic()
+    {
+        // `ldr d8, [x19, #0x38]` read as its first float, then `str d8, [x20, #0x10]`: the
+        // store copies two floats, and naming `a` alone would drop `b`. A SIMD store's width
+        // is only on the instruction; its operand keeps width 0.
+        var (app, module, receiver) = FloatHolder();
+        var value = Local("value", app.SystemTypes.SystemSingleType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, new MemoryOperand(receiver, null, 0x10, 0, 0), value) { NativeStoreWidthBytes = 8 },
+            new(1, OpCode.Return)], [receiver, value]);
+
+        MetadataResolver.ResolveFieldOffsets(caller);
+        IlGenerator.GenerateIl(caller, method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(Stores(method, "a"), Is.False, () => Dump(method));
+            Assert.That(Diagnoses(method, "could not be emitted"), Is.True, () => Dump(method));
         });
     }
 

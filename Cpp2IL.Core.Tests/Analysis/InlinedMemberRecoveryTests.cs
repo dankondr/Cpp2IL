@@ -621,6 +621,37 @@ public class InlinedMemberRecoveryTests
         });
     }
 
+    // A factory that builds its result in the return buffer matches its own stores;
+    // calling itself there would recurse forever.
+    [Test]
+    public void FactoryKeepsItsOwnStores()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+
+        var record = InjectedStruct("Record");
+        var a = Field(record, "a", App.SystemTypes.SystemInt32Type, FieldAttributes.Private | FieldAttributes.InitOnly);
+        var b = Field(record, "b", App.SystemTypes.SystemInt32Type, FieldAttributes.Private | FieldAttributes.InitOnly);
+        record.Fields.Add(a);
+        record.Fields.Add(b);
+        var make = Member(record, "Make", record, MethodAttributes.Public | MethodAttributes.Static,
+            App.SystemTypes.SystemInt32Type, App.SystemTypes.SystemInt32Type);
+        record.Methods.Add(make);
+        var p0 = Local("p0", App.SystemTypes.SystemInt32Type);
+        var p1 = Local("p1", App.SystemTypes.SystemInt32Type);
+        var buffer = Local("returnBuffer", record);
+        make.ParameterLocals = [p0, p1];
+        GiveBody(make,
+            new Instruction(0, OpCode.Move, new FieldReference(a, buffer, 0), p0),
+            new Instruction(1, OpCode.Move, new FieldReference(b, buffer, 4), p1),
+            new Instruction(2, OpCode.Return, buffer));
+
+        InlinedMemberRecovery.Run(make);
+
+        Assert.That(Body(make).Instructions.Any(i => i.Operands.FirstOrDefault() == (IOperand)make), Is.False,
+            () => string.Join("\n", Body(make).Instructions));
+    }
+
     // A static the caller can name - here a private one of its own assembly,
     // the `count++` beside `Read() => count` shape - is read directly, not
     // through the holder's getter.
