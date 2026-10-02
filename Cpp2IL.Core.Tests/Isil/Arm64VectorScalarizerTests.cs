@@ -1184,3 +1184,199 @@ public class Arm64VectorScalarizerTests
         });
     }
 }
+
+public class Arm64VectorScalarizerIndexedStoreTests
+{
+    private static List<Instruction> Lift(params uint[] words) => LiftAt(0, words);
+
+    private static List<Instruction> LiftAt(ulong baseAddress, params uint[] words)
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Test",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Public | MethodAttributes.Static, []);
+        return new NewArmV8InstructionSet().ConvertInstructions(
+            Disassembler.Disassemble(words.SelectMany(BitConverter.GetBytes).ToArray(), baseAddress), context);
+    }
+
+    [Test]
+    public void PairedVectorLoadStoreCopiesWholeRange()
+    {
+        // ldp q1,q0 loads a 32-byte range; stp q1,q0 stores it back — one
+        // memory-to-memory move, not per-field stores that truncate the copy.
+        var il = Lift(
+            0xad410001, // ldp q1, q0, [x0, #0x20]
+            0xad000021); // stp q1, q0, [x1]
+
+        var copies = il.Where(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand && i.Operands[1] is MemoryOperand).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(copies, Has.Count.EqualTo(1), () => string.Join("\n", il));
+            var dst = (MemoryOperand)copies[0].Operands[0];
+            var src = (MemoryOperand)copies[0].Operands[1];
+            Assert.That(dst.Base, Is.EqualTo(new Register(null, "X1")));
+            Assert.That(dst.Addend, Is.EqualTo(0));
+            Assert.That(dst.AccessSize, Is.EqualTo(32));
+            Assert.That(src.Base, Is.EqualTo(new Register(null, "X0")));
+            Assert.That(src.Addend, Is.EqualTo(0x20));
+            Assert.That(src.AccessSize, Is.EqualTo(32));
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        });
+    }
+
+    [Test]
+    public void PostIndexedVectorStoreWritesBaseThenAdvancesBase()
+    {
+        // str q0,[x9],#0x30 stores at [x9] — not [x9+0x30] — and the writeback
+        // must be emitted after the store since the scalarizer's path replaces
+        // the caller's (which owns EmitWriteback).
+        var il = Lift(
+            0x6f00e400, // movi v0.2d, #0
+            0x3c830520); // str q0, [x9], #0x30
+
+        var storeIndex = il.FindIndex(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand { Base: Register { Name: "X9" }, Addend: 0 });
+        var bumpIndex = il.FindIndex(i => i.OpCode == OpCode.Add
+            && i.Operands[0] is Register { Name: "X9" });
+        Assert.Multiple(() =>
+        {
+            Assert.That(storeIndex, Is.GreaterThanOrEqualTo(0), () => string.Join("\n", il));
+            var store = il[storeIndex];
+            Assert.That(((MemoryOperand)store.Operands[0]).AccessSize, Is.EqualTo(16));
+            Assert.That(store.Operands[1], Is.EqualTo(new Immediate(0, 16)));
+            Assert.That(il.Any(i => i.OpCode == OpCode.Move
+                && i.Operands[0] is MemoryOperand { Base: Register { Name: "X9" }, Addend: 0x30 }),
+                Is.False, "post-index offset must not be used as the store addend");
+            Assert.That(bumpIndex, Is.GreaterThan(storeIndex),
+                () => "writeback must follow the store\n" + string.Join("\n", il));
+            var bump = il[bumpIndex];
+            Assert.That(bump.Operands[1], Is.EqualTo(new Register(null, "X9")));
+            Assert.That(bump.Operands[2], Is.EqualTo(new Immediate(0x30)));
+        });
+    }
+
+    [Test]
+    public void PreIndexedVectorStoreAdvancesBaseFirst()
+    {
+        // str q0,[x9,#0x30]! bumps x9 first, then stores at [x9].
+        var il = Lift(
+            0x6f00e400, // movi v0.2d, #0
+            0x3c830d20); // str q0, [x9, #0x30]!
+
+        var storeIndex = il.FindIndex(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand { Base: Register { Name: "X9" }, Addend: 0 });
+        var bumpIndex = il.FindIndex(i => i.OpCode == OpCode.Add
+            && i.Operands[0] is Register { Name: "X9" });
+        Assert.Multiple(() =>
+        {
+            Assert.That(storeIndex, Is.GreaterThanOrEqualTo(0), () => string.Join("\n", il));
+            Assert.That(bumpIndex, Is.GreaterThanOrEqualTo(0).And.LessThan(storeIndex),
+                () => "pre-index writeback must precede the store\n" + string.Join("\n", il));
+            Assert.That(il[bumpIndex].Operands[2], Is.EqualTo(new Immediate(0x30)));
+        });
+    }
+
+    [Test]
+    public void ScalarCompareDoesNotWipeTrackedRegister()
+    {
+        // fcmp reads its operands without writing: the register's proven
+        // windows must survive so a later 64-bit read still resolves the
+        // lane pair instead of being diagnosed.
+        var il = Lift(
+            0xfd400120, // ldr d0, [x9]
+            0x1e612000, // fcmp d0, d1
+            0x9e660009); // fmov x9, d0
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False,
+                () => string.Join("\n", il));
+            Assert.That(il.Any(i => i.OpCode == OpCode.Move
+                && i.Operands[0] is Register { Name: "X9" }), Is.True,
+                () => string.Join("\n", il));
+        });
+    }
+
+    [Test]
+    public void ConditionalScalarSelectMaterializesLanesOnEdge()
+    {
+        // fcsel writes the scalar register — a conditional-select, not a
+        // compare — so its edge must canonicalize the high window like every
+        // other scalar write; a merge reading V0.S1 on this path must find
+        // the local defined.
+        var il = LiftNative(
+            0xfd400120, // ldr d0, [x9]
+            0x1e610c00, // fcsel d0, d0, d1, eq
+            0x14000001, // b +4
+            0xfd400120); // ldr d0, [x9]
+
+        Assert.That(il.Any(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is Register { Name: "V0.S1" }), Is.True,
+            () => "fcsel edge must materialize V0.S1\n" + string.Join("\n", il));
+    }
+
+    [Test]
+    public void EdgeMaterializesLaneWrittenByPreviousInstruction()
+    {
+        // fmov s0 leaves only the low window proven; ldr d0 widens the register's
+        // proven value to 64 bits. The branch edge must materialize V0.S1 from
+        // the value ldr produced — a stale pre-write snapshot would read it as
+        // 32-bit and skip the mirror, leaving the element local undefined on
+        // this edge.
+        var il = LiftNative(
+            0x1e270000, // fmov s0, w0
+            0xfd400120, // ldr d0, [x9]
+            0x14000001, // b +4
+            0xfd400120); // ldr d0, [x9]
+
+        Assert.That(il.Any(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is Register { Name: "V0.S1" }), Is.True,
+            () => "edge after a widening write must materialize V0.S1\n" + string.Join("\n", il));
+    }
+
+    [Test]
+    public void CalleeSavedRegisterSurvivingCallReadsAsRegisterLocal()
+    {
+        // fmov d9 keeps the double in callee-saved d9 across a merge and a
+        // call, then fmov d0 restores it. The register local is proven for
+        // the low 64 bits on every path, so the restore is a register copy —
+        // splitting it into a Convert/ShiftLeft/Or recomposition only feeds
+        // the reader a temp whose write can sink after its use.
+        var il = LiftNative(
+            0x1e604009, // fmov d9, d0
+            0x34000068, // cbz w8, +12
+            0xf94003a0, // ldr x0, [x29]
+            0xd63f0100, // blr x8
+            0x1e604120); // fmov d0, d9
+
+        Assert.That(il.Any(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is Register { Name: "V0" }
+            && i.Operands[1] is Register { Name: "V9" }), Is.True,
+            () => "restore must read the proven register local\n" + string.Join("\n", il));
+        Assert.That(il.Any(i => i.OpCode is OpCode.ShiftLeft or OpCode.Or
+            && i.Operands[0] is Register { Name: { } t } && t.StartsWith("TEMP_VEC")), Is.False,
+            () => "no recomposition temps when the register local is proven\n" + string.Join("\n", il));
+    }
+
+    private sealed class NativeMethod(TypeAnalysisContext owner, ulong address)
+        : InjectedMethodAnalysisContext(owner, "Test", owner.AppContext.SystemTypes.SystemVoidType,
+            MethodAttributes.Public | MethodAttributes.Static, [])
+    {
+        public override ulong UnderlyingPointer => address;
+    }
+
+    private static List<Instruction> LiftNative(params uint[] words)
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        var bytes = words.SelectMany(BitConverter.GetBytes).ToArray();
+        var context = new NativeMethod(app.SystemTypes.SystemObjectType, 0x1000)
+        {
+            RawBytes = new BinarySlice(bytes)
+        };
+        return new NewArmV8InstructionSet().ConvertInstructions(
+            Disassembler.Disassemble(bytes, 0x1000), context);
+    }
+
+}
