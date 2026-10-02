@@ -1136,11 +1136,13 @@ public class Arm64VectorScalarizerTests
     }
 
     [Test]
-    public void ZeroVectorStoresEmitWholeWidthImmediates()
+    public void ZeroVectorStoresEmitPerWindowImmediates()
     {
-        // `movi` + vector stores is the compiler's struct/array zero-fill: each
-        // store must carry its full width with an immediate zero source so the
-        // resolver can split the range per field or merge a run into initobj.
+        // `movi` + vector stores is the compiler's struct/array zero-fill: the
+        // store is spelled one 4-byte Move per window — a base whose element
+        // type is not yet proven resolves each window to its own field (a
+        // 16-byte store would resolve to the single field at its addend and
+        // drop the rest), and a typed base still merges the run into initobj.
         var il = Lift(
             0x6f00e400, // movi v0.2d, #0
             0xad008120, // stp q0, q0, [x9, #0x10]
@@ -1150,13 +1152,15 @@ public class Arm64VectorScalarizerTests
             && i.Operands[0] is MemoryOperand { Base: Register { Name: "X9" } }).ToList();
         Assert.Multiple(() =>
         {
-            Assert.That(stores, Has.Count.EqualTo(3), () => string.Join("\n", il));
+            Assert.That(stores, Has.Count.EqualTo(12), () => string.Join("\n", il));
             Assert.That(stores.Select(s => ((MemoryOperand)s.Operands[0]).Addend),
-                Is.EqualTo(new long[] { 0x10, 0x20, 0x00 }));
+                Is.EqualTo(new long[] {
+                    0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C,
+                    0x00, 0x04, 0x08, 0x0C }));
             foreach (var store in stores)
             {
-                Assert.That(((MemoryOperand)store.Operands[0]).AccessSize, Is.EqualTo(16));
-                Assert.That(store.Operands[1], Is.EqualTo(new Immediate(0, 16)));
+                Assert.That(((MemoryOperand)store.Operands[0]).AccessSize, Is.EqualTo(4));
+                Assert.That(store.Operands[1], Is.EqualTo(new Immediate(0, 4)));
             }
             Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
         });
@@ -1243,8 +1247,8 @@ public class Arm64VectorScalarizerIndexedStoreTests
         {
             Assert.That(storeIndex, Is.GreaterThanOrEqualTo(0), () => string.Join("\n", il));
             var store = il[storeIndex];
-            Assert.That(((MemoryOperand)store.Operands[0]).AccessSize, Is.EqualTo(16));
-            Assert.That(store.Operands[1], Is.EqualTo(new Immediate(0, 16)));
+            Assert.That(((MemoryOperand)store.Operands[0]).AccessSize, Is.EqualTo(4));
+            Assert.That(store.Operands[1], Is.EqualTo(new Immediate(0, 4)));
             Assert.That(il.Any(i => i.OpCode == OpCode.Move
                 && i.Operands[0] is MemoryOperand { Base: Register { Name: "X9" }, Addend: 0x30 }),
                 Is.False, "post-index offset must not be used as the store addend");

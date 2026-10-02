@@ -677,11 +677,13 @@ internal sealed class Arm64VectorScalarizer
         var written = new HashSet<string>();
         foreach (var insn in _instructions)
         {
-            if (insn.Address <= target || !_reachable.Contains(insn.Address))
+            // the merge target's own instruction executes inside the loop
+            // too — its writes reach the back-edge like every other body's
+            if (insn.Address < target || !_reachable.Contains(insn.Address))
                 continue;
             if (insn.Address > hi)
                 break;
-            if (_mergeTargets.Contains(insn.Address)
+            if ((insn.Address != target && _mergeTargets.Contains(insn.Address))
                 || insn.Mnemonic is Arm64Mnemonic.BL or Arm64Mnemonic.BLR
                 || insn.Op0Kind == Arm64OperandKind.None)
             {
