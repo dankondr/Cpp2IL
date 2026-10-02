@@ -1068,6 +1068,7 @@ public static class ArrayRecovery
         var definitions = SingleDefinitions(method.ControlFlowGraph!);
         Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>>? uses = null;
         var guardContext = new GuardedIndexContext(method);
+        var lengthWordBases = new List<LocalVariable>();
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
@@ -1092,7 +1093,11 @@ public static class ArrayRecovery
                                  () => uses ??= CollectUses(method.ControlFlowGraph!), guardContext) is { } guardedDerived)
                         instruction.SetOperand(i, guardedDerived);
                     else if (LengthWordLoad(instruction, i, memory, pointerSize, definitions) is { } lengthArray)
+                    {
                         instruction.SetOperand(i, new ArrayLength(lengthArray));
+                        if (memory.Base is LocalVariable lengthWordBase)
+                            lengthWordBases.Add(lengthWordBase);
+                    }
                     continue;
                 }
 
@@ -1116,6 +1121,45 @@ public static class ArrayRecovery
                 else if (GuardedIndexAccess(method, instruction, i, memory, pointerSize, definitions,
                              () => uses ??= CollectUses(method.ControlFlowGraph!), guardContext) is { } guarded)
                     instruction.SetOperand(i, guarded);
+            }
+        }
+
+        DropDeadHeaderAddresses(method.ControlFlowGraph!, lengthWordBases, definitions);
+    }
+
+    // A length-word load folded into ldlen no longer reads the `array + K` header
+    // address it went through. Address arithmetic on a managed reference has no IL
+    // spelling, so a chain link nothing reads any more is dropped with the load
+    // that needed it - walking back from the folded base through the same
+    // Move/Add/Subtract links LengthWordLoad proved - instead of reaching
+    // emission as a value. A link still read elsewhere stays.
+    private static void DropDeadHeaderAddresses(ISILControlFlowGraph cfg, List<LocalVariable> bases,
+        Dictionary<LocalVariable, Instruction?> definitions)
+    {
+        if (bases.Count == 0)
+            return;
+        var reads = new Dictionary<LocalVariable, int>();
+        foreach (var instruction in cfg.Instructions)
+            foreach (var used in DeadCodeEliminator.UsedLocals(instruction))
+                reads[used] = reads.GetValueOrDefault(used) + 1;
+        var work = new Stack<LocalVariable>(bases);
+        while (work.Count > 0)
+        {
+            var local = work.Pop();
+            if (local.Type is SzArrayTypeAnalysisContext || reads.GetValueOrDefault(local) != 0
+                || !definitions.TryGetValue(local, out var definition)
+                || definition is not { OpCode: OpCode.Move or OpCode.Add or OpCode.Subtract }
+                || definition is { OpCode: OpCode.Move, Operands: [_, MemoryOperand] }
+                || EvaluateHeaderBase(local, definitions, 0) is not
+                    { Root: LocalVariable { Type: SzArrayTypeAnalysisContext }, Multiplier: 1 })
+                continue;
+            var sources = DeadCodeEliminator.UsedLocals(definition).ToList();
+            MakeNop(definition);
+            definitions[local] = null;
+            foreach (var source in sources)
+            {
+                reads[source]--;
+                work.Push(source);
             }
         }
     }

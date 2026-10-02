@@ -81,4 +81,37 @@ public class ImpossibleBoxCoercionTests
                 Assert.That(il.Any(i => i.OpCode == CilOpCodes.Castclass), Is.False, listing);
         });
     }
+    // The ISIL Box op (il2cpp_value_box) casts the boxed value to its store
+    // contract; a contract that can never hold it is refused the same way.
+    [TestCase("System.String", true)]
+    [TestCase("System.IComparable", false)]
+    [TestCase("System.Object", false)]
+    public void BoxOpIntoSlot(string destination, bool refused)
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var int32 = app.SystemTypes.SystemInt32Type;
+        var destinationType = app.AssembliesByName["mscorlib"].GetTypeByFullName(destination)!;
+        var source = new LocalVariable("source", new Register(null, "source")) { Type = int32 };
+        var boxed = new LocalVariable("boxed", new Register(null, "boxed")) { Type = destinationType };
+        var module = new ModuleDefinition("BoxOp.dll");
+        SeedCorLibTypes(app, module, int32, destinationType, app.SystemTypes.SystemVoidType);
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, source, new Immediate(3)),
+            new(1, OpCode.Box, boxed, int32, source),
+            new(2, OpCode.Return)], [source, boxed]);
+
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        var listing = string.Join("\n", il.Select(i => i.ToString()));
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Box), Is.True, listing);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Castclass), Is.False, listing);
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr && ((string)i.Operand!).Contains(Refused)),
+                Is.EqualTo(refused), listing);
+        });
+    }
 }

@@ -1126,7 +1126,14 @@ public static class IlGenerator
                                 or GenericParameterTypeAnalysisContext)
                             && !IsAssignableToLoose(boxedType, boxContract) && CanEmitTypeToken(boxContract))
                         {
-                            if (TypeTokenUsableFrom(boxContract, context))
+                            // Same rule as EmitStackCoerce: a cast the boxed value can never pass is no conversion.
+                            if (boxedType.IsValueType && !CanHoldBoxed(boxContract, boxedType))
+                            {
+                                instructions.Add(CilOpCodes.Pop);
+                                PushDefaultOf(boxContract, method, instructions, context,
+                                    SlotDefaultReason(boxedType, boxContract));
+                            }
+                            else if (TypeTokenUsableFrom(boxContract, context))
                                 instructions.Add(CilOpCodes.Castclass, boxContract.ToTypeSignature().ToTypeDefOrRef());
                             else
                             {
