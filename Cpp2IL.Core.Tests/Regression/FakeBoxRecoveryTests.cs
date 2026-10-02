@@ -66,7 +66,7 @@ public class FakeBoxRecoveryTests
             {
                 Assert.That(box, Is.Not.Null, listing);
                 Assert.That(box!.Operands[1], Is.SameAs(type), listing);
-                Assert.That(box.Operands[2], Is.EqualTo(new AddressOf(valueCell)), listing);
+                Assert.That(box.Operands[2], Is.SameAs(valueCell), listing);
                 Assert.That(call.Operands[2], Is.SameAs(box.Operands[0]), listing);
             });
         }

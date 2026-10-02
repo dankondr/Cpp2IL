@@ -15,7 +15,7 @@ namespace Cpp2IL.Core.Analysis;
 ///
 /// <see cref="Run"/> runs before the first dead-code pass (which would drop the sentry
 /// and value stores nothing reads) and turns the address into a fresh local defined by
-/// <c>Box local, klassCell, &amp;valueCell</c>. <see cref="ResolveTypes"/> runs once
+/// <c>Box local, klassCell, valueCell</c>. <see cref="ResolveTypes"/> runs once
 /// metadata is resolved: the class operand becomes the value type it describes, or -
 /// when it does not describe one - the rewrite is undone.
 /// </summary>
@@ -62,8 +62,7 @@ public static class FakeBoxRecovery
                 var boxed = new LocalVariable($"fakeBox_{user.Index}",
                     new Register(null, $"FAKEBOX_{method.Locals.Count}"));
                 method.Locals.Add(boxed);
-                block.Instructions.Insert(u, new Instruction(user.Index, OpCode.Box, boxed, klassCell,
-                    new AddressOf(valueCell)));
+                block.Instructions.Insert(u, new Instruction(user.Index, OpCode.Box, boxed, klassCell, valueCell));
                 for (var i = 0; i < user.Operands.Count; i++)
                     if (ReferenceEquals(user.Operands[i], address))
                         user.SetOperand(i, boxed);
@@ -91,7 +90,7 @@ public static class FakeBoxRecovery
         var cfg = method.ControlFlowGraph!;
         foreach (var box in cfg.Instructions.ToList())
         {
-            if (box is not { OpCode: OpCode.Box, Operands: [LocalVariable boxed, LocalVariable klassCell, AddressOf] }
+            if (box is not { OpCode: OpCode.Box, Operands: [LocalVariable boxed, LocalVariable klassCell, _] }
                 || !boxed.Name.StartsWith("fakeBox_"))
                 continue;
 
