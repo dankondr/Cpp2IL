@@ -58,7 +58,36 @@ internal sealed class Arm64VectorScalarizer
         /// normal-path emission materializes it, cleared by any lane-level
         /// write. Lets a full-width store fall back to the register read.
         /// </summary>
-        public bool Whole;
+        public bool Whole
+        {
+            get => _whole;
+            set
+            {
+                _whole = value;
+                if (!value)
+                    LoadMemory = null;
+            }
+        }
+        private bool _whole;
+
+        /// <summary>
+        /// The memory a whole-register load copied this register's value from,
+        /// when the load was a plain offset-addressed LDR/LDUR/LDP/LD1. Lets a
+        /// later store of the same register emit a memory-to-memory copy, which
+        /// resolves the aggregate on both sides instead of reading a
+        /// lane-typed local at the destination's width.
+        /// </summary>
+        public MemoryOperand? LoadMemory;
+
+        /// <summary>
+        /// Any lane window write invalidates the load provenance: the register
+        /// no longer holds exactly what that memory held.
+        /// </summary>
+        public void SetSlot(int slot, LaneSlice? slice)
+        {
+            Slots[slot] = slice;
+            LoadMemory = null;
+        }
 
         /// <summary>
         /// The register's normalized name ("V0"), set when the state is
@@ -69,7 +98,7 @@ internal sealed class Arm64VectorScalarizer
 
         public VectorState Clone()
         {
-            var clone = new VectorState { Whole = Whole, Name = Name };
+            var clone = new VectorState { Whole = Whole, Name = Name, LoadMemory = LoadMemory };
             Array.Copy(Slots, clone.Slots, Slots.Length);
             return clone;
         }
@@ -101,8 +130,8 @@ internal sealed class Arm64VectorScalarizer
             var reg = name is ['V', ..] && int.TryParse(name[1..], out var n) ? n : -1;
             if (reg is >= 8 and <= 15)
             {
-                state.Slots[2] = null;
-                state.Slots[3] = null;
+                state.SetSlot(2,  null);
+                state.SetSlot(3,  null);
                 state.Whole = false;
             }
             else
@@ -373,12 +402,12 @@ internal sealed class Arm64VectorScalarizer
                     canonicalMove.NativeFloatWriteBits = 32;
                     ImmediateWriteWidth.ApplyToMove(canonicalMove);
                     _emitted = true;
-                    state.Slots[slot] = new LaneSlice(CanonicalSlot(name, slot), 0);
+                    state.SetSlot(slot,  new LaneSlice(CanonicalSlot(name, slot), 0));
                     if (slot == 0)
                         state.Whole = false;
                 }
                 else
-                    state.Slots[slot] = null;
+                    state.SetSlot(slot,  null);
             }
     }
 
@@ -464,7 +493,7 @@ internal sealed class Arm64VectorScalarizer
                         if (slot == 0)
                             window0Clobbered = true;
                     }
-                    state.Slots[slot] = new LaneSlice(canonical, 0);
+                    state.SetSlot(slot,  new LaneSlice(canonical, 0));
                 }
                 var whole = fallThrough == null
                     || (fallThrough.TryGetValue(name, out var wholeState) && wholeState.Whole);
@@ -537,7 +566,7 @@ internal sealed class Arm64VectorScalarizer
             // an element write we did not claim rewrites one lane window
             var element = insn.Op0VectorElement;
             var elementState = Ensure(insn.Op0Reg);
-            elementState.Slots[ElementBits(element) * element.Index / 32] = null;
+            elementState.SetSlot(ElementBits(element) * element.Index / 32,  null);
             elementState.Whole = false;
             return;
         }
@@ -576,9 +605,14 @@ internal sealed class Arm64VectorScalarizer
         {
             var state = Ensure(insn.Op0Reg);
             for (var i = 0; i < 4; i++)
-                state.Slots[i] = 32 * i < writtenBits ? new LaneSlice(Reg(insn.Op0Reg), 32 * i) : new LaneSlice(Zero, 0);
+                state.SetSlot(i,  32 * i < writtenBits ? new LaneSlice(Reg(insn.Op0Reg), 32 * i) : new LaneSlice(Zero, 0));
             state.Whole = false; // the local now holds only the narrow scalar
             ClearCopyOrigin(Normalize(insn.Op0Reg));
+            if (insn.Mnemonic is Arm64Mnemonic.LDR or Arm64Mnemonic.LDUR or Arm64Mnemonic.LDP
+                && insn.MemBase is not (Arm64Register.INVALID or Arm64Register.X31)
+                && insn.MemIndexMode == Arm64MemoryIndexMode.Offset)
+                state.LoadMemory = new MemoryOperand(Reg(insn.MemBase), addend: insn.MemOffset,
+                    accessSize: writtenBits / 8);
 
             // the second destination of a paired load (LDP S/D) follows the
             // same narrow-write rule as Op0 — otherwise its state goes stale
@@ -591,8 +625,12 @@ internal sealed class Arm64VectorScalarizer
                 {
                     var second = Ensure(insn.Op1Reg);
                     for (var i = 0; i < 4; i++)
-                        second.Slots[i] = 32 * i < secondBits ? new LaneSlice(Reg(insn.Op1Reg), 32 * i) : new LaneSlice(Zero, 0);
+                        second.SetSlot(i,  32 * i < secondBits ? new LaneSlice(Reg(insn.Op1Reg), 32 * i) : new LaneSlice(Zero, 0));
                     second.Whole = false;
+                    if (insn.MemBase is not (Arm64Register.INVALID or Arm64Register.X31)
+                        && insn.MemIndexMode == Arm64MemoryIndexMode.Offset)
+                        second.LoadMemory = new MemoryOperand(Reg(insn.MemBase),
+                            addend: insn.MemOffset + secondBits / 8, accessSize: secondBits / 8);
                 }
             }
             return;
@@ -601,7 +639,7 @@ internal sealed class Arm64VectorScalarizer
         if (_vectors.TryGetValue(name!, out var existing))
         {
             for (var i = 0; i < 4; i++)
-                existing.Slots[i] = null; // opaque write: lanes no longer provable
+                existing.SetSlot(i,  null); // opaque write: lanes no longer provable
             existing.Whole = false;
         }
     }
@@ -702,8 +740,10 @@ internal sealed class Arm64VectorScalarizer
         if (!windowed)
         {
             for (var i = 0; i < 4; i++)
-                state.Slots[i] = null; // lanes opaque, but the local itself is current
+                state.SetSlot(i,  null); // lanes opaque, but the local itself is current
             state.Whole = true;
+            if (insn.MemBase != Arm64Register.X31 && RegisterBytes(reg) is > 0 and var loadBytes)
+                state.LoadMemory = new MemoryOperand(Reg(insn.MemBase), addend: offset, accessSize: loadBytes);
             return;
         }
 
@@ -716,9 +756,11 @@ internal sealed class Arm64VectorScalarizer
                 : new MemoryOperand(Reg(insn.MemBase), addend: offset + 4 * i, accessSize: 4);
             _add(_address, OpCode.Move, [laneReg, mem]).NativeMemoryAccessSize = 4;
             _emitted = true;
-            state.Slots[i] = new LaneSlice(laneReg, 0);
+            state.SetSlot(i,  new LaneSlice(laneReg, 0));
         }
         state.Whole = true; // the caller's normal-path Move materialized Vn too
+        if (insn.MemBase != Arm64Register.X31 && RegisterBytes(reg) is > 0 and var wholeBytes)
+            state.LoadMemory = new MemoryOperand(Reg(insn.MemBase), addend: offset, accessSize: wholeBytes);
     }
 
     private void Diagnostic(string message)
@@ -958,9 +1000,9 @@ internal sealed class Arm64VectorScalarizer
         _emitted = true;
         if (laneBits >= 32)
         {
-            dest.Slots[lane * laneBits / 32] = new LaneSlice(destReg, 0);
+            dest.SetSlot(lane * laneBits / 32,  new LaneSlice(destReg, 0));
             if (laneBits == 64)
-                dest.Slots[lane * 2 + 1] = new LaneSlice(destReg, 32);
+                dest.SetSlot(lane * 2 + 1,  new LaneSlice(destReg, 32));
             return;
         }
         // sub-32-bit lanes are masked to the lane width and buffered: their
@@ -1070,9 +1112,9 @@ internal sealed class Arm64VectorScalarizer
             // source operand would alias it: a later write to the source's
             // register would then read through to this lane. Immediates keep
             // their own slice so constant provenance survives.
-            dest.Slots[lane * laneBits / 32] = new LaneSlice(value is Immediate ? value : elementReg, 0);
+            dest.SetSlot(lane * laneBits / 32,  new LaneSlice(value is Immediate ? value : elementReg, 0));
             if (laneBits == 64)
-                dest.Slots[lane * 2 + 1] = new LaneSlice(value is Immediate ? value : elementReg, 32);
+                dest.SetSlot(lane * 2 + 1,  new LaneSlice(value is Immediate ? value : elementReg, 32));
             return;
         }
 
@@ -1118,7 +1160,7 @@ internal sealed class Arm64VectorScalarizer
                 continue;
             if (count < partsPerWindow)
             {
-                dest.Slots[window] = null; // partial window: hardware wrote it, we cannot name it
+                dest.SetSlot(window,  null); // partial window: hardware wrote it, we cannot name it
                 continue;
             }
 
@@ -1148,7 +1190,7 @@ internal sealed class Arm64VectorScalarizer
             windowMove.NativeIntegerWidthBits = 32;
             ImmediateWriteWidth.ApplyToMove(windowMove);
             _emitted = true;
-            dest.Slots[window] = new LaneSlice(windowReg, 0);
+            dest.SetSlot(window,  new LaneSlice(windowReg, 0));
         }
     }
 
@@ -1205,8 +1247,8 @@ internal sealed class Arm64VectorScalarizer
         var dest = Ensure(destReg);
         if (destBits >= 32)
         {
-            dest.Slots[0] = new LaneSlice(elementReg, 0);
-            dest.Slots[1] = destBits == 64 ? new LaneSlice(elementReg, 32) : new LaneSlice(Zero, 0);
+            dest.SetSlot(0,  new LaneSlice(elementReg, 0));
+            dest.SetSlot(1,  destBits == 64 ? new LaneSlice(elementReg, 32) : new LaneSlice(Zero, 0));
         }
         else
         {
@@ -1215,11 +1257,11 @@ internal sealed class Arm64VectorScalarizer
             var windowReg = ElementRegister(destName, 32, 0);
             _add(_address, OpCode.Move, [windowReg, elementReg]).NativeIntegerWidthBits = 32;
             _emitted = true;
-            dest.Slots[0] = new LaneSlice(windowReg, 0);
-            dest.Slots[1] = new LaneSlice(Zero, 0);
+            dest.SetSlot(0,  new LaneSlice(windowReg, 0));
+            dest.SetSlot(1,  new LaneSlice(Zero, 0));
         }
-        dest.Slots[2] = new LaneSlice(Zero, 0);
-        dest.Slots[3] = new LaneSlice(Zero, 0);
+        dest.SetSlot(2,  new LaneSlice(Zero, 0));
+        dest.SetSlot(3,  new LaneSlice(Zero, 0));
         SyncScalarView(dest, destName);
     }
 
@@ -1605,9 +1647,9 @@ internal sealed class Arm64VectorScalarizer
             // the hardware still writes every lane with a value we cannot name
             var used = laneCount * laneBits / 32;
             for (var s = 0; s < used; s++)
-                opaqueDest.Slots[s] = null;
+                opaqueDest.SetSlot(s,  null);
             for (var s = used; s < 4; s++)
-                opaqueDest.Slots[s] = new LaneSlice(Zero, 0);
+                opaqueDest.SetSlot(s,  new LaneSlice(Zero, 0));
             Diagnostic($"ARM64 SIMD lane {Normalize(insn.Op1Reg)}.{ElementLetter(ElementBits(element))}{element.Index} is unproven; broadcast is not safe.");
             return true;
         }
@@ -1622,20 +1664,20 @@ internal sealed class Arm64VectorScalarizer
             _add(_address, OpCode.Move, [laneReg, source]).NativeFloatWriteBits = laneBits;
             _emitted = true;
             if (laneBits == 32)
-                dest.Slots[lane] = new LaneSlice(laneReg, 0);
+                dest.SetSlot(lane,  new LaneSlice(laneReg, 0));
             else if (laneBits == 64)
             {
-                dest.Slots[lane * 2] = new LaneSlice(laneReg, 0);
-                dest.Slots[lane * 2 + 1] = new LaneSlice(laneReg, 32);
+                dest.SetSlot(lane * 2,  new LaneSlice(laneReg, 0));
+                dest.SetSlot(lane * 2 + 1,  new LaneSlice(laneReg, 32));
             }
             // 8/16-bit lanes cannot be represented at 32-bit granularity: the
             // element Moves are still emitted faithfully, slots stay unproven.
         }
         if (laneBits < 32)
             for (var slot = 0; slot < slotsUsed; slot++)
-                dest.Slots[slot] = null; // bytes rewritten at sub-window granularity
+                dest.SetSlot(slot,  null); // bytes rewritten at sub-window granularity
         for (var slot = slotsUsed; slot < 4; slot++)
-            dest.Slots[slot] = new LaneSlice(Zero, 0); // 64-bit forms zero the upper half
+            dest.SetSlot(slot,  new LaneSlice(Zero, 0)); // 64-bit forms zero the upper half
 
         SyncScalarView(dest, destName);
         if (!_emitted)
@@ -1729,7 +1771,7 @@ internal sealed class Arm64VectorScalarizer
         }
 
         for (var slot = laneCount * laneBits / 32; slot < 4; slot++)
-            dest.Slots[slot] = new LaneSlice(Zero, 0); // narrow forms zero the upper half
+            dest.SetSlot(slot,  new LaneSlice(Zero, 0)); // narrow forms zero the upper half
         SyncScalarView(dest, destName);
         return true;
     }
@@ -1832,11 +1874,11 @@ internal sealed class Arm64VectorScalarizer
             var lane = ElementRegister(destName, 32, w);
             _add(_address, OpCode.Or, [lane, left, right]).NativeIntegerWidthBits = 32;
             _emitted = true;
-            dest.Slots[w] = new LaneSlice(lane, 0);
+            dest.SetSlot(w,  new LaneSlice(lane, 0));
         }
 
         for (var w = slots; w < 4; w++)
-            dest.Slots[w] = new LaneSlice(Zero, 0); // the 8B form zeroes the upper half
+            dest.SetSlot(w,  new LaneSlice(Zero, 0)); // the 8B form zeroes the upper half
         SyncScalarView(dest, destName);
         return true;
     }
@@ -1907,7 +1949,7 @@ internal sealed class Arm64VectorScalarizer
         if (source == null)
         {
             var srcElement = insn.Op1VectorElement;
-            dest.Slots[elementBits * element.Index / 32] = null;
+            dest.SetSlot(elementBits * element.Index / 32,  null);
             Diagnostic($"ARM64 SIMD lane {Normalize(insn.Op1Reg)}.{ElementLetter(ElementBits(srcElement))}{srcElement.Index} is unproven; insert source is not safe.");
             return true;
         }
@@ -1918,14 +1960,14 @@ internal sealed class Arm64VectorScalarizer
         switch (elementBits)
         {
             case 32:
-                dest.Slots[element.Index] = new LaneSlice(elementReg, 0);
+                dest.SetSlot(element.Index,  new LaneSlice(elementReg, 0));
                 break;
             case 64:
-                dest.Slots[element.Index * 2] = new LaneSlice(elementReg, 0);
-                dest.Slots[element.Index * 2 + 1] = new LaneSlice(elementReg, 32);
+                dest.SetSlot(element.Index * 2,  new LaneSlice(elementReg, 0));
+                dest.SetSlot(element.Index * 2 + 1,  new LaneSlice(elementReg, 32));
                 break;
             default:
-                dest.Slots[elementBits * element.Index / 32] = null; // partial-window write
+                dest.SetSlot(elementBits * element.Index / 32,  null); // partial-window write
                 break;
         }
         if (elementBits * element.Index < 32)
@@ -2016,18 +2058,18 @@ internal sealed class Arm64VectorScalarizer
                 _add(_address, OpCode.Move, [laneReg, laneLiteral]).NativeFloatWriteBits = laneBits;
                 _emitted = true;
                 if (laneBits == 32)
-                    dest.Slots[lane] = new LaneSlice(laneReg, 0);
+                    dest.SetSlot(lane,  new LaneSlice(laneReg, 0));
                 else if (laneBits == 64)
                 {
-                    dest.Slots[lane * 2] = new LaneSlice(laneReg, 0);
-                    dest.Slots[lane * 2 + 1] = new LaneSlice(laneReg, 32);
+                    dest.SetSlot(lane * 2,  new LaneSlice(laneReg, 0));
+                    dest.SetSlot(lane * 2 + 1,  new LaneSlice(laneReg, 32));
                 }
             }
             if (laneBits < 32)
                 for (var slot = 0; slot < slotsUsed; slot++)
-                    dest.Slots[slot] = null;
+                    dest.SetSlot(slot,  null);
             for (var slot = slotsUsed; slot < 4; slot++)
-                dest.Slots[slot] = new LaneSlice(Zero, 0);
+                dest.SetSlot(slot,  new LaneSlice(Zero, 0));
             SyncScalarView(dest, destName);
             return true;
         }
@@ -2045,7 +2087,7 @@ internal sealed class Arm64VectorScalarizer
             _emitted = true;
             var dest = Ensure(insn.Op0Reg);
             for (var i = 0; i < 4; i++)
-                dest.Slots[i] = 32 * i < width ? new LaneSlice(Reg(insn.Op0Reg), 32 * i) : new LaneSlice(Zero, 0);
+                dest.SetSlot(i,  32 * i < width ? new LaneSlice(Reg(insn.Op0Reg), 32 * i) : new LaneSlice(Zero, 0));
             ClaimDest(insn.Op0Reg);
             return true;
         }
@@ -2086,7 +2128,7 @@ internal sealed class Arm64VectorScalarizer
             ImmediateWriteWidth.ApplyToMove(move);
             _emitted = true;
             for (var i = 0; i < 4; i++)
-                dest.Slots[i] = 32 * i < (width64 ? 64 : 32) ? new LaneSlice(Reg(insn.Op0Reg), 32 * i) : new LaneSlice(Zero, 0);
+                dest.SetSlot(i,  32 * i < (width64 ? 64 : 32) ? new LaneSlice(Reg(insn.Op0Reg), 32 * i) : new LaneSlice(Zero, 0));
             return true;
         }
 
@@ -2108,10 +2150,10 @@ internal sealed class Arm64VectorScalarizer
             var value = insn.Mnemonic == Arm64Mnemonic.MVNI ? ~insn.Op1Imm : insn.Op1Imm;
             _add(_address, OpCode.Move, [convertOperand(insn, 0), new Immediate(value, 8)]);
             _emitted = true;
-            dest.Slots[0] = new LaneSlice(new Immediate(value, 8), 0);
-            dest.Slots[1] = new LaneSlice(new Immediate(value, 8), 32);
-            dest.Slots[2] = new LaneSlice(Zero, 0);
-            dest.Slots[3] = new LaneSlice(Zero, 0);
+            dest.SetSlot(0,  new LaneSlice(new Immediate(value, 8), 0));
+            dest.SetSlot(1,  new LaneSlice(new Immediate(value, 8), 32));
+            dest.SetSlot(2,  new LaneSlice(Zero, 0));
+            dest.SetSlot(3,  new LaneSlice(Zero, 0));
             return true;
         }
 
@@ -2144,8 +2186,8 @@ internal sealed class Arm64VectorScalarizer
                 var laneReg = ElementRegister(destName, 64, lane);
                 _add(_address, OpCode.Move, [laneReg, new Immediate(lane64, 8)]).NativeFloatWriteBits = 64;
                 _emitted = true;
-                dest.Slots[lane * 2] = new LaneSlice(new Immediate(lane64, 8), 0);
-                dest.Slots[lane * 2 + 1] = new LaneSlice(new Immediate(lane64, 8), 32);
+                dest.SetSlot(lane * 2,  new LaneSlice(new Immediate(lane64, 8), 0));
+                dest.SetSlot(lane * 2 + 1,  new LaneSlice(new Immediate(lane64, 8), 32));
             }
         }
         else
@@ -2165,11 +2207,11 @@ internal sealed class Arm64VectorScalarizer
                 var laneReg = ElementRegister(destName, 32, slot);
                 _add(_address, OpCode.Move, [laneReg, new Immediate(window, 4)]).NativeFloatWriteBits = 32;
                 _emitted = true;
-                dest.Slots[slot] = new LaneSlice(new Immediate(window, 4), 0);
+                dest.SetSlot(slot,  new LaneSlice(new Immediate(window, 4), 0));
             }
         }
         for (var slot = slotsUsed; slot < 4; slot++)
-            dest.Slots[slot] = new LaneSlice(Zero, 0);
+            dest.SetSlot(slot,  new LaneSlice(Zero, 0));
         return true;
 
         static int ExpandToWindow(ushort lane) => unchecked((int)(uint)(lane | (uint)lane << 16));
@@ -2211,9 +2253,9 @@ internal sealed class Arm64VectorScalarizer
         if (!proven)
         {
             for (var slot = 0; slot < slotsUsed; slot++)
-                dest.Slots[slot] = null;
+                dest.SetSlot(slot,  null);
             for (var slot = slotsUsed; slot < 4; slot++)
-                dest.Slots[slot] = new LaneSlice(Zero, 0);
+                dest.SetSlot(slot,  new LaneSlice(Zero, 0));
             Diagnostic($"ARM64 SIMD {insn.Mnemonic} immediate form has unproven lane provenance; scalarization skipped.");
             return true;
         }
@@ -2225,10 +2267,10 @@ internal sealed class Arm64VectorScalarizer
                 [laneReg, operands[slot]!, new Immediate(expanded)]);
             emitted.NativeIntegerWidthBits = 32;
             _emitted = true;
-            dest.Slots[slot] = new LaneSlice(laneReg, 0);
+            dest.SetSlot(slot,  new LaneSlice(laneReg, 0));
         }
         for (var slot = slotsUsed; slot < 4; slot++)
-            dest.Slots[slot] = new LaneSlice(Zero, 0);
+            dest.SetSlot(slot,  new LaneSlice(Zero, 0));
         SyncScalarView(dest, destName);
         return true;
     }
@@ -2265,9 +2307,9 @@ internal sealed class Arm64VectorScalarizer
         if (!proven)
         {
             for (var slot = 0; slot < slotsUsed; slot++)
-                dest.Slots[slot] = null;
+                dest.SetSlot(slot,  null);
             for (var slot = slotsUsed; slot < 4; slot++)
-                dest.Slots[slot] = new LaneSlice(Zero, 0);
+                dest.SetSlot(slot,  new LaneSlice(Zero, 0));
             Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarization skipped.");
             return true;
         }
@@ -2293,11 +2335,11 @@ internal sealed class Arm64VectorScalarizer
         if (narrow != null)
         {
             for (var slot = 0; slot < slotsUsed; slot++)
-                dest.Slots[slot] = null; // FlushNarrowLanes re-proves covered windows
+                dest.SetSlot(slot,  null); // FlushNarrowLanes re-proves covered windows
             FlushNarrowLanes(dest, destName, laneBits, narrow);
         }
         for (var slot = slotsUsed; slot < 4; slot++)
-            dest.Slots[slot] = new LaneSlice(Zero, 0);
+            dest.SetSlot(slot,  new LaneSlice(Zero, 0));
         SyncScalarView(dest, destName);
         return true;
     }
@@ -2394,9 +2436,9 @@ internal sealed class Arm64VectorScalarizer
             if (supported && bitwise)
                 return false;
             for (var slot = 0; slot < vectorSlots; slot++)
-                dest.Slots[slot] = null;
+                dest.SetSlot(slot,  null);
             for (var slot = vectorSlots; slot < 4; slot++)
-                dest.Slots[slot] = new LaneSlice(Zero, 0);
+                dest.SetSlot(slot,  new LaneSlice(Zero, 0));
             Diagnostic(supported
                 ? $"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarization skipped."
                 : $"ARM64 SIMD {insn.Mnemonic} on {laneBits}-bit lanes cannot be scalarized.");
@@ -2411,10 +2453,10 @@ internal sealed class Arm64VectorScalarizer
                 // this lane is genuinely unknown — the hardware writes it, but
                 // no local describes it: leave the window unproven and report.
                 if (bitwise)
-                    dest.Slots[lane] = null;
+                    dest.SetSlot(lane,  null);
                 else if (narrow == null)
                     for (var w = lane * laneBits / 32; w < (lane + 1) * laneBits / 32; w++)
-                        dest.Slots[w] = null;
+                        dest.SetSlot(w,  null);
                 unprovenLanes++;
                 continue;
             }
@@ -2449,11 +2491,11 @@ internal sealed class Arm64VectorScalarizer
         if (narrow != null)
         {
             for (var slot = 0; slot < vectorSlots; slot++)
-                dest.Slots[slot] = null; // FlushNarrowLanes re-proves covered windows
+                dest.SetSlot(slot,  null); // FlushNarrowLanes re-proves covered windows
             FlushNarrowLanes(dest, destName, laneBits, narrow);
         }
         for (var slot = vectorSlots; slot < 4; slot++)
-            dest.Slots[slot] = new LaneSlice(Zero, 0);
+            dest.SetSlot(slot,  new LaneSlice(Zero, 0));
         SyncScalarView(dest, destName);
         if (unprovenLanes > 0)
             Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarized {rows - unprovenLanes} of {rows} lanes.");
@@ -2492,7 +2534,7 @@ internal sealed class Arm64VectorScalarizer
             var op = SlotOperand(source, slot);
             if (op == null)
             {
-                dest.Slots[slot] = null;
+                dest.SetSlot(slot,  null);
                 continue;
             }
             var laneReg = ElementRegister(destName, 32, slot);
@@ -2500,10 +2542,10 @@ internal sealed class Arm64VectorScalarizer
             slotMove.NativeFloatWriteBits = 32;
             ImmediateWriteWidth.ApplyToMove(slotMove);
             _emitted = true;
-            dest.Slots[slot] = new LaneSlice(laneReg, 0);
+            dest.SetSlot(slot,  new LaneSlice(laneReg, 0));
         }
         for (var slot = slotsUsed; slot < 4; slot++)
-            dest.Slots[slot] = new LaneSlice(Zero, 0);
+            dest.SetSlot(slot,  new LaneSlice(Zero, 0));
         dest.Whole = source.Whole;
         return true;
     }
@@ -2524,17 +2566,17 @@ internal sealed class Arm64VectorScalarizer
             var op = SlotOperand(source, slot);
             if (op == null)
             {
-                dest.Slots[slot] = null;
+                dest.SetSlot(slot,  null);
                 unproven++;
                 continue;
             }
             var laneReg = ElementRegister(destName, 32, slot);
             _add(_address, OpCode.Not, [laneReg, op]).NativeIntegerWidthBits = 32;
             _emitted = true;
-            dest.Slots[slot] = new LaneSlice(laneReg, 0);
+            dest.SetSlot(slot,  new LaneSlice(laneReg, 0));
         }
         for (var slot = slotsUsed; slot < 4; slot++)
-            dest.Slots[slot] = new LaneSlice(Zero, 0);
+            dest.SetSlot(slot,  new LaneSlice(Zero, 0));
         SyncScalarView(dest, destName);
         if (unproven > 0)
             Diagnostic($"ARM64 SIMD MVN has unproven lane provenance; scalarized {slotsUsed - unproven} of {slotsUsed} lanes.");
@@ -2581,9 +2623,9 @@ internal sealed class Arm64VectorScalarizer
         if (!proven)
         {
             for (var slot = 0; slot < slotsUsed; slot++)
-                dest.Slots[slot] = null;
+                dest.SetSlot(slot,  null);
             for (var slot = slotsUsed; slot < 4; slot++)
-                dest.Slots[slot] = new LaneSlice(Zero, 0);
+                dest.SetSlot(slot,  new LaneSlice(Zero, 0));
             Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarization skipped.");
             return true;
         }
@@ -2599,11 +2641,11 @@ internal sealed class Arm64VectorScalarizer
         if (narrow != null)
         {
             for (var slot = 0; slot < slotsUsed; slot++)
-                dest.Slots[slot] = null;
+                dest.SetSlot(slot,  null);
             FlushNarrowLanes(dest, destName, destBits, narrow);
         }
         for (var slot = slotsUsed; slot < 4; slot++)
-            dest.Slots[slot] = new LaneSlice(Zero, 0);
+            dest.SetSlot(slot,  new LaneSlice(Zero, 0));
         SyncScalarView(dest, destName);
         return true;
     }
@@ -2640,7 +2682,7 @@ internal sealed class Arm64VectorScalarizer
         if (!proven)
         {
             for (var slot = firstWritten * destBits / 32; slot < slotsUsed; slot++)
-                destState.Slots[slot] = null;
+                destState.SetSlot(slot,  null);
             Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarization skipped.");
             return true;
         }
@@ -2658,7 +2700,7 @@ internal sealed class Arm64VectorScalarizer
         FlushNarrowLanes(destState, destName, destBits, narrow);
         if (!upper)
             for (var slot = slotsUsed; slot < 4; slot++)
-                destState.Slots[slot] = new LaneSlice(Zero, 0);
+                destState.SetSlot(slot,  new LaneSlice(Zero, 0));
         SyncScalarView(destState, destName);
         return true;
     }
@@ -2702,9 +2744,9 @@ internal sealed class Arm64VectorScalarizer
         {
             // a scalar write zeroes the vector above the scalar; the scalar
             // itself cannot be named, so only window 0 loses provenance.
-            dest.Slots[0] = null;
+            dest.SetSlot(0,  null);
             for (var slot = 1; slot < 4; slot++)
-                dest.Slots[slot] = new LaneSlice(Zero, 0);
+                dest.SetSlot(slot,  new LaneSlice(Zero, 0));
             Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarization skipped.");
             return true;
         }
@@ -2797,7 +2839,7 @@ internal sealed class Arm64VectorScalarizer
                 unprovenLanes++;
                 if (narrow == null)
                     for (var w = lane * laneBits / 32; w < (lane + 1) * laneBits / 32; w++)
-                        dest.Slots[w] = null;
+                        dest.SetSlot(w,  null);
                 continue;
             }
             var laneReg = ElementRegister(destName, laneBits, lane);
@@ -2809,9 +2851,9 @@ internal sealed class Arm64VectorScalarizer
             _emitted = true;
             if (laneBits >= 32)
             {
-                dest.Slots[lane * laneBits / 32] = new LaneSlice(laneReg, 0);
+                dest.SetSlot(lane * laneBits / 32,  new LaneSlice(laneReg, 0));
                 if (laneBits == 64)
-                    dest.Slots[lane * 2 + 1] = new LaneSlice(laneReg, 32);
+                    dest.SetSlot(lane * 2 + 1,  new LaneSlice(laneReg, 32));
             }
             else
             {
@@ -2823,11 +2865,11 @@ internal sealed class Arm64VectorScalarizer
         if (narrow != null)
         {
             for (var slot = 0; slot < slotsUsed; slot++)
-                dest.Slots[slot] = null;
+                dest.SetSlot(slot,  null);
             FlushNarrowLanes(dest, destName, laneBits, narrow);
         }
         for (var slot = slotsUsed; slot < 4; slot++)
-            dest.Slots[slot] = new LaneSlice(Zero, 0);
+            dest.SetSlot(slot,  new LaneSlice(Zero, 0));
         SyncScalarView(dest, destName);
         if (unprovenLanes > 0)
             Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarized {laneCount - unprovenLanes} of {laneCount} lanes.");
@@ -2882,7 +2924,7 @@ internal sealed class Arm64VectorScalarizer
                 unprovenLanes++;
                 if (narrow == null)
                     for (var w = lane * laneBits / 32; w < (lane + 1) * laneBits / 32; w++)
-                        dest.Slots[w] = null;
+                        dest.SetSlot(w,  null);
                 continue;
             }
             var diff = EmitTempOp(OpCode.Xor, aOps[lane]!, bOps[lane]!, width);
@@ -2895,11 +2937,11 @@ internal sealed class Arm64VectorScalarizer
         if (narrow != null)
         {
             for (var slot = 0; slot < slotsUsed; slot++)
-                dest.Slots[slot] = null;
+                dest.SetSlot(slot,  null);
             FlushNarrowLanes(dest, destName, laneBits, narrow);
         }
         for (var slot = slotsUsed; slot < 4; slot++)
-            dest.Slots[slot] = new LaneSlice(Zero, 0);
+            dest.SetSlot(slot,  new LaneSlice(Zero, 0));
         SyncScalarView(dest, destName);
         if (unprovenLanes > 0)
             Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarized {laneCount - unprovenLanes} of {laneCount} lanes.");
@@ -2950,7 +2992,7 @@ internal sealed class Arm64VectorScalarizer
                 unprovenLanes++;
                 if (narrow == null)
                     for (var w = lane * laneBits / 32; w < (lane + 1) * laneBits / 32; w++)
-                        dest.Slots[w] = null;
+                        dest.SetSlot(w,  null);
                 continue;
             }
             var value = EmitVectorShiftLane(vOps[lane]!, sOps[lane]!, laneBits, signed);
@@ -2959,11 +3001,11 @@ internal sealed class Arm64VectorScalarizer
         if (narrow != null)
         {
             for (var slot = 0; slot < slotsUsed; slot++)
-                dest.Slots[slot] = null;
+                dest.SetSlot(slot,  null);
             FlushNarrowLanes(dest, destName, laneBits, narrow);
         }
         for (var slot = slotsUsed; slot < 4; slot++)
-            dest.Slots[slot] = new LaneSlice(Zero, 0);
+            dest.SetSlot(slot,  new LaneSlice(Zero, 0));
         SyncScalarView(dest, destName);
         if (unprovenLanes > 0)
             Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarized {laneCount - unprovenLanes} of {laneCount} lanes.");
@@ -3045,9 +3087,9 @@ internal sealed class Arm64VectorScalarizer
         if (!proven)
         {
             for (var slot = 0; slot < slotsUsed; slot++)
-                dest.Slots[slot] = null;
+                dest.SetSlot(slot,  null);
             for (var slot = slotsUsed; slot < 4; slot++)
-                dest.Slots[slot] = new LaneSlice(Zero, 0);
+                dest.SetSlot(slot,  new LaneSlice(Zero, 0));
             Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarization skipped.");
             return true;
         }
@@ -3057,7 +3099,7 @@ internal sealed class Arm64VectorScalarizer
         for (var lane = 0; lane < laneCount; lane++)
             EmitLaneValue(dest, destName, laneBits, lane, operands[lane]!, null, integerLanes: integer);
         for (var slot = slotsUsed; slot < 4; slot++)
-            dest.Slots[slot] = new LaneSlice(Zero, 0);
+            dest.SetSlot(slot,  new LaneSlice(Zero, 0));
         SyncScalarView(dest, destName);
         return true;
     }
@@ -3099,9 +3141,9 @@ internal sealed class Arm64VectorScalarizer
             ClaimDest(insn.Op0Reg);
             var used = laneCount * laneBits / 32;
             for (var slot = 0; slot < used; slot++)
-                poison.Slots[slot] = null;
+                poison.SetSlot(slot,  null);
             for (var slot = used; slot < 4; slot++)
-                poison.Slots[slot] = new LaneSlice(Zero, 0);
+                poison.SetSlot(slot,  new LaneSlice(Zero, 0));
             Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarization skipped.");
             return true;
         }
@@ -3118,18 +3160,18 @@ internal sealed class Arm64VectorScalarizer
             if (a == null || (binary && b == null))
             {
                 for (var w = lane * laneBits / 32; w < (lane + 1) * laneBits / 32; w++)
-                    dest.Slots[w] = null;
+                    dest.SetSlot(w,  null);
                 continue;
             }
             var laneReg = ElementRegister(destName, laneBits, lane);
             emitLane(laneReg, a, b);
             _emitted = true;
-            dest.Slots[lane * laneBits / 32] = new LaneSlice(laneReg, 0);
+            dest.SetSlot(lane * laneBits / 32,  new LaneSlice(laneReg, 0));
             if (laneBits == 64)
-                dest.Slots[lane * 2 + 1] = new LaneSlice(laneReg, 32);
+                dest.SetSlot(lane * 2 + 1,  new LaneSlice(laneReg, 32));
         }
         for (var slot = slotsUsed; slot < 4; slot++)
-            dest.Slots[slot] = new LaneSlice(Zero, 0);
+            dest.SetSlot(slot,  new LaneSlice(Zero, 0));
         SyncScalarView(dest, destName);
         if (provenLanes < laneCount)
             Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarized {provenLanes} of {laneCount} lanes.");
@@ -3263,9 +3305,9 @@ internal sealed class Arm64VectorScalarizer
             if (ops[window] is { } op)
                 EmitLaneValue(dest, destName, 32, window, op, null);
             else
-                dest.Slots[window] = null;
+                dest.SetSlot(window,  null);
         for (var slot = slotCount; slot < 4; slot++)
-            dest.Slots[slot] = new LaneSlice(Zero, 0);
+            dest.SetSlot(slot,  new LaneSlice(Zero, 0));
         SyncScalarView(dest, destName);
         if (proven < slotCount)
             Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarized {proven} of {slotCount} windows.");
@@ -3327,9 +3369,9 @@ internal sealed class Arm64VectorScalarizer
                 EmitLaneValue(dest, destName, laneBits, lane, op, null);
             else
                 for (var w = lane * laneBits / 32; w < (lane + 1) * laneBits / 32; w++)
-                    dest.Slots[w] = null;
+                    dest.SetSlot(w,  null);
         for (var slot = laneCount * laneBits / 32; slot < 4; slot++)
-            dest.Slots[slot] = new LaneSlice(Zero, 0);
+            dest.SetSlot(slot,  new LaneSlice(Zero, 0));
         SyncScalarView(dest, destName);
         if (proven < laneCount)
             Diagnostic($"ARM64 SIMD {insn.Mnemonic} has unproven lane provenance; scalarized {proven} of {laneCount} lanes.");
@@ -3379,7 +3421,7 @@ internal sealed class Arm64VectorScalarizer
         for (var lane = 0; lane < laneCount; lane++)
             EmitLaneValue(dest, destName, laneBits, lane, mem, null);
         for (var slot = laneCount * laneBits / 32; slot < 4; slot++)
-            dest.Slots[slot] = new LaneSlice(Zero, 0);
+            dest.SetSlot(slot,  new LaneSlice(Zero, 0));
         SyncScalarView(dest, destName);
         return true;
     }
@@ -3404,14 +3446,14 @@ internal sealed class Arm64VectorScalarizer
         var dest = Ensure(insn.Op0Reg);
         ClaimDest(insn.Op0Reg);
         if (bits == 32)
-            dest.Slots[element.Index] = new LaneSlice(elementReg, 0);
+            dest.SetSlot(element.Index,  new LaneSlice(elementReg, 0));
         else if (bits == 64)
         {
-            dest.Slots[element.Index * 2] = new LaneSlice(elementReg, 0);
-            dest.Slots[element.Index * 2 + 1] = new LaneSlice(elementReg, 32);
+            dest.SetSlot(element.Index * 2,  new LaneSlice(elementReg, 0));
+            dest.SetSlot(element.Index * 2 + 1,  new LaneSlice(elementReg, 32));
         }
         else
-            dest.Slots[bits * element.Index / 32] = null; // a partial window is unproven
+            dest.SetSlot(bits * element.Index / 32,  null); // a partial window is unproven
         dest.Whole = false;
         return true;
     }
@@ -3469,7 +3511,7 @@ internal sealed class Arm64VectorScalarizer
                 EmitLaneValue(dest, name, laneBits, lane, mem, null);
             }
             for (var slot = laneCount * laneBits / 32; slot < 4; slot++)
-                dest.Slots[slot] = new LaneSlice(Zero, 0);
+                dest.SetSlot(slot,  new LaneSlice(Zero, 0));
             dest.Whole = true;
         }
         _emitted = true;
@@ -3526,12 +3568,6 @@ internal sealed class Arm64VectorScalarizer
         if (bytes < 4)
             return false;
 
-        // an unproven store is left to the caller's normal path: it emits the
-        // whole-register move the baseline produced — correct whenever the
-        // register local was materialized by a load or a scalar write.
-        if (bytes == 16 && first.Whole && (!pair || second!.Whole))
-            return false;
-
         var slots = bytes / 4;
 
         var proven = true;
@@ -3540,6 +3576,15 @@ internal sealed class Arm64VectorScalarizer
         if (pair)
             for (var slot = 0; slot < slots; slot++)
                 proven &= second!.Slots[slot] != null;
+
+        // a load-into-store whole-register copy keeps its source memory as
+        // provenance; a whole-register store whose load address was not
+        // recorded keeps the caller's whole-register move, correct whenever
+        // the local was materialized. Check before any emission: a false
+        // here must not leave a half-emitted pair.
+        if (first.Whole && first.LoadMemory == null
+            || pair && second!.Whole && second.LoadMemory == null)
+            return false;
 
         if (!proven)
             return false;
@@ -3560,44 +3605,175 @@ internal sealed class Arm64VectorScalarizer
             return true;
         }
 
+        // two registers still holding adjacent slices of one loaded range are
+        // one contiguous struct copy — emit a single memory-to-memory move so
+        // the resolver can store the whole aggregate (LDELEM/STOBJ shape)
+        // instead of truncating to the first covered field.
+        if (pair && insn.MemBase != Arm64Register.X31
+            && first.LoadMemory is { } firstSource && second!.LoadMemory is { } secondSource
+            && firstSource.AccessSize >= bytes && secondSource.AccessSize >= bytes
+            && firstSource.Base is Register { Name: { } sourceBase }
+            && secondSource.Base is Register { Name: { } secondBase } && secondBase == sourceBase
+            && firstSource.Index == null && secondSource.Index == null
+            && firstSource.Addend + bytes == secondSource.Addend)
+        {
+            var copy = _add(_address, OpCode.Move,
+            [
+                new MemoryOperand(Reg(insn.MemBase), addend: insn.MemOffset, accessSize: 2 * bytes),
+                new MemoryOperand(firstSource.Base, addend: firstSource.Addend, accessSize: 2 * bytes)
+            ]);
+            copy.NativeMemoryAccessSize = 2 * bytes;
+            copy.NativeStoreWidthBytes = 2 * bytes;
+            _emitted = true;
+            return true;
+        }
+
         for (var r = 0; r < (pair ? 2 : 1); r++)
         {
             var state = r == 0 ? first : second!;
             var baseOff = insn.MemOffset + r * bytes;
-            if (slots == 4
-                && WholeVectorStoreOperand(state) is { } vectorOperand)
-            {
-                // All four lanes constant (a vector literal the resolver can
-                // store whole), the register's own slices, or four adjacent
-                // fields of one local — a single whole-register write. Other
-                // mixes keep the per-window writes so an adjacent-fields
-                // target resolves each member.
-                IOperand vectorMem = insn.MemBase == Arm64Register.X31
-                    ? new StackOffset((int)baseOff)
-                    : new MemoryOperand(Reg(insn.MemBase), addend: baseOff, accessSize: 16);
-                var vectorMove = _add(_address, OpCode.Move, [vectorMem, vectorOperand]);
-                vectorMove.NativeStoreWidthBytes = 16;
-                _emitted = true;
-                continue;
-            }
-            for (var slot = 0; slot < slots; slot++)
-            {
-                var op = SlotOperand(state, slot);
-                if (op == null)
-                    continue;
-                // accessSize stays unset: the window's 4-byte width goes on
-                // NativeStoreWidthBytes instead, matching the base lifter's
-                // pair-store shape so an address-taken local can still widen
-                // into the aggregate the two windows compose.
-                IOperand mem = insn.MemBase == Arm64Register.X31
-                    ? new StackOffset((int)(baseOff + slot * 4))
-                    : new MemoryOperand(Reg(insn.MemBase), addend: baseOff + slot * 4);
-                _add(_address, OpCode.Move, [mem, op]).NativeStoreWidthBytes = 4;
-                _emitted = true;
-            }
+            if (!EmitStore(insn, state, baseOff, bytes, slots))
+                return false;
         }
         return true;
     }
+
+    /// <summary>
+    /// Emits one register's part of a store. Wide forms first: a memory-to-
+    /// memory copy for a register that still holds a whole-load's source, a
+    /// single whole-value move when every lane names the same operand or
+    /// adjacent fields of one aggregate, whole-width zero/immediate stores
+    /// for constant lanes (the resolver splits them per field or merges zero
+    /// runs into initobj). Anything else keeps the per-window writes so an
+    /// adjacent-fields target resolves each member. Returns false only for an
+    /// opaque whole-register store the caller's normal path must emit.
+    /// </summary>
+    private bool EmitStore(Arm64Instruction insn, VectorState state, long baseOff, int bytes, int slots)
+    {
+        if (state.LoadMemory is { AccessSize: var loaded } source && loaded >= bytes
+            && insn.MemBase != Arm64Register.X31)
+        {
+            var copy = _add(_address, OpCode.Move,
+            [
+                StoreMem(insn, baseOff, bytes),
+                new MemoryOperand(source.Base, source.Index, source.Addend, source.Scale, bytes)
+            ]);
+            copy.NativeMemoryAccessSize = bytes;
+            copy.NativeStoreWidthBytes = bytes;
+            _emitted = true;
+            return true;
+        }
+        if (bytes == 16 && state.Whole)
+            return false;
+
+        if (slots > 1 && AllSlotsConstant(state, slots))
+        {
+            if (bytes == 16 && IsAllZero(state, slots))
+            {
+                // one whole-width zero: the resolver merges adjacent runs into
+                // initobj or splits the range per field.
+                var zero = _add(_address, OpCode.Move,
+                    [StoreMem(insn, baseOff, 16), new Immediate(0, 16)]);
+                zero.NativeStoreWidthBytes = 16;
+            }
+            else
+            {
+                for (var group = 0; group < slots / 2; group++)
+                {
+                    var bits = SlotConstantBits(state.Slots[group * 2]!.Value)
+                               | SlotConstantBits(state.Slots[group * 2 + 1]!.Value) << 32;
+                    var constant = _add(_address, OpCode.Move,
+                        [StoreMem(insn, baseOff + group * 8, 8),
+                         new Immediate(unchecked((long)bits), 8)]);
+                    constant.NativeStoreWidthBytes = 8;
+                }
+            }
+            _emitted = true;
+            return true;
+        }
+
+        if (slots == 4
+            && WholeVectorStoreOperand(state) is { } vectorOperand)
+        {
+            var vectorMove = _add(_address, OpCode.Move, [StoreMem(insn, baseOff, 16), vectorOperand]);
+            vectorMove.NativeStoreWidthBytes = 16;
+            _emitted = true;
+            return true;
+        }
+
+        // a 64-bit store whose two lanes are the low and high halves of one
+        // operand names that operand whole — an 8-byte field or aggregate
+        // resolves without reading a lane-typed local.
+        if (slots == 2
+            && state.Slots[0] is { } low && state.Slots[1] is { } high
+            && low.BitOffset == 0 && high.BitOffset == 32
+            && SameOperand(low.Operand, high.Operand))
+        {
+            var wide = _add(_address, OpCode.Move, [StoreMem(insn, baseOff, 8), low.Operand]);
+            wide.NativeStoreWidthBytes = 8;
+            _emitted = true;
+            return true;
+        }
+
+        for (var slot = 0; slot < slots; slot++)
+        {
+            var op = SlotOperand(state, slot);
+            if (op == null)
+                continue;
+            // accessSize stays unset: the window's 4-byte width goes on
+            // NativeStoreWidthBytes instead, matching the base lifter's
+            // pair-store shape so an address-taken local can still widen
+            // into the aggregate the two windows compose.
+            _add(_address, OpCode.Move, [StoreMem(insn, baseOff + slot * 4, 0), op])
+                .NativeStoreWidthBytes = 4;
+            _emitted = true;
+        }
+        return true;
+    }
+
+    private IOperand StoreMem(Arm64Instruction insn, long addend, int accessSize)
+        => insn.MemBase == Arm64Register.X31
+            ? new StackOffset((int)addend)
+            : new MemoryOperand(Reg(insn.MemBase), addend: addend, accessSize: accessSize);
+
+    /// <summary>Two lane slices spelling one operand's low and high halves.</summary>
+    private static bool SameOperand(IOperand a, IOperand b) => (a, b) switch
+    {
+        (Register left, Register right) => left.Name == right.Name,
+        _ => ReferenceEquals(a, b)
+    };
+
+    private static bool AllSlotsConstant(VectorState state, int slots)
+    {
+        for (var slot = 0; slot < slots; slot++)
+            if (state.Slots[slot] is not { } slice || !IsSlotConstant(slice))
+                return false;
+        return true;
+    }
+
+    private static bool IsAllZero(VectorState state, int slots)
+    {
+        for (var slot = 0; slot < slots; slot++)
+            if (SlotConstantBits(state.Slots[slot]!.Value) != 0)
+                return false;
+        return true;
+    }
+
+    private static bool IsSlotConstant(LaneSlice slice) => slice.Operand is Immediate or FloatLiteral or DoubleLiteral;
+
+    /// <summary>The raw 32 bits a constant lane slice carries.</summary>
+    private static ulong SlotConstantBits(LaneSlice slice) => slice.Operand switch
+    {
+        Immediate { UnsignedValue: var bits } when slice.BitOffset == 0 => bits & 0xFFFFFFFF,
+        Immediate { UnsignedValue: var bits } when slice.BitOffset == 32 => bits >> 32,
+        FloatLiteral { Value: var value } when slice.BitOffset == 0
+            => unchecked((uint)BitConverter.SingleToInt32Bits(value)),
+        DoubleLiteral { Value: var value } when slice.BitOffset == 0
+            => unchecked((ulong)BitConverter.DoubleToInt64Bits(value)) & 0xFFFFFFFF,
+        DoubleLiteral { Value: var value } when slice.BitOffset == 32
+            => unchecked((ulong)BitConverter.DoubleToInt64Bits(value)) >> 32,
+        _ => 0
+    };
 
     /// <summary>
     /// The operand naming a 128-bit register's whole value for a wide store:

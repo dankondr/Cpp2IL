@@ -230,10 +230,10 @@ public class Arm64VectorScalarizerTests
     [Test]
     public void StoreOfReloadedRegisterReadsReloadedValue()
     {
-        // Two 8-byte copies through d0: the second store must read the value
-        // the second load left in v0 — any carry-over of the first sequence
-        // (a cached high-half temporary, a stale lane) would show the second
-        // store reading an operand the second load did not produce.
+        // Two 8-byte copies through d0: each store is a memory-to-memory copy
+        // of the address its own load read — any carry-over of the first
+        // sequence (a cached high-half temporary, a stale lane) would show the
+        // second store reading the first load's source.
         var il = Lift(
             0xfd402520, // ldr d0, [x9, #0x48]
             0xfc024260, // stur d0, [x19, #0x24]
@@ -244,16 +244,12 @@ public class Arm64VectorScalarizerTests
             && i.Operands[0] is MemoryOperand { Base: Register { Name: "X19" } }).ToList();
         Assert.Multiple(() =>
         {
-            // each 8-byte store writes the register's low window, then the
-            // shifted-out high window — the second store's windows must read
-            // operands the second load produced
-            Assert.That(stores, Has.Count.EqualTo(4), () => string.Join("\n", il));
-            Assert.That(stores[0].Operands[1], Is.EqualTo(new Register(null, "V0")));
-            Assert.That(stores[2].Operands[1], Is.EqualTo(new Register(null, "V0")));
-            Assert.That(stores[0].Operands[1], Is.Not.EqualTo(stores[1].Operands[1]));
-            Assert.That(stores[2].Operands[1], Is.Not.EqualTo(stores[3].Operands[1]));
-            Assert.That(stores[1].Operands[1], Is.Not.EqualTo(stores[3].Operands[1]),
-                "the second high window must not reuse the first store's temp");
+            Assert.That(stores, Has.Count.EqualTo(2), () => string.Join("\n", il));
+            Assert.That(stores[0].Operands[1], Is.EqualTo(
+                new MemoryOperand(new Register(null, "X9"), addend: 0x48, accessSize: 8)));
+            Assert.That(stores[1].Operands[1], Is.EqualTo(
+                new MemoryOperand(new Register(null, "X8"), addend: 0x48, accessSize: 8)),
+                "the second store must read the second load's source, not the first's");
             Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
         });
     }
@@ -1068,11 +1064,12 @@ public class Arm64VectorScalarizerTests
     }
 
     [Test]
-    public void ScalarDoubleStoreWritesBothWindows()
+    public void ScalarDoubleStoreIsAMemoryCopy()
     {
-        // A `str d` is an eight-byte store: the low window carries the
-        // register's value and the high window its upper half, so a target
-        // made of two adjacent float members resolves both fields.
+        // A `str d` of a register an `ldr d` just filled is one eight-byte
+        // memory-to-memory copy: the resolver spells the whole aggregate on
+        // both sides — a target made of two adjacent float members resolves
+        // both fields, a double member resolves the double.
         var il = Lift(
             0xfd400e60, // ldr d0, [x19, #0x18]
             0xfd402100, // ldr d0, [x8, #0x40]
@@ -1082,12 +1079,106 @@ public class Arm64VectorScalarizerTests
             && i.Operands[0] is MemoryOperand { Base: Register { Name: "X20" } }).ToList();
         Assert.Multiple(() =>
         {
-            Assert.That(stores, Has.Count.EqualTo(2),
-                () => string.Join("\n", il));
-            Assert.That(((MemoryOperand)stores[0].Operands[0]).Addend, Is.EqualTo(0x20));
-            Assert.That(((MemoryOperand)stores[1].Operands[0]).Addend, Is.EqualTo(0x24));
+            Assert.That(stores, Has.Count.EqualTo(1), () => string.Join("\n", il));
+            Assert.That((MemoryOperand)stores[0].Operands[0],
+                Is.EqualTo(new MemoryOperand(new Register(null, "X20"), addend: 0x20, accessSize: 8)));
+            Assert.That(stores[0].Operands[1], Is.EqualTo(
+                new MemoryOperand(new Register(null, "X8"), addend: 0x40, accessSize: 8)));
             Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False,
                 () => string.Join("\n", il));
+        });
+    }
+
+    [Test]
+    public void PairStoreOfAdjacentVectorLoadsIsOneStructCopy()
+    {
+        // `ldp q1, q0` + `stp q1, q0` copies 32 bytes of one range to another —
+        // the classic struct copy a C compiler emits for `dst = src` on a
+        // 32-byte struct. Emit a single memory-to-memory move so the resolver
+        // stores the whole aggregate instead of truncating to one field.
+        var il = Lift(
+            0xad410001, // ldp q1, q0, [x0, #0x20]
+            0xad000021); // stp q1, q0, [x1]
+
+        var stores = il.Where(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand { Base: Register { Name: "X1" } }).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(stores, Has.Count.EqualTo(1), () => string.Join("\n", il));
+            Assert.That((MemoryOperand)stores[0].Operands[0],
+                Is.EqualTo(new MemoryOperand(new Register(null, "X1"), accessSize: 32)));
+            Assert.That(stores[0].Operands[1], Is.EqualTo(
+                new MemoryOperand(new Register(null, "X0"), addend: 0x20, accessSize: 32)));
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        });
+    }
+
+    [Test]
+    public void VectorStoreOfReloadedRegisterIsMemoryCopy()
+    {
+        var il = Lift(
+            0x3dc00400, // ldr q0, [x0, #0x10]
+            0x3d800020); // str q0, [x1]
+
+        var stores = il.Where(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand { Base: Register { Name: "X1" } }).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(stores, Has.Count.EqualTo(1), () => string.Join("\n", il));
+            Assert.That((MemoryOperand)stores[0].Operands[0],
+                Is.EqualTo(new MemoryOperand(new Register(null, "X1"), accessSize: 16)));
+            Assert.That(stores[0].Operands[1], Is.EqualTo(
+                new MemoryOperand(new Register(null, "X0"), addend: 0x10, accessSize: 16)));
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        });
+    }
+
+    [Test]
+    public void ZeroVectorStoresEmitWholeWidthImmediates()
+    {
+        // `movi` + vector stores is the compiler's struct/array zero-fill: each
+        // store must carry its full width with an immediate zero source so the
+        // resolver can split the range per field or merge a run into initobj.
+        var il = Lift(
+            0x6f00e400, // movi v0.2d, #0
+            0xad008120, // stp q0, q0, [x9, #0x10]
+            0x3d800120); // str q0, [x9]
+
+        var stores = il.Where(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand { Base: Register { Name: "X9" } }).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(stores, Has.Count.EqualTo(3), () => string.Join("\n", il));
+            Assert.That(stores.Select(s => ((MemoryOperand)s.Operands[0]).Addend),
+                Is.EqualTo(new long[] { 0x10, 0x20, 0x00 }));
+            foreach (var store in stores)
+            {
+                Assert.That(((MemoryOperand)store.Operands[0]).AccessSize, Is.EqualTo(16));
+                Assert.That(store.Operands[1], Is.EqualTo(new Immediate(0, 16)));
+            }
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        });
+    }
+
+    [Test]
+    public void DoubleStoreOfScalarValueWritesOneWideStore()
+    {
+        // `fmov d0, x0` leaves v0 holding one 64-bit scalar: `str d` stores the
+        // register's low and high halves of that one operand, so emit the
+        // eight-byte store a double member resolves whole.
+        var il = Lift(
+            0x9e670000, // fmov d0, x0
+            0xfd000420); // str d0, [x1, #0x8]
+
+        var stores = il.Where(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand { Base: Register { Name: "X1" } }).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(stores, Has.Count.EqualTo(1), () => string.Join("\n", il));
+            Assert.That((MemoryOperand)stores[0].Operands[0],
+                Is.EqualTo(new MemoryOperand(new Register(null, "X1"), addend: 0x8, accessSize: 8)));
+            Assert.That(stores[0].Operands[1], Is.EqualTo(new Register(null, "V0")));
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
         });
     }
 }
