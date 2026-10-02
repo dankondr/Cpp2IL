@@ -167,5 +167,12 @@ public enum OpCode
     /// stored in op 1. Not a copy - the result's type comes from the instruction's
     /// destination register width and its conversion flags, never from the source.
     /// </summary>
-    Convert
+    Convert,
+
+    /// <summary>
+    /// Multi-way branch recovered from a constant lookup-table shape: op 1 is the
+    /// out-of-range (default) target block, op 2 the selector, and the remaining
+    /// operands the first instruction of each case block in selector order.
+    /// </summary>
+    Switch
 }

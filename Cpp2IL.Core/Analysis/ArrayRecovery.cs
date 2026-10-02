@@ -425,12 +425,23 @@ public static class ArrayRecovery
                 ? IsLength(a, array, dimension) ? b : IsLength(b, array, dimension) ? a : null
                 : IsLength(operand, array, dimension) ? new Immediate(1) : null;
 
+        // A counter that starts at or above 0 and steps by 1 meets its length before it can pass it,
+        // so clang checks it with `cmp len, i; b.eq` rather than an ordering.
         bool Compared(IOperand index, IOperand array, int dimension)
-            => cfg.Instructions.Any(check => check.OpCode is OpCode.CheckLess or OpCode.CheckGreater
+            => cfg.Instructions.Any(check => (check.OpCode is OpCode.CheckLess or OpCode.CheckGreater
                     or OpCode.CheckLessOrEqual or OpCode.CheckGreaterOrEqual
+                    || check.OpCode == OpCode.CheckEqual && Unextended(index) is LocalVariable counter && CountsUp(counter))
                 && check.Operands.Count == 3
                 && (IsLength(check.Operands[1], array, dimension) && SameValue(check.Operands[2], index)
                     || IsLength(check.Operands[2], array, dimension) && SameValue(check.Operands[1], index)));
+
+        // `i = s` with s >= 0, and `i = i + 1` directly or through a copy of `i + 1`; nothing else.
+        bool CountsUp(LocalVariable local)
+            => allDefinitions.TryGetValue(local, out var defs) && defs.Count == 2
+               && defs.Any(d => d is { OpCode: OpCode.Move, Operands: [_, Immediate { Value: >= 0 }] })
+               && defs.Any(d => (d is { OpCode: OpCode.Move, Operands: [_, LocalVariable copy] } ? Definition(copy) : d)
+                   is { OpCode: OpCode.Add, Operands: [_, LocalVariable from, Immediate { Value: 1 }] }
+                   && ReferenceEquals(from, local));
 
         Instruction? Definition(IOperand operand)
             => operand is LocalVariable local && definitions.TryGetValue(local, out var definition) ? definition : null;
@@ -1068,6 +1079,7 @@ public static class ArrayRecovery
         var definitions = SingleDefinitions(method.ControlFlowGraph!);
         Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>>? uses = null;
         var guardContext = new GuardedIndexContext(method);
+        var lengthWordBases = new List<LocalVariable>();
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
@@ -1092,7 +1104,11 @@ public static class ArrayRecovery
                                  () => uses ??= CollectUses(method.ControlFlowGraph!), guardContext) is { } guardedDerived)
                         instruction.SetOperand(i, guardedDerived);
                     else if (LengthWordLoad(instruction, i, memory, pointerSize, definitions) is { } lengthArray)
+                    {
                         instruction.SetOperand(i, new ArrayLength(lengthArray));
+                        if (memory.Base is LocalVariable lengthWordBase)
+                            lengthWordBases.Add(lengthWordBase);
+                    }
                     continue;
                 }
 
@@ -1116,6 +1132,45 @@ public static class ArrayRecovery
                 else if (GuardedIndexAccess(method, instruction, i, memory, pointerSize, definitions,
                              () => uses ??= CollectUses(method.ControlFlowGraph!), guardContext) is { } guarded)
                     instruction.SetOperand(i, guarded);
+            }
+        }
+
+        DropDeadHeaderAddresses(method.ControlFlowGraph!, lengthWordBases, definitions);
+    }
+
+    // A length-word load folded into ldlen no longer reads the `array + K` header
+    // address it went through. Address arithmetic on a managed reference has no IL
+    // spelling, so a chain link nothing reads any more is dropped with the load
+    // that needed it - walking back from the folded base through the same
+    // Move/Add/Subtract links LengthWordLoad proved - instead of reaching
+    // emission as a value. A link still read elsewhere stays.
+    private static void DropDeadHeaderAddresses(ISILControlFlowGraph cfg, List<LocalVariable> bases,
+        Dictionary<LocalVariable, Instruction?> definitions)
+    {
+        if (bases.Count == 0)
+            return;
+        var reads = new Dictionary<LocalVariable, int>();
+        foreach (var instruction in cfg.Instructions)
+            foreach (var used in DeadCodeEliminator.UsedLocals(instruction))
+                reads[used] = reads.GetValueOrDefault(used) + 1;
+        var work = new Stack<LocalVariable>(bases);
+        while (work.Count > 0)
+        {
+            var local = work.Pop();
+            if (local.Type is SzArrayTypeAnalysisContext || reads.GetValueOrDefault(local) != 0
+                || !definitions.TryGetValue(local, out var definition)
+                || definition is not { OpCode: OpCode.Move or OpCode.Add or OpCode.Subtract }
+                || definition is { OpCode: OpCode.Move, Operands: [_, MemoryOperand] }
+                || EvaluateHeaderBase(local, definitions, 0) is not
+                    { Root: LocalVariable { Type: SzArrayTypeAnalysisContext }, Multiplier: 1 })
+                continue;
+            var sources = DeadCodeEliminator.UsedLocals(definition).ToList();
+            MakeNop(definition);
+            definitions[local] = null;
+            foreach (var source in sources)
+            {
+                reads[source]--;
+                work.Push(source);
             }
         }
     }

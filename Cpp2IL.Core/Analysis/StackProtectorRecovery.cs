@@ -130,10 +130,90 @@ public static class StackProtectorRecovery
                 instruction.SetOperands();
                 changed = true;
             }
+            changed |= SweepUnreadProtectorDefs(cfg, deadCells, deadLocals);
             if (!changed)
                 return;
         }
     }
+
+    // The lifter coalesces a register's protector values with its later, real
+    // uses (`mrs x25, tpidr_el0` early, `orr x25, ...` later; a scratch x8 that
+    // reloads the spilled thread pointer and later carries data), so after the
+    // guards fold the local still has readers by name and its protector defs
+    // survive as undefined-SYSREG reads. A protector def no path reads before
+    // the local is redefined is dead whatever the local carries elsewhere; one
+    // with a reader stays. The local is not marked swept: its other defs are
+    // real.
+    private static bool SweepUnreadProtectorDefs(ISILControlFlowGraph cfg, HashSet<MemoryOperand> deadCells,
+        HashSet<LocalVariable> deadLocals)
+    {
+        if (!cfg.Instructions.Any(instruction => instruction.Operands.Any(IsSysregRooted)))
+            return false;
+
+        var changed = false;
+        foreach (var block in cfg.Blocks)
+        {
+            for (var i = 0; i < block.Instructions.Count; i++)
+            {
+                var def = block.Instructions[i];
+                if (def.OpCode is not (OpCode.Move or OpCode.CheckEqual or OpCode.CheckNotEqual or OpCode.Not)
+                    || def.Destination is not LocalVariable local
+                    || local.Register.Name == "SYSREG"
+                    || !TouchesProtector(def, deadCells, deadLocals, cfg)
+                    || IsReadBeforeRedefinition(cfg, block, i + 1, local))
+                    continue;
+                def.OpCode = OpCode.Nop;
+                def.SetOperands();
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    private static bool IsSysregRooted(IOperand operand) => operand switch
+    {
+        Register { Name: "SYSREG" } or LocalVariable { Register.Name: "SYSREG" } => true,
+        MemoryOperand { Base: LocalVariable { Register.Name: "SYSREG" } } => true,
+        _ => false,
+    };
+
+    // Forward walk from (start, index): true when an instruction reads `local`
+    // before a path redefines it. Blocks no edge reaches (landing-pad code the
+    // graph keeps detached) count as readers when they mention the local at all.
+    private static bool IsReadBeforeRedefinition(ISILControlFlowGraph cfg, Block start, int index, LocalVariable local)
+    {
+        foreach (var detached in cfg.Blocks)
+            if (detached != cfg.EntryBlock && detached.Predecessors.Count == 0
+                && detached.Instructions.Any(instruction => Mentions(instruction, local)))
+                return true;
+
+        var visited = new HashSet<Block>();
+        var queue = new Queue<(Block Block, int Index)>();
+        queue.Enqueue((start, index));
+        while (queue.Count > 0)
+        {
+            var (block, from) = queue.Dequeue();
+            var killed = false;
+            for (var i = from; i < block.Instructions.Count && !killed; i++)
+            {
+                var instruction = block.Instructions[i];
+                if (instruction.Sources.Any(source => LocalVariables.OperandLocals(source).Contains(local))
+                    || instruction.Destination is { } destination and not LocalVariable
+                        && LocalVariables.OperandLocals(destination).Contains(local))
+                    return true;
+                killed = ReferenceEquals(instruction.Destination, local);
+            }
+            if (killed)
+                continue;
+            foreach (var successor in block.Successors)
+                if (visited.Add(successor))
+                    queue.Enqueue((successor, 0));
+        }
+        return false;
+    }
+
+    private static bool Mentions(Instruction instruction, LocalVariable local) =>
+        instruction.Operands.Any(operand => LocalVariables.OperandLocals(operand).Contains(local));
 
     // Only instructions on the protector's def-chain may be swept: an operand
     // naming a proven protector cell, a TLS canary read, a SYSREG root, or a
@@ -150,6 +230,8 @@ public static class StackProtectorRecovery
                         Base: LocalVariable canaryBase }
                     when deadLocals.Contains(canaryBase)
                         || IsSysregProvenanced(canaryBase, cfg.Instructions, cfg):
+                case MemoryOperand { Index: null, Addend: TlsStackGuardOffset, Base: LocalVariable reloaded }
+                    when ReloadsTlsPointerCell(reloaded, deadCells, cfg):
                 case MemoryOperand cell when deadCells.Contains(cell):
                 case Register { Name: "SYSREG" }:
                     return true;
@@ -165,6 +247,15 @@ public static class StackProtectorRecovery
         }
         return false;
     }
+
+    // A frame keeps the thread pointer in a cell across calls (`stur x8, [x29, #-0x20]`
+    // after `mrs x8, tpidr_el0`) and reloads it for each guard: `[reload + 0x28]` is
+    // the TLS canary read one hop removed.
+    private static bool ReloadsTlsPointerCell(LocalVariable local, HashSet<MemoryOperand> deadCells,
+        ISILControlFlowGraph cfg) =>
+        cfg.Instructions.Any(instruction => ReferenceEquals(instruction.Destination, local)
+            && instruction is { OpCode: OpCode.Move, Operands: [_, MemoryOperand cell] }
+            && deadCells.Contains(cell));
 
     private static void CollectSourceUse(IOperand operand, HashSet<LocalVariable> locals,
         HashSet<MemoryOperand> cells)
