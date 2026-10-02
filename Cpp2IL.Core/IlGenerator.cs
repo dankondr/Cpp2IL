@@ -4811,10 +4811,7 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldarga, addressedParameter);
                 break;
             case AddressOf { Target: LocalVariable addressed }:
-                if (ParameterForLocal(addressed, method, callingContext) is { } addressedParameter)
-                    instructions.Add(CilOpCodes.Ldarga, addressedParameter);
-                else
-                    instructions.Add(CilOpCodes.Ldloca, locals[addressed]);
+                instructions.Add(CilOpCodes.Ldloca, locals[addressed]);
                 break;
             case AddressOf { Target: FieldReference addressedField }:
                 if (!FieldReferenceUsableFrom(addressedField, callingContext, writeAccess: true))

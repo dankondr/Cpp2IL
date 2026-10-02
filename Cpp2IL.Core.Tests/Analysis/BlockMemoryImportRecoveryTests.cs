@@ -1324,4 +1324,52 @@ public class BlockMemoryImportRecoveryTests
         Assert.That(call.Operands[0], Is.EqualTo(new StringLiteral("memcpy")));
         Assert.That(call.Operands[1], Is.SameAs(result));
     }
+
+    // castle-recovery#306: a by-value struct wider than 16 bytes arrives as the
+    // address of the caller's copy, so the parameter's register is a pointer; as a
+    // block-op operand it is the parameter's own storage.
+    [Test]
+    public void WideStructParameterIsItsOwnStorageInABlockCopy()
+    {
+        var wide = ValueType("Wide", ("A", _int64, 0), ("B", _int64, 8), ("C", _int64, 16));
+        EmitModule(wide);
+        var caller = CallerWithUnresolvedCall(out var call);
+        var parameter = new LocalVariable("adInfo", new Register(null, "X1"), wide);
+        var copy = Reg("HRET_2", wide, 1);
+        caller.Locals!.AddRange([parameter, copy]);
+        caller.ParameterLocals = [parameter];
+        call.SetOperand(2, new AddressOf(copy));
+        call.SetOperand(3, parameter);
+        call.SetOperand(4, new Immediate(24));
+
+        BlockMemoryImportRecovery.Run(caller, _ => "memcpy");
+
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.MemoryCopy));
+        Assert.That(call.Operands[1], Is.TypeOf<AddressOf>());
+        Assert.That(((AddressOf)call.Operands[1]).Target, Is.SameAs(parameter));
+    }
+
+    // The address of a parameter is its argument slot (ldarga), not the shadow
+    // local every ISIL local also gets.
+    [Test]
+    public void AddressOfParameterEmitsLdarga()
+    {
+        var decimal_ = FixtureDecimal();
+        var parameters = new (TypeAnalysisContext Type, string Name)[] { (decimal_, "value") };
+        var caller = RunnerMethod("ZeroParam", _app.SystemTypes.SystemVoidType, parameters, out var locals);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.MemorySet, new AddressOf(locals[0]), new Immediate(0), new Immediate(16)),
+            new Instruction(1, OpCode.Return),
+        ]);
+
+        var module = NewModule(decimal_);
+        DecimalDef(module, decimal_);
+        var definition = Definition(module, "ZeroParam", _app.SystemTypes.SystemVoidType, parameters);
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldarga || i.OpCode == CilOpCodes.Ldarga_S), Is.True,
+            () => string.Join("\n", il.Select(i => i.ToString())));
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldloca || i.OpCode == CilOpCodes.Ldloca_S), Is.False);
+    }
 }

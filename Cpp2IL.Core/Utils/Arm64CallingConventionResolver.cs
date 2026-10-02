@@ -46,8 +46,8 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
 
     // integer args in X0-X7, fp args in V0-V7 (independent counters). A homogeneous
     // float aggregate of n floats takes one V register per lane; any other value
-    // type of 9-16 bytes takes an integer register pair; wider composites go on the
-    // stack.
+    // type of 9-16 bytes takes an integer register pair; wider composites pass a
+    // pointer to a copy in one register.
     public override IReadOnlyList<AggregateLane> ExtraLanes(TypeAnalysisContext type, Register firstLane)
     {
         var firstIndex = FirstRegisterIndex(firstLane, FloatRegisters);
@@ -124,14 +124,13 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
                 }
 
                 // A composite that does not fit the remaining registers spills whole to
-                // the stack and the register file is done (AAPCS C.3); a >16 byte one
-                // is passed on the stack without consuming registers at all.
+                // the stack and the register file is done (AAPCS C.3).
                 if (integerRegisterCount > 0)
                     integer = IntegerRegisters.Length;
             }
 
             args.Add(new StackOffset(stack));
-            stack += par != null && par.ParameterType.IsValueType
+            stack += par != null && par.ParameterType.IsValueType && !PassesByReference(par.ParameterType)
                 ? (int)((System.Math.Max(StructSize(par.ParameterType), 1) + 7) & ~7L)
                 : PtrSize;
         }
@@ -150,19 +149,24 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
     private static int FloatingRegisterCount(TypeAnalysisContext type)
         => TryGetHomogeneousFloatAggregate(type, [], out _, out var count) ? count : 0;
 
-    // 0 = too wide for registers at all (stack), 1 = one register, 2 = a pair.
+    // 1 = one register, 2 = a pair. A composite wider than 16 bytes is copied by the
+    // caller and replaced by a pointer to the copy (AAPCS64 B.4), which takes one
+    // register like any other pointer.
     private static int IntegerRegisterCount(TypeAnalysisContext type)
     {
         if (!type.IsValueType || IsFloatingPoint(type))
             return 1;
 
-        return StructSize(type) switch
-        {
-            > 8 and <= 16 => 2,
-            > 16 => 0,
-            _ => 1,
-        };
+        return StructSize(type) is > 8 and <= 16 ? 2 : 1;
     }
+
+    // AAPCS64 B.4: a composite wider than 16 bytes that is not a homogeneous float
+    // aggregate travels as a pointer to a caller-owned copy. Its parameter register
+    // holds that address, not the value.
+    public override bool PassesByReference(TypeAnalysisContext type)
+        => type.IsValueType && !IsFloatingPoint(type) && !type.IsEnumType
+           && type is not GenericParameterTypeAnalysisContext
+           && FloatingRegisterCount(type) == 0 && StructSize(type) > 16;
 
     private static bool TryGetHomogeneousFloatAggregate(TypeAnalysisContext type,
         HashSet<TypeAnalysisContext> active, out TypeAnalysisContext? elementType, out int count)
