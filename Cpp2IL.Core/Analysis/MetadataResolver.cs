@@ -333,6 +333,18 @@ public static class MetadataResolver
                         instruction.OpCode == OpCode.Move && i == 0, addressed: false))
                     continue;
 
+                // A store writes every byte of its register (a SIMD store's width is only on
+                // the instruction): when those bytes cover the next field too, naming the one
+                // field it starts at would drop the rest of the value. A struct value's copy
+                // is regrouped into whole-field stores by the aggregate passes instead.
+                if (i == 0 && instruction.OpCode == OpCode.Move && storeWidth > 0
+                    && !(instruction.Operands[1] is LocalVariable { Type: { IsValueType: true } storedType }
+                         && PrimitiveStorageSize(storedType, method.AppContext.Binary.PointerSizeBytes) == null)
+                    && PrimitiveStorageSize(field.FieldType, method.AppContext.Binary.PointerSizeBytes) < storeWidth
+                    && CoveredFields(owner, memory.Addend, storeWidth, wholeStructs: true, staticOwner != null)
+                        is { Count: > 1 })
+                    continue;
+
                 // The produced reference pushes `local` as its ldfld/stfld base.
                 // When the local's declared type supplies neither `&host` nor a
                 // host-assignable reference the emission is invalid IL - keep the
@@ -344,6 +356,7 @@ public static class MetadataResolver
                 if (genericOwner != null && field is not ConcreteGenericFieldAnalysisContext)
                     field = BindResolvedFieldLeaf(owner, resolved.Value.Containers, field);
 
+                NarrowMergeToOwner(local, owner, staticOwner ?? byRefElement, definitions);
                 instruction.SetOperand(i, new FieldReference(field, local, (int)memory.Addend,
                     resolved!.Value.Containers, memory.AccessSize));
                 changed = true;
@@ -569,7 +582,8 @@ public static class MetadataResolver
                 if (!consumed.All(IsStruct) || consumed.Select(t => t!.FullName).Distinct().Count() != 1)
                     continue;
                 whole = consumed[0];
-                cells = cells.Select(c => c is { Field: { } f } ? Widened(f, whole!) is { } w ? (w, whole!) : null : c).ToList();
+                cells = cells.Select(c => c is { Read: FieldReference f } ? Widened(f, whole!) is { } w ? ((IOperand?)w, whole!) : null
+                    : c is { Read: ArrayAccess } ? null : c).ToList();
             }
 
             if (cells.Any(c => c == null) || cells.Select(c => c!.Value.Type.FullName).Distinct().Count() != 1)
@@ -579,7 +593,8 @@ public static class MetadataResolver
             // runs where the join is not reached: only a read that cannot fault may go there - a
             // literal slot, or a field of `this`.
             if (cells.Where((c, k) => block.Predecessors[k].Successors.Count != 1)
-                .Any(c => c!.Value.Field is { } edgeRead && !IsThisValue(edgeRead.Local)))
+                .Any(c => c!.Value.Read is ArrayAccess
+                          || c.Value.Read is FieldReference edgeRead && !IsThisValue(edgeRead.Local)))
                 continue;
 
             // A load of a struct cell reads only the bytes it covers, not the value; a primitive cell
@@ -594,13 +609,13 @@ public static class MetadataResolver
             var values = new List<IOperand> { NewLocal(type) };
             for (var k = 0; k < cells.Count; k++)
             {
-                if (cells[k]!.Value.Field is not { } field)
+                if (cells[k]!.Value.Read is not { } read)
                 {
                     values.Add(phi.Operands[1 + k]);
                     continue;
                 }
                 var value = NewLocal(type);
-                SsaForm.InsertBeforeTerminator(block.Predecessors[k], [new Instruction(-1, OpCode.Move, value, field)]);
+                SsaForm.InsertBeforeTerminator(block.Predecessors[k], [new Instruction(-1, OpCode.Move, value, read)]);
                 values.Add(value);
             }
             block.Instructions.Insert(block.Instructions.IndexOf(phi) + 1, new Instruction(-1, OpCode.Phi, values));
@@ -619,8 +634,9 @@ public static class MetadataResolver
 
         // The cell an incoming address names: `&o.f`, `o + offset` of a typed reference
         // (the fixpoint sees this form; RecoverObjectFieldAddresses turns it into `&o.f`
-        // later), or a string literal slot.
-        (FieldReference? Field, TypeAnalysisContext Type)? Cell(IOperand operand, int accessSize)
+        // later), an element of an array at a constant index (`&wheels[0]` is
+        // `wheels + 0x20`), or a string literal slot.
+        (IOperand? Read, TypeAnalysisContext Type)? Cell(IOperand operand, int accessSize)
         {
             if (operand is AddressOf { Target: FieldReference addressed })
                 return (new FieldReference(addressed.Field, addressed.Local, addressed.Offset, addressed.Containers,
@@ -629,12 +645,30 @@ public static class MetadataResolver
                 return null;
             if (definition is { OpCode: OpCode.Move, Operands: [_, StringLiteral] })
                 return (null, method.AppContext.SystemTypes.SystemStringType);
+            if (definition is { OpCode: OpCode.Add, Operands: [_, LocalVariable { Type: SzArrayTypeAnalysisContext { ElementType: var elementType } } array, Immediate elementOffset] }
+                && HoldsObject(array, [])
+                && PrimitiveStorageSize(elementType, method.AppContext.Binary.PointerSizeBytes) is { } elementSize
+                && (accessSize == 0 || accessSize == elementSize)
+                && elementOffset.Value - 4L * method.AppContext.Binary.PointerSizeBytes is >= 0 and var inData
+                && inData % elementSize == 0)
+                return (new ArrayAccess(array, new Immediate(inData / elementSize)), elementType);
             if (definition is { OpCode: OpCode.Add, Operands: [_, LocalVariable { Type: { IsValueType: false } ownerType } owner, Immediate offset] }
                 && FindInstanceFieldPathAtOffset(ownerType, offset.Value, accessSize) is { } path)
                 return (new FieldReference(path.Field, owner, (int)offset.Value, path.Containers, accessSize),
                     path.Field.FieldType);
             return null;
         }
+
+        // The array itself on every path, not an element address the merge of `a` and
+        // `a + i*4` still types as the array: no definition on the way is address arithmetic.
+        bool HoldsObject(LocalVariable local, HashSet<LocalVariable> seen)
+            => !seen.Add(local) || !definitions.TryGetValue(local, out var definition)
+               || definition.OpCode switch
+               {
+                   OpCode.Phi => definition.Operands.Skip(1).All(input => input is LocalVariable next && HoldsObject(next, seen)),
+                   OpCode.Move => definition.Operands[1] is not LocalVariable source || HoldsObject(source, seen),
+                   _ => definition.OpCode is not (OpCode.Add or OpCode.Subtract or OpCode.Or),
+               };
 
         static bool Mentions(IOperand operand, LocalVariable local) => operand switch
         {
@@ -750,6 +784,11 @@ public static class MetadataResolver
                     var by = (int)amount.Value;
                     return (source.Low >> by | source.High << (64 - by), source.High >> by, source.FromLiteral);
                 }
+                // `movz x8, #0xe; movk x8, #0x4020, lsl #48` builds one constant in halves.
+                if (definition is { OpCode: OpCode.Or, Operands: [_, var left, var right] }
+                    && ConstantBits(left, definitions, depth + 1) is { } low
+                    && ConstantBits(right, definitions, depth + 1) is { } high)
+                    return (low.Low | high.Low, low.High | high.High, low.FromLiteral || high.FromLiteral);
                 return null;
             default:
                 return null;
@@ -1678,15 +1717,13 @@ public static class MetadataResolver
         for (var i = 0; i < instruction.Operands.Count; i++)
         {
             if (instruction.Operands[i] is not MemoryOperand { Base: LocalVariable alias } memory
-                || !definitions.TryGetValue(alias, out var definition)
-                || definition is not { OpCode: OpCode.Add or OpCode.Subtract, Operands: [_, LocalVariable root, Immediate displacement] }
+                || AddressAlias(alias, definitions, []) is not (LocalVariable root, var signed)
                 || ReferenceEquals(root, alias)
                 || EffectiveObjectType(root, definitions, method.DeclaringType) is not { } rootType
                 || rootType.IsValueType && !root.IsThis)
                 continue;
             // ldarg.0 of a struct method's own `this` is &T, so this + disp is interior
             // addressing just like object + disp is for references.
-            var signed = definition.OpCode == OpCode.Subtract ? -displacement.Value : displacement.Value;
             long offset;
             try { offset = checked(memory.Addend + signed); }
             catch (System.OverflowException) { continue; }
@@ -1700,6 +1737,73 @@ public static class MetadataResolver
             changed = true;
         }
         return changed;
+    }
+
+    // A merge whose wider annotation came from a use (op_Equality's UnityEngine.Object)
+    // holds the owner the access just resolved against on every path (MergedObjectType).
+    // The merge, the copies the access reads it through and the merge's inputs are
+    // declared with that owner, so the access is spelled as the source did, with no cast.
+    private static void NarrowMergeToOwner(LocalVariable local, TypeAnalysisContext owner,
+        TypeAnalysisContext? notInstance, IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+    {
+        if (notInstance != null || owner.IsValueType || !Wider(local) || !ReachesMerge(local, []))
+            return;
+        Narrow(local, []);
+
+        bool Wider(LocalVariable current) => current.Type is { IsValueType: false } declared
+            && owner.FullName != declared.FullName && owner.IsAssignableTo(declared);
+
+        bool ReachesMerge(LocalVariable current, HashSet<LocalVariable> seen) => seen.Add(current)
+            && definitions.TryGetValue(current, out var definition)
+            && (definition.OpCode == OpCode.Phi
+                || definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] } && ReachesMerge(source, seen));
+
+        void Narrow(LocalVariable current, HashSet<LocalVariable> seen)
+        {
+            if (!seen.Add(current))
+                return;
+            if (Wider(current))
+                current.Type = owner;
+            if (!definitions.TryGetValue(current, out var definition))
+                return;
+            var inputs = definition switch
+            {
+                { OpCode: OpCode.Move, Operands: [_, LocalVariable source] } => [source],
+                { OpCode: OpCode.Phi } => definition.Operands.Skip(1).OfType<LocalVariable>()
+                    .Where(input => !(definitions.TryGetValue(input, out var constant)
+                                      && constant is { OpCode: OpCode.Move, Operands: [_, Immediate { Value: 0 }] })),
+                _ => [],
+            };
+            foreach (var input in inputs)
+                Narrow(input, seen);
+        }
+    }
+
+    // The address `root + displacement` a local holds on every path: a root plus a
+    // constant, or a phi whose inputs all hold that same address. A pre-indexed store
+    // on each of two paths (`str x0, [x19, #0x18]!`) steps the base to the same field
+    // address twice, and the access after the join is relative to the merge.
+    private static (LocalVariable Root, long Displacement)? AddressAlias(LocalVariable local,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions, HashSet<LocalVariable> visiting)
+    {
+        if (!visiting.Add(local) || !definitions.TryGetValue(local, out var definition))
+            return null;
+        if (definition is { OpCode: OpCode.Add or OpCode.Subtract, Operands: [_, LocalVariable root, Immediate displacement] })
+            return (root, definition.OpCode == OpCode.Subtract ? -displacement.Value : displacement.Value);
+        if (definition.OpCode != OpCode.Phi)
+            return null;
+        (LocalVariable Root, long Displacement)? common = null;
+        foreach (var input in definition.Operands.Skip(1))
+        {
+            // An input already being resolved is a loop carrying this same value back.
+            if (input is LocalVariable seen && visiting.Contains(seen))
+                continue;
+            if (input is not LocalVariable next || AddressAlias(next, definitions, visiting) is not { } address
+                || common is { } known && (!ReferenceEquals(known.Root, address.Root) || known.Displacement != address.Displacement))
+                return null;
+            common = address;
+        }
+        return common;
     }
 
     private static TypeAnalysisContext? EffectiveObjectType(LocalVariable local,
@@ -1755,11 +1859,38 @@ public static class MetadataResolver
             { OpCode: OpCode.Move, Operands: [_, AddressOf { Target: ArrayAccess element }] }
                 => EffectiveObjectType(element.Array, definitions, visiting, thisType) is SzArrayTypeAnalysisContext { ElementType: { IsValueType: true } elementType }
                     ? elementType : null,
+            { OpCode: OpCode.Phi } => MergedObjectType(definition),
             _ => null,
         };
 
         visiting.Remove(local);
         return recovered ?? fallback;
+
+        // `x = c ? a.config : null` holds a config or null on every path, whatever wider
+        // type a use gave the merge (op_Equality's UnityEngine.Object): the inputs that
+        // are not null must agree on one object type, a narrowing of the merge's own.
+        TypeAnalysisContext? MergedObjectType(Instruction phi)
+        {
+            TypeAnalysisContext? common = null;
+            foreach (var input in phi.Operands.Skip(1))
+            {
+                if (IsNullConstant(input) || input is LocalVariable seen && visiting.Contains(seen))
+                    continue;
+                // An address computed into an object (`a + i*4`) can carry the object's type.
+                if (input is not LocalVariable next
+                    || definitions.TryGetValue(next, out var inputDefinition)
+                    && inputDefinition.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Or
+                    || EffectiveObjectType(next, definitions, visiting, thisType) is not { IsValueType: false } type
+                    || common != null && common.FullName != type.FullName)
+                    return null;
+                common = type;
+            }
+            return common != null && (local.Type == null || common.IsAssignableTo(local.Type)) ? common : null;
+        }
+
+        bool IsNullConstant(IOperand operand) => operand is Immediate { Value: 0 }
+            || operand is LocalVariable constant && definitions.TryGetValue(constant, out var constantDefinition)
+            && constantDefinition is { OpCode: OpCode.Move, Operands: [_, Immediate { Value: 0 }] };
     }
 
     private static bool ResolvesToKnownAccess(TypeAnalysisContext owner, MemoryOperand memory, int pointerSize,

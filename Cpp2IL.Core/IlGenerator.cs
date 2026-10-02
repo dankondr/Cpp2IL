@@ -62,6 +62,12 @@ public static class IlGenerator
         // foreign reference.
         Analysis.InlinedEventRaiseRecovery.Run(context);
 
+        // Analysis asks for emitted slot types mid-pipeline (a field base's receiver
+        // check), which fills these per-method caches from a graph later passes still
+        // rewrote: emission derives them again from the graph it emits.
+        foreach (var cache in (string[])["RawAddressLocals", "MemoryBaseLocals", "NumericLocalTypes"])
+            context.PutExtraData<object>(cache, null!);
+
         // Change branch targets to instructions
         foreach (var instruction in context.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))
         {
@@ -444,6 +450,7 @@ public static class IlGenerator
         Analysis.ExceptionRegionRecovery.Apply(context, definition, instructionMap, catchHandlers);
 
         RemoveDiscardedDefaults(definition, writeLine);
+        RemoveDeadThrowTails(body, writeLine);
 
         // Nothing may fall off the physical end of a body: a conditional branch
         // (or any other fall-through-capable opcode) as the last instruction
@@ -658,7 +665,7 @@ public static class IlGenerator
                 {
                     FieldReference directField => directField,
                     MemoryOperand storeOperand when TryRecoverFieldStore(storeOperand,
-                        instruction.Operands[1], context, out var recovered) => recovered,
+                        instruction.Operands[1], instruction.NativeStoreWidthBytes ?? 0, context, out var recovered) => recovered,
                     _ => null,
                 };
                 if (storeField is { } field)
@@ -1136,7 +1143,14 @@ public static class IlGenerator
                                 or GenericParameterTypeAnalysisContext)
                             && !IsAssignableToLoose(boxedType, boxContract) && CanEmitTypeToken(boxContract))
                         {
-                            if (TypeTokenUsableFrom(boxContract, context))
+                            // Same rule as EmitStackCoerce: a cast the boxed value can never pass is no conversion.
+                            if (boxedType.IsValueType && !CanHoldBoxed(boxContract, boxedType))
+                            {
+                                instructions.Add(CilOpCodes.Pop);
+                                PushDefaultOf(boxContract, method, instructions, context,
+                                    SlotDefaultReason(boxedType, boxContract));
+                            }
+                            else if (TypeTokenUsableFrom(boxContract, context))
                                 instructions.Add(CilOpCodes.Castclass, boxContract.ToTypeSignature().ToTypeDefOrRef());
                             else
                             {
@@ -1793,6 +1807,10 @@ public static class IlGenerator
                 if (TryEmitUnityVectorOperation(instruction, context, method, locals, writeLine))
                     break;
 
+                // `p = arr + dataOffset` read only by Span slots, which spell it `new Span(arr)`.
+                if (OnlyFeedsSpanSlots(instruction, context))
+                    break;
+
                 // Integer ops on operands that cannot legally sit in an integer slot are
                 // native idioms the lifter mistyped: `&slot | N`/`&slot + N` names a field
                 // inside a struct local, `packed >> 32`/`packed & mask` selects a field out
@@ -1941,18 +1959,24 @@ public static class IlGenerator
                     || !StackContractSatisfied(emitted2, contract2, context, isComparison)
                     || !operandsUsable)
                 {
-                    if (unrecoverableIntegerOperation)
-                        EmitUnrecoverableOperation(method, writeLine, $"Unrecoverable integer operation: {instruction}");
                     // No shared stack kind exists for this operation (e.g. a Vector3
                     // tested against an int, or a struct fed to add). Equality still
                     // has honest answers - a shared native-int lowering covers
                     // integral/pointer operands, and a zero literal on a managed or
                     // generic operand is the null test - while ordering and
-                    // arithmetic have none, so they default to false/zero.
-                    else if (instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual)
+                    // arithmetic have none, so they default to false/zero: the
+                    // zero after the throw keeps the store below stack-consistent
+                    // (IL2CPP's stack analysis walks that dead tail too).
+                    if (unrecoverableIntegerOperation
+                        || instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual)
                         || !(TryEmitNativeIntEquality(instruction, context, method, locals, writeLine)
                             || TryEmitReferenceEquality(instruction, context, method, locals, writeLine)))
-                        EmitUnrecoverableOperation(method, writeLine, $"Unrecoverable operation: {instruction}");
+                    {
+                        EmitUnrecoverableOperation(method, writeLine, unrecoverableIntegerOperation
+                            ? $"Unrecoverable integer operation: {instruction}"
+                            : $"Unrecoverable operation: {instruction}");
+                        instructions.Add(CilOpCodes.Ldc_I4_0);
+                    }
                     EmitStackCoerceOrDefault(context.AppContext.SystemTypes.SystemInt32Type,
                         StoreContract(instruction.Operands[0], context), method, context);
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
@@ -7586,20 +7610,14 @@ public static class IlGenerator
         }
     }
 
-    // A slot whose operand was never produced is filled with a synthetic
-    // default (a note plus ldnull/ldc/default(T)); a destination with no store
-    // spelling then reports the drop by popping that value right back off, and
-    // the pair decompiles to `_ = <expr>` (CS8183 for `_ = null`). The
-    // diagnostics already name the site, so cut the discarded value and its
-    // pop out of the emitted sequence entirely.
-    private static void RemoveDiscardedDefaults(MethodDefinition method, IMethodDescriptor writeLine)
+    // Every instruction another instruction or handler boundary points at
+    // is a label target; removing one of those would orphan the label. By
+    // identity: CilInstruction equality compares opcode, operand and offset,
+    // so every other `ldnull` would read as a target too.
+    private static HashSet<CilInstruction> LabelTargets(CilMethodBody body)
     {
-        var instructions = method.CilMethodBody!.Instructions;
-
-        // Every instruction another instruction or handler boundary points at
-        // is a label target; removing one of those would orphan the label.
-        HashSet<CilInstruction> referenced = [];
-        foreach (var instruction in instructions)
+        var referenced = new HashSet<CilInstruction>(ReferenceEqualityComparer.Instance);
+        foreach (var instruction in body.Instructions)
         {
             switch (instruction.Operand)
             {
@@ -7616,7 +7634,7 @@ public static class IlGenerator
                     break;
             }
         }
-        foreach (var handler in method.CilMethodBody.ExceptionHandlers)
+        foreach (var handler in body.ExceptionHandlers)
         {
             foreach (var boundary in new ICilLabel?[]
                      {
@@ -7629,6 +7647,71 @@ public static class IlGenerator
                     referenced.Add(boundaryTarget);
             }
         }
+        return referenced;
+    }
+
+    // A stub throws in place of the value it could not recover, but the
+    // instruction that consumed the value (stloc, ret, and, ...) is still
+    // emitted after the throw. Nothing there runs until a branch or handler
+    // boundary lands, yet il2cpp converts dead code too, with an empty stack,
+    // and one `Stack empty.` aborts the whole assembly. Cut each dead tail; its
+    // note pairs move ahead of the throw so every diagnostic stays counted.
+    // Repeat until stable: a label that only dead code branched to is dead too.
+    // ponytail: linear, not a reachability walk - a dead loop whose label only
+    // its own back edge targets survives; walk the flow graph if one shows up.
+    private static void RemoveDeadThrowTails(CilMethodBody body, IMethodDescriptor writeLine)
+    {
+        var instructions = body.Instructions;
+        bool removed;
+        do
+        {
+            removed = false;
+            var referenced = LabelTargets(body);
+            for (var i = 0; i < instructions.Count; i++)
+            {
+                if (instructions[i].OpCode != CilOpCodes.Throw)
+                    continue;
+                var end = i + 1;
+                while (end < instructions.Count && !referenced.Contains(instructions[end]))
+                    end++;
+                if (end == i + 1)
+                    continue;
+                List<CilInstruction> notes = [];
+                for (var k = i + 1; k + 1 < end; k++)
+                    if (IsDecompilerNotePair(instructions[k], instructions[k + 1], writeLine))
+                        notes.AddRange([instructions[k], instructions[++k]]);
+                for (var k = end - 1; k > i; k--)
+                    instructions.RemoveAt(k);
+                // Ahead of the thrown value's straight-line producer, so a
+                // `throw new E(...)` keeps its shape; else right before the throw.
+                var at = i;
+                var need = 1;
+                while (need > 0 && at > 0 && !referenced.Contains(instructions[at])
+                       && instructions[at - 1].OpCode.FlowControl is CilFlowControl.Next or CilFlowControl.Call)
+                {
+                    at--;
+                    need += instructions[at].GetStackPopCount(body) - instructions[at].GetStackPushCount();
+                }
+                if (need != 0)
+                    at = i;
+                foreach (var note in notes)
+                    instructions.Insert(at++, note);
+                i += notes.Count;
+                removed = true;
+            }
+        } while (removed);
+    }
+
+    // A slot whose operand was never produced is filled with a synthetic
+    // default (a note plus ldnull/ldc/default(T)); a destination with no store
+    // spelling then reports the drop by popping that value right back off, and
+    // the pair decompiles to `_ = <expr>` (CS8183 for `_ = null`). The
+    // diagnostics already name the site, so cut the discarded value and its
+    // pop out of the emitted sequence entirely.
+    private static void RemoveDiscardedDefaults(MethodDefinition method, IMethodDescriptor writeLine)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        var referenced = LabelTargets(method.CilMethodBody);
 
         for (var i = instructions.Count - 1; i >= 0; i--)
         {
@@ -8060,6 +8143,12 @@ public static class IlGenerator
             "System.Double" => factory.Double,
             _ => null
         };
+        // A boxed value whose type the slot can never hold makes the cast throw
+        // on every execution - that is no conversion, so the slot is defaulted.
+        if ((primitive != null || from.IsValueType) && !to.IsValueType
+            && to is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext)
+            && !CanHoldBoxed(to, from))
+            return false;
         if (primitive != null && !to.IsValueType
             && to is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext))
         {
@@ -8113,8 +8202,9 @@ public static class IlGenerator
 
         if (!from.IsValueType && to.IsValueType)
         {
-            // unbox.any on a ref struct is not legal IL either.
-            if (IsByRefLike(to))
+            // unbox.any on a ref struct is not legal IL either, nor is it a
+            // conversion when the source's type can never hold a boxed `to`.
+            if (IsByRefLike(to) || !CanHoldBoxed(from, to))
                 return false;
             if (!CanEmitTypeToken(to))
                 return true;
@@ -8368,6 +8458,11 @@ public static class IlGenerator
         // never made, so the slot takes the diagnosed default instead.
         if (from.IsValueType && to is Analysis.BooleanClaimVetoedSlotTypeAnalysisContext)
             return false;
+        // Mirrors EmitStackCoerce: boxing into a slot that can never hold the
+        // boxed value is a guaranteed InvalidCastException, not a coercion.
+        if ((from.IsValueType || fromWidth > 0 || from.FullName is "System.Single" or "System.Double")
+            && !to.IsValueType && !CanHoldBoxed(to, from))
+            return false;
         if (from.IsValueType && !to.IsValueType)
             // box, plus castclass when the reference target narrows - both need
             // tokens the caller can legally name. A byref-like source cannot be
@@ -8388,8 +8483,10 @@ public static class IlGenerator
             && SpanArrayConstructor(spanSlot) != null)
             return true;
         if (!from.IsValueType && to.IsValueType)
-            // unbox.any accepts any managed reference - but not a byref-like target
-            return !IsByRefLike(to) && (!CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context));
+            // unbox.any accepts a managed reference that can hold a boxed `to` -
+            // but not a byref-like target
+            return !IsByRefLike(to) && CanHoldBoxed(from, to)
+                && (!CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context));
         if (!from.IsValueType && !to.IsValueType)
             // castclass narrows any reference pair - unless the caller cannot name it
             return IsAssignableToLoose(from, to) || !CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context);
@@ -8743,18 +8840,11 @@ public static class IlGenerator
         // pointer; for a Span<T>/ReadOnlySpan<T> slot the honest operand is the
         // array itself - `new Span(arr)` writes the same pointer plus the
         // array's length. Only fires when the operand is not already span-kind.
-        if (contract is GenericInstanceTypeAnalysisContext
-                { GenericType.FullName: "System.Span`1" or "System.ReadOnlySpan`1" } spanContract
-            && emitted is not GenericInstanceTypeAnalysisContext
+        if (emitted is not GenericInstanceTypeAnalysisContext
                 { GenericType.FullName: "System.Span`1" or "System.ReadOnlySpan`1" }
-            && Analysis.LocalVariables.TryUnwrapArrayDataPointer(operand, context,
-                context.AppContext.Binary.PointerSizeBytes, out var spanArrayOperand)
-            && EmittedOperandType(spanArrayOperand!, context) is SzArrayTypeAnalysisContext
-                { ElementType: { } spanArrayElement }
-            && ThisConstructorCallPlan.SameTypeIdentity(spanArrayElement,
-                spanContract.GenericArguments[0]))
+            && SpanSlotArray(operand, contract, context) is { } spanArrayOperand)
         {
-            resolved = spanArrayOperand!;
+            resolved = spanArrayOperand;
             emitted = EmittedOperandType(resolved, context, contract);
         }
         // An operand emitting &S is already the address of S's offset-0 field: when
@@ -8801,6 +8891,67 @@ public static class IlGenerator
         return contract == null || StackContractSatisfied(emitted, contract, context, convertByRef);
     }
 
+    // The array a Span<T>/ReadOnlySpan<T> slot spells `new Span(arr)` from when the
+    // operand is that array's data pointer (`arr + dataOffset`, traced through copies).
+    private static IOperand? SpanSlotArray(IOperand operand, TypeAnalysisContext? contract,
+        MethodAnalysisContext context)
+        => contract is GenericInstanceTypeAnalysisContext
+                { GenericType.FullName: "System.Span`1" or "System.ReadOnlySpan`1" } spanContract
+            && Analysis.LocalVariables.TryUnwrapArrayDataPointer(operand, context,
+                context.AppContext.Binary.PointerSizeBytes, out var arrayOperand)
+            && EmittedOperandType(arrayOperand!, context) is SzArrayTypeAnalysisContext { ElementType: { } element }
+            && ThisConstructorCallPlan.SameTypeIdentity(element, spanContract.GenericArguments[0])
+                ? arrayOperand
+                : null;
+
+    // `p = arr + dataOffset` is the array's data pointer; a managed reference takes no
+    // `+`, so the add has no honest emission. When no read of p is left - its stores
+    // already respelled as `new Span(arr)` - or every read of p (directly, or through
+    // phi/copy locals read the same way) is a Span slot that SpanSlotArray respells,
+    // nothing in the IL needs the add: it emits nothing instead of a throwing
+    // unrecoverable operation that would make the rest of the block dead.
+    private static bool OnlyFeedsSpanSlots(Instruction instruction, MethodAnalysisContext context)
+    {
+        if (instruction is not { OpCode: OpCode.Add,
+                Operands: [LocalVariable pointer, var arrayBase, Immediate { Value: var offset }] }
+            || offset != context.AppContext.Binary.PointerSizeBytes * 4
+            || EmittedOperandType(arrayBase, context) is not SzArrayTypeAnalysisContext)
+            return false;
+
+        var visited = new HashSet<LocalVariable>();
+        var work = new Stack<LocalVariable>([pointer]);
+        while (work.Count > 0)
+        {
+            var local = work.Pop();
+            if (!visited.Add(local))
+                continue;
+            foreach (var reader in context.ControlFlowGraph!.Instructions)
+            {
+                if (ReferenceEquals(reader, instruction)
+                    || !Analysis.DeadCodeEliminator.UsedLocals(reader).Contains(local))
+                    continue;
+                if (reader is { OpCode: OpCode.Move, Operands: [var slot, LocalVariable stored] }
+                    && ReferenceEquals(stored, local))
+                {
+                    if (SpanSlotArray(local, StoreContract(slot, context), context) != null)
+                        continue;
+                    if (slot is LocalVariable copy)
+                        work.Push(copy);
+                    else
+                        return false;
+                    continue;
+                }
+                if (reader is { OpCode: OpCode.Phi, Destination: LocalVariable merged })
+                {
+                    work.Push(merged);
+                    continue;
+                }
+                return false;
+            }
+        }
+        return true;
+    }
+
     // A store through a managed pointer is honest only when the value's emitted
     // form satisfies the pointee contract on its own - a slot that would take
     // LoadOperandIntoSlot's default filler keeps the explicit diagnostic rather
@@ -8824,7 +8975,7 @@ public static class IlGenerator
     // generic layouts). Unbound frame slots with no type evidence, indexed or
     // scaled forms, absolute addresses, and offsets that hit no field keep
     // the explicit drop diagnostic.
-    private static bool TryRecoverFieldStore(MemoryOperand memory, IOperand source,
+    private static bool TryRecoverFieldStore(MemoryOperand memory, IOperand source, int nativeWidth,
         MethodAnalysisContext context, out FieldReference field)
     {
         field = null!;
@@ -8851,13 +9002,20 @@ public static class IlGenerator
         // leaves inside reference-typed members, which interior never descends.
         var candidates = Analysis.MetadataResolver.FindInteriorInstanceFieldPaths(owner,
             memory.Addend, memory.AccessSize) ?? [];
+        // A SIMD store keeps width 0 on its operand; the register it wrote is the width.
+        // Covering several fields, it is no store of the one it starts at.
+        var coversSeveral = memory.AccessSize == 0 && nativeWidth > 0
+            && Analysis.MetadataResolver.CoveredFields(owner, memory.Addend, nativeWidth, wholeStructs: true)
+                is { Count: > 1 };
         if (Analysis.MetadataResolver.FindInstanceFieldPathAtOffset(owner, memory.Addend,
                 memory.AccessSize) is { } flat
             && candidates.All(c => c.Field != flat.Field))
             candidates.Add(flat);
         foreach (var found in candidates)
         {
-            if (found.Containers.Count == 0 && !FieldStoreWidthMatches(memory, source, found.Field, context))
+            if (found.Containers.Count == 0 && !FieldStoreWidthMatches(memory, source, found.Field, context)
+                || coversSeveral && TypeSizes.MinimumUnboxedSize(found.Field.FieldType,
+                    context.AppContext.Binary.PointerSizeBytes) < nativeWidth)
                 continue;
             // A nested store spells `receiver.c1...cN.leaf = v`: the first
             // ldflda reads `receiver.c1`, so the receiver itself must already
@@ -10022,6 +10180,31 @@ public static class IlGenerator
         return derivedType.InterfaceContexts.Any(@interface => IsAssignableToLoose(@interface, baseType));
     }
 
+    // Can a reference of static type `reference` ever hold a boxed `value`? A boxed
+    // value type is only an Object, a ValueType, an Enum (when it is an enum) and the
+    // interfaces it implements; any other class or array makes box+castclass and
+    // unbox.any throw on every execution. Nullable<T> boxes to T or null, and a
+    // reference kind without a metadata definition (type parameter, boxed wrapper,
+    // injected or sentinel type) cannot be classified, so both stay permitted.
+    private static bool CanHoldBoxed(TypeAnalysisContext reference, TypeAnalysisContext value)
+    {
+        if (value is GenericInstanceTypeAnalysisContext { GenericType.FullName: "System.Nullable`1" }
+            || reference.FullName is "System.Object" or "System.ValueType")
+            return true;
+        if (reference.FullName == "System.Enum")
+            return value.IsEnumType;
+        var definition = reference is GenericInstanceTypeAnalysisContext instance ? instance.GenericType : reference;
+        if (reference is not (SzArrayTypeAnalysisContext or ArrayTypeAnalysisContext) && definition.Definition == null)
+            return true;
+        if (!reference.IsInterface)
+            return false;
+        // An implemented instantiation of the same generic interface may still
+        // match through variance, so only an unimplemented definition refuses.
+        return IsAssignableToLoose(value, reference)
+            || reference is GenericInstanceTypeAnalysisContext { GenericType: var interfaceDefinition }
+            && IsAssignableToLoose(value, interfaceDefinition);
+    }
+
     // True when ToTypeSignature can produce a usable operand for box/unbox/castclass.
     // Reduced test fixtures may not carry the AsmResolver metadata the real pipeline
     // always has, in which case the coercion is skipped rather than fatal.
@@ -10287,20 +10470,23 @@ public static class IlGenerator
         // unverifiable IL. A block write to a numeric literal has no provable
         // managed meaning: keep the named diagnostic rather than emit
         // guaranteed-invalid IL.
-        if (destination is Immediate
-            || !Analysis.BlockMemoryImportRecovery.IsProvablyReferenceFreeRegion(destination, count, context)
-            || !contentProvable
-            || !Analysis.BlockMemoryImportRecovery.IsScalarOperand(count, context))
+        var operandsProvable = destination is not Immediate && contentProvable
+            && Analysis.BlockMemoryImportRecovery.IsScalarOperand(count, context);
+
+        // A block write covering exactly a proven value type through managed
+        // pointers to that type is the type's assignment - verifiable IL, and
+        // barrier-correct where cpblk would skip a managed-reference field, so
+        // it needs no reference-free region.
+        var typed = operandsProvable && TryEmitTypedBlockOperation(instruction, destination, content, count,
+            context, method, locals, writeLine);
+        if (!typed && (!operandsProvable
+            || !Analysis.BlockMemoryImportRecovery.IsProvablyReferenceFreeRegion(destination, count, context)))
         {
             EmitUnrecoverableOperation(method, writeLine, $"Unproven block memory operand: {instruction}");
             return;
         }
 
-        // A block write covering exactly a proven value type through managed
-        // pointers to that type is the type's assignment - verifiable IL, and
-        // barrier-correct where cpblk would skip a managed-reference field.
-        if (!TryEmitTypedBlockOperation(instruction, destination, content, count, context, method, locals,
-                writeLine))
+        if (!typed)
             switch (instruction.OpCode)
             {
             case OpCode.MemoryCopy:
@@ -10402,9 +10588,33 @@ public static class IlGenerator
         IOperand content, IOperand count, MethodAnalysisContext context, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
     {
+        if (TypedBlockPointee(instruction.OpCode, ref destination, ref content, count, context) is not { } pointee)
+            return false;
+
+        var instructions = method.CilMethodBody!.Instructions;
+        var pointeeRef = pointee.ToTypeSignature().ToTypeDefOrRef();
+        EmitBlockPointerOperand(destination, false, context, method, locals, writeLine);
+        if (instruction.OpCode == OpCode.MemorySet)
+        {
+            instructions.Add(CilOpCodes.Initobj, pointeeRef);
+            return true;
+        }
+        EmitBlockPointerOperand(content, false, context, method, locals, writeLine);
+        instructions.Add(CilOpCodes.Ldobj, pointeeRef);
+        instructions.Add(CilOpCodes.Stobj, pointeeRef);
+        return true;
+    }
+
+    // The value type a block op assigns whole - TryEmitTypedBlockOperation's
+    // proof, shared with the recovery pass so a rewrite it accepts for a
+    // struct holding references is one emission spells typed. The operands
+    // come back in the form emission loads.
+    internal static TypeAnalysisContext? TypedBlockPointee(OpCode opCode, ref IOperand destination,
+        ref IOperand content, IOperand count, MethodAnalysisContext context)
+    {
         // `&local.first` of a struct local is `&local` when that makes the two sides one type:
         // value-type field addresses are canonicalized to the first field upstream.
-        if (instruction.OpCode is OpCode.MemoryCopy or OpCode.MemoryMove)
+        if (opCode is OpCode.MemoryCopy or OpCode.MemoryMove)
         {
             destination = WholeStorage(destination, BlockCopyPointee(content, context));
             content = WholeStorage(content, BlockCopyPointee(destination, context));
@@ -10420,26 +10630,15 @@ public static class IlGenerator
             || ManagedSize(pointee, context) is not { } pointeeSize
             || byteCount.Value != pointeeSize
             || !TypeTokenUsableFrom(pointee, context))
-            return false;
+            return null;
 
-        var instructions = method.CilMethodBody!.Instructions;
-        var pointeeRef = pointee.ToTypeSignature().ToTypeDefOrRef();
-        switch (instruction.OpCode)
+        return opCode switch
         {
-            case OpCode.MemoryCopy or OpCode.MemoryMove
-                when ThisConstructorCallPlan.SameTypeIdentity(pointee, BlockCopyPointee(content, context)):
-                EmitBlockPointerOperand(destination, false, context, method, locals, writeLine);
-                EmitBlockPointerOperand(content, false, context, method, locals, writeLine);
-                instructions.Add(CilOpCodes.Ldobj, pointeeRef);
-                instructions.Add(CilOpCodes.Stobj, pointeeRef);
-                return true;
-            case OpCode.MemorySet when content is Immediate { Value: 0 }:
-                EmitBlockPointerOperand(destination, false, context, method, locals, writeLine);
-                instructions.Add(CilOpCodes.Initobj, pointeeRef);
-                return true;
-            default:
-                return false;
-        }
+            OpCode.MemoryCopy or OpCode.MemoryMove
+                when ThisConstructorCallPlan.SameTypeIdentity(pointee, BlockCopyPointee(content, context)) => pointee,
+            OpCode.MemorySet when content is Immediate { Value: 0 } => pointee,
+            _ => null,
+        };
     }
 
     // The managed size (instance size less the object header), not the marshaled native size,

@@ -20,19 +20,14 @@ namespace Cpp2IL.Core.Tests.Regression;
 // forward to the produced version, or the producing Move must survive.
 public class CastOperandUseTests
 {
-    private static string? CastOperandLocalType(MethodAnalysisContext caller, AsmResolver.DotNet.MethodDefinition method)
-    {
-        var il = method.CilMethodBody!.Instructions;
-        var isinstIndex = il.ToList().FindIndex(i => i.OpCode == CilOpCodes.Isinst);
-        Assert.That(isinstIndex, Is.GreaterThan(0),
-            () => $"expected an isinst in the emitted body:\n{string.Join("\n", il.Select(i => i.ToString()))}");
-        var load = il.Take(isinstIndex).LastOrDefault(i =>
-            i.OpCode == CilOpCodes.Ldloc || i.OpCode == CilOpCodes.Ldloc_S
-            || i.OpCode == CilOpCodes.Ldloc_0 || i.OpCode == CilOpCodes.Ldloc_1
-            || i.OpCode == CilOpCodes.Ldloc_2 || i.OpCode == CilOpCodes.Ldloc_3);
-        Assert.That(load, Is.Not.Null, "expected a local load before the isinst");
-        return ((CilLocalVariable)load!.Operand!).VariableType?.FullName;
-    }
+    // The cast reads its operand's emitted local, so that local's declared type
+    // is the type the isinst sees. Read from the locals signature: the fixtures
+    // produce the value with a stubbed (throwing) load, so the cast itself is
+    // unreachable and never emitted.
+    private static string? CastOperandLocalType(MethodAnalysisContext caller, AsmResolver.DotNet.MethodDefinition method,
+        Instruction cast)
+        => method.CilMethodBody!.LocalVariables[caller.Locals.IndexOf(((ReferenceCast)cast.Operands[1]).Value)]
+            .VariableType?.FullName;
 
     [Test]
     public void SsaSimplifierForwardsCastOperandToProducedVersion()
@@ -76,7 +71,7 @@ public class CastOperandUseTests
         {
             Assert.That(((ReferenceCast)castInstruction.Operands[1]).Value, Is.SameAs(produced),
                 "the cast operand must forward through the copy to the produced version");
-            Assert.That(CastOperandLocalType(caller, method), Is.EqualTo("System.String"),
+            Assert.That(CastOperandLocalType(caller, method, castInstruction), Is.EqualTo("System.String"),
                 "the emitted local must carry the producer's proven type");
         });
     }
@@ -114,7 +109,7 @@ public class CastOperandUseTests
         {
             Assert.That(((ReferenceCast)castInstruction.Operands[1]).Value, Is.SameAs(produced),
                 "the cast operand must rebind to the coalesced representative");
-            Assert.That(CastOperandLocalType(caller, method), Is.EqualTo("System.String"),
+            Assert.That(CastOperandLocalType(caller, method, castInstruction), Is.EqualTo("System.String"),
                 "the emitted local must carry the producer's proven type");
         });
     }
@@ -169,7 +164,7 @@ public class CastOperandUseTests
             Assert.That(caller.ControlFlowGraph!.Instructions
                     .Any(i => ReferenceEquals(i.Destination, castOperand)), Is.True,
                 "the operand's version must keep a producer after coalescing");
-            Assert.That(CastOperandLocalType(caller, method), Is.EqualTo("System.Object"),
+            Assert.That(CastOperandLocalType(caller, method, castInstruction), Is.EqualTo("System.Object"),
                 "the merged slot carries no proven type, so the slot contract owns the type");
         });
     }

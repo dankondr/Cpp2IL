@@ -111,13 +111,12 @@ public class AddressTakeClobberTests
 
         IlGenerator.GenerateIl(caller, method);
 
-        var il = method.CilMethodBody!.Instructions;
-        var callIndex = Enumerable.Range(0, il.Count).FirstOrDefault(i =>
-            il[i].Operand is IMethodDescriptor named && named.Name?.ToString() == "Cleanup");
-        Assert.That(callIndex, Is.GreaterThan(0),
-            () => string.Join("\n", il.Select(i => i.ToString())));
-        Assert.That(il[callIndex - 1].OpCode, Is.EqualTo(CilOpCodes.Ldarg_0),
-            () => string.Join("\n", il.Select(i => i.ToString())));
+        // The receiver is `this`, which emits as ldarg.0. Checked on the call
+        // itself: the load through the record is an unmanaged-load stub that
+        // throws, so the base call after it is unreachable and never emitted.
+        var cleanup = caller.ControlFlowGraph.Instructions.Single(i => i.OpCode == OpCode.CallVoid);
+        Assert.That(cleanup.Operands[1] is LocalVariable { IsThis: true }, Is.True,
+            () => string.Join("\n", caller.ControlFlowGraph.Instructions));
     }
 
     [Test]
