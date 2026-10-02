@@ -592,8 +592,84 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     protected MethodAnalysisContext(ApplicationAnalysisContext context) : base(0, context)
     { }
 
+    // ConvertedIsil is assigned early inside AnalyzeCore, so it cannot mark
+    // completion: only this does. Recovery passes may ask for a member's lifted
+    // body mid-pipeline (see InlinedMemberRecovery) - the lock serializes a
+    // nested Analyze() against the parallel decompile's own call, and waiting
+    // callers resume on the flag, not on the first writes.
+    private volatile bool _analysisDone;
+
+    // A body lifted by a summary ask (AnalyzeForMemberSummary) skips the
+    // member-recovery pass, so a forced body can never itself force another -
+    // two workers can then never wait on each other. The pass stays pending
+    // and whichever Analyze() lands first runs it once.
+    private bool _suppressMemberRecovery;
+    private volatile bool _memberRecoveryPending;
+
+    // The member-body facts InlinedMemberRecovery summarizes from, captured at
+    // a fixed point in AnalyzeCore so a forced read and the body's own
+    // pipeline see the same instructions.
+    internal InlinedMemberRecovery.BodyFacts? MemberBodyFacts;
+
     [MemberNotNull(nameof(ConvertedIsil))]
     public void Analyze()
+    {
+        if (_analysisDone)
+        {
+            if (_memberRecoveryPending)
+                RunDeferredMemberRecovery();
+            ConvertedIsil ??= [];
+            return;
+        }
+
+        lock (this)
+        {
+            if (!_analysisDone)
+            {
+                AnalyzeCore();
+                _analysisDone = true;
+            }
+            RunDeferredMemberRecoveryCore();
+            ConvertedIsil ??= [];
+        }
+    }
+
+    // Lift the member for a member-body summary only. Called with this
+    // monitor already held by the asking thread (Monitor.TryEnter), so the
+    // lock is a same-thread re-entry: the suppression is what keeps the
+    // nested pipeline from reaching back into the recovery pass.
+    internal void AnalyzeForMemberSummary()
+    {
+        lock (this)
+        {
+            if (_analysisDone)
+                return;
+            _suppressMemberRecovery = true;
+            AnalyzeCore();
+            _analysisDone = true;
+            _memberRecoveryPending = true;
+            ConvertedIsil ??= [];
+        }
+    }
+
+    private void RunDeferredMemberRecovery()
+    {
+        lock (this)
+        {
+            RunDeferredMemberRecoveryCore();
+        }
+    }
+
+    private void RunDeferredMemberRecoveryCore()
+    {
+        if (!_memberRecoveryPending)
+            return;
+        _memberRecoveryPending = false;
+        InlinedMemberRecovery.Run(this);
+    }
+
+    [MemberNotNull(nameof(ConvertedIsil))]
+    private void AnalyzeCore()
     {
         if (MaxMethodSizeBytes != -1 && RawBytes.Length > MaxMethodSizeBytes)
         {
@@ -640,6 +716,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // flag/temporary has a single, version-stable definition.
         FlagConditionRecovery.Run(this);
         DeadCodeEliminator.Run(this);
+
+        // PLT imports are named before call resolution can mistake one for a managed method.
+        BlockMemoryImportRecovery.NameImports(this);
 
         // Resolve call targets, strings and getters, then run the combined type-propagation and
         // field-resolution fixpoint - all while still in SSA form, so every local is
@@ -717,6 +796,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Runs late so array and runtime-class operands reach their helpers after copy propagation has inlined them.
         ArrayRecovery.Run(this);
+        // Needs the array accesses recovered, and a T[,] index is only recovered while its bounds check proves it.
+        Il2CppCheckRecovery.Run(this);
         LocalVariables.ResolveLateGeneratedTypes(this);
         KeyFunctionRecovery.Run(this);
 
@@ -739,6 +820,16 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         CallArgumentTrimmer.Run(this);
         InlinedListClearRecovery.Run(this);
         InlinedListAddRecovery.Run(this);
+
+        // Member accesses an inlined member left behind - a store into a field the
+        // caller cannot name, or a read behind a private container - map back to
+        // the accessible member (ctor, setter, factory, getter) whose own lifted
+        // body is exactly that access. The body facts are captured first, at
+        // this fixed point, so a member summarized mid-pipeline and one read
+        // after its own analysis describe the same body.
+        InlinedMemberRecovery.CaptureBodyFacts(this);
+        if (!_suppressMemberRecovery)
+            InlinedMemberRecovery.Run(this);
 
         // ARM64 ELF block-memory imports (`bl` into a GOT veneer whose relocated symbol
         // is memcpy/memset/memmove) become dedicated block ops, scalar imports get a
@@ -772,6 +863,18 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // final and no later pass can restamp them.
         PackedRegisterFields.Run(this, finalPass: true);
 
+        // A packed read projected only here, on a local whose emitted type could
+        // not be proven inside the fixpoint, can still carry a leaf the caller
+        // cannot spell: the accessor rewrite above has already run, so one more
+        // pass maps such reads onto their returned-field accessors.
+        if (!_suppressMemberRecovery)
+            InlinedMemberRecovery.Run(this);
+
+        // A bounds-checked indexed read of a constant table is LLVM's
+        // switch-to-lookup-table lowering; recover it to a real switch once
+        // local types and operand forms are final.
+        SwitchLookupTableRecovery.Run(this);
+
         LocalVariables.RemoveUnused(this);
 
     }
@@ -783,6 +886,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         ConvertedIsil = null;
         ExceptionRegionInstructions = null;
         ControlFlowGraph = null;
+        // MemberBodyFacts stays: it is the whole point of the facts - a way to
+        // read a member body without holding its pipeline data. Clearing it
+        // would make a member ask's answer depend on whether it lands before
+        // or after this method's emit.
         DominatorInfo = null;
     }
 

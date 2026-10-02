@@ -266,6 +266,55 @@ public class AllocationConstructorTests
         }
     }
 
+    // A generic class's .cctor: the allocation sits in one block and its constructor call heads a
+    // later block that a jump enters (the guard removal left the jump). The jump must resume after
+    // the fused newobj, not branch back to it - that would allocate forever.
+    [Test]
+    public void BranchOntoFusedConstructorCallAfterItsAllocationDoesNotLoop()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly, "Tests", "Capture",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public);
+        var allocated = new InjectedTypeAnalysisContext(owner.DeclaringAssembly, "Tests", "Item",
+            app.SystemTypes.SystemObjectType, R.TypeAttributes.Public);
+        var ctor = new NativeCtor(allocated, 0x1000);
+        allocated.Methods.Add(ctor);
+        var result = new LocalVariable("result", new Register(null, "result"), allocated);
+        var call = new Instruction(2, OpCode.CallVoid, ctor, result);
+        var caller = new InjectedMethodAnalysisContext(owner, "Create", app.SystemTypes.SystemVoidType,
+            R.MethodAttributes.Public | R.MethodAttributes.Static, []);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Newobj, result, allocated),
+            new(1, OpCode.Jump, call), call,
+            new(3, OpCode.Return)]);
+        caller.Locals = [result]; caller.ParameterLocals = []; caller.AnalysisWarnings = [];
+
+        var module = new ModuleDefinition("AllocationLoop.dll");
+        var type = new TypeDefinition("Tests", "Capture", TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(type);
+        var itemType = new TypeDefinition("Tests", "Item", TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(itemType);
+        var ctorDefinition = new MethodDefinition(".ctor", MethodAttributes.Public,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        itemType.Methods.Add(ctorDefinition);
+        allocated.PutExtraData("AsmResolverType", itemType);
+        ctor.PutExtraData("AsmResolverMethod", ctorDefinition);
+        var definition = new MethodDefinition("Create", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        type.Methods.Add(definition);
+
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Count(i => i.OpCode == CilOpCodes.Newobj), Is.EqualTo(1));
+            foreach (var branch in il.Where(i => i.OpCode == CilOpCodes.Br || i.OpCode == CilOpCodes.Br_S))
+                Assert.That(il.IndexOf(((CilInstructionLabel)branch.Operand!).Instruction!), Is.GreaterThan(il.IndexOf(branch)),
+                    "the branch onto the fused constructor call goes back to the allocation");
+        });
+    }
+
     private static (InjectedTypeAnalysisContext GrandBase, InjectedTypeAnalysisContext Base,
         InjectedTypeAnalysisContext Derived, NativeCtor DistantCtor, NativeCtor BaseCtor,
         NativeCtor Context, LocalVariable This) ThisCtorFixture(ApplicationAnalysisContext app,

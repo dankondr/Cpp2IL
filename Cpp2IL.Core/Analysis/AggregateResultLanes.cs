@@ -43,6 +43,7 @@ internal static class AggregateResultLanes
         // SSA renaming is only the reaching def on paths the call dominates, so
         // late defs are resolved per use.
         var provenLanes = new Dictionary<LocalVariable, FieldReference>();
+        var splitLanes = new Dictionary<LocalVariable, (FieldReference Low, FieldReference High)>();
         var lateLanes = new Dictionary<int, List<(Instruction Call, FieldReference Projection)>>();
 
         foreach (var call in graph.Instructions)
@@ -66,7 +67,11 @@ internal static class AggregateResultLanes
                     continue;
                 var projection = LaneField(resultType, result, lane, pointerSize);
                 if (projection == null)
+                {
+                    if (definition.Version > 0 && SplitLane(resultType, result, lane, pointerSize) is { } split)
+                        splitLanes[laneLocal] = split;
                     continue;
+                }
                 // The lane register holds this field's bytes alone, so the lane
                 // local's honest type is the field's. A whole-aggregate type on
                 // a lane register is a smear (a copy, a phi merge or the call's
@@ -133,7 +138,11 @@ internal static class AggregateResultLanes
             {
                 var projection = LaneField(method.Parameters[i].ParameterType, paramLocal, lane, pointerSize);
                 if (projection == null)
+                {
+                    if (SplitLane(method.Parameters[i].ParameterType, paramLocal, lane, pointerSize) is { } split)
+                        splitLanes.TryAdd(laneLocal!, split);
                     continue;
+                }
                 if (laneLocal!.Type == null
                     || laneLocal.Type.FullName == method.Parameters[i].ParameterType.FullName)
                     laneLocal.Type = projection.Field.FieldType;
@@ -146,8 +155,10 @@ internal static class AggregateResultLanes
         // the fields its bytes hold - before the projection loop below so the
         // operands still name their registers.
         var changed = RebuildAggregateReturns(method, resolver, pointerSize);
+        changed |= BuildPackedStructValues(method, pointerSize);
         changed |= ProjectScalarReturns(method, resolver, pointerSize);
         changed |= DropLaneStoresOfWholeStores(method, resolver, pointerSize);
+        changed |= ProjectSplitLanes(method, splitLanes);
 
         if (provenLanes.Count == 0 && lateLanes.Count == 0 && entryLanes.Count == 0)
             return created || changed;
@@ -263,8 +274,13 @@ internal static class AggregateResultLanes
 
         var firstLane = resolver.ReturnRegister(method);
         var lanes = resolver.ExtraLanes(method.ReturnType, firstLane);
-        if (lanes.Count == 0)
+        // A composite of at most eight bytes has no extra lane: its one register is the
+        // whole value, rebuilt here only when it was packed from two 32-bit halves.
+        var firstWidth = lanes.Count > 0 ? lanes[0].ByteOffset
+            : IsWholePackedPair(method.ReturnType, pointerSize) ? 8 : 0;
+        if (firstWidth == 0)
             return false;
+        var definitions = SingleDefinitions(method);
 
         var changed = false;
         foreach (var block in method.ControlFlowGraph!.Blocks)
@@ -280,7 +296,7 @@ internal static class AggregateResultLanes
                 // Each operand must still name the register of the lane at its
                 // position - lane 0 covering [0, lanes[0].ByteOffset).
                 var sources = new List<(IOperand Operand, int Offset, int Width)>
-                    { (lane0, 0, lanes[0].ByteOffset) };
+                    { (lane0, 0, firstWidth) };
                 var proven = true;
                 for (var laneIndex = 0; laneIndex < lanes.Count; laneIndex++)
                 {
@@ -298,7 +314,7 @@ internal static class AggregateResultLanes
                 // Lane 0 holding a call's whole result of the return type, with every other
                 // lane that call's own lane register, is the value passed through unchanged,
                 // however its fields straddle the lanes (`Nullable<DateTime>`, `UniTask`).
-                if (lane0 is LocalVariable { Type: { } wholeType } whole
+                if (lanes.Count > 0 && lane0 is LocalVariable { Type: { } wholeType } whole
                     && wholeType.FullName == method.ReturnType.FullName
                     && method.ControlFlowGraph.Instructions.FirstOrDefault(i => ReferenceEquals(i.Destination, whole)) is
                         { OpCode: OpCode.Call } call
@@ -311,40 +327,46 @@ internal static class AggregateResultLanes
                     continue;
                 }
 
-                var fields = new List<(FieldAnalysisContext Field, int Offset,
-                    IReadOnlyList<FieldAnalysisContext> Containers, int Width)>();
-                foreach (var (_, offset, width) in sources)
+                // The same for a parameter of the return type still in its entry registers:
+                // `I4 Identity(I4 v) => v` is a bare `ret`.
+                if (lanes.Count > 0 && EntryParameterPassedThrough(method, resolver, sources.Select(s => s.Operand).ToList(),
+                        definitions) is { } parameter)
+                {
+                    instruction.SetOperands(parameter);
+                    changed = true;
+                    continue;
+                }
+
+                var stores = new List<(FieldReference Target, IOperand Value)>();
+                var prelude = new List<Instruction>();
+                var result = new LocalVariable($"aggregateResult_{instruction.Index}",
+                    new Register(null, $"ARET_{instruction.Index}"), method.ReturnType);
+                foreach (var (operand, offset, width) in sources)
                 {
                     if (MetadataResolver.FindInstanceFieldPathAtOffset(method.ReturnType, offset, width)
-                            is not { } path
-                        || TypeSizes.MinimumUnboxedSize(path.Field.FieldType, pointerSize) != width)
+                            is { } path
+                        && TypeSizes.MinimumUnboxedSize(path.Field.FieldType, pointerSize) == width)
+                        stores.Add((new FieldReference(path.Field, result, offset, path.Containers, width),
+                            LaneValue(operand, width, pointerSize)));
+                    // An eight-byte lane can hold two 32-bit fields packed by the method.
+                    else if (width == 8
+                             && PackedHalves(operand, method.ReturnType, offset, result, definitions, method, prelude,
+                                 pointerSize) is { } halves)
+                        stores.AddRange(halves);
+                    else
                     {
                         proven = false;
                         break;
                     }
-                    fields.Add((path.Field, offset, path.Containers, width));
                 }
                 if (!proven)
                     continue;
 
-                var result = new LocalVariable($"aggregateResult_{instruction.Index}",
-                    new Register(null, $"ARET_{instruction.Index}"), method.ReturnType);
                 method.Locals.Add(result);
-
-                for (var i = 0; i < sources.Count; i++)
-                {
-                    var (operand, offset, width) = sources[i];
-                    var (field, _, containers, _) = fields[i];
-                    block.Instructions.Insert(index + i, new Instruction(instruction.Index, OpCode.Move,
-                        new FieldReference(field, result, offset, containers, width),
-                        LaneValue(operand, width, pointerSize))
-                    {
-                        NativeMemoryAccessSize = width
-                    });
-                }
-
+                var built = BuildInstructions(method, instruction.Index, prelude, stores);
+                block.Instructions.InsertRange(index, built);
                 instruction.SetOperands(result);
-                index += sources.Count;
+                index += built.Count;
                 changed = true;
             }
         }
@@ -464,6 +486,240 @@ internal static class AggregateResultLanes
         return changed;
     }
 
+    // A composite of two 32-bit integer fields fills one X register, and clang builds it there
+    // from the halves: `mov w8, w0; orr x0, x8, x1, lsl #32` is `new I2 { A = a, B = b }` (the
+    // low half zero-extended first; a pre-scaled high half shifts further, `b * 2` is
+    // `lsl #33`), a constant pair is one wide literal. Lifted, that is an integer Or no struct
+    // slot can take - a field store, a local or phi of the struct type. Rebuild the value as a
+    // local of the slot's type with each half stored into its field; the return lanes are
+    // rebuilt the same way above. Anything that is not such a pair keeps its diagnostic.
+    private static bool BuildPackedStructValues(MethodAnalysisContext method, int pointerSize)
+    {
+        var graph = method.ControlFlowGraph!;
+        var definitions = SingleDefinitions(method);
+        var edits = new List<(Instruction Consumer, int OperandIndex, Block At, Instruction? Before,
+            LocalVariable Value, List<Instruction> Built)>();
+        foreach (var block in graph.Blocks)
+        foreach (var instruction in block.Instructions)
+        {
+            if (instruction.OpCode is not (OpCode.Move or OpCode.Phi))
+                continue;
+            var slot = instruction.Operands[0] switch
+            {
+                LocalVariable { Type: { } localType } => localType,
+                FieldReference field when instruction.OpCode == OpCode.Move => field.Field.FieldType,
+                _ => null,
+            };
+            if (slot == null || !IsWholePackedPair(slot, pointerSize))
+                continue;
+            for (var operandIndex = 1; operandIndex < instruction.Operands.Count; operandIndex++)
+            {
+                var operand = instruction.Operands[operandIndex];
+                if (operand is LocalVariable { Type: { } operandType } && operandType.FullName == slot.FullName
+                    && !(definitions.TryGetValue((LocalVariable)operand, out var producer) && producer.OpCode == OpCode.Or))
+                    continue;
+                var prelude = new List<Instruction>();
+                var value = new LocalVariable($"packedValue{method.Locals.Count + edits.Count}",
+                    new Register(null, $"PACKED{method.Locals.Count + edits.Count}"), slot);
+                // A word alone is a pair with a zero high half only where the slot's type is
+                // metadata (a field), not a register local's inferred type.
+                if (PackedHalves(operand, slot, 0, value, definitions, method, prelude, pointerSize,
+                        allowLoneWord: instruction.Operands[0] is FieldReference) is not { } halves)
+                    continue;
+                var built = BuildInstructions(method, instruction.Index, prelude, halves);
+                // A phi input is built on its edge, at the end of the predecessor it comes from.
+                edits.Add(instruction.OpCode == OpCode.Phi
+                    ? (instruction, operandIndex, block.Predecessors[operandIndex - 1], null, value, built)
+                    : (instruction, operandIndex, block, instruction, value, built));
+            }
+        }
+
+        foreach (var (consumer, operandIndex, at, before, value, built) in edits)
+        {
+            method.Locals.Add(value);
+            if (before != null)
+                at.Instructions.InsertRange(at.Instructions.IndexOf(before), built);
+            else
+                SsaForm.InsertBeforeTerminator(at, built);
+            consumer.SetOperand(operandIndex, value);
+        }
+        return edits.Count > 0;
+    }
+
+    // A value type with two 4-byte integer fields at `offset` and `offset + 4`.
+    private static bool IsPackedPair(TypeAnalysisContext type, int offset, int pointerSize)
+        => type is { IsValueType: true } && IlGenerator.IntegralStackWidth(type) == 0
+           && HalfField(type, offset, pointerSize) != null && HalfField(type, offset + 4, pointerSize) != null;
+
+    // An eight-byte value type that is exactly such a pair: one X register holds all of it.
+    private static bool IsWholePackedPair(TypeAnalysisContext type, int pointerSize)
+        => IsPackedPair(type, 0, pointerSize) && TypeSizes.MinimumUnboxedSize(type, pointerSize) == 8;
+
+    private static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)? HalfField(
+        TypeAnalysisContext type, int offset, int pointerSize)
+        => MetadataResolver.FindInstanceFieldPathAtOffset(type, offset, 4) is { } path
+           && TypeSizes.MinimumUnboxedSize(path.Field.FieldType, pointerSize) == 4
+           && IlGenerator.IntegralStackWidth(path.Field.FieldType) == 4
+            ? path
+            : null;
+
+    // The two field stores of an eight-byte region of `type` at `offset` whose value is a pair
+    // of 32-bit halves - `lo | hi << 32`, `hi << 32`, a zero-extended word alone (when the
+    // caller allows it), or a literal proven for all eight bytes - or null. A high half
+    // shifted past 32 bits gets its own 32-bit shift in `prelude`.
+    private static List<(FieldReference Target, IOperand Value)>? PackedHalves(IOperand value,
+        TypeAnalysisContext type, int offset, LocalVariable holder,
+        Dictionary<LocalVariable, Instruction> definitions, MethodAnalysisContext method,
+        List<Instruction> prelude, int pointerSize, bool allowLoneWord = true)
+    {
+        if (!IsPackedPair(type, offset, pointerSize))
+            return null;
+
+        value = Copied(value, definitions);
+        IOperand? low = null, high = null;
+        if (value is Immediate { EffectiveProvenBytes: 8 } wide)
+            (low, high) = (new Immediate((int)wide.Value, 4), new Immediate((int)(wide.Value >> 32), 4));
+        else if (value is LocalVariable local && definitions.TryGetValue(local, out var definition)
+                 && definition.NativeIntegerWidthBits != 32)
+        {
+            if (definition is { OpCode: OpCode.Or, Operands: [_, var left, var right] })
+            {
+                if (HighHalf(right, definitions, method, prelude) is { } rightHigh
+                    && IsZeroExtendedWord(left, definitions, method, []))
+                    (low, high) = (left, rightHigh);
+                else if (HighHalf(left, definitions, method, prelude) is { } leftHigh
+                         && IsZeroExtendedWord(right, definitions, method, []))
+                    (low, high) = (right, leftHigh);
+            }
+            else if (definition.OpCode == OpCode.ShiftLeft
+                     && HighHalf(local, definitions, method, prelude) is { } shifted)
+                (low, high) = (new Immediate(0, 4), shifted);
+        }
+        if (low == null && allowLoneWord && value is LocalVariable && IsZeroExtendedWord(value, definitions, method, []))
+            (low, high) = (value, new Immediate(0, 4));
+        if (low == null || high == null || !IsWordValue(low) || !IsWordValue(high))
+            return null;
+
+        var (lowField, lowContainers) = HalfField(type, offset, pointerSize)!.Value;
+        var (highField, highContainers) = HalfField(type, offset + 4, pointerSize)!.Value;
+        return
+        [
+            (new FieldReference(lowField, holder, offset, lowContainers, 4), low),
+            (new FieldReference(highField, holder, offset + 4, highContainers, 4), high),
+        ];
+    }
+
+    // The 32-bit value a 64-bit `x << n` (32 <= n < 64) puts in the upper half: `x` itself, or
+    // `x << (n - 32)` computed as a 32-bit shift.
+    private static IOperand? HighHalf(IOperand operand, Dictionary<LocalVariable, Instruction> definitions,
+        MethodAnalysisContext method, List<Instruction> prelude)
+    {
+        if (Copied(operand, definitions) is not LocalVariable local
+            || !definitions.TryGetValue(local, out var shift)
+            || shift is not { OpCode: OpCode.ShiftLeft, Operands: [_, var shifted, Immediate { Value: >= 32 and < 64 } count] }
+            || shift.NativeIntegerWidthBits == 32
+            || !IsWordValue(shifted))
+            return null;
+        if (count.Value == 32)
+            return shifted;
+        var scaled = new LocalVariable($"packedHigh{method.Locals.Count + prelude.Count}",
+            new Register(null, $"PACKEDHIGH{method.Locals.Count + prelude.Count}"),
+            method.AppContext.SystemTypes.SystemInt32Type);
+        prelude.Add(new Instruction(shift.Index, OpCode.ShiftLeft, scaled, shifted, new Immediate(count.Value - 32))
+            { NativeIntegerWidthBits = 32 });
+        return scaled;
+    }
+
+    // A value IL can store into a 4-byte integer field as is.
+    private static bool IsWordValue(IOperand operand)
+        => operand is Immediate || operand is LocalVariable { Type: { } type } && IlGenerator.IntegralStackWidth(type) == 4;
+
+    // Whether the upper 32 bits of the register holding `operand` are zero, so `operand` fills
+    // only the low half of a pair: a 32-bit literal, a load of at most four bytes, a 32-bit
+    // operation (recorded as a W-register write, or typed as a 4-byte integer - the lift does
+    // not record the width of every W-register op), a 32-bit parameter or call result (clang
+    // zero-extends those with a `mov wN, wM` the lift forwards away) - directly or through
+    // copies and phis. A 64-bit shift or Or is itself a packed value, never a half.
+    private static bool IsZeroExtendedWord(IOperand operand, Dictionary<LocalVariable, Instruction> definitions,
+        MethodAnalysisContext method, HashSet<LocalVariable> visiting)
+    {
+        switch (operand)
+        {
+            case Immediate immediate:
+                return immediate.ProvenBytes == 4 || immediate.Value is >= 0 and <= uint.MaxValue;
+            case LocalVariable local:
+                if (!visiting.Add(local))
+                    return true;
+                if (!definitions.TryGetValue(local, out var definition))
+                    return method.ParameterLocals.Contains(local) && IsWordType(local.Type, method);
+                return definition switch
+                {
+                    { NativeIntegerWidthBits: { } bits } => bits == 32,
+                    { OpCode: OpCode.Move, NativeMemoryAccessSize: { } loaded } => loaded is >= 1 and <= 4,
+                    { OpCode: OpCode.Move, Operands: [_, var source] }
+                        => IsZeroExtendedWord(source, definitions, method, visiting),
+                    { OpCode: OpCode.Phi } => definition.Operands.Skip(1)
+                        .All(input => IsZeroExtendedWord(input, definitions, method, visiting)),
+                    { OpCode: OpCode.Call, Operands: [MethodAnalysisContext callee, ..] }
+                        => IsWordType(callee.ReturnType, method),
+                    { OpCode: OpCode.Or or OpCode.ShiftLeft or OpCode.Call or OpCode.CallVoid } => false,
+                    _ => IsWordType(local.Type, method),
+                };
+            default:
+                return false;
+        }
+    }
+
+    private static bool IsWordType(TypeAnalysisContext? type, MethodAnalysisContext method)
+        => IlGenerator.IntegralStackWidth(type) == 4
+           && TypeSizes.MinimumUnboxedSize(type!, method.AppContext.Binary.PointerSizeBytes) == 4;
+
+    // A register copy chain (`mov x1, x8`) leads to the value it copies.
+    private static IOperand Copied(IOperand operand, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        for (var depth = 0; depth < 8 && operand is LocalVariable local
+                            && definitions.TryGetValue(local, out var copy)
+                            && copy is { OpCode: OpCode.Move, NativeMemoryAccessSize: null, Operands: [_, LocalVariable or Immediate] }; depth++)
+            operand = copy.Operands[1];
+        return operand;
+    }
+
+    private static List<Instruction> BuildInstructions(MethodAnalysisContext method, int index,
+        List<Instruction> prelude, List<(FieldReference Target, IOperand Value)> stores)
+    {
+        foreach (var scaled in prelude)
+            method.Locals.Add((LocalVariable)scaled.Destination!);
+        return prelude.Concat(stores.Select(store => new Instruction(index, OpCode.Move, store.Target, store.Value)
+            { NativeMemoryAccessSize = store.Target.AccessSize })).ToList();
+    }
+
+    private static Dictionary<LocalVariable, Instruction> SingleDefinitions(MethodAnalysisContext method)
+        => method.ControlFlowGraph!.Instructions
+            .Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!)
+            .Where(g => g.Count() == 1)
+            .ToDictionary(g => g.Key, g => g.Single());
+
+    // The parameter of the return type whose entry registers every return lane still holds
+    // (through register copies), or null.
+    private static LocalVariable? EntryParameterPassedThrough(MethodAnalysisContext method,
+        BaseCallingConventionResolver resolver, List<IOperand> laneValues, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        if (Copied(laneValues[0], definitions) is not LocalVariable { Register.Version: -1 } parameter
+            || !method.ParameterLocals.Contains(parameter)
+            || parameter.Type?.FullName != method.ReturnType.FullName)
+            return null;
+        var parameterLanes = resolver.ExtraLanes(parameter.Type, parameter.Register);
+        if (parameterLanes.Count != laneValues.Count - 1
+            || method.ControlFlowGraph!.Instructions.Any(i => i.ImplicitDefinitions.Any(d => parameterLanes.Any(l => l.Register.Name == d.Name))))
+            return null;
+        for (var k = 0; k < parameterLanes.Count; k++)
+            if (Copied(laneValues[k + 1], definitions) is not LocalVariable { Register: { Version: -1 } register }
+                || register.Name != parameterLanes[k].Register.Name)
+                return null;
+        return parameter;
+    }
+
     private static MethodAnalysisContext Concrete(Instruction call, MethodAnalysisContext callee, MethodAnalysisContext method)
         => !callee.IsStatic && call.Operands.Count > 2
             ? IlGenerator.RetargetToReceiverInstantiation(callee,
@@ -496,6 +752,78 @@ internal static class AggregateResultLanes
     private static FieldReference Clone(FieldReference projection)
         => new(projection.Field, projection.Local, projection.Offset, projection.Containers,
             projection.AccessSize);
+
+    // An eight-byte lane holding two 32-bit fields is no one field, but each read of it takes
+    // one: `SumArg(I4 v) => v.A + v.B + v.C + v.D` reads X1 as `w1` (`v.C`) and as
+    // `lsr x9, x1, #32` (`v.D`). Any other read of the lane stays as it is.
+    private static (FieldReference Low, FieldReference High)? SplitLane(TypeAnalysisContext aggregateType,
+        LocalVariable local, BaseCallingConventionResolver.AggregateLane lane, int pointerSize)
+    {
+        if (lane.AccessSize != 8 || !IsPackedPair(aggregateType, lane.ByteOffset, pointerSize))
+            return null;
+        var (low, lowContainers) = HalfField(aggregateType, lane.ByteOffset, pointerSize)!.Value;
+        var (high, highContainers) = HalfField(aggregateType, lane.ByteOffset + 4, pointerSize)!.Value;
+        return (new FieldReference(low, local, lane.ByteOffset, lowContainers, 4),
+            new FieldReference(high, local, lane.ByteOffset + 4, highContainers, 4));
+    }
+
+    private static bool ProjectSplitLanes(MethodAnalysisContext method,
+        Dictionary<LocalVariable, (FieldReference Low, FieldReference High)> splitLanes)
+    {
+        if (splitLanes.Count == 0)
+            return false;
+        var definitions = SingleDefinitions(method);
+        (FieldReference Low, FieldReference High)? LaneOf(IOperand operand)
+            => Copied(operand, definitions) is LocalVariable local && splitLanes.TryGetValue(local, out var lane)
+                ? lane
+                : null;
+
+        var changed = false;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction is { OpCode: OpCode.ShiftRight, Operands: [LocalVariable destination, var shifted, Immediate { Value: 32 }] }
+                && instruction.NativeIntegerWidthBits != 32
+                && LaneOf(shifted) is { } lane
+                && (destination.Type == null || IsWordType(destination.Type, method)))
+            {
+                instruction.OpCode = OpCode.Move;
+                instruction.SetOperands(destination, Clone(lane.High));
+                destination.Type ??= lane.High.Field.FieldType;
+                changed = true;
+                continue;
+            }
+
+            for (var index = 1; index < instruction.Operands.Count; index++)
+            {
+                if (LaneOf(instruction.Operands[index]) is not { } split || !ReadsLowWord(instruction, index, method))
+                    continue;
+                instruction.SetOperand(index, Clone(split.Low));
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    // Whether only the low 32 bits of the operand at `index` decide what the instruction does:
+    // a W-register op, a 32-bit argument, or a 32-bit add, subtract, multiply or negate (no
+    // 64-bit carry-propagating op has a meaning on two packed fields, so one typed as a 4-byte
+    // integer is the W-register op the lift did not record the width of).
+    private static bool ReadsLowWord(Instruction instruction, int index, MethodAnalysisContext method)
+    {
+        if (instruction.NativeIntegerWidthBits == 32)
+            return instruction.OpCode is not (OpCode.Move or OpCode.Phi);
+        switch (instruction.OpCode)
+        {
+            case OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Negate:
+                return instruction.Destination is LocalVariable { Type: var resultType } && IsWordType(resultType, method);
+            case OpCode.Call or OpCode.CallVoid when instruction.Operands[0] is MethodAnalysisContext callee:
+                var parameter = index - (instruction.OpCode == OpCode.Call ? 2 : 1) - (callee.IsStatic ? 0 : 1);
+                return parameter >= 0 && parameter < callee.Parameters.Count
+                       && IsWordType(callee.Parameters[parameter].ParameterType, method);
+            default:
+                return false;
+        }
+    }
 
     // The lane's bytes are a field of the aggregate: a member at exactly the lane's
     // offset covering exactly the lane's width, nested when the layout nests it.

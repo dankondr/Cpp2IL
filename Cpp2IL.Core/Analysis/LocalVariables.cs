@@ -152,6 +152,10 @@ public static class LocalVariables
         {
             bufferLocal.Name = "returnBuffer";
             bufferLocal.Type = method.ReturnType;
+            // The result is what the method built in the buffer; x0 at `ret` holds nothing of it.
+            foreach (var ret in method.ControlFlowGraph!.Instructions)
+                if (ret is { OpCode: OpCode.Return, Operands.Count: > 0 })
+                    ret.SetOperands([bufferLocal]);
         }
 
         // Runs here, not with the rest of type resolution: the sibling
@@ -1110,9 +1114,11 @@ public static class LocalVariables
 
             result.Type = resultType;
             call.SetOperand(0, concreteTarget);
-            foreach (var instruction in method.ControlFlowGraph.Instructions)
-            for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
+            var callIndex = instructions.IndexOf(call);
+            for (var index = 0; index < instructions.Count; index++)
+            for (var operandIndex = 0; operandIndex < instructions[index].Operands.Count; operandIndex++)
             {
+                var instruction = instructions[index];
                 var operand = instruction.Operands[operandIndex];
                 var field = operand switch
                 {
@@ -1121,11 +1127,15 @@ public static class LocalVariables
                         => addressed,
                     _ => null,
                 };
+                // An address of the slot taken before the call is not the call's result: an early
+                // `return new T[0, 0]` takes the address of its lengths stored in the same slot.
                 IOperand? replacement = field == null
-                    ? result.HiddenReturnBuffer == null || operandIndex == 0 && instruction.IsAssignment ? null
+                    ? result.HiddenReturnBuffer == null || operandIndex == 0 && instruction.IsAssignment
+                      || operand is AddressOf && index <= callIndex
+                        ? null
                         : RewriteHiddenReturnStackOperand(operand, result.HiddenReturnBuffer, result,
                             resultType, instruction.NativeMemoryAccessSize ?? 0,
-                            local => StoredBetween(definedAt, local, instructions.IndexOf(call), instructions.IndexOf(instruction)))
+                            local => StoredBetween(definedAt, local, callIndex, index))
                     : HiddenReturnField(resultType, result, field.Offset, field.AccessSize);
                 if (replacement == null)
                     continue;
@@ -1154,8 +1164,10 @@ public static class LocalVariables
     private static IOperand? RewriteHiddenReturnStackOperand(IOperand operand, LocalVariable buffer,
         LocalVariable result, TypeAnalysisContext returnType, int accessSize, System.Func<LocalVariable, bool> overwritten)
     {
+        // An address of the cell is the result's address under the same rule as a read: once the
+        // slot is stored again (a later `new T[w, h]` writing its lengths there), it is that store's.
         if (operand is AddressOf address
-            && HiddenReturnStackStorage(address.Target, buffer, result, returnType, accessSize, null) is { } addressed)
+            && HiddenReturnStackStorage(address.Target, buffer, result, returnType, accessSize, overwritten) is { } addressed)
             return new AddressOf(addressed);
 
         return HiddenReturnStackStorage(operand, buffer, result, returnType, accessSize, overwritten);
@@ -2959,6 +2971,16 @@ public static class LocalVariables
                     or OpCode.CheckLess or OpCode.CheckLessOrEqual:
                     SplitScalarComparisonSources(method, instruction);
                     break;
+                case OpCode.Convert:
+                    // A numeric conversion reads only the low lane of its source
+                    // register: `fcvtzs x10, s0` reads `point.x`, `scvtf s0, w0`
+                    // reads the low int. The lifter's recorded source width and
+                    // floatness name the lane; anything wider stays whole.
+                    if (instruction.ConversionSourceWidthBits is { } sourceBits
+                        && ScalarLaneType(method, sourceBits,
+                            instruction.ConversionFromFloat) is { } convertLane)
+                        SplitScalarSources(method, instruction, convertLane);
+                    break;
             }
         }
     }
@@ -3115,23 +3137,26 @@ public static class LocalVariables
     private static void SplitScalarComparisonSources(MethodAnalysisContext method, Instruction instruction)
     {
         // A comparison's operand pair shares one stack kind, which the flag-typed
-        // destination does not reveal; take it from whichever side is already scalar.
-        if (instruction.Operands.Count < 3
-            || instruction.Operands[1] is not LocalVariable left
-            || instruction.Operands[2] is not LocalVariable right)
+        // destination does not reveal; take it from whichever side is already
+        // scalar - a typed local, or the literal's own family. An integer
+        // immediate names no lane: the whole-packed compare it sits in is the
+        // packed-fields pass's to read.
+        if (instruction.Operands.Count < 3)
             return;
+        var left = instruction.Operands[1];
+        var right = instruction.Operands[2];
 
-        var laneType = IsScalarLaneType(left.Type) ? left.Type
-            : IsScalarLaneType(right.Type) ? right.Type
-            : null;
+        var laneType = left is LocalVariable { Type: { } leftType } && IsScalarLaneType(leftType) ? leftType
+            : right is LocalVariable { Type: { } rightType } && IsScalarLaneType(rightType) ? rightType
+            : ScalarLiteralLaneType(left, method) ?? ScalarLiteralLaneType(right, method);
         // When both operands carry the same aggregate type the register
         // comparison reads their offset-0 lane - spell it as the covered
         // field's type there (a `v3 == v3` compare is `v3.x == v3.x`).
         if (laneType == null
-            && left.Type is { IsValueType: true } leftType
-            && leftType.FullName == right.Type?.FullName
-            && (MetadataResolver.FindCoveredInstanceFieldPathAtOffset(leftType, 0, 4)
-                ?? MetadataResolver.FindCoveredInstanceFieldPathAtOffset(leftType, 0, 8)) is { } firstField
+            && left.Type is { IsValueType: true } sameAggregateType
+            && sameAggregateType.FullName == right.Type?.FullName
+            && (MetadataResolver.FindCoveredInstanceFieldPathAtOffset(sameAggregateType, 0, 4)
+                ?? MetadataResolver.FindCoveredInstanceFieldPathAtOffset(sameAggregateType, 0, 8)) is { } firstField
             && IsScalarLaneType(firstField.Field.FieldType))
             laneType = firstField.Field.FieldType;
         if (laneType == null)
@@ -3142,6 +3167,29 @@ public static class LocalVariables
         if (LaneOperand(left, laneType, method) is { } leftLane)
             instruction.SetOperand(1, leftLane);
     }
+
+    // The stack type a scalar literal compares at: a float literal proves the
+    // float lane, anything else proves nothing.
+    private static TypeAnalysisContext? ScalarLiteralLaneType(IOperand operand,
+        MethodAnalysisContext method)
+        => operand switch
+        {
+            FloatLiteral => method.AppContext.SystemTypes.SystemSingleType,
+            DoubleLiteral => method.AppContext.SystemTypes.SystemDoubleType,
+            _ => null,
+        };
+
+    // The stack type a native read of `bits` of a register lane carries.
+    private static TypeAnalysisContext? ScalarLaneType(MethodAnalysisContext method,
+        int bits, bool isFloat)
+        => bits switch
+        {
+            32 => isFloat ? method.AppContext.SystemTypes.SystemSingleType
+                : method.AppContext.SystemTypes.SystemInt32Type,
+            64 => isFloat ? method.AppContext.SystemTypes.SystemDoubleType
+                : method.AppContext.SystemTypes.SystemInt64Type,
+            _ => null,
+        };
 
     private static IOperand? LaneOperand(IOperand operand, TypeAnalysisContext laneType,
         MethodAnalysisContext method, int slotByteOffset = 0)

@@ -776,6 +776,87 @@ public class IlGeneratorTests
     }
 
     [Test]
+    public void HiddenReturnBufferSlotStoredAfterTheCallIsItsOwnAddress()
+    {
+        // GetEnumerator returns into the slot, and after the loop the same slot holds the lengths of
+        // `new T[w, h]`: `stp xzr, xzr, [sp, #0x10]; add x1, sp, #0x10`. An address of the slot taken
+        // before that store is the enumerator's; one of the stored cell is the length buffer's.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var list = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var instance = new GenericInstanceTypeAnalysisContext(list, [app.SystemTypes.SystemStringType]);
+        var getEnumerator = new ConcreteGenericMethodAnalysisContext(
+            list.Methods.Single(method => method.Name == "GetEnumerator"), [app.SystemTypes.SystemObjectType], []);
+        var receiver = new LocalVariable("receiver", new Register(null, "X0")) { Type = instance };
+        var buffer = new LocalVariable("buffer", new Register(null, "stack_-20"));
+        var pointer = new LocalVariable("pointer", new Register(null, "X8"));
+        var enumeratorAddress = new LocalVariable("enumeratorAddress", new Register(null, "X0"));
+        var lengths = new LocalVariable("lengths", new Register(null, "stack_-20"));
+        var lengthsAddress = new LocalVariable("lengthsAddress", new Register(null, "X1"));
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Read",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        var call = new Instruction(1, OpCode.Call, getEnumerator, new MemoryOperand(pointer), receiver);
+        var enumeratorTake = new Instruction(2, OpCode.Move, enumeratorAddress, new AddressOf(buffer));
+        var lengthsTake = new Instruction(4, OpCode.Move, lengthsAddress, new AddressOf(lengths));
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, pointer, new AddressOf(buffer)), call, enumeratorTake,
+            new(3, OpCode.Move, lengths, new Immediate(0)), lengthsTake, new(5, OpCode.Return)]);
+        context.Locals = [receiver, buffer, pointer, enumeratorAddress, lengths, lengthsAddress];
+        context.ParameterLocals = [];
+
+        Cpp2IL.Core.Analysis.LocalVariables.ResolveHiddenReturnBuffers(context);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(((AddressOf)enumeratorTake.Operands[1]).Target, Is.SameAs(call.Destination));
+            Assert.That(((AddressOf)lengthsTake.Operands[1]).Target, Is.SameAs(lengths));
+        });
+    }
+
+    [Test]
+    public void SharpenedHiddenReturnLeavesTheSlotBeforeTheCallAlone()
+    {
+        // `if (c) return new T[0, 0];` stores the lengths into the slot GetEnumerator later returns
+        // into. Sharpening the enumerator through the receiver copy retypes the result; the early
+        // path never ran the call, so its address of the slot stays the length buffer's.
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var list = app.AssembliesByName["mscorlib"].GetTypeByFullName("System.Collections.Generic.List`1")!;
+        var getEnumerator = list.Methods.Single(method => method.Name == "GetEnumerator");
+        var source = new LocalVariable("source", new Register(null, "source"),
+            new GenericInstanceTypeAnalysisContext(list, [app.SystemTypes.SystemStringType]));
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver"),
+            new GenericInstanceTypeAnalysisContext(list, [app.SystemTypes.SystemObjectType]));
+        var buffer = new LocalVariable("buffer", new Register(null, "stack_-20"));
+        var pointer = new LocalVariable("pointer", new Register(null, "X8"));
+        var condition = new LocalVariable("condition", new Register(null, "C"), app.SystemTypes.SystemBooleanType);
+        var lengths = new LocalVariable("lengths", new Register(null, "stack_-20"));
+        var lengthsAddress = new LocalVariable("lengthsAddress", new Register(null, "X1"));
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Read",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Static, []);
+        var call = new Instruction(3, OpCode.Call, getEnumerator, new MemoryOperand(pointer), receiver);
+        var early = new Instruction(5, OpCode.Move, lengths, new Immediate(0));
+        var lengthsTake = new Instruction(6, OpCode.Move, lengthsAddress, new AddressOf(lengths));
+        context.ControlFlowGraph = new ISILControlFlowGraph([
+            new(0, OpCode.Move, pointer, new AddressOf(buffer)),
+            new(1, OpCode.ConditionalJump, early, condition),
+            new(2, OpCode.Move, receiver, source), call, new(4, OpCode.Return),
+            early, lengthsTake, new(7, OpCode.Return)]);
+        context.Locals = [source, receiver, buffer, pointer, condition, lengths, lengthsAddress];
+        context.ParameterLocals = [];
+
+        Cpp2IL.Core.Analysis.LocalVariables.ResolveTypesAndFields(context);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(((LocalVariable)call.Destination!).Type!.FullName, Does.Contain("System.String"));
+            Assert.That(((AddressOf)lengthsTake.Operands[1]).Target, Is.SameAs(lengths));
+        });
+    }
+
+    [Test]
     public void ValueTypeReceiverCarriedThroughCopiesIsItsAddress()
     {
         // `add x9, sp, #0x70; str x9, [sp, #0x40]; …; ldr x0, [sp, #0x40]; bl Enumerator.Dispose`

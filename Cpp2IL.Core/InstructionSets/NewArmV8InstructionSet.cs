@@ -1257,9 +1257,19 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     break;
                 }
             case Arm64Mnemonic.CMP:
+                EmitCompareFlags(ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                break;
             case Arm64Mnemonic.FCMP:
             case Arm64Mnemonic.FCMPE:
-                EmitCompareFlags(ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                // The immediate form of a float compare is `fcmp sn, #0.0` - a float
+                // constant, not an integer bound. Emitting it as a float literal keeps
+                // the flag checks' lane view on the aggregate's float leaf.
+                EmitCompareFlags(ConvertOperand(instruction, 0),
+                    instruction.Op1Kind == Arm64OperandKind.Immediate
+                        ? RegisterWidthBytes(instruction.Op0Reg) == 8
+                            ? new DoubleLiteral(instruction.Op1Imm)
+                            : new FloatLiteral(instruction.Op1Imm)
+                        : ConvertOperand(instruction, 1));
                 break;
             case Arm64Mnemonic.CMN:
                 // cmp against the negated operand

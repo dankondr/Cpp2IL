@@ -250,6 +250,36 @@ public class MetadataBackedMemberEmissionTests
     }
 
     [Test]
+    public void ConstructorRunOnAValueTypeLocalDefinesIt()
+    {
+        // `new Vector4(1, 2, 3, 4)` built in place (`ldloca res; ...; call .ctor`) is the
+        // local's definition: its read is the built value, not an undefined local.
+        var module = NewModule();
+        var (vector4, _) = FixtureTypes(module);
+        var host = _app.AssembliesByName["UnityEngine.CoreModule"].InjectType("Tests", "Host",
+            _app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var caller = Runner(host, "Build", vector4, [], out _);
+        var result = new LocalVariable("res", new Register(null, "ARET_1"), vector4);
+        caller.Locals = [result];
+        var ctor = vector4.Methods.First(m => m is { IsStatic: false } && m.Name == ".ctor"
+            && m.Parameters.Count == 4
+            && m.Parameters.All(p => p.ParameterType.DefaultFullName == "System.Single"));
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.CallVoid, [ctor, result,
+                new FloatLiteral(1f), new FloatLiteral(2f), new FloatLiteral(3f), new FloatLiteral(4f)]),
+            new Instruction(1, OpCode.Return, result),
+        ]);
+
+        var definition = Definition(module, "Build", vector4, []);
+        var (_, method) = Load(caller, definition, module);
+
+        Assert.That(definition.CilMethodBody!.Instructions.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.False,
+            () => string.Join("\n", definition.CilMethodBody.Instructions));
+        var built = method.Invoke(null, [])!;
+        Assert.That(built.GetType().GetField("w")!.GetValue(built), Is.EqualTo(4f));
+    }
+
+    [Test]
     public void VectorMinMaxLowersToInlineCompareWithoutMathf()
     {
         // A Vector2 typedef in an assembly with no Mathf still lowers honestly:

@@ -47,6 +47,9 @@ public class Block : ISIL.IOperand
         {
             OpCode.Jump => BlockType.OneWay,
             OpCode.ConditionalJump => BlockType.TwoWay,
+            // A recovered switch is multi-way; TwoWay is the closest existing
+            // classification and no consumer distinguishes a wider split.
+            OpCode.Switch => BlockType.TwoWay,
             OpCode.IndirectJump => BlockType.TailCall, //TODO this is wrong for switch statements but that's better than tail calls to virtual methods stopping the stack settling
             OpCode.Call or OpCode.CallVoid => BlockType.Call,
             OpCode.Return => BlockType.Return,

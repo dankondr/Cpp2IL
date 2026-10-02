@@ -635,4 +635,78 @@ public class StackProtectorRecoveryTests
         Assert.That(branch.OpCode, Is.EqualTo(OpCode.ConditionalJump));
         Assert.That(failCall.OpCode, Is.EqualTo(OpCode.Call));
     }
+
+    // The lifter coalesces a callee-saved register's thread-pointer copy with the
+    // register's later real use: `mrs x25, tpidr_el0` early, `orr x25, ...` later.
+    // The TLS copy no path reads before the redefinition is dead; the real def and
+    // its use stay.
+    [Test]
+    public void CoalescedTlsCopyNothingReadsIsSwept()
+    {
+        var caller = Caller();
+        var sysLocal = new LocalVariable("v_sys", new Register(null, "SYSREG"), _int64);
+        var coalesced = Reg("X25", _int64, 4);
+        var frame = Reg("X26", _int64, 1);
+        var tlsCopy = new Instruction(0, OpCode.Move, coalesced, sysLocal);
+        var realDef = new Instruction(1, OpCode.Or, coalesced, frame, new Immediate(5));
+        var realUse = new Instruction(2, OpCode.Move, new MemoryOperand(coalesced), Reg("X1", _int64, 1));
+        caller.ControlFlowGraph = new ISILControlFlowGraph([tlsCopy, realDef, realUse,
+            new Instruction(3, OpCode.Return)]);
+        caller.Locals = [sysLocal, coalesced, frame];
+
+        StackProtectorRecovery.Run(caller);
+
+        Assert.That(tlsCopy.OpCode, Is.EqualTo(OpCode.Nop));
+        Assert.That(realDef.OpCode, Is.EqualTo(OpCode.Or));
+        Assert.That(realUse.OpCode, Is.EqualTo(OpCode.Move));
+    }
+
+    [Test]
+    public void TlsCopyStillReadIsKept()
+    {
+        var caller = Caller();
+        var sysLocal = new LocalVariable("v_sys", new Register(null, "SYSREG"), _int64);
+        var tls = Reg("X25", _int64, 4);
+        var read = Reg("X0", _int64, 2);
+        var tlsCopy = new Instruction(0, OpCode.Move, tls, sysLocal);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([tlsCopy,
+            new Instruction(1, OpCode.Move, read, new MemoryOperand(tls, null, 0x30)),
+            new Instruction(2, OpCode.Return, read)]);
+        caller.Locals = [sysLocal, tls, read];
+
+        StackProtectorRecovery.Run(caller);
+
+        Assert.That(tlsCopy.OpCode, Is.EqualTo(OpCode.Move));
+    }
+
+    // Frames that keep the thread pointer in a cell across calls (generic
+    // methods with alloca temporaries) reload it for each guard. Once the
+    // guard's branch is gone the reload, its `[reload + 0x28]` compare, the
+    // canary read and the spill all go: nothing reads SYSREG afterwards.
+    [Test]
+    public void SpilledThreadPointerReloadIsSwept()
+    {
+        var caller = Caller();
+        var sysLocal = new LocalVariable("v_sys", new Register(null, "SYSREG"), _int64);
+        var frame = Reg("X29", _int64, 1);
+        var canary = Reg("X8", _int64, 2);
+        var reload = Reg("X8", _int64, 34);
+        var cond = Reg("TEMPCOND", _app.SystemTypes.SystemBooleanType, 8);
+        var slot = new LocalVariable("slot", new Register(null, "stack_-60"), null);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Move, frame, new AddressOf(slot)),
+            new Instruction(1, OpCode.Move, new MemoryOperand(frame, null, -0x20), sysLocal),
+            new Instruction(2, OpCode.Move, canary, new MemoryOperand(sysLocal, null, 0x28)),
+            new Instruction(3, OpCode.Move, reload, new MemoryOperand(frame, null, -0x20)),
+            new Instruction(4, OpCode.CheckNotEqual, cond, new MemoryOperand(reload, null, 0x28), canary),
+            new Instruction(5, OpCode.Return),
+        ]);
+        caller.Locals = [sysLocal, frame, canary, reload, cond, slot];
+
+        StackProtectorRecovery.Run(caller);
+
+        var left = caller.ControlFlowGraph!.Instructions.Where(i => i.OpCode != OpCode.Nop).ToList();
+        Assert.That(left.Any(i => i.Operands.Any(o => o.ToString()!.Contains("SYSREG"))), Is.False,
+            () => string.Join("\n", left));
+    }
 }
