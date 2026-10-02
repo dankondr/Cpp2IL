@@ -120,17 +120,17 @@ stored value`, and the slot gets `default` instead of a
 whole-type conversion the move cannot satisfy. Same-type copies are
 whole copies and are exempt.
 
-## Numbers (gate control `18a7d759` vs branch `5b4a2b47`, r241 /
+## Numbers (gate control `d8a9dd9f` vs branch `63520dd8`, r241 /
 Castle Busters 1.11.1 — re-measured after `origin/development`
-adopted #200 vector-register lanes)
+adopted #200 vector-register lanes and #234 SUBS-flag conditions)
 
 Pre-merge gate (`tools/codeverify/gate.py`, control = merge base
-`18a7d759`, branch = `5b4a2b47`): **Verdict PASS** — game-owned
+`d8a9dd9f`, branch = `63520dd8`): **Verdict PASS** — game-owned
 methods **cleared 20, regressed 57** (every regressed method named
 below); ILVerify transitions **none**; silent wrong-recovery compare
 `empty-diamond` **4 → 3 (0 new, 1 gone)**, `uninit-read` 16 → 16,
 no new silent hits in any class; corpus oracle **0 match→mismatch**
-(359/623 matched on both, per-lane deltas all 0).
+(360/623 matched on both, per-lane deltas all 0).
 
 Every cleared method is a genuine covered-field recovery: control's
 diagnostics on each were `Aggregate→scalar`/`scalar→Aggregate`
