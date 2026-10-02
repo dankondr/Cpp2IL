@@ -503,4 +503,36 @@ public class MultiDimensionalArrayTests
         body[6] = 0x6b08003f; // cmp w1, w8: the column is not checked
         Assert.That(ArrayRecovery.ProvesOutlinedGetter(0x1000, Read), Is.Null);
     }
+
+    [Test]
+    public void CounterCheckedForEqualityWithItsLengthIsAnIndex()
+    {
+        // for (i = 0; …; i++) grid[i, 0] = i: clang checks the counter as `cmp len0, i; b.eq`.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("Grid.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemBooleanType,
+            app.SystemTypes.SystemObjectType);
+        var int32 = app.SystemTypes.SystemInt32Type;
+        var grid = Local("grid", new ArrayTypeAnalysisContext(int32, 2));
+        LocalVariable i = Local("i", int32), b = Local("bounds"), c = Local("c", app.SystemTypes.SystemBooleanType),
+            m = Local("m"), s = Local("s"), p = Local("p"), t = Local("t", int32);
+        var store = new Instruction(6, OpCode.Move, new MemoryOperand(p, null, 0x20, 0, 4), i);
+        var (caller, _) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, i, new Immediate(0)),
+            new(1, OpCode.Move, b, new MemoryOperand(grid, null, 0x10, 0, 8)),
+            new(2, OpCode.CheckEqual, c, new MemoryOperand(b, null, 0, 0, 4), i),
+            new(3, OpCode.Multiply, m, new MemoryOperand(b, null, 0x10, 0, 4), i),
+            new(4, OpCode.ShiftLeft, s, m, new Immediate(2)),
+            new(5, OpCode.Add, p, grid, s),
+            store,
+            new(7, OpCode.Add, t, i, new Immediate(1)),
+            new(8, OpCode.Move, i, t),
+            new(9, OpCode.Return)], [grid, i, b, c, m, s, p, t]);
+        caller.ParameterLocals = [grid];
+
+        ArrayRecovery.RecoverMultiDimensionalAccesses(caller);
+
+        Assert.That(store.OpCode, Is.EqualTo(OpCode.CallVoid), () => string.Join("\n", Instructions(caller)));
+        Assert.That(store.Operands.Skip(1), Is.EqualTo(new IOperand[] { grid, i, new Immediate(0), i }));
+    }
 }

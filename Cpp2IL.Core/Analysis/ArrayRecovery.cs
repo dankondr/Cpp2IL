@@ -425,12 +425,23 @@ public static class ArrayRecovery
                 ? IsLength(a, array, dimension) ? b : IsLength(b, array, dimension) ? a : null
                 : IsLength(operand, array, dimension) ? new Immediate(1) : null;
 
+        // A counter that starts at or above 0 and steps by 1 meets its length before it can pass it,
+        // so clang checks it with `cmp len, i; b.eq` rather than an ordering.
         bool Compared(IOperand index, IOperand array, int dimension)
-            => cfg.Instructions.Any(check => check.OpCode is OpCode.CheckLess or OpCode.CheckGreater
+            => cfg.Instructions.Any(check => (check.OpCode is OpCode.CheckLess or OpCode.CheckGreater
                     or OpCode.CheckLessOrEqual or OpCode.CheckGreaterOrEqual
+                    || check.OpCode == OpCode.CheckEqual && Unextended(index) is LocalVariable counter && CountsUp(counter))
                 && check.Operands.Count == 3
                 && (IsLength(check.Operands[1], array, dimension) && SameValue(check.Operands[2], index)
                     || IsLength(check.Operands[2], array, dimension) && SameValue(check.Operands[1], index)));
+
+        // `i = s` with s >= 0, and `i = i + 1` directly or through a copy of `i + 1`; nothing else.
+        bool CountsUp(LocalVariable local)
+            => allDefinitions.TryGetValue(local, out var defs) && defs.Count == 2
+               && defs.Any(d => d is { OpCode: OpCode.Move, Operands: [_, Immediate { Value: >= 0 }] })
+               && defs.Any(d => (d is { OpCode: OpCode.Move, Operands: [_, LocalVariable copy] } ? Definition(copy) : d)
+                   is { OpCode: OpCode.Add, Operands: [_, LocalVariable from, Immediate { Value: 1 }] }
+                   && ReferenceEquals(from, local));
 
         Instruction? Definition(IOperand operand)
             => operand is LocalVariable local && definitions.TryGetValue(local, out var definition) ? definition : null;

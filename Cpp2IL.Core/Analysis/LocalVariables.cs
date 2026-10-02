@@ -152,6 +152,10 @@ public static class LocalVariables
         {
             bufferLocal.Name = "returnBuffer";
             bufferLocal.Type = method.ReturnType;
+            // The result is what the method built in the buffer; x0 at `ret` holds nothing of it.
+            foreach (var ret in method.ControlFlowGraph!.Instructions)
+                if (ret is { OpCode: OpCode.Return, Operands.Count: > 0 })
+                    ret.SetOperands([bufferLocal]);
         }
 
         // Runs here, not with the rest of type resolution: the sibling
@@ -1065,9 +1069,11 @@ public static class LocalVariables
 
             result.Type = resultType;
             call.SetOperand(0, concreteTarget);
-            foreach (var instruction in method.ControlFlowGraph.Instructions)
-            for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
+            var callIndex = instructions.IndexOf(call);
+            for (var index = 0; index < instructions.Count; index++)
+            for (var operandIndex = 0; operandIndex < instructions[index].Operands.Count; operandIndex++)
             {
+                var instruction = instructions[index];
                 var operand = instruction.Operands[operandIndex];
                 var field = operand switch
                 {
@@ -1076,11 +1082,15 @@ public static class LocalVariables
                         => addressed,
                     _ => null,
                 };
+                // An address of the slot taken before the call is not the call's result: an early
+                // `return new T[0, 0]` takes the address of its lengths stored in the same slot.
                 IOperand? replacement = field == null
-                    ? result.HiddenReturnBuffer == null || operandIndex == 0 && instruction.IsAssignment ? null
+                    ? result.HiddenReturnBuffer == null || operandIndex == 0 && instruction.IsAssignment
+                      || operand is AddressOf && index <= callIndex
+                        ? null
                         : RewriteHiddenReturnStackOperand(operand, result.HiddenReturnBuffer, result,
                             resultType, instruction.NativeMemoryAccessSize ?? 0,
-                            local => StoredBetween(definedAt, local, instructions.IndexOf(call), instructions.IndexOf(instruction)))
+                            local => StoredBetween(definedAt, local, callIndex, index))
                     : HiddenReturnField(resultType, result, field.Offset, field.AccessSize);
                 if (replacement == null)
                     continue;
@@ -1109,8 +1119,10 @@ public static class LocalVariables
     private static IOperand? RewriteHiddenReturnStackOperand(IOperand operand, LocalVariable buffer,
         LocalVariable result, TypeAnalysisContext returnType, int accessSize, System.Func<LocalVariable, bool> overwritten)
     {
+        // An address of the cell is the result's address under the same rule as a read: once the
+        // slot is stored again (a later `new T[w, h]` writing its lengths there), it is that store's.
         if (operand is AddressOf address
-            && HiddenReturnStackStorage(address.Target, buffer, result, returnType, accessSize, null) is { } addressed)
+            && HiddenReturnStackStorage(address.Target, buffer, result, returnType, accessSize, overwritten) is { } addressed)
             return new AddressOf(addressed);
 
         return HiddenReturnStackStorage(operand, buffer, result, returnType, accessSize, overwritten);
