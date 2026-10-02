@@ -280,6 +280,92 @@ public class MetadataBackedMemberEmissionTests
     }
 
     [Test]
+    public void PrivateStructMemberReadsThroughItsProvenGetter()
+    {
+        // `v.m_Y` of a Vector2Int parameter (a packed-register read projected onto the private
+        // member) is spelled through get_y, whose native body is proven to load exactly m_Y -
+        // not a synthetic default.
+        var module = NewModule();
+        var vector2Int = _app.AssembliesByName["UnityEngine.CoreModule"].GetTypeByFullName("UnityEngine.Vector2Int")!;
+        var memberY = vector2Int.Fields.First(f => f.Name == "m_Y");
+        var vectorDef = BindType(module, vector2Int);
+        var fieldDefs = vector2Int.Fields.Where(f => !f.IsStatic)
+            .ToDictionary(f => f.Name, f => BindField(module, vectorDef, f));
+        var getY = vector2Int.Methods.First(m => m is { Name: "get_y", IsStatic: false });
+        var getYDef = BindMethod(module, vectorDef, getY);
+        getYDef.CilMethodBody = new CilMethodBody();
+        getYDef.CilMethodBody.Instructions.Add(CilOpCodes.Ldarg_0);
+        getYDef.CilMethodBody.Instructions.Add(CilOpCodes.Ldfld, fieldDefs["m_Y"]);
+        getYDef.CilMethodBody.Instructions.Add(CilOpCodes.Ret);
+
+        // The reader lives in another module, where m_Y is private to CoreModule.
+        var host = _app.AssembliesByName["UnityEngine.GridModule"].InjectType("Tests", "Host",
+            _app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var int32 = _app.SystemTypes.SystemInt32Type;
+        var parameters = new[] { (vector2Int, "v") };
+        var caller = Runner(host, "ReadY", int32, parameters, out var locals);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Return, new FieldReference(memberY, locals[0], 4, [], 4)),
+        ]);
+
+        var definition = Definition(module, "ReadY", int32, parameters);
+        var (_, method) = Load(caller, definition, module);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.False, () => string.Join("\n", il));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand is MethodDefinition callee && callee.Name == "get_y"),
+                Is.True, () => string.Join("\n", il));
+        });
+        var vectorType = method.DeclaringType!.Assembly.GetType("UnityEngine.Vector2Int")!;
+        var value = Activator.CreateInstance(vectorType)!;
+        vectorType.GetField("m_Y")!.SetValue(value, 7);
+        Assert.That(method.Invoke(null, [value]), Is.EqualTo(7));
+    }
+
+    [Test]
+    public void AddressOfAStructParameterIsItsArgumentSlot()
+    {
+        // `v.y` recovered as `get_y(&v)` on a parameter: the address is ldarga of the
+        // argument, not ldloca of the never-stored local the parameter is also declared as.
+        var module = NewModule();
+        var vector2Int = _app.AssembliesByName["UnityEngine.CoreModule"].GetTypeByFullName("UnityEngine.Vector2Int")!;
+        var vectorDef = BindType(module, vector2Int);
+        var fieldDefs = vector2Int.Fields.Where(f => !f.IsStatic)
+            .ToDictionary(f => f.Name, f => BindField(module, vectorDef, f));
+        var getY = vector2Int.Methods.First(m => m is { Name: "get_y", IsStatic: false });
+        var getYDef = BindMethod(module, vectorDef, getY);
+        getYDef.CilMethodBody = new CilMethodBody();
+        getYDef.CilMethodBody.Instructions.Add(CilOpCodes.Ldarg_0);
+        getYDef.CilMethodBody.Instructions.Add(CilOpCodes.Ldfld, fieldDefs["m_Y"]);
+        getYDef.CilMethodBody.Instructions.Add(CilOpCodes.Ret);
+        var int32 = _app.SystemTypes.SystemInt32Type;
+        SyntheticFixture.SeedCorLibTypes(_app, module, int32);
+
+        var host = _app.AssembliesByName["UnityEngine.GridModule"].InjectType("Tests", "Host",
+            _app.SystemTypes.SystemObjectType, R.TypeAttributes.Public | R.TypeAttributes.Class);
+        var parameters = new[] { (vector2Int, "v") };
+        var caller = Runner(host, "ReadY", int32, parameters, out var locals);
+        var result = new LocalVariable("res", new Register(null, "RES"), int32);
+        caller.Locals = [.. locals, result];
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Call, getY, result, new AddressOf(locals[0])),
+            new Instruction(1, OpCode.Return, result),
+        ]);
+
+        var definition = Definition(module, "ReadY", int32, parameters);
+        IlGenerator.GenerateIl(caller, definition);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldarga), Is.True, () => string.Join("\n", il));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldloca), Is.False, () => string.Join("\n", il));
+        });
+    }
+
+    [Test]
     public void VectorMinMaxLowersToInlineCompareWithoutMathf()
     {
         // A Vector2 typedef in an assembly with no Mathf still lowers honestly:

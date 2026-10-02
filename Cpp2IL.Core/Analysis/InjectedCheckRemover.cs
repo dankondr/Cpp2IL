@@ -55,6 +55,9 @@ public static class InjectedCheckRemover
                 continue;
             }
 
+            if (method != null && thrownType == "System.NullReferenceException")
+                Il2CppCheckRecovery.MarkCheckedReceiver(method, block, target);
+
             terminator.OpCode = OpCode.Nop;
             terminator.SetOperands();
 

@@ -513,6 +513,8 @@ public static class IlGenerator
             body.Instructions.Add(CilOpCodes.Ret);
         }
 
+        var undefinedReads = UndefinedReads(body, locals, context);
+
         // Add analysis warnings
         var instructions = body.Instructions;
         foreach (var warning in context.AnalysisWarnings)
@@ -520,7 +522,12 @@ public static class IlGenerator
             instructions.Add(CilOpCodes.Ldstr, Diagnostic("Warning: " + warning));
             instructions.Add(CilOpCodes.Call, writeLine);
         }
-        if (context.AnalysisWarnings.Count != 0)
+        foreach (var note in undefinedReads)
+        {
+            instructions.Add(CilOpCodes.Ldstr, Diagnostic(note));
+            instructions.Add(CilOpCodes.Call, writeLine);
+        }
+        if (context.AnalysisWarnings.Count != 0 || undefinedReads.Count != 0)
         {
             // Even unreachable CIL must not fall off the physical end of a body:
             // the CLR rejects such a trailer before executing the valid entry path.
@@ -559,6 +566,133 @@ public static class IlGenerator
         }
     }
 
+
+    // A read of a local that no store reaches on some path from the entry reads the zeroed slot:
+    // a merge the lifter could not prove (a phi edge with no legal managed copy) left that path
+    // without a value, and C# cannot say this. The rule is the uninit-read scan's: definite
+    // assignment over the normal-flow IL graph, ldloca counting as a store; handler code, which
+    // normal flow does not reach, is not checked. Only locals that some path does store count:
+    // one with no store at all is the never-stored rule's (its note at the read, or a register
+    // that rule proves holds a value), and a parameter local holds its argument.
+    private static List<string> UndefinedReads(CilMethodBody body, Dictionary<LocalVariable, CilLocalVariable> locals,
+        MethodAnalysisContext context)
+    {
+        var code = body.Instructions;
+        if (code.Count == 0)
+            return [];
+
+        // CilInstruction compares by value; two `ldarg n` before offsets are assigned are equal.
+        var position = new Dictionary<CilInstruction, int>(ReferenceEqualityComparer.Instance);
+        for (var i = 0; i < code.Count; i++)
+            position[code[i]] = i;
+        IEnumerable<int> Targets(CilInstruction instruction) => (instruction.Operand switch
+        {
+            ICilLabel label => [label],
+            IList<ICilLabel> labels => labels,
+            _ => [],
+        }).Select(label => label is CilInstructionLabel { Instruction: { } target } && position.TryGetValue(target, out var at) ? at : -1)
+            .Where(at => at >= 0);
+        bool Jumps(CilInstruction i) => i.OpCode.FlowControl is CilFlowControl.Branch or CilFlowControl.ConditionalBranch;
+        bool Ends(CilInstruction i) => i.OpCode.FlowControl is CilFlowControl.Return or CilFlowControl.Throw;
+
+        var leaders = new SortedSet<int> { 0 };
+        for (var i = 0; i < code.Count; i++)
+            if (Jumps(code[i]))
+            {
+                leaders.UnionWith(Targets(code[i]));
+                leaders.Add(i + 1);
+            }
+            else if (Ends(code[i]))
+                leaders.Add(i + 1);
+        var starts = leaders.Where(l => l < code.Count).ToList();
+        var blockAt = starts.Select((start, b) => (start, b)).ToDictionary(p => p.start, p => p.b);
+        int End(int b) => b + 1 < starts.Count ? starts[b + 1] : code.Count;
+        var successors = starts.Select((start, b) =>
+        {
+            var last = code[End(b) - 1];
+            var fall = b + 1 < starts.Count ? [b + 1] : new List<int>();
+            return last.OpCode.FlowControl switch
+            {
+                CilFlowControl.ConditionalBranch => Targets(last).Select(t => blockAt[t]).Concat(fall).ToList(),
+                CilFlowControl.Branch => Targets(last).Select(t => blockAt[t]).ToList(),
+                CilFlowControl.Return or CilFlowControl.Throw => [],
+                _ => fall,
+            };
+        }).ToList();
+
+        int? Slot(CilInstruction i) => i.OpCode.Code switch
+        {
+            CilCode.Ldloc_0 or CilCode.Stloc_0 => 0,
+            CilCode.Ldloc_1 or CilCode.Stloc_1 => 1,
+            CilCode.Ldloc_2 or CilCode.Stloc_2 => 2,
+            CilCode.Ldloc_3 or CilCode.Stloc_3 => 3,
+            _ => (i.Operand as CilLocalVariable)?.Index,
+        };
+        bool Writes(CilInstruction i) => i.OpCode.Code is CilCode.Stloc or CilCode.Stloc_S or CilCode.Stloc_0 or CilCode.Stloc_1
+            or CilCode.Stloc_2 or CilCode.Stloc_3 or CilCode.Ldloca or CilCode.Ldloca_S;
+        bool Reads(CilInstruction i) => i.OpCode.Code is CilCode.Ldloc or CilCode.Ldloc_S or CilCode.Ldloc_0 or CilCode.Ldloc_1
+            or CilCode.Ldloc_2 or CilCode.Ldloc_3;
+
+        // Forward must-be-assigned sets, intersected at joins, over the blocks normal flow reaches.
+        var reached = new HashSet<int> { 0 };
+        var pending = new Stack<int>([0]);
+        while (pending.Count > 0)
+            foreach (var next in successors[pending.Pop()])
+                if (reached.Add(next))
+                    pending.Push(next);
+        var predecessors = reached.ToDictionary(b => b, _ => new List<int>());
+        foreach (var b in reached)
+            foreach (var next in successors[b])
+                predecessors[next].Add(b);
+        HashSet<int> Transfer(int b, HashSet<int> state)
+        {
+            var result = new HashSet<int>(state);
+            for (var i = starts[b]; i < End(b); i++)
+                if (Writes(code[i]) && Slot(code[i]) is { } written)
+                    result.Add(written);
+            return result;
+        }
+        var entry = reached.ToDictionary(b => b, b => b == 0 ? [] : new HashSet<int>(Enumerable.Range(0, body.LocalVariables.Count)));
+        var exit = reached.ToDictionary(b => b, b => Transfer(b, entry[b]));
+        for (var changed = true; changed;)
+        {
+            changed = false;
+            foreach (var b in reached.Where(b => b != 0).OrderBy(b => b))
+            {
+                var merged = new HashSet<int>(exit[predecessors[b][0]]);
+                foreach (var p in predecessors[b].Skip(1))
+                    merged.IntersectWith(exit[p]);
+                if (merged.SetEquals(entry[b]))
+                    continue;
+                entry[b] = merged;
+                exit[b] = Transfer(b, merged);
+                changed = true;
+            }
+        }
+
+        var unassigned = new SortedSet<int>();
+        foreach (var b in reached)
+        {
+            var state = new HashSet<int>(entry[b]);
+            for (var i = starts[b]; i < End(b); i++)
+            {
+                if (Slot(code[i]) is not { } slot)
+                    continue;
+                if (Reads(code[i]) && !state.Contains(slot))
+                    unassigned.Add(slot);
+                if (Writes(code[i]))
+                    state.Add(slot);
+            }
+        }
+
+        var named = locals.ToDictionary(pair => pair.Value.Index, pair => pair.Key);
+        var stored = code.Where(Writes).Select(Slot).OfType<int>().ToHashSet();
+        return unassigned
+            .Where(slot => stored.Contains(slot) && !(named.TryGetValue(slot, out var local) && context.ParameterLocals.Contains(local)))
+            .Select(slot => $"Undefined local {(named.TryGetValue(slot, out var local) ? local.ToString() : $"V_{slot}")} on some path: "
+                            + "a read is reached by no store on one path from the method entry.")
+            .ToList();
+    }
 
     // Limit so we don't run into the 16mb limit (see AsmResolver issue #775)
     private static string Diagnostic(string message) 
@@ -2025,9 +2159,8 @@ public static class IlGenerator
                     // has honest answers - a shared native-int lowering covers
                     // integral/pointer operands, and a zero literal on a managed or
                     // generic operand is the null test - while ordering and
-                    // arithmetic have none, so they default to false/zero: the
-                    // zero after the throw keeps the store below stack-consistent
-                    // (IL2CPP's stack analysis walks that dead tail too).
+                    // arithmetic have none, so they throw; the store below is then
+                    // dead and RemoveDeadThrowTails cuts it.
                     if (unrecoverableIntegerOperation
                         || instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual)
                         || !(TryEmitNativeIntEquality(instruction, context, method, locals, writeLine)
@@ -2036,7 +2169,6 @@ public static class IlGenerator
                         EmitUnrecoverableOperation(method, writeLine, unrecoverableIntegerOperation
                             ? $"Unrecoverable integer operation: {instruction}"
                             : $"Unrecoverable operation: {instruction}");
-                        instructions.Add(CilOpCodes.Ldc_I4_0);
                     }
                     EmitStackCoerceOrDefault(context.AppContext.SystemTypes.SystemInt32Type,
                         StoreContract(instruction.Operands[0], context), method, context);
@@ -4674,11 +4806,14 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldlen);
                 instructions.Add(CilOpCodes.Conv_I4);
                 break;
+            // A parameter's address is its argument slot: the local the declaration also gets
+            // is never stored, so `ldloca` of it would hand the callee a zeroed struct.
+            case AddressOf { Target: LocalVariable { IsThis: false } addressed }
+                when ParameterForLocal(addressed, method, callingContext) is { } addressedParameter:
+                instructions.Add(CilOpCodes.Ldarga, addressedParameter);
+                break;
             case AddressOf { Target: LocalVariable addressed }:
-                if (ParameterForLocal(addressed, method, callingContext) is { } addressedParameter)
-                    instructions.Add(CilOpCodes.Ldarga, addressedParameter);
-                else
-                    instructions.Add(CilOpCodes.Ldloca, locals[addressed]);
+                instructions.Add(CilOpCodes.Ldloca, locals[addressed]);
                 break;
             case AddressOf { Target: FieldReference addressedField }:
                 if (!FieldReferenceUsableFrom(addressedField, callingContext, writeAccess: true))
@@ -4760,6 +4895,8 @@ public static class IlGenerator
                 if (TryEmitInlinedEnumeratorCurrent(field, callingContext, method, locals, writeLine))
                     break;
                 if (TryEmitInlinedListCount(field, callingContext, method, locals))
+                    break;
+                if (TryEmitProvenStructFieldGetter(field, callingContext, method, locals, writeLine))
                     break;
                 if (WholeValueContainerReference(field, expectedType, callingContext) is { } wholeValue
                     && FieldReferenceUsableFrom(wholeValue, callingContext))
@@ -5547,6 +5684,53 @@ public static class IlGenerator
             : receiver is GenericInstanceTypeAnalysisContext instance
                 ? new ConcreteGenericMethodAnalysisContext(getter, instance.GenericArguments, [])
                 : getter;
+    }
+
+    // A private member of a value type another assembly declares (`Vector2Int.m_Y`) has a public
+    // spelling when the type's own getter is proven to return exactly that member: its native
+    // body is one load from [this + offset] and ret (MetadataResolver.GetterProvablyReadsField).
+    // Naming or a matching return type alone are no proof - `get_sqrMagnitude` returns an int
+    // too - so the getter must be the only proven one. Only a member read straight off the
+    // struct qualifies; the read is emitted as `ldarga/ldloca s; call get_y`.
+    internal static MethodAnalysisContext? ProvenStructFieldGetter(FieldReference field, MethodAnalysisContext context)
+    {
+        // Cheapest checks first: this runs for every field read the emitter spells.
+        if (field is not { Containers.Count: 0, Field: { IsStatic: false, DeclaringType: { IsValueType: true } owner } }
+            || field.Local is not LocalVariable { IsThis: false } receiver
+            || FieldReferenceUsableFrom(field, context)
+            || ProvenGetterCache.GetOrAdd((field.Field, field.Offset), key => ProvenGetter(key.Member, key.Offset))
+                is not { } getter
+            || EmittedLocalType(receiver, context) is not { } receiverType
+            || (receiverType is ByRefTypeAnalysisContext byRef ? byRef.ElementType : receiverType).FullName != owner.FullName)
+            return null;
+        return Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(getter, context) ? getter : null;
+
+        static MethodAnalysisContext? ProvenGetter(FieldAnalysisContext member, long offset)
+        {
+            var proven = member.DeclaringType!.Methods
+                .Where(candidate => !candidate.IsStatic && candidate.Parameters.Count == 0
+                    && candidate.Name.StartsWith("get_", System.StringComparison.Ordinal)
+                    && (candidate.Attributes & MethodAttributes.MemberAccessMask) == MethodAttributes.Public
+                    && candidate.ReturnType.FullName == member.FieldType.FullName
+                    && Analysis.MetadataResolver.GetterProvablyReadsField(member.AppContext, candidate, offset))
+                .Take(2)
+                .ToList();
+            return proven.Count == 1 ? proven[0] : null;
+        }
+    }
+
+    // The proven getter per member and the struct offset it was proven at.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(FieldAnalysisContext Member, long Offset),
+        MethodAnalysisContext?> ProvenGetterCache = new();
+
+    private static bool TryEmitProvenStructFieldGetter(FieldReference field, MethodAnalysisContext context,
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        if (ProvenStructFieldGetter(field, context) is not { } getter
+            || !EmitManagedAddress(field.Local, method, context, locals, writeLine, field.Field.DeclaringType))
+            return false;
+        method.CilMethodBody!.Instructions.Add(CilOpCodes.Call, getter.ToMethodDescriptor());
+        return true;
     }
 
     // Every caller reaches this helper only because the recovered operand cannot
@@ -7897,12 +8081,14 @@ public static class IlGenerator
     // A label or handler boundary landing on a removed instruction is
     // redirected to the first kept instruction after it: the removed pushes
     // are dead, so jumping to one is jumping past them. Returns false when a
-    // removed instruction has no kept successor to land on.
+    // removed instruction has no kept successor to land on. Keyed by identity:
+    // CilInstruction equality is opcode, operand and offset, so a label on a
+    // kept `ldnull` would otherwise follow a removed one.
     private static bool RetargetRemoved(MethodDefinition? method,
         CilInstructionCollection instructions, List<int> remove)
     {
         var removeSet = new HashSet<int>(remove);
-        var afterOf = new Dictionary<CilInstruction, CilInstruction>();
+        var afterOf = new Dictionary<CilInstruction, CilInstruction>(ReferenceEqualityComparer.Instance);
         foreach (var k in remove)
         {
             var next = k + 1;
@@ -8896,6 +9082,7 @@ public static class IlGenerator
                 || !FieldReferenceUsableFrom(collapsed, context))
             && !InlinedEnumeratorCurrentCandidate(unspellableField, context)
             && !InlinedListCountCandidate(unspellableField, context)
+            && ProvenStructFieldGetter(unspellableField, context) == null
             && unspellableField.Local is LocalVariable referent
             && (unspellableField.Containers.LastOrDefault(link =>
                         link.FieldType?.FullName
@@ -12206,6 +12393,12 @@ public static class IlGenerator
 
         switch (operand)
         {
+            // A parameter's reads are ldarg, so its stores must be starg: a stloc would write a
+            // shadow local no read sees.
+            case LocalVariable local when !local.IsThis && ParameterForLocal(local, method, context) is { } parameter:
+                instructions.Add(CilOpCodes.Starg, parameter);
+                break;
+
             case LocalVariable local:
                 instructions.Add(CilOpCodes.Stloc, locals[local]);
                 break;
@@ -12286,13 +12479,17 @@ public static class IlGenerator
                     instructions.Add(CilOpCodes.Call, writeLine);
                     break;
                 }
+                // A struct local stands for its own storage: `[s] = 0` is `s = default`.
                 if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
-                    && memory.Base is LocalVariable local2)
+                    && memory.Base is LocalVariable { Type: { IsValueType: true } structType } structLocal
+                    && IntegralStackWidth(structType) == 0
+                    && structType.FullName is not ("System.Single" or "System.Double"))
                 {
-                    // Can pointer assignments just be ignored because it's C#? (Move [local], 123)
-                    instructions.Add(CilOpCodes.Stloc, locals[local2]);
+                    instructions.Add(CilOpCodes.Stloc, locals[structLocal]);
                     break;
                 }
+                // `[p] = v` through a pointer writes the memory p points at; storing v into p
+                // itself would be a silent wrong value. A store nothing resolved is dropped, said so.
                 instructions.Add(CilOpCodes.Pop);
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Store through unmanaged memory form {memory} could not be emitted; the value was dropped."));
                 instructions.Add(CilOpCodes.Call, writeLine);
