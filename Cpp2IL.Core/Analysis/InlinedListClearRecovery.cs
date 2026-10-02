@@ -72,7 +72,7 @@ internal static class InlinedListClearRecovery
 
     // The inlined body of List<T>.Clear around `_size = 0` in `block`:
     //   _version++                      Add t, (_version | t0), 1 [after Move t0, _version]; Move _version, t
-    //   size = _size                    optional Move s, _size
+    //   size = _size                    optional Move s, _size (or s = get_Count())
     //   _size = 0
     //   Array.Clear(_items, 0, size)    inline, or in `clearBlock` behind `if (size < 1) goto merge`
     // Its temps must not reach a read outside it. A shape that cannot be matched leaves the body alone.
@@ -108,20 +108,21 @@ internal static class InlinedListClearRecovery
             return null;
 
         var anchorIndex = instructions.IndexOf(anchor);
-        var saved = instructions.Take(anchorIndex).Where(instruction => instruction is
-            { OpCode: OpCode.Move, Operands: [LocalVariable, var source] } && IsListField(source, list, "_size")).ToList();
+        var saved = instructions.Take(anchorIndex).Where(instruction => SizeRead(instruction, list) != null).ToList();
         if (saved.Count > 1)
             return null;
-        var savedSize = saved.Count == 1 ? (LocalVariable)saved[0].Operands[0] : null;
+        var savedSize = saved.Count == 1 ? SizeRead(saved[0], list) : null;
         if (saved.Count == 1)
             body.Add(saved[0]);
         bool IsSize(IOperand operand) => IsListField(operand, list, "_size")
             || savedSize != null && ReferenceEquals(operand, savedSize);
-        bool IsArrayClear(Instruction instruction) => instruction is
+        bool ClearsItems(Instruction instruction) => instruction is
             {
                 OpCode: OpCode.CallVoid,
-                Operands: [MethodAnalysisContext { Name: "Clear", DeclaringType.FullName: "System.Array" }, var items, Immediate { Value: 0 }, var length]
-            } && IsListField(items, list, "_items") && IsSize(length);
+                Operands: [MethodAnalysisContext { Name: "Clear", DeclaringType.FullName: "System.Array" }, var items, ..]
+            } && IsListField(items, list, "_items");
+        bool IsArrayClear(Instruction instruction) => ClearsItems(instruction)
+            && instruction.Operands is [_, _, Immediate { Value: 0 }, var length] && IsSize(length);
 
         Block? clearBlock = null;
         if (instructions.LastOrDefault() is { OpCode: OpCode.ConditionalJump, Operands: [Block merge, LocalVariable condition] } jump
@@ -152,11 +153,12 @@ internal static class InlinedListClearRecovery
         }
         else
         {
-            // An Array.Clear behind a size check this shape does not match is not a delimited body.
-            if (block.Successors.Any(successor => successor.Instructions.Any(IsArrayClear)))
+            // An Array.Clear behind a size check this shape does not match, or over a length
+            // it does not recognize as the size, is not a delimited body.
+            if (block.Successors.Any(successor => successor.Instructions.Any(ClearsItems)))
                 return null;
-            var inline = instructions.Skip(anchorIndex + 1).Where(IsArrayClear).ToList();
-            if (inline.Count > 1)
+            var inline = instructions.Skip(anchorIndex + 1).Where(ClearsItems).ToList();
+            if (inline.Count > 1 || !inline.All(IsArrayClear))
                 return null;
             body.UnionWith(inline);
         }
@@ -193,6 +195,16 @@ internal static class InlinedListClearRecovery
                 return instructions[i];
         return null;
     }
+
+    // `s = _size`, or the `s = get_Count()` an earlier pass made of it where the getter is
+    // provably the field's accessor.
+    private static LocalVariable? SizeRead(Instruction instruction, LocalVariable list) => instruction switch
+    {
+        { OpCode: OpCode.Move, Operands: [LocalVariable size, var source] } when IsListField(source, list, "_size") => size,
+        { OpCode: OpCode.Call, Operands: [MethodAnalysisContext { Name: "get_Count" } getter, LocalVariable size, var receiver] }
+            when ReferenceEquals(receiver, list) && IsList(getter.DeclaringType) => size,
+        _ => null,
+    };
 
     private static bool IsListField(IOperand operand, LocalVariable list, string name) =>
         operand is FieldReference { Containers.Count: 0 } field

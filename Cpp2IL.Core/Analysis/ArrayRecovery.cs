@@ -32,6 +32,7 @@ public static class ArrayRecovery
         RecoverMultiDimensionalAllocations(method);
         RecoverOutlinedGetters(method);
         RecoverMultiDimensionalAccesses(method);
+        RecoverMergedElementAddresses(method);
         RecoverAccesses(method);
         RecoverElementPointerWalkers(method);
         RecoverReferenceArrayOffsetWalkers(method);
@@ -116,6 +117,8 @@ public static class ArrayRecovery
             instruction.SetOperand(i, field == null
                 ? value
                 : new FieldReference(field, value, (int)field.Offset, [], memory.AccessSize));
+            if (field == null && instruction.IsCall && SizeOf(arrayType.ElementType) == 2L * pointerSize)
+                DropUpperLane(block, instruction, pointer, memory.Addend + pointerSize);
         }
 
         // The address arithmetic the elements no longer read is dead; drop it before the
@@ -475,6 +478,27 @@ public static class ArrayRecovery
             _ => false,
         };
 
+        // A two-register element passed whole to a call came in a register pair (`ldp x0, x1, [e]`):
+        // the load of its upper half into the next argument register is part of the same argument,
+        // which the Get now supplies whole. Nothing reads that register before the call, and the
+        // call clobbers it, so the load has no other reader.
+        void DropUpperLane(Block block, Instruction call, LocalVariable pointer, long addend)
+        {
+            var at = block.Instructions.IndexOf(call);
+            for (var k = at - 1; k >= 0; k--)
+            {
+                if (block.Instructions[k] is not { OpCode: OpCode.Move,
+                        Operands: [LocalVariable { Register.Name: "X1" or "X2" or "X3" or "X4" or "X5" or "X6" or "X7" } lane,
+                            MemoryOperand { Index: null, Scale: 0 } upper] } load
+                    || !ReferenceEquals(upper.Base, pointer) || upper.Addend != addend || upper.AccessSize != pointerSize)
+                    continue;
+                if (block.Instructions.Skip(k + 1).Take(at - k - 1).All(between => !DeadCodeEliminator.UsedLocals(between).Contains(lane))
+                    && !DeadCodeEliminator.UsedLocals(call).Contains(lane))
+                    MakeNop(load);
+                return;
+            }
+        }
+
         LocalVariable NewLocal(TypeAnalysisContext type)
         {
             var local = new LocalVariable($"element{created}", new Register(null, $"ELEMENT{created++}"), type);
@@ -536,7 +560,7 @@ public static class ArrayRecovery
         return value is >= 0 and <= int.MaxValue ? new Immediate(value) : null;
     }
 
-    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<ApplicationAnalysisContext,
+    internal static readonly System.Runtime.CompilerServices.ConditionalWeakTable<ApplicationAnalysisContext,
         System.Collections.Concurrent.ConcurrentDictionary<ulong, bool>> ArrayNewStubs = new();
 
     internal static bool IsArrayNewWithoutBounds(ApplicationAnalysisContext app, ulong address)
@@ -1046,6 +1070,106 @@ public static class ArrayRecovery
                     address.Target = canonical;
                     instruction.SetOperand(i, address);
                 }
+    }
+
+    // clang shares one element load between paths that address different elements: one path
+    // sets `p = a + (i << s)`, another `p = b` (element 0), and the join reads `[p + 4p]`. p is
+    // then no array - on the first path it is an element address - though it shares b's type, so
+    // reading the load as `p[0]` is wrong. Each definition of p records its array and index instead,
+    // and the join reads `array[index]`. Every read an element address can reach must be such an
+    // element access; the array definitions' own reads (`p.Length`) stay p's.
+    internal static void RecoverMergedElementAddresses(MethodAnalysisContext method)
+    {
+        var cfg = method.ControlFlowGraph!;
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        var definitions = SingleDefinitions(cfg);
+        var int32 = method.AppContext.SystemTypes.SystemInt32Type;
+        var created = 0;
+        foreach (var (pointer, defs) in cfg.Instructions.Where(d => d.Destination is LocalVariable)
+                     .GroupBy(d => (LocalVariable)d.Destination!).ToDictionary(g => g.Key, g => g.ToList()))
+        {
+            if (defs.Count < 2 || pointer.Type is not SzArrayTypeAnalysisContext arrayType)
+                continue;
+            var elementType = arrayType.ElementType;
+            var size = elementType.IsValueType && ElementSize(elementType, pointerSize) == 0
+                ? MetadataElementSize(elementType, pointerSize)
+                : ElementSize(elementType, pointerSize);
+            var sites = defs.Select(def => def switch
+            {
+                { OpCode: OpCode.Move, Operands: [_, var source] } when IsArray(source, arrayType)
+                    => (Def: def, Array: source, Index: (IOperand)new Immediate(0), Address: false),
+                { OpCode: OpCode.Add, Operands: [_, var a, var b] } when IsArray(a, arrayType) && !ReferenceEquals(a, pointer)
+                                                                         && ScaledIndex(b, size, definitions, 0) is { } index
+                    => (Def: def, Array: a, Index: index, Address: true),
+                _ => (Def: def, Array: (IOperand?)null, Index: (IOperand)new Immediate(0), Address: false),
+            }).ToList();
+            if (size <= 0 || sites.Any(site => site.Array == null) || !sites.Any(site => site.Address)
+                || sites.Where(site => site.Address).Any(site => !OnlyElementReads(site.Def, pointer)))
+                continue;
+
+            var array = new LocalVariable($"merged{created}", new Register(null, $"MERGED{created}"), arrayType);
+            var index = new LocalVariable($"mergedIndex{created}", new Register(null, $"MERGED_INDEX{created++}"), int32);
+            method.Locals.Add(array);
+            method.Locals.Add(index);
+            foreach (var site in sites)
+            {
+                var block = cfg.Blocks.First(b => b.Instructions.Contains(site.Def));
+                block.Instructions.InsertRange(block.Instructions.IndexOf(site.Def) + 1, [
+                    new Instruction(-1, OpCode.Move, array, site.Array!),
+                    new Instruction(-1, OpCode.Move, index, site.Index)]);
+                // Its only readers were the element reads now taken from array and index; p stays
+                // live for the array definitions' own reads, so the dead element address goes here.
+                if (site.Address)
+                    MakeNop(site.Def);
+            }
+            foreach (var instruction in cfg.Instructions)
+            for (var i = 0; i < instruction.Operands.Count; i++)
+                if (IsElementRead(instruction.Operands[i], pointer))
+                    instruction.SetOperand(i, new ArrayAccess(array, index));
+        }
+
+        bool IsArray(IOperand operand, TypeAnalysisContext arrayType) => operand switch
+        {
+            LocalVariable { Type: SzArrayTypeAnalysisContext local } => local.FullName == arrayType.FullName,
+            FieldReference { Field.FieldType: SzArrayTypeAnalysisContext stored } => stored.FullName == arrayType.FullName,
+            _ => false,
+        };
+
+        // `[p + 4p]`, or the `p[0]` an earlier access recovery already read it as.
+        bool IsElementRead(IOperand operand, LocalVariable pointer) => operand switch
+        {
+            MemoryOperand { Index: null, Scale: 0 } memory => ReferenceEquals(memory.Base, pointer)
+                                                              && memory.Addend == ElementsOffset(pointerSize),
+            ArrayAccess { Index: Immediate { Value: 0 } } access => ReferenceEquals(access.Array, pointer),
+            _ => false,
+        };
+
+        // Every read of `pointer` the definition reaches, up to the next definition, is an element read.
+        bool OnlyElementReads(Instruction definition, LocalVariable pointer)
+        {
+            var origin = cfg.Blocks.First(b => b.Instructions.Contains(definition));
+            var work = new Stack<(Block Block, int Start)>([(origin, origin.Instructions.IndexOf(definition) + 1)]);
+            var seen = new HashSet<Block>();
+            while (work.Count > 0)
+            {
+                var (block, start) = work.Pop();
+                var stopped = false;
+                for (var k = start; k < block.Instructions.Count && !stopped; k++)
+                {
+                    var instruction = block.Instructions[k];
+                    if (instruction.Operands.Any(operand => !IsElementRead(operand, pointer)
+                            && Analysis.LocalVariables.OperandLocals(operand).Contains(pointer)
+                            && !(ReferenceEquals(operand, instruction.Destination))))
+                        return false;
+                    stopped = ReferenceEquals(instruction.Destination, pointer);
+                }
+                if (!stopped)
+                    foreach (var successor in block.Successors)
+                        if (seen.Add(successor))
+                            work.Push((successor, 0));
+            }
+            return true;
+        }
     }
 
     private static void MakeNop(Instruction instruction)

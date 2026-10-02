@@ -218,6 +218,8 @@ public static class MetadataResolver
 
                 // check if static field access
                 var staticOwner = (localType as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
+                if (staticOwner != null && !LoadsStaticBlock(local, definitions, []))
+                    continue;
                 // [ref-to-struct + off] is a member read of the referenced value
                 // (min.y), not pointer arithmetic - resolve it against the element
                 // type's layout. Only a byref lowers to a legal ldfld receiver; an
@@ -498,8 +500,84 @@ public static class MetadataResolver
                 use.SetOperand(1, part);
                 changed = true;
             }
+            else if (use is { OpCode: OpCode.Move, Operands: [MemoryOperand { Index: null, Scale: 0, Base: LocalVariable storeBase, AccessSize: > 1 and var copyWidth } wideStore, LocalVariable copied] }
+                     && CopiedBytes(copied) is { } source && source.Width == copyWidth
+                     && MatchingParts(source.Base, source.Offset, storeBase, wideStore.Addend, copyWidth) is { } parts)
+            {
+                // `ldrh w8, [x20, #0x10]; sturh w8, [x21, #0x11]` copies two bools: each covered
+                // field is read where the wide load read it and stored where the wide store wrote.
+                // Only a general-register store (its operand keeps its width): a SIMD register's
+                // lanes can be rewritten in place (`fmul v0.2s` between `ldr d0` and `str d0`)
+                // without a new value the copy could see, so those stay with the vector lane.
+                var loads = method.ControlFlowGraph.Blocks.First(b => b.Instructions.Contains(source.Load));
+                var stores = new List<Instruction>();
+                for (var k = 0; k < parts.Count; k++)
+                {
+                    var (relative, size) = parts[k];
+                    var part = new LocalVariable($"part{created}", new Register(null, $"PART{created++}_{use.Index}"));
+                    method.Locals.Add(part);
+                    loads.Instructions.Insert(loads.Instructions.IndexOf(source.Load) + 1 + k,
+                        new Instruction(-1, OpCode.Move, part,
+                            new MemoryOperand(source.Base, null, source.Offset + relative, 0, size)) { NativeMemoryAccessSize = size });
+                    stores.Add(new Instruction(-1, OpCode.Move,
+                        new MemoryOperand(storeBase, null, wideStore.Addend + relative, 0, size), part)
+                        { NativeMemoryAccessSize = size, NativeStoreWidthBytes = size });
+                }
+                use.SetOperands(stores[0].Operands[0], stores[0].Operands[1]);
+                use.NativeMemoryAccessSize = use.NativeStoreWidthBytes = parts[0].Size;
+                block.Instructions.InsertRange(block.Instructions.IndexOf(use) + 1, stores.Skip(1));
+                changed = true;
+            }
         }
         return changed;
+
+        // The bytes a value was loaded from: a load still raw, or one already read as the
+        // field at its start whatever its width (FieldReference keeps the native width).
+        (Instruction Load, LocalVariable Base, long Offset, int Width)? CopiedBytes(LocalVariable value)
+            => definitions.TryGetValue(value, out var load) ? load switch
+            {
+                { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable loadBase, AccessSize: > 0 } memory] }
+                    => (load, loadBase, memory.Addend, memory.AccessSize),
+                { OpCode: OpCode.Move, Operands: [_, FieldReference { Local: { } fieldBase, AccessSize: > 0 } field] }
+                    => (load, fieldBase, field.Offset, field.AccessSize),
+                _ => null,
+            } : null;
+
+        // A copy whose source and destination bytes cover fields at the same relative offsets,
+        // of the same sizes and types, is one copy per field: the (offset, size) of each. Two or
+        // more fields only - one is a plain field copy. Every part is a scalar (primitive, enum
+        // or reference): a narrow access to a struct the size of its first member (LayerMask)
+        // would name that member, not the struct.
+        List<(long Relative, int Size)>? MatchingParts(LocalVariable from, long fromOffset, LocalVariable to,
+            long toOffset, int width)
+        {
+            if (Covered(from, fromOffset, width) is not { Count: > 1 } read
+                || Covered(to, toOffset, width) is not { Count: > 1 } written
+                || read.Count != written.Count)
+                return null;
+            var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+            var parts = new List<(long Relative, int Size)>();
+            for (var k = 0; k < read.Count; k++)
+            {
+                if (read[k].Offset - fromOffset != written[k].Offset - toOffset || read[k].Size != written[k].Size
+                    || read[k].Field.FieldType.FullName != written[k].Field.FieldType.FullName
+                    || PrimitiveStorageSize(read[k].Field.FieldType, pointerSize) == null)
+                    return null;
+                parts.Add((read[k].Offset - fromOffset, read[k].Size));
+            }
+            return parts;
+        }
+
+        List<(FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers, long Offset, int Size)>?
+            Covered(LocalVariable local, long offset, int width)
+            => EffectiveObjectType(local, definitions, method.DeclaringType) switch
+            {
+                StaticFieldStorageTypeAnalysisContext statics => CoveredFields(statics.OwnerType, offset, width, wholeStructs: true, statics: true),
+                ByRefTypeAnalysisContext { ElementType: { IsValueType: true } element } => CoveredFields(element, offset, width, wholeStructs: true),
+                { IsValueType: false } owner and not (SzArrayTypeAnalysisContext or PointerTypeAnalysisContext or ByRefTypeAnalysisContext)
+                    => CoveredFields(owner, offset, width, wholeStructs: true),
+                _ => null,
+            };
 
         (Instruction Load, MemoryOperand Memory)? WideLoad(LocalVariable value, int minimumWidth)
             => definitions.TryGetValue(value, out var load)
@@ -539,6 +617,7 @@ public static class MetadataResolver
             .GroupBy(i => (LocalVariable)i.Destination!)
             .Where(g => g.Count() == 1)
             .ToDictionary(g => g.Key, g => g.Single());
+        var storageLocals = new Dictionary<TypeAnalysisContext, LocalVariable>();
         var changed = false;
         foreach (var block in graph.Blocks.ToList())
         foreach (var phi in block.Instructions.Where(i => i.OpCode == OpCode.Phi).ToList())
@@ -591,10 +670,12 @@ public static class MetadataResolver
 
             // An edge's read runs at the end of its block, so on a block with another exit it also
             // runs where the join is not reached: only a read that cannot fault may go there - a
-            // literal slot, or a field of `this`.
+            // literal slot, a field of `this`, or a static (its class was initialized where its
+            // address was taken).
             if (cells.Where((c, k) => block.Predecessors[k].Successors.Count != 1)
                 .Any(c => c!.Value.Read is ArrayAccess
-                          || c.Value.Read is FieldReference edgeRead && !IsThisValue(edgeRead.Local)))
+                          || c.Value.Read is FieldReference edgeRead && !IsThisValue(edgeRead.Local)
+                             && edgeRead.Local.Type is not StaticFieldStorageTypeAnalysisContext))
                 continue;
 
             // A load of a struct cell reads only the bytes it covers, not the value; a primitive cell
@@ -617,6 +698,9 @@ public static class MetadataResolver
                 var value = NewLocal(type);
                 SsaForm.InsertBeforeTerminator(block.Predecessors[k], [new Instruction(-1, OpCode.Move, value, read)]);
                 values.Add(value);
+                if (read is FieldReference { Local: var storage } && storageLocals.ContainsValue(storage)
+                    && !method.Locals.Contains(storage))
+                    method.Locals.Add(storage);
             }
             block.Instructions.Insert(block.Instructions.IndexOf(phi) + 1, new Instruction(-1, OpCode.Phi, values));
             foreach (var (user, index) in loads)
@@ -635,12 +719,22 @@ public static class MetadataResolver
         // The cell an incoming address names: `&o.f`, `o + offset` of a typed reference
         // (the fixpoint sees this form; RecoverObjectFieldAddresses turns it into `&o.f`
         // later), an element of an array at a constant index (`&wheels[0]` is
-        // `wheels + 0x20`), or a string literal slot.
+        // `wheels + 0x20`), a static (`&T.s`, see StaticStorage), or a string literal slot.
         (IOperand? Read, TypeAnalysisContext Type)? Cell(IOperand operand, int accessSize)
         {
             if (operand is AddressOf { Target: FieldReference addressed })
                 return (new FieldReference(addressed.Field, addressed.Local, addressed.Offset, addressed.Containers,
                     addressed.AccessSize), addressed.Field.FieldType);
+            // An address kept in a callee-saved register reaches the merge as a copy.
+            for (var depth = 0; depth < 8 && operand is LocalVariable copy
+                     && definitions.TryGetValue(copy, out var copied)
+                     && copied is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] }; depth++)
+                operand = source;
+            // T's static block is the address of the static at its offset 0.
+            if (operand is LocalVariable && StaticStorage(operand) is { } block
+                && ResolveField(block.Owner, block.Owner, 0, accessSize) is { } first)
+                return (new FieldReference(first.Field, block.Local, 0, first.Containers, accessSize),
+                    first.Field.FieldType);
             if (operand is not LocalVariable local || !definitions.TryGetValue(local, out var definition))
                 return null;
             if (definition is { OpCode: OpCode.Move, Operands: [_, StringLiteral] })
@@ -652,6 +746,11 @@ public static class MetadataResolver
                 && elementOffset.Value - 4L * method.AppContext.Binary.PointerSizeBytes is >= 0 and var inData
                 && inData % elementSize == 0)
                 return (new ArrayAccess(array, new Immediate(inData / elementSize)), elementType);
+            if (definition is { OpCode: OpCode.Add, Operands: [_, var storage, Immediate staticOffset] }
+                && StaticStorage(storage) is { } statics
+                && ResolveField(statics.Owner, statics.Owner, staticOffset.Value, accessSize) is { } staticPath)
+                return (new FieldReference(staticPath.Field, statics.Local, (int)staticOffset.Value,
+                    staticPath.Containers, accessSize), staticPath.Field.FieldType);
             if (definition is { OpCode: OpCode.Add, Operands: [_, LocalVariable { Type: { IsValueType: false } ownerType } owner, Immediate offset] }
                 && FindInstanceFieldPathAtOffset(ownerType, offset.Value, accessSize) is { } path)
                 return (new FieldReference(path.Field, owner, (int)offset.Value, path.Containers, accessSize),
@@ -669,6 +768,52 @@ public static class MetadataResolver
                    OpCode.Move => definition.Operands[1] is not LocalVariable source || HoldsObject(source, seen),
                    _ => definition.OpCode is not (OpCode.Add or OpCode.Subtract or OpCode.Or),
                };
+
+        // `&T.s` is T's static block plus the field's offset: a typed storage local, or the
+        // block pointer loaded straight off a class constant (`[klass + static_fields]`), for
+        // which a storage local without a definition stands in, as static reads need no base.
+        (LocalVariable Local, TypeAnalysisContext Owner)? StaticStorage(IOperand operand)
+        {
+            if (operand is LocalVariable local)
+                return EffectiveObjectType(local, definitions) is StaticFieldStorageTypeAnalysisContext typed
+                       && LoadsStaticBlock(local, definitions, [])
+                    ? (local, typed.OwnerType) : null;
+            if (operand is not MemoryOperand { Base: LocalVariable klass, Index: null, Scale: 0 } memory
+                || memory.Addend != (method.AppContext.Binary.is32Bit ? 0x5C : 0xB8)
+                || ClassConstant(klass) is not { } owner)
+                return null;
+            if (!storageLocals.TryGetValue(owner, out var stand))
+                storageLocals[owner] = stand = new LocalVariable($"statics{method.Locals.Count + storageLocals.Count}",
+                    new Register(null, $"STATICS{method.Locals.Count + storageLocals.Count}"),
+                    new StaticFieldStorageTypeAnalysisContext(owner, owner.DeclaringAssembly));
+            return (stand, owner);
+        }
+
+        // The class a local provably holds: a type-metadata load, through copies and merges of
+        // the same class (a class-init guard reloads it on one arm). A merge of different
+        // class pointers is no single class, whatever its joined type says.
+        TypeAnalysisContext? ClassConstant(LocalVariable local, HashSet<LocalVariable>? visiting = null)
+        {
+            if (!(visiting ??= []).Add(local) || !definitions.TryGetValue(local, out var definition))
+                return null;
+            switch (definition)
+            {
+                case { OpCode: OpCode.Move, Operands: [_, RuntimeClassTypeAnalysisContext { RepresentedType: var represented }] }:
+                    return represented;
+                case { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext type and not (RuntimeMethodInfoAnalysisContext
+                        or RuntimeFieldInfoAnalysisContext or StaticFieldStorageTypeAnalysisContext)] }:
+                    return type;
+                case { OpCode: OpCode.Move, Operands: [_, LocalVariable source] }:
+                    return ClassConstant(source, visiting);
+                case { OpCode: OpCode.Phi }:
+                    var classes = definition.Operands.Skip(1)
+                        .Select(input => input is LocalVariable source ? ClassConstant(source, visiting) : null).ToList();
+                    return classes.All(c => c != null) && classes.Select(c => c!.FullName).Distinct().Count() == 1
+                        ? classes[0] : null;
+                default:
+                    return null;
+            }
+        }
 
         static bool Mentions(IOperand operand, LocalVariable local) => operand switch
         {
@@ -865,6 +1010,8 @@ public static class MetadataResolver
             return null;
 
         var staticOwner = (localType as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
+        if (staticOwner != null && !LoadsStaticBlock(local, definitions, []))
+            return null;
         var byRefElement = staticOwner == null
             && localType is ByRefTypeAnalysisContext { ElementType.IsValueType: true } byRef
             ? byRef.ElementType : null;
@@ -1252,6 +1399,26 @@ public static class MetadataResolver
            && PrimitiveStorageSize(referent, referent.AppContext.Binary.PointerSizeBytes) is { } size
            && (memory.AccessSize <= 0 || memory.AccessSize == size);
 
+    // A static-storage type reaches a local by inference too: a merge takes it from one input
+    // and hands it back to its untyped inputs. The local holds T's static block only when
+    // every definition reaching it is the block load (`[klass + static_fields]`), through
+    // copies and merges; `x = c ? &T.s : &o.f; *x` read through T's layout would name T.s on
+    // both paths.
+    private static bool LoadsStaticBlock(LocalVariable local,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions, HashSet<LocalVariable> visiting)
+    {
+        if (!visiting.Add(local) || !definitions.TryGetValue(local, out var definition))
+            return true;
+        return definition switch
+        {
+            { OpCode: OpCode.Phi } => definition.Operands.Skip(1).All(input => input is LocalVariable source
+                && LoadsStaticBlock(source, definitions, visiting)),
+            { OpCode: OpCode.Move, Operands: [_, LocalVariable source] } => LoadsStaticBlock(source, definitions, visiting),
+            { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: LocalVariable, Index: null }] } => true,
+            _ => false,
+        };
+    }
+
     private static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)? ResolveField(
         TypeAnalysisContext owner, TypeAnalysisContext? staticOwner, long offset, int accessSize,
         bool sizeMatchedLeaf = false, bool laneView = false)
@@ -1500,8 +1667,24 @@ public static class MetadataResolver
         return IsCompilerGeneratedBackingField(leaf)
             && (addressed
                 || !(BackingAccessorVisible(leaf, caller, store)
-                     || IsOwnBackingAccessor(leaf, caller, store)));
+                     || IsOwnBackingAccessor(leaf, caller, store)
+                     || store && IsOwnInitializer(leaf, caller)));
     }
+
+    // A get-only auto-property is assigned only in its own type's constructor of the same
+    // kind: `static P { get; } = v` is `stsfld <P>k__BackingField` in the .cctor, and
+    // `P { get; } = v` or `P = v` is `stfld` in an instance .ctor. That store is the
+    // property assignment the source made, not a setter call.
+    private static bool IsOwnInitializer(FieldAnalysisContext field, MethodAnalysisContext caller)
+        => caller.Name == (field.IsStatic ? ".cctor" : ".ctor")
+           && caller.IsStatic == field.IsStatic
+           && FindBackingAccessor(field, store: true) == null
+           && FindBackingAccessor(field, store: false) != null
+           && GenericDefinition(field.DeclaringType) is { } owner
+           && ReferenceEquals(owner, GenericDefinition(caller.DeclaringType));
+
+    private static TypeAnalysisContext? GenericDefinition(TypeAnalysisContext? type)
+        => type is GenericInstanceTypeAnalysisContext instance ? instance.GenericType : type;
 
     internal static bool IsCompilerGeneratedBackingField(FieldAnalysisContext field) =>
         field.Name.StartsWith("<", System.StringComparison.Ordinal)
@@ -2596,7 +2779,10 @@ public static class MetadataResolver
                 continue;
             }
 
-            if (instruction.Operands[0] is not Immediate target)
+            // The array-new stub (`mov x2, xzr; b NewFull`) sets its own x2: a MethodInfo* there
+            // is a stale one from an earlier call, never this call's hidden argument.
+            if (instruction.Operands[0] is not Immediate target
+                || ArrayRecovery.IsArrayNewWithoutBounds(method.AppContext, target.UnsignedValue))
                 continue;
 
             // A concrete MethodInfo* in the exact hidden-argument slot is more

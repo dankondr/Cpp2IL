@@ -408,6 +408,51 @@ public static class IlGenerator
             branchInstruction.Operand = new CilInstructionLabel(target);
         }
 
+        // A conditional whose two edges reach the same instruction through only
+        // `br`/`nop` hops is dead: the taken edge and the fallthrough edge
+        // merge without work between them. Emitting it produces `if (c) {}` -
+        // a diamond with two empty arms - so the check and the pure operand
+        // loads that fed it emit as nops instead.
+        var bodyInstructions = definition.CilMethodBody!.Instructions;
+        foreach (var (jump, il) in instructionMap)
+        {
+            if (jump.OpCode != OpCode.ConditionalJump)
+                continue;
+            var ilBranch = il.LastOrDefault(i => i.OpCode == CilOpCodes.Brtrue || i.OpCode == CilOpCodes.Brfalse);
+            if (ilBranch?.Operand is not CilInstructionLabel { Instruction: { } takenEntry })
+                continue;
+            // Find the branch's own position by identity: CilInstructionLabel
+            // equality degenerates while offsets are unassigned, so IndexOf
+            // could report an earlier, different brtrue/brfalse.
+            var branchIndex = -1;
+            for (var i = 0; i < bodyInstructions.Count; i++)
+                if (ReferenceEquals(bodyInstructions[i], ilBranch))
+                {
+                    branchIndex = i;
+                    break;
+                }
+            if (branchIndex < 0 || branchIndex + 1 >= bodyInstructions.Count)
+                continue;
+            var fallthroughEntry = bodyInstructions[branchIndex + 1];
+            // The branch is dead only when its taken edge and its fallthrough
+            // edge land on the same instruction once br/nop bridges are
+            // resolved away. A landing that is a real instruction elsewhere in
+            // the method (a loop head, a ret) keeps the test.
+            var takenLanding = EmissionResolveJoinTarget(takenEntry, bodyInstructions);
+            if (takenLanding == null || il.Contains(takenLanding))
+                continue;
+            var fallLanding = EmissionResolveJoinTarget(fallthroughEntry, bodyInstructions);
+            if (!ReferenceEquals(takenLanding, fallLanding))
+                continue;
+            if (il.Any(emitted => emitted != ilBranch && !EmissionIsPureLocalComputation(emitted)))
+                continue;
+            foreach (var emitted in il)
+            {
+                emitted.OpCode = CilOpCodes.Nop;
+                emitted.Operand = null;
+            }
+        }
+
         // A proven unwind landing pad on a finalizer is emitted as the finally clause
         // it was compiled from: exit copies of the base call become leaves out of the
         // try, and the handler carries base.Finalize + endfinally.
@@ -468,6 +513,8 @@ public static class IlGenerator
             body.Instructions.Add(CilOpCodes.Ret);
         }
 
+        var undefinedReads = UndefinedReads(body, locals, context);
+
         // Add analysis warnings
         var instructions = body.Instructions;
         foreach (var warning in context.AnalysisWarnings)
@@ -475,7 +522,12 @@ public static class IlGenerator
             instructions.Add(CilOpCodes.Ldstr, Diagnostic("Warning: " + warning));
             instructions.Add(CilOpCodes.Call, writeLine);
         }
-        if (context.AnalysisWarnings.Count != 0)
+        foreach (var note in undefinedReads)
+        {
+            instructions.Add(CilOpCodes.Ldstr, Diagnostic(note));
+            instructions.Add(CilOpCodes.Call, writeLine);
+        }
+        if (context.AnalysisWarnings.Count != 0 || undefinedReads.Count != 0)
         {
             // Even unreachable CIL must not fall off the physical end of a body:
             // the CLR rejects such a trailer before executing the valid entry path.
@@ -514,6 +566,133 @@ public static class IlGenerator
         }
     }
 
+
+    // A read of a local that no store reaches on some path from the entry reads the zeroed slot:
+    // a merge the lifter could not prove (a phi edge with no legal managed copy) left that path
+    // without a value, and C# cannot say this. The rule is the uninit-read scan's: definite
+    // assignment over the normal-flow IL graph, ldloca counting as a store; handler code, which
+    // normal flow does not reach, is not checked. Only locals that some path does store count:
+    // one with no store at all is the never-stored rule's (its note at the read, or a register
+    // that rule proves holds a value), and a parameter local holds its argument.
+    private static List<string> UndefinedReads(CilMethodBody body, Dictionary<LocalVariable, CilLocalVariable> locals,
+        MethodAnalysisContext context)
+    {
+        var code = body.Instructions;
+        if (code.Count == 0)
+            return [];
+
+        // CilInstruction compares by value; two `ldarg n` before offsets are assigned are equal.
+        var position = new Dictionary<CilInstruction, int>(ReferenceEqualityComparer.Instance);
+        for (var i = 0; i < code.Count; i++)
+            position[code[i]] = i;
+        IEnumerable<int> Targets(CilInstruction instruction) => (instruction.Operand switch
+        {
+            ICilLabel label => [label],
+            IList<ICilLabel> labels => labels,
+            _ => [],
+        }).Select(label => label is CilInstructionLabel { Instruction: { } target } && position.TryGetValue(target, out var at) ? at : -1)
+            .Where(at => at >= 0);
+        bool Jumps(CilInstruction i) => i.OpCode.FlowControl is CilFlowControl.Branch or CilFlowControl.ConditionalBranch;
+        bool Ends(CilInstruction i) => i.OpCode.FlowControl is CilFlowControl.Return or CilFlowControl.Throw;
+
+        var leaders = new SortedSet<int> { 0 };
+        for (var i = 0; i < code.Count; i++)
+            if (Jumps(code[i]))
+            {
+                leaders.UnionWith(Targets(code[i]));
+                leaders.Add(i + 1);
+            }
+            else if (Ends(code[i]))
+                leaders.Add(i + 1);
+        var starts = leaders.Where(l => l < code.Count).ToList();
+        var blockAt = starts.Select((start, b) => (start, b)).ToDictionary(p => p.start, p => p.b);
+        int End(int b) => b + 1 < starts.Count ? starts[b + 1] : code.Count;
+        var successors = starts.Select((start, b) =>
+        {
+            var last = code[End(b) - 1];
+            var fall = b + 1 < starts.Count ? [b + 1] : new List<int>();
+            return last.OpCode.FlowControl switch
+            {
+                CilFlowControl.ConditionalBranch => Targets(last).Select(t => blockAt[t]).Concat(fall).ToList(),
+                CilFlowControl.Branch => Targets(last).Select(t => blockAt[t]).ToList(),
+                CilFlowControl.Return or CilFlowControl.Throw => [],
+                _ => fall,
+            };
+        }).ToList();
+
+        int? Slot(CilInstruction i) => i.OpCode.Code switch
+        {
+            CilCode.Ldloc_0 or CilCode.Stloc_0 => 0,
+            CilCode.Ldloc_1 or CilCode.Stloc_1 => 1,
+            CilCode.Ldloc_2 or CilCode.Stloc_2 => 2,
+            CilCode.Ldloc_3 or CilCode.Stloc_3 => 3,
+            _ => (i.Operand as CilLocalVariable)?.Index,
+        };
+        bool Writes(CilInstruction i) => i.OpCode.Code is CilCode.Stloc or CilCode.Stloc_S or CilCode.Stloc_0 or CilCode.Stloc_1
+            or CilCode.Stloc_2 or CilCode.Stloc_3 or CilCode.Ldloca or CilCode.Ldloca_S;
+        bool Reads(CilInstruction i) => i.OpCode.Code is CilCode.Ldloc or CilCode.Ldloc_S or CilCode.Ldloc_0 or CilCode.Ldloc_1
+            or CilCode.Ldloc_2 or CilCode.Ldloc_3;
+
+        // Forward must-be-assigned sets, intersected at joins, over the blocks normal flow reaches.
+        var reached = new HashSet<int> { 0 };
+        var pending = new Stack<int>([0]);
+        while (pending.Count > 0)
+            foreach (var next in successors[pending.Pop()])
+                if (reached.Add(next))
+                    pending.Push(next);
+        var predecessors = reached.ToDictionary(b => b, _ => new List<int>());
+        foreach (var b in reached)
+            foreach (var next in successors[b])
+                predecessors[next].Add(b);
+        HashSet<int> Transfer(int b, HashSet<int> state)
+        {
+            var result = new HashSet<int>(state);
+            for (var i = starts[b]; i < End(b); i++)
+                if (Writes(code[i]) && Slot(code[i]) is { } written)
+                    result.Add(written);
+            return result;
+        }
+        var entry = reached.ToDictionary(b => b, b => b == 0 ? [] : new HashSet<int>(Enumerable.Range(0, body.LocalVariables.Count)));
+        var exit = reached.ToDictionary(b => b, b => Transfer(b, entry[b]));
+        for (var changed = true; changed;)
+        {
+            changed = false;
+            foreach (var b in reached.Where(b => b != 0).OrderBy(b => b))
+            {
+                var merged = new HashSet<int>(exit[predecessors[b][0]]);
+                foreach (var p in predecessors[b].Skip(1))
+                    merged.IntersectWith(exit[p]);
+                if (merged.SetEquals(entry[b]))
+                    continue;
+                entry[b] = merged;
+                exit[b] = Transfer(b, merged);
+                changed = true;
+            }
+        }
+
+        var unassigned = new SortedSet<int>();
+        foreach (var b in reached)
+        {
+            var state = new HashSet<int>(entry[b]);
+            for (var i = starts[b]; i < End(b); i++)
+            {
+                if (Slot(code[i]) is not { } slot)
+                    continue;
+                if (Reads(code[i]) && !state.Contains(slot))
+                    unassigned.Add(slot);
+                if (Writes(code[i]))
+                    state.Add(slot);
+            }
+        }
+
+        var named = locals.ToDictionary(pair => pair.Value.Index, pair => pair.Key);
+        var stored = code.Where(Writes).Select(Slot).OfType<int>().ToHashSet();
+        return unassigned
+            .Where(slot => stored.Contains(slot) && !(named.TryGetValue(slot, out var local) && context.ParameterLocals.Contains(local)))
+            .Select(slot => $"Undefined local {(named.TryGetValue(slot, out var local) ? local.ToString() : $"V_{slot}")} on some path: "
+                            + "a read is reached by no store on one path from the method entry.")
+            .ToList();
+    }
 
     // Limit so we don't run into the 16mb limit (see AsmResolver issue #775)
     private static string Diagnostic(string message) 
@@ -939,6 +1118,22 @@ public static class IlGenerator
                 // Try and fuse our Newobj + the follow up constructor CallVoid into one IL newobj.
                 // If we can't, just fall back to an Ldnull.
                 var allocatedDestination = StoreContract(instruction.Operands[0], context);
+                // object_new handed a class pointer that differs by path allocates a different
+                // type on each path; no single newobj says that, so the site degrades to a
+                // diagnostic and the destination's default instead of picking one class.
+                if (instruction.Operands.Count > 1
+                    && PathDependentAllocatedClasses(context, instruction.Operands[1]) is { } pathClasses)
+                {
+                    EmitNullOrDefault(allocatedDestination, method, instructions, context,
+                        $"Allocated class differs by path ({string.Join(", ", pathClasses.Select(type => type.FullName))}): no single newobj constructs it");
+                    StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
+                    if (constructorPairs.TryGetValue(instruction, out var pathConstructorCall))
+                    {
+                        pathConstructorCall.OpCode = OpCode.Nop;
+                        pathConstructorCall.SetOperands();
+                    }
+                    break;
+                }
                 if (constructorPairs.TryGetValue(instruction, out var constructorCall)
                     && constructorCall.Operands is [MethodAnalysisContext constructor, _, ..])
                 {
@@ -1964,9 +2159,8 @@ public static class IlGenerator
                     // has honest answers - a shared native-int lowering covers
                     // integral/pointer operands, and a zero literal on a managed or
                     // generic operand is the null test - while ordering and
-                    // arithmetic have none, so they default to false/zero: the
-                    // zero after the throw keeps the store below stack-consistent
-                    // (IL2CPP's stack analysis walks that dead tail too).
+                    // arithmetic have none, so they throw; the store below is then
+                    // dead and RemoveDeadThrowTails cuts it.
                     if (unrecoverableIntegerOperation
                         || instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual)
                         || !(TryEmitNativeIntEquality(instruction, context, method, locals, writeLine)
@@ -1975,7 +2169,6 @@ public static class IlGenerator
                         EmitUnrecoverableOperation(method, writeLine, unrecoverableIntegerOperation
                             ? $"Unrecoverable integer operation: {instruction}"
                             : $"Unrecoverable operation: {instruction}");
-                        instructions.Add(CilOpCodes.Ldc_I4_0);
                     }
                     EmitStackCoerceOrDefault(context.AppContext.SystemTypes.SystemInt32Type,
                         StoreContract(instruction.Operands[0], context), method, context);
@@ -3428,6 +3621,8 @@ public static class IlGenerator
         {
             RuntimeClassTypeAnalysisContext { RepresentedType: { } represented } => represented,
             TypeAnalysisContext type => type,
+            // The definitions decide before the static type a join gave the local.
+            LocalVariable local when PathDependentAllocatedClasses(context, local) != null => null,
             LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { } represented } } => represented,
             MemoryOperand { Base: null, Index: null, Scale: 0 } memory => ResolveTypeGlobal(context, (ulong)memory.Addend),
             Immediate immediate => ResolveTypeGlobal(context, immediate.UnsignedValue),
@@ -3446,23 +3641,44 @@ public static class IlGenerator
             if (!ReferenceEquals(instruction.Destination, local))
                 continue;
 
-            var candidate = instruction switch
-            {
-                { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext type] }
-                    => type is RuntimeClassTypeAnalysisContext { RepresentedType: { } represented } ? represented : type,
-                { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: null, Index: null, Scale: 0 } memory] }
-                    => ResolveTypeGlobal(context, (ulong)memory.Addend),
-                { OpCode: OpCode.Move, Operands: [_, Immediate immediate] }
-                    => ResolveTypeGlobal(context, immediate.UnsignedValue),
-                _ => null,
-            };
-
+            var candidate = DefinedClass(context, instruction);
             if (candidate == null || (resolved != null && !ReferenceEquals(resolved, candidate)))
                 return null;
             resolved = candidate;
         }
 
         return resolved;
+    }
+
+    private static TypeAnalysisContext? DefinedClass(MethodAnalysisContext context, Instruction definition) =>
+        definition switch
+        {
+            { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext type] }
+                => type is RuntimeClassTypeAnalysisContext { RepresentedType: { } represented } ? represented : type,
+            { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: null, Index: null, Scale: 0 } memory] }
+                => ResolveTypeGlobal(context, (ulong)memory.Addend),
+            { OpCode: OpCode.Move, Operands: [_, Immediate immediate] }
+                => ResolveTypeGlobal(context, immediate.UnsignedValue),
+            _ => null,
+        };
+
+    // A class-pointer local that paths load with different type globals - a phi of class
+    // pointers - names no single allocated type, whatever static type the join gave it.
+    // Definitions that are not type globals (method/field metadata, computed values) are
+    // not class evidence and do not count.
+    private static List<TypeAnalysisContext>? PathDependentAllocatedClasses(MethodAnalysisContext context,
+        IOperand classOperand)
+    {
+        if (classOperand is not LocalVariable local)
+            return null;
+        var classes = new List<TypeAnalysisContext>();
+        foreach (var instruction in context.ControlFlowGraph!.Instructions)
+            if (ReferenceEquals(instruction.Destination, local)
+                && DefinedClass(context, instruction) is { } candidate
+                and not RuntimeMethodInfoAnalysisContext and not RuntimeFieldInfoAnalysisContext
+                && !classes.Any(known => ReferenceEquals(known, candidate)))
+                classes.Add(candidate);
+        return classes.Count > 1 ? classes : null;
     }
 
     private static TypeAnalysisContext? ResolveTypeGlobal(MethodAnalysisContext context, ulong address) =>
@@ -7865,12 +8081,14 @@ public static class IlGenerator
     // A label or handler boundary landing on a removed instruction is
     // redirected to the first kept instruction after it: the removed pushes
     // are dead, so jumping to one is jumping past them. Returns false when a
-    // removed instruction has no kept successor to land on.
+    // removed instruction has no kept successor to land on. Keyed by identity:
+    // CilInstruction equality is opcode, operand and offset, so a label on a
+    // kept `ldnull` would otherwise follow a removed one.
     private static bool RetargetRemoved(MethodDefinition? method,
         CilInstructionCollection instructions, List<int> remove)
     {
         var removeSet = new HashSet<int>(remove);
-        var afterOf = new Dictionary<CilInstruction, CilInstruction>();
+        var afterOf = new Dictionary<CilInstruction, CilInstruction>(ReferenceEqualityComparer.Instance);
         foreach (var k in remove)
         {
             var next = k + 1;
@@ -10114,6 +10332,69 @@ public static class IlGenerator
                     or OpCode.Divide or OpCode.Modulo
     };
 
+    // Positions must be found by identity: label and nop operands compare equal
+    // while offsets are unassigned, which makes collection IndexOf unreliable.
+    private static int EmissionBodyIndex(CilInstructionCollection body, CilInstruction item)
+    {
+        for (var i = 0; i < body.Count; i++)
+            if (ReferenceEquals(body[i], item))
+                return i;
+        return -1;
+    }
+
+    // Walks forward from `entry` through only `br` targets and `nop`s and
+    // returns the first instruction that does real work - the instruction a
+    // control-flow edge semantically lands on. Null when the walk leaves the
+    // body or exceeds the hop bound (a cycle of pure jumps).
+    private static CilInstruction? EmissionResolveJoinTarget(CilInstruction entry,
+        CilInstructionCollection body)
+    {
+        for (var hops = 0; hops < 8; hops++)
+        {
+            if (entry.OpCode == CilOpCodes.Br && entry.Operand is CilInstructionLabel { Instruction: { } next })
+            {
+                entry = next;
+                continue;
+            }
+            if (entry.OpCode == CilOpCodes.Nop)
+            {
+                var index = EmissionBodyIndex(body, entry);
+                if (index < 0 || index + 1 >= body.Count)
+                    return null;
+                entry = body[index + 1];
+                continue;
+            }
+            return entry;
+        }
+        return null;
+    }
+
+    // Instruction kinds that only read existing state onto the evaluation
+    // stack - no stores, calls, member loads or potentially-throwing
+    // operations - so nop'ing them out with a dead branch keeps the IL
+    // balanced and semantics unchanged.
+    private static bool EmissionIsPureLocalComputation(CilInstruction instruction) => instruction.OpCode.Code switch
+    {
+        CilCode.Ldloc or CilCode.Ldloc_S or CilCode.Ldloca or CilCode.Ldloca_S
+            or CilCode.Ldloc_0 or CilCode.Ldloc_1 or CilCode.Ldloc_2 or CilCode.Ldloc_3
+            or CilCode.Ldarg or CilCode.Ldarg_S or CilCode.Ldarga or CilCode.Ldarga_S
+            or CilCode.Ldarg_0 or CilCode.Ldarg_1 or CilCode.Ldarg_2 or CilCode.Ldarg_3
+            or CilCode.Ldc_I4 or CilCode.Ldc_I4_S or CilCode.Ldc_I8 or CilCode.Ldc_R4 or CilCode.Ldc_R8
+            or CilCode.Ldc_I4_M1 or CilCode.Ldc_I4_0 or CilCode.Ldc_I4_1 or CilCode.Ldc_I4_2
+            or CilCode.Ldc_I4_3 or CilCode.Ldc_I4_4 or CilCode.Ldc_I4_5 or CilCode.Ldc_I4_6
+            or CilCode.Ldc_I4_7 or CilCode.Ldc_I4_8
+            or CilCode.Ldnull
+            or CilCode.Pop or CilCode.Dup
+            or CilCode.Ceq or CilCode.Cgt or CilCode.Cgt_Un or CilCode.Clt or CilCode.Clt_Un
+            or CilCode.Not or CilCode.Neg
+            or CilCode.Add or CilCode.Sub or CilCode.Mul or CilCode.Shl or CilCode.Shr or CilCode.Shr_Un
+            or CilCode.And or CilCode.Or or CilCode.Xor
+            or CilCode.Conv_I or CilCode.Conv_I1 or CilCode.Conv_I2 or CilCode.Conv_I4 or CilCode.Conv_I8
+            or CilCode.Conv_U or CilCode.Conv_U1 or CilCode.Conv_U2 or CilCode.Conv_U4 or CilCode.Conv_U8
+            or CilCode.Conv_R4 or CilCode.Conv_R8 or CilCode.Conv_R_Un => true,
+        _ => false,
+    };
+
     // Equality between integral or pointer operands lowers to ceq on two native
     // ints - every side converts through conv.i (a zero literal is then the
     // native null-address test). Returns false when an operand cannot become a
@@ -10181,6 +10462,14 @@ public static class IlGenerator
                 return false; // a ref struct can never become a reference either
             emitted.Add(emittedType);
         }
+
+        // A boxed value is only reference-comparable against ldnull: box+ceq
+        // against any other operand compares distinct boxes, which is always
+        // false. Such a test has no honest lowering; leave it diagnosed.
+        for (var i = 0; i < emitted.Count; i++)
+            if (emitted[i] is { IsValueType: true }
+                && emitted[(i + 1) % emitted.Count] != null)
+                return false;
 
         for (var i = 0; i < operands.Count; i++)
         {
@@ -12104,6 +12393,12 @@ public static class IlGenerator
 
         switch (operand)
         {
+            // A parameter's reads are ldarg, so its stores must be starg: a stloc would write a
+            // shadow local no read sees.
+            case LocalVariable local when !local.IsThis && ParameterForLocal(local, method, context) is { } parameter:
+                instructions.Add(CilOpCodes.Starg, parameter);
+                break;
+
             case LocalVariable local:
                 instructions.Add(CilOpCodes.Stloc, locals[local]);
                 break;
@@ -12184,13 +12479,17 @@ public static class IlGenerator
                     instructions.Add(CilOpCodes.Call, writeLine);
                     break;
                 }
+                // A struct local stands for its own storage: `[s] = 0` is `s = default`.
                 if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
-                    && memory.Base is LocalVariable local2)
+                    && memory.Base is LocalVariable { Type: { IsValueType: true } structType } structLocal
+                    && IntegralStackWidth(structType) == 0
+                    && structType.FullName is not ("System.Single" or "System.Double"))
                 {
-                    // Can pointer assignments just be ignored because it's C#? (Move [local], 123)
-                    instructions.Add(CilOpCodes.Stloc, locals[local2]);
+                    instructions.Add(CilOpCodes.Stloc, locals[structLocal]);
                     break;
                 }
+                // `[p] = v` through a pointer writes the memory p points at; storing v into p
+                // itself would be a silent wrong value. A store nothing resolved is dropped, said so.
                 instructions.Add(CilOpCodes.Pop);
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Store through unmanaged memory form {memory} could not be emitted; the value was dropped."));
                 instructions.Add(CilOpCodes.Call, writeLine);
