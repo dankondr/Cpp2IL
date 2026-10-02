@@ -2870,6 +2870,16 @@ public static class LocalVariables
                     or OpCode.CheckLess or OpCode.CheckLessOrEqual:
                     SplitScalarComparisonSources(method, instruction);
                     break;
+                case OpCode.Convert:
+                    // A numeric conversion reads only the low lane of its source
+                    // register: `fcvtzs x10, s0` reads `point.x`, `scvtf s0, w0`
+                    // reads the low int. The lifter's recorded source width and
+                    // floatness name the lane; anything wider stays whole.
+                    if (instruction.ConversionSourceWidthBits is { } sourceBits
+                        && ScalarLaneType(method, sourceBits,
+                            instruction.ConversionFromFloat) is { } convertLane)
+                        SplitScalarSources(method, instruction, convertLane);
+                    break;
             }
         }
     }
@@ -2975,15 +2985,18 @@ public static class LocalVariables
     private static void SplitScalarComparisonSources(MethodAnalysisContext method, Instruction instruction)
     {
         // A comparison's operand pair shares one stack kind, which the flag-typed
-        // destination does not reveal; take it from whichever side is already scalar.
-        if (instruction.Operands.Count < 3
-            || instruction.Operands[1] is not LocalVariable left
-            || instruction.Operands[2] is not LocalVariable right)
+        // destination does not reveal; take it from whichever side is already
+        // scalar - a typed local, or the literal's own family. An integer
+        // immediate names no lane: the whole-packed compare it sits in is the
+        // packed-fields pass's to read.
+        if (instruction.Operands.Count < 3)
             return;
+        var left = instruction.Operands[1];
+        var right = instruction.Operands[2];
 
-        var laneType = IsScalarLaneType(left.Type) ? left.Type
-            : IsScalarLaneType(right.Type) ? right.Type
-            : null;
+        var laneType = left is LocalVariable { Type: { } leftType } && IsScalarLaneType(leftType) ? leftType
+            : right is LocalVariable { Type: { } rightType } && IsScalarLaneType(rightType) ? rightType
+            : ScalarLiteralLaneType(left, method) ?? ScalarLiteralLaneType(right, method);
         if (laneType == null)
             return;
 
@@ -2992,6 +3005,29 @@ public static class LocalVariables
         if (LaneOperand(left, laneType, method) is { } leftLane)
             instruction.SetOperand(1, leftLane);
     }
+
+    // The stack type a scalar literal compares at: a float literal proves the
+    // float lane, anything else proves nothing.
+    private static TypeAnalysisContext? ScalarLiteralLaneType(IOperand operand,
+        MethodAnalysisContext method)
+        => operand switch
+        {
+            FloatLiteral => method.AppContext.SystemTypes.SystemSingleType,
+            DoubleLiteral => method.AppContext.SystemTypes.SystemDoubleType,
+            _ => null,
+        };
+
+    // The stack type a native read of `bits` of a register lane carries.
+    private static TypeAnalysisContext? ScalarLaneType(MethodAnalysisContext method,
+        int bits, bool isFloat)
+        => bits switch
+        {
+            32 => isFloat ? method.AppContext.SystemTypes.SystemSingleType
+                : method.AppContext.SystemTypes.SystemInt32Type,
+            64 => isFloat ? method.AppContext.SystemTypes.SystemDoubleType
+                : method.AppContext.SystemTypes.SystemInt64Type,
+            _ => null,
+        };
 
     private static IOperand? LaneOperand(IOperand operand, TypeAnalysisContext laneType,
         MethodAnalysisContext method)

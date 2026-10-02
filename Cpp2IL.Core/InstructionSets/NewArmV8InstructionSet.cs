@@ -184,8 +184,40 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     public override List<Instruction> GetIsilFromMethod(MethodAnalysisContext context)
         => ConvertInstructions(NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext, context.UnderlyingPointer), context);
 
+    // LLD's Cortex-A53 erratum-843419 fix moves one instruction out of line and leaves `b veneer` in its place,
+    // the veneer being `<that instruction>; b <branch + 4>`. Such a branch is that instruction, decoded at the
+    // branch's address; PC-relative instructions would change meaning there, so they are left alone.
+    internal static IReadOnlyList<Arm64Instruction> FollowRelocationVeneers(IReadOnlyList<Arm64Instruction> insns,
+        ulong start, ulong end, Func<ulong, uint?> readWord)
+    {
+        List<Arm64Instruction>? result = null;
+        for (var i = 0; i < insns.Count; i++)
+        {
+            var branch = insns[i];
+            if (branch.Mnemonic != Arm64Mnemonic.B || branch.MnemonicConditionCode is not (Arm64ConditionCode.NONE or Arm64ConditionCode.AL))
+                continue;
+            var target = branch.BranchTarget;
+            if (target >= start && target < end
+                || readWord(target) is not { } word
+                || NewArm64KeyFunctionAddresses.MatchTailCallVeneerTarget(target + 4, readWord) != branch.Address + 4)
+                continue;
+
+            var moved = Disassembler.Disassemble(BitConverter.GetBytes(word), branch.Address, new Disassembler.Options(true, true, false)).ToList();
+            if (moved is not [var insn]
+                || insn.Mnemonic == Arm64Mnemonic.INVALID
+                || insn.MnemonicCategory is Arm64MnemonicCategory.Branch or Arm64MnemonicCategory.ConditionalBranch
+                    or Arm64MnemonicCategory.Return or Arm64MnemonicCategory.LoadAddress
+                || new[] { insn.Op0Kind, insn.Op1Kind, insn.Op2Kind, insn.Op3Kind }.Contains(Arm64OperandKind.ImmediatePcRelative))
+                continue;
+
+            (result ??= insns.ToList())[i] = insn;
+        }
+
+        return result ?? insns;
+    }
+
     internal List<Instruction> ConvertInstructions(IEnumerable<Arm64Instruction> insns, MethodAnalysisContext context,
-        Func<ulong, string?>? importNameResolver = null)
+        Func<ulong, string?>? importNameResolver = null, Func<ulong, uint?>? readWord = null)
     {
         if (adrpOffsets == null) // initializers for ThreadStatic fields only run on the first thread
             adrpOffsets = new();
@@ -197,7 +229,11 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         var instructions = new List<Instruction>();
         var addresses = new List<ulong>();
 
-        var instructionList = insns as IReadOnlyList<Arm64Instruction> ?? insns.ToList();
+        var binary = context.AppContext.Binary;
+        var instructionList = FollowRelocationVeneers(insns as IReadOnlyList<Arm64Instruction> ?? insns.ToList(),
+            context.UnderlyingPointer, context.UnderlyingPointer + (ulong)context.RawBytes.Length,
+            readWord ?? (va => binary.TryMapVirtualAddressToRaw(va, out var raw) && raw >= 0 && raw + 4 <= binary.RawLength
+                ? BitConverter.ToUInt32(binary.GetRawBinaryContent().Slice((int)raw, 4)) : null));
         var scalarizer = new Arm64VectorScalarizer();
         scalarizer.Begin(instructionList);
 
@@ -1268,9 +1304,19 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     break;
                 }
             case Arm64Mnemonic.CMP:
+                EmitCompareFlags(ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                break;
             case Arm64Mnemonic.FCMP:
             case Arm64Mnemonic.FCMPE:
-                EmitCompareFlags(ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                // The immediate form of a float compare is `fcmp sn, #0.0` - a float
+                // constant, not an integer bound. Emitting it as a float literal keeps
+                // the flag checks' lane view on the aggregate's float leaf.
+                EmitCompareFlags(ConvertOperand(instruction, 0),
+                    instruction.Op1Kind == Arm64OperandKind.Immediate
+                        ? RegisterWidthBytes(instruction.Op0Reg) == 8
+                            ? new DoubleLiteral(instruction.Op1Imm)
+                            : new FloatLiteral(instruction.Op1Imm)
+                        : ConvertOperand(instruction, 1));
                 break;
             case Arm64Mnemonic.CMN:
                 // cmp against the negated operand
