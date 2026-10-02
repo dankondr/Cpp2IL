@@ -118,6 +118,17 @@ internal sealed class Arm64VectorScalarizer
     /// <summary>Merge targets also reached by falling through from the previous instruction.</summary>
     private readonly HashSet<ulong> _mergeFallThrough = new();
 
+    /// <summary>Address of each instruction's recorded intra-method branch target.</summary>
+    private readonly Dictionary<ulong, ulong> _branchTargets = new();
+
+    /// <summary>
+    /// Instructions some control-flow path can reach: bytes after an
+    /// unconditional branch or return are dead code — a literal pool or a
+    /// tail-shared sequence — and are no predecessor of the merge target that
+    /// follows them.
+    /// </summary>
+    private readonly HashSet<ulong> _reachable = new();
+
     /// <summary>
     /// Lane state snapshot taken at a branch instruction — the value one
     /// incoming edge hands to the merge its target reaches.
@@ -199,10 +210,21 @@ internal sealed class Arm64VectorScalarizer
         or Arm64Mnemonic.CBZ or Arm64Mnemonic.CBNZ
         or Arm64Mnemonic.TBZ or Arm64Mnemonic.TBNZ;
 
+    /// <summary>
+    /// Whether the instruction leaves the linear flow with no fall-through:
+    /// returns, register-indirect branches and unconditional immediate
+    /// branches. Disarm decodes an ordinary <c>b.cond</c> with the same
+    /// <see cref="Arm64Mnemonic.B"/> mnemonic as an unconditional branch —
+    /// only the conditional-branch category distinguishes the two.
+    /// </summary>
+    private static bool IsUnconditionalExit(Arm64Instruction insn) =>
+        insn.Mnemonic is Arm64Mnemonic.BR
+            or Arm64Mnemonic.RET or Arm64Mnemonic.RETAA or Arm64Mnemonic.RETAB
+        || (insn.Mnemonic == Arm64Mnemonic.B
+            && insn.MnemonicCategory == Arm64MnemonicCategory.Branch);
+
     /// <summary>Whether the instruction passes control to the next one in address order.</summary>
-    private static bool FallsThrough(Arm64Instruction insn) => insn.Mnemonic is not
-        (Arm64Mnemonic.B or Arm64Mnemonic.BR
-            or Arm64Mnemonic.RET or Arm64Mnemonic.RETAA or Arm64Mnemonic.RETAB);
+    private static bool FallsThrough(Arm64Instruction insn) => !IsUnconditionalExit(insn);
 
     /// <summary>
     /// Called once per method before conversion. Records every intra-method
@@ -216,6 +238,8 @@ internal sealed class Arm64VectorScalarizer
         _mergeTargets.Clear();
         _mergePreds.Clear();
         _mergeFallThrough.Clear();
+        _branchTargets.Clear();
+        _reachable.Clear();
         _edgeExit.Clear();
         _claimedDests.Clear();
         _copySource.Clear();
@@ -236,13 +260,35 @@ internal sealed class Arm64VectorScalarizer
             if (target is not { } t)
                 continue;
             _mergeTargets.Add(t);
+            _branchTargets[insn.Address] = t;
             if (!_mergePreds.TryGetValue(t, out var preds))
                 _mergePreds[t] = preds = [];
             preds.Add(insn.Address);
         }
 
+        if (instructions.Count > 0)
+            _reachable.Add(instructions[0].Address);
+        for (var changed = true; changed;)
+        {
+            changed = false;
+            for (var i = 0; i < instructions.Count; i++)
+            {
+                var insn = instructions[i];
+                if (!_reachable.Contains(insn.Address))
+                    continue;
+                if (_branchTargets.TryGetValue(insn.Address, out var branchTarget)
+                    && _reachable.Add(branchTarget))
+                    changed = true;
+                if (i + 1 < instructions.Count && FallsThrough(insn)
+                    && _reachable.Add(instructions[i + 1].Address))
+                    changed = true;
+            }
+        }
+
         for (var i = 1; i < instructions.Count; i++)
-            if (_mergeTargets.Contains(instructions[i].Address) && FallsThrough(instructions[i - 1]))
+            if (_mergeTargets.Contains(instructions[i].Address)
+                && FallsThrough(instructions[i - 1])
+                && _reachable.Contains(instructions[i - 1].Address))
                 _mergeFallThrough.Add(instructions[i].Address);
     }
 
@@ -354,13 +400,14 @@ internal sealed class Arm64VectorScalarizer
             branchEdges = new(predAddresses.Count);
             foreach (var pred in predAddresses)
             {
+                if (!_reachable.Contains(pred))
+                    continue; // dead bytes can branch here but carry no live state
                 if (_edgeExit.TryGetValue(pred, out var exit))
                     branchEdges.Add(exit);
                 else
                     backwardEdge = true;
             }
         }
-
         var merged = new Dictionary<string, VectorState>();
         var names = new HashSet<string>();
         if (fallThrough != null)
@@ -469,8 +516,7 @@ internal sealed class Arm64VectorScalarizer
         // unconditional branch or return are not this path's code.
         if (insn.Mnemonic is Arm64Mnemonic.BL or Arm64Mnemonic.BLR)
             ClobberCall();
-        else if (insn.Mnemonic is Arm64Mnemonic.B or Arm64Mnemonic.BR
-            or Arm64Mnemonic.RET or Arm64Mnemonic.RETAA or Arm64Mnemonic.RETAB)
+        else if (IsUnconditionalExit(insn))
             _clearProvenanceNext = true;
 
         // stores read the register rather than writing it — no invalidation
@@ -3584,6 +3630,16 @@ internal sealed class Arm64VectorScalarizer
     /// </summary>
     private static bool ScalarWholeRegisterWrite(Arm64Instruction insn, out int bits)
     {
+        bits = 0;
+        // Op0 is a read operand here, never a write: FP compares only set the
+        // flags, and a store leaves its source register unchanged. Seeding
+        // lanes for either would fabricate provenance the register never had.
+        if (insn.Mnemonic is Arm64Mnemonic.FCMP or Arm64Mnemonic.FCMPE
+                or Arm64Mnemonic.FCCMP or Arm64Mnemonic.FCCMPE
+            || insn.MnemonicCategory is Arm64MnemonicCategory.FloatingPointComparison
+                or Arm64MnemonicCategory.Comparison
+            || insn.Mnemonic.ToString().StartsWith("ST", StringComparison.Ordinal))
+            return false;
         bits = insn.Mnemonic switch
         {
             Arm64Mnemonic.LDRB or Arm64Mnemonic.LDURB

@@ -12,14 +12,16 @@ namespace Cpp2IL.Core.Tests.Isil;
 
 public class Arm64VectorScalarizerTests
 {
-    private static List<Instruction> Lift(params uint[] words)
+    private static List<Instruction> Lift(params uint[] words) => LiftAt(0, words);
+
+    private static List<Instruction> LiftAt(ulong baseAddress, params uint[] words)
     {
         Cpp2IlApi.ResetInternalState();
         var app = TestGameLoader.LoadSimple2019Game();
         var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Test",
             app.SystemTypes.SystemVoidType, MethodAttributes.Public | MethodAttributes.Static, []);
         return new NewArmV8InstructionSet().ConvertInstructions(
-            Disassembler.Disassemble(words.SelectMany(BitConverter.GetBytes).ToArray(), 0), context);
+            Disassembler.Disassemble(words.SelectMany(BitConverter.GetBytes).ToArray(), baseAddress), context);
     }
 
     private static bool IsMove(Instruction i, string dest, string src)
@@ -1029,4 +1031,32 @@ public class Arm64VectorScalarizerTests
 
     private static void Set(object insn, string property, object value)
         => typeof(Arm64Instruction).GetProperty(property)!.SetValue(insn, value);
+
+    [Test]
+    public void ConditionalBranchKeepsFallThroughLanes()
+    {
+        // b.cond shares the B mnemonic with the unconditional branch in Disarm
+        // — only the conditional-branch category separates them. Treating it
+        // as unconditional clears lane state on the fall-through path, so the
+        // next instruction's edge snapshot is empty and the merge reports the
+        // insert's source lane unproven.
+        var il = LiftAt(0x180001000,
+            0x2f00e400, // movi d0, #0            seeds V0's lanes
+            0x7100011f, // cmp w8, #0
+            0x54000060, // b.eq +0x0c           one edge into the merge
+            0x14000002, // b +0x08             the other edge — its snapshot
+                        //                    was empty when b.eq cleared
+            0x52800028, // mov w8, #1          dead bytes after the branch
+            0x6e0c0401, // mov v1.s[1], v0.s[0] reads the merged lane
+            0xd65f03c0); // ret
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented
+                && i.Operands[0] is StringLiteral s && s.Value.Contains("unproven")), Is.False,
+                () => string.Join("\n", il));
+            Assert.That(il.Any(i => IsMove(i, "V1.S1", "V0")), Is.True,
+                "both edges carry the lane through the conditional branch");
+        });
+    }
 }
