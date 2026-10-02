@@ -65,6 +65,15 @@ public class MergedAddressLoadTests
         {
             if (name == "slot")
                 return slot;
+            if (name.StartsWith("items["))
+            {
+                // `&items[k]` is items + 0x20 + 8k: the element after the array header.
+                var items = Local("items", new SzArrayTypeAnalysisContext(app.SystemTypes.SystemStringType));
+                var element = Local($"element_{name}");
+                caller.ControlFlowGraph!.Blocks.First().Instructions.Insert(0, new Instruction(-3, OpCode.Add,
+                    element, items, new Immediate(0x20 + 8 * int.Parse(name[6..^1]))));
+                return element;
+            }
             var field = type.Fields.Single(f => f.Name == name.TrimStart('+'));
             if (!name.StartsWith('+'))
                 return new AddressOf(new FieldReference(field, holder, field.Offset));
@@ -89,7 +98,12 @@ public class MergedAddressLoadTests
         {
             var source = (LocalVariable)merged.Operands[1 + k];
             var move = predecessor.Instructions.SingleOrDefault(i => i.OpCode == OpCode.Move && ReferenceEquals(i.Operands[0], source));
-            return move?.Operands[1] is FieldReference field ? field.Field.Name : source.Name;
+            return move?.Operands[1] switch
+            {
+                FieldReference field => field.Field.Name,
+                ArrayAccess { Array.Name: var array, Index: Immediate index } => $"{array}[{index.Value}]",
+                _ => source.Name,
+            };
         }).ToList();
     }
 
@@ -111,6 +125,17 @@ public class MergedAddressLoadTests
         MetadataResolver.LoadThroughMergedAddresses(shape.Caller);
 
         Assert.That(MergedValues(shape), Is.EquivalentTo(new[] { "name", "other" }));
+    }
+
+    [Test]
+    public void ArrayElementCellMergesAsTheElement()
+    {
+        // `return c ? holder.name : items[1]`: a constant element address is a cell of its own.
+        var shape = Build("name", "items[1]");
+
+        MetadataResolver.LoadThroughMergedAddresses(shape.Caller);
+
+        Assert.That(MergedValues(shape), Is.EquivalentTo(new[] { "name", "items[1]" }));
     }
 
     [Test]
