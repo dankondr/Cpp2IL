@@ -323,9 +323,16 @@ internal static class PackedRegisterFields
         for (var index = 1; index < instruction.Operands.Count; index++)
         {
             if (OperandReadRange(instruction, index, operandWidth) is not { } range
-                || PackedOperandType(instruction.Operands[index], pointerSize) is not { } type
-                || ProjectOperand(instruction.Operands[index], type, range.Offset, range.Width,
-                    method, pointerSize, LeafKind.Integral, finalPass) is not var (field, _))
+                || PackedOperandType(instruction.Operands[index], pointerSize) is not { } type)
+                continue;
+            if ((ProjectOperand(instruction.Operands[index], type, range.Offset, range.Width,
+                        method, pointerSize, LeafKind.Integral, finalPass)
+                    ?? (LowWordArithmetic(instruction, operandWidth)
+                        && instruction.Operands[index] is LocalVariable { IsThis: false }
+                        && TypeSizes.MinimumUnboxedSize(type, pointerSize) <= 8
+                        ? ProjectOperand(instruction.Operands[index], type, 0, 4,
+                            method, pointerSize, LeafKind.Integral, finalPass)
+                        : null)) is not var (field, _))
                 continue;
             instruction.SetOperand(index, field);
             changed = true;
@@ -339,6 +346,18 @@ internal static class PackedRegisterFields
 
         return changed;
     }
+
+    // The lift records no width for `add`/`sub`/`mul`/`neg`, so a W-register one reads as
+    // eight bytes. A 64-bit carry-propagating op has no meaning on two packed fields - each
+    // would spill into the other - so when the eight-byte range names no one field and the
+    // result is not an eight-byte integer, the op is the 32-bit one and reads the low field:
+    // `add w10, w9, w2` on a `Vector2Int` in x2 is `b.x + ...`. Only a value that fits the
+    // register qualifies: a struct's `this`, or a wider struct, is an address there.
+    private static bool LowWordArithmetic(Instruction instruction, int operandWidth)
+        => operandWidth == 8
+           && instruction.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Negate
+           && instruction.Destination is LocalVariable { Type: var resultType }
+           && (resultType == null || IlGenerator.IntegralStackWidth(resultType) == 4);
 
     private static (int Offset, int Width)? OperandReadRange(Instruction instruction,
         int operandIndex, int operandWidth)
@@ -354,6 +373,11 @@ internal static class PackedRegisterFields
                         : operandWidth)
                 : null,
             OpCode.Not or OpCode.Negate => operandIndex == 1 ? (0, operandWidth) : null,
+            // `scvtf s0, w0` converts the source register's low `W` bytes.
+            OpCode.Convert => operandIndex == 1 && !instruction.ConversionFromFloat
+                              && instruction.ConversionSourceWidthBits is (32 or 64) and var sourceBits
+                ? (0, sourceBits / 8)
+                : null,
             _ => null,
         };
 
@@ -681,13 +705,15 @@ internal static class PackedRegisterFields
         // are unusable from the caller substitutes a synthetic default at
         // emission, swapping this instruction's own diagnostic for a fabricated
         // value - decline and keep the register read diagnosed instead. The
-        // two inlined-member rewrites emission performs (an enumerator's
-        // `_current` through get_Current, a list's `_size` through get_Count)
-        // keep those reads spellable despite private accessibility.
+        // inlined-member rewrites emission performs (an enumerator's `_current`
+        // through get_Current, a list's `_size` through get_Count, a private
+        // struct member through its proven public getter - `Vector2Int.m_Y`
+        // through get_y) keep those reads spellable despite private accessibility.
         var check = new FieldReference(projected.Field, projected.Local, 0,
             projected.Containers);
         if (!IlGenerator.FieldReferenceUsableFrom(check, method, requireToken: false)
-            && !EmissionRescuesFieldReference(check, method))
+            && !EmissionRescuesFieldReference(check, method)
+            && IlGenerator.ProvenStructFieldGetter(projected, method) == null)
             return null;
         return (projected, leafType);
     }
