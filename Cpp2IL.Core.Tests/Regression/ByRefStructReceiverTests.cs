@@ -96,6 +96,28 @@ public class ByRefStructReceiverTests
     }
 
     [Test]
+    public void ArrayNewStubIgnoresAStaleMethodInfo()
+    {
+        // The array-new stub zeroes x2 itself (`mov x2, xzr; b NewFull`): a MethodInfo* left in x2
+        // by an earlier call is not its hidden argument, however well the operands fit.
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        var (container, target) = ContainerWithInstanceMethod(app);
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver"), container);
+        var arg = new LocalVariable("arg", new Register(null, "arg"),
+            app.SystemTypes.SystemInt32Type);
+        var dest = new LocalVariable("dest", new Register(null, "dest"));
+        var methodInfo = new RuntimeMethodInfoAnalysisContext(target, container.DeclaringAssembly);
+        var call = new Instruction(1, OpCode.Call, new Immediate(0x4000), dest, receiver, arg, methodInfo);
+        var caller = Caller([new(0, OpCode.Nop), call, new(2, OpCode.Return)]);
+        ArrayRecovery.ArrayNewStubs.GetOrCreateValue(app)[0x4000] = true;
+
+        MetadataResolver.ResolveCallsViaMethodInfo(caller);
+
+        Assert.That(call.Operands[0], Is.TypeOf<Immediate>());
+    }
+
+    [Test]
     public void StructByRefNarrowsToOffsetZeroField()
     {
         // &Envelope is the address of Envelope.payload when payload sits at offset

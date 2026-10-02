@@ -500,8 +500,84 @@ public static class MetadataResolver
                 use.SetOperand(1, part);
                 changed = true;
             }
+            else if (use is { OpCode: OpCode.Move, Operands: [MemoryOperand { Index: null, Scale: 0, Base: LocalVariable storeBase, AccessSize: > 1 and var copyWidth } wideStore, LocalVariable copied] }
+                     && CopiedBytes(copied) is { } source && source.Width == copyWidth
+                     && MatchingParts(source.Base, source.Offset, storeBase, wideStore.Addend, copyWidth) is { } parts)
+            {
+                // `ldrh w8, [x20, #0x10]; sturh w8, [x21, #0x11]` copies two bools: each covered
+                // field is read where the wide load read it and stored where the wide store wrote.
+                // Only a general-register store (its operand keeps its width): a SIMD register's
+                // lanes can be rewritten in place (`fmul v0.2s` between `ldr d0` and `str d0`)
+                // without a new value the copy could see, so those stay with the vector lane.
+                var loads = method.ControlFlowGraph.Blocks.First(b => b.Instructions.Contains(source.Load));
+                var stores = new List<Instruction>();
+                for (var k = 0; k < parts.Count; k++)
+                {
+                    var (relative, size) = parts[k];
+                    var part = new LocalVariable($"part{created}", new Register(null, $"PART{created++}_{use.Index}"));
+                    method.Locals.Add(part);
+                    loads.Instructions.Insert(loads.Instructions.IndexOf(source.Load) + 1 + k,
+                        new Instruction(-1, OpCode.Move, part,
+                            new MemoryOperand(source.Base, null, source.Offset + relative, 0, size)) { NativeMemoryAccessSize = size });
+                    stores.Add(new Instruction(-1, OpCode.Move,
+                        new MemoryOperand(storeBase, null, wideStore.Addend + relative, 0, size), part)
+                        { NativeMemoryAccessSize = size, NativeStoreWidthBytes = size });
+                }
+                use.SetOperands(stores[0].Operands[0], stores[0].Operands[1]);
+                use.NativeMemoryAccessSize = use.NativeStoreWidthBytes = parts[0].Size;
+                block.Instructions.InsertRange(block.Instructions.IndexOf(use) + 1, stores.Skip(1));
+                changed = true;
+            }
         }
         return changed;
+
+        // The bytes a value was loaded from: a load still raw, or one already read as the
+        // field at its start whatever its width (FieldReference keeps the native width).
+        (Instruction Load, LocalVariable Base, long Offset, int Width)? CopiedBytes(LocalVariable value)
+            => definitions.TryGetValue(value, out var load) ? load switch
+            {
+                { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable loadBase, AccessSize: > 0 } memory] }
+                    => (load, loadBase, memory.Addend, memory.AccessSize),
+                { OpCode: OpCode.Move, Operands: [_, FieldReference { Local: { } fieldBase, AccessSize: > 0 } field] }
+                    => (load, fieldBase, field.Offset, field.AccessSize),
+                _ => null,
+            } : null;
+
+        // A copy whose source and destination bytes cover fields at the same relative offsets,
+        // of the same sizes and types, is one copy per field: the (offset, size) of each. Two or
+        // more fields only - one is a plain field copy. Every part is a scalar (primitive, enum
+        // or reference): a narrow access to a struct the size of its first member (LayerMask)
+        // would name that member, not the struct.
+        List<(long Relative, int Size)>? MatchingParts(LocalVariable from, long fromOffset, LocalVariable to,
+            long toOffset, int width)
+        {
+            if (Covered(from, fromOffset, width) is not { Count: > 1 } read
+                || Covered(to, toOffset, width) is not { Count: > 1 } written
+                || read.Count != written.Count)
+                return null;
+            var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+            var parts = new List<(long Relative, int Size)>();
+            for (var k = 0; k < read.Count; k++)
+            {
+                if (read[k].Offset - fromOffset != written[k].Offset - toOffset || read[k].Size != written[k].Size
+                    || read[k].Field.FieldType.FullName != written[k].Field.FieldType.FullName
+                    || PrimitiveStorageSize(read[k].Field.FieldType, pointerSize) == null)
+                    return null;
+                parts.Add((read[k].Offset - fromOffset, read[k].Size));
+            }
+            return parts;
+        }
+
+        List<(FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers, long Offset, int Size)>?
+            Covered(LocalVariable local, long offset, int width)
+            => EffectiveObjectType(local, definitions, method.DeclaringType) switch
+            {
+                StaticFieldStorageTypeAnalysisContext statics => CoveredFields(statics.OwnerType, offset, width, wholeStructs: true, statics: true),
+                ByRefTypeAnalysisContext { ElementType: { IsValueType: true } element } => CoveredFields(element, offset, width, wholeStructs: true),
+                { IsValueType: false } owner and not (SzArrayTypeAnalysisContext or PointerTypeAnalysisContext or ByRefTypeAnalysisContext)
+                    => CoveredFields(owner, offset, width, wholeStructs: true),
+                _ => null,
+            };
 
         (Instruction Load, MemoryOperand Memory)? WideLoad(LocalVariable value, int minimumWidth)
             => definitions.TryGetValue(value, out var load)
@@ -1591,8 +1667,24 @@ public static class MetadataResolver
         return IsCompilerGeneratedBackingField(leaf)
             && (addressed
                 || !(BackingAccessorVisible(leaf, caller, store)
-                     || IsOwnBackingAccessor(leaf, caller, store)));
+                     || IsOwnBackingAccessor(leaf, caller, store)
+                     || store && IsOwnInitializer(leaf, caller)));
     }
+
+    // A get-only auto-property is assigned only in its own type's constructor of the same
+    // kind: `static P { get; } = v` is `stsfld <P>k__BackingField` in the .cctor, and
+    // `P { get; } = v` or `P = v` is `stfld` in an instance .ctor. That store is the
+    // property assignment the source made, not a setter call.
+    private static bool IsOwnInitializer(FieldAnalysisContext field, MethodAnalysisContext caller)
+        => caller.Name == (field.IsStatic ? ".cctor" : ".ctor")
+           && caller.IsStatic == field.IsStatic
+           && FindBackingAccessor(field, store: true) == null
+           && FindBackingAccessor(field, store: false) != null
+           && GenericDefinition(field.DeclaringType) is { } owner
+           && ReferenceEquals(owner, GenericDefinition(caller.DeclaringType));
+
+    private static TypeAnalysisContext? GenericDefinition(TypeAnalysisContext? type)
+        => type is GenericInstanceTypeAnalysisContext instance ? instance.GenericType : type;
 
     internal static bool IsCompilerGeneratedBackingField(FieldAnalysisContext field) =>
         field.Name.StartsWith("<", System.StringComparison.Ordinal)
@@ -2687,7 +2779,10 @@ public static class MetadataResolver
                 continue;
             }
 
-            if (instruction.Operands[0] is not Immediate target)
+            // The array-new stub (`mov x2, xzr; b NewFull`) sets its own x2: a MethodInfo* there
+            // is a stale one from an earlier call, never this call's hidden argument.
+            if (instruction.Operands[0] is not Immediate target
+                || ArrayRecovery.IsArrayNewWithoutBounds(method.AppContext, target.UnsignedValue))
                 continue;
 
             // A concrete MethodInfo* in the exact hidden-argument slot is more

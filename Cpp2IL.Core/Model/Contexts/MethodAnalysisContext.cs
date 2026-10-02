@@ -715,6 +715,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // then eliminate the now-dead flag computations. Both run in SSA form, where each
         // flag/temporary has a single, version-stable definition.
         FlagConditionRecovery.Run(this);
+        // Stack-built boxes (Il2CppFakeBox) before the dead-code pass drops their value store.
+        FakeBoxRecovery.Run(this);
         DeadCodeEliminator.Run(this);
 
         // PLT imports are named before call resolution can mistake one for a managed method.
@@ -743,6 +745,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Runtime class targets become available only after type resolution.
         KeyFunctionRecovery.Run(this);
+        FakeBoxRecovery.ResolveTypes(this);
         ArrayRecovery.RecoverObjectFieldAddresses(this);
 
         // Needs the MethodInfo* receivers typed, so runs after resolution unlike the class-init guards
@@ -864,6 +867,13 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // `ldflda` step on the root - land here, where emitted local types are
         // final and no later pass can restamp them.
         PackedRegisterFields.Run(this, finalPass: true);
+
+        // A packed read projected only here, on a local whose emitted type could
+        // not be proven inside the fixpoint, can still carry a leaf the caller
+        // cannot spell: the accessor rewrite above has already run, so one more
+        // pass maps such reads onto their returned-field accessors.
+        if (!_suppressMemberRecovery)
+            InlinedMemberRecovery.Run(this);
 
         // A bounds-checked indexed read of a constant table is LLVM's
         // switch-to-lookup-table lowering; recover it to a real switch once

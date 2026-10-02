@@ -118,6 +118,36 @@ public class DiscardedDefaultEmissionTests
         });
     }
 
+    // CilInstruction equality is opcode, operand and offset, so a kept `ldnull`
+    // equals the removed synthetic one. A branch to the kept one stays on it.
+    [Test]
+    public void BranchToIdenticalKeptInstructionStaysOnIt()
+    {
+        var module = new ModuleDefinition("RetargetIdentity.dll");
+        var (method, writeLine) = DiscardedDefaultBody(module);
+        var il = method.CilMethodBody!.Instructions;
+        var removed = il[4];
+        var kept = new CilInstruction(CilOpCodes.Ldnull);
+        il.Add(kept);
+        il.Add(CilOpCodes.Throw);
+        var toRemoved = new CilInstruction(CilOpCodes.Br, new CilInstructionLabel(removed));
+        var toKept = new CilInstruction(CilOpCodes.Br, new CilInstructionLabel(kept));
+        il.Insert(0, toRemoved);
+        il.Insert(0, toKept);
+
+        RunRemoveDiscardedDefaults(method, writeLine);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Contains(removed), Is.True, "precondition: the kept ldnull equals the removed one");
+            Assert.That(il.Any(i => ReferenceEquals(i, removed)), Is.False, "the synthetic ldnull is removed");
+            Assert.That(ReferenceEquals(((CilInstructionLabel)toKept.Operand!).Instruction, kept), Is.True,
+                "the branch to the kept ldnull stays on it\n" + string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(((CilInstructionLabel)toRemoved.Operand!).Instruction!.OpCode, Is.EqualTo(CilOpCodes.Ret),
+                "the branch into the removed range lands past it");
+        });
+    }
+
     [Test]
     public void ExceptionHandlerBoundaryIntoRemovedRangeRetargetsPastIt()
     {
