@@ -3005,21 +3005,35 @@ public static class LocalVariables
             // destination keeps the diagnostic.
             if (!ReceiverIsByRefParameter(destinationField.Local, method))
             {
+                var storePointerSize = method.AppContext.Binary.PointerSizeBytes;
                 // The emitter prefers the whole-value store through an outer
                 // container whose field type is the source's own type
                 // (`part.endBuildingTime._dateData = now` writes `stfld
-                // endBuildingTime`, never the private leaf). Splitting the
-                // source to `now._dateData` would drop that route into a
-                // private-member store.
+                // endBuildingTime`, never the private leaf) - but only when the
+                // leaf's bytes are the container's whole content. stfld writes
+                // the whole container, so a leaf that covers part of it
+                // (`vec.x = v` where the store touched .x alone) would let the
+                // emit write bytes the store never covered. There the lane form
+                // is honest, and a run of lane stores covering the container is
+                // the shape inlined-member recovery collapses to the whole-
+                // aggregate store.
                 if (IlGenerator.EmittedOperandType(instruction.Operands[1], method) is not { } storeType
                     || IlGenerator.WholeValueContainerReference(destinationField, storeType, method)
                         is not { } wholeValue
+                    || (int)System.Math.Min(TypeSizes.MinimumUnboxedSize(wholeValue.Field.FieldType,
+                            storePointerSize), int.MaxValue)
+                        > (destinationField.AccessSize > 0 ? destinationField.AccessSize
+                            : (int)System.Math.Min(TypeSizes.MinimumUnboxedSize(fieldType,
+                                storePointerSize), int.MaxValue))
                     || !AggregateFieldWritableFrom(wholeValue.Field, method))
-                    // A lane slot inside a value-type local's own window (`v.y`)
-                    // reads the source at the same byte offset the slot occupies;
-                    // a store to an object's member reads the source's low lane.
+                    // A lane slot inside a value-type local's own register
+                    // window reads the source at the byte offset the slot
+                    // occupies (`v.y = v` touches v's bytes 4-8); a store fed
+                    // by another register's local reads that source's low lane.
                     SplitScalarSources(method, instruction, fieldType,
                         destinationField.Local.Type is { IsValueType: true }
+                            && SourceSharesRegisterWindow(instruction.Operands[1],
+                                destinationField.Local)
                             ? destinationField.Offset
                             : 0);
             }
@@ -3061,7 +3075,8 @@ public static class LocalVariables
                         sourceSize) is { } covered
                 && CoveredStoreValueCompatible(covered.Field.FieldType, instruction.Operands[1])
                 && covered.Containers.All(container => AggregateFieldWritableFrom(container, method))
-                && AggregateFieldWritableFrom(covered.Field, method))
+                && AggregateFieldWritableFrom(covered.Field, method)
+                && LocalDefinedBytesCover(destination, destinationSize, pointerSize, method))
             {
                 instruction.SetOperand(0, new FieldReference(covered.Field, destination, 0,
                     covered.Containers, sourceSize));
@@ -3392,6 +3407,149 @@ public static class LocalVariables
             }
         }
         return true;
+    }
+
+    // Whether a local's definitions materialize every byte of `width`: a
+    // whole-value store fills what its source proves, a member store fills
+    // the member's span, a phi fills what every input fills, a constructor or
+    // by-ref callee fills its receiver, and a computed result fills the
+    // register's coverage. A local with no definitions is entry-defined - a
+    // parameter or signature value carries its bytes by convention. The check
+    // answers "did the binary write this value", not "is this type claim
+    // proven", so a local whose only write is a 4-byte store does not cover a
+    // 16-byte aggregate's slot.
+    private static bool LocalDefinedBytesCover(LocalVariable local, int width, int pointerSize,
+        MethodAnalysisContext method)
+        => LocalDefinedCoverageEnd(local, width, pointerSize, method,
+            new HashSet<LocalVariable>()) >= width;
+
+    // The length of `local`'s leading materialized byte run: a write never
+    // removes bytes another definition stored, so the union of every
+    // definition's covered span bounds the run. A phi contributes the run its
+    // inputs all share; a cycle contributes nothing and the phi's other
+    // inputs decide.
+    private static int LocalDefinedCoverageEnd(LocalVariable local, int width, int pointerSize,
+        MethodAnalysisContext method, HashSet<LocalVariable> seen)
+    {
+        if (!seen.Add(local))
+            return 0;
+        var covered = new List<(int Start, int End)>();
+        var defined = false;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction.OpCode == OpCode.Move
+                && instruction.Operands is [FieldReference { Local: { } owner } member, ..]
+                && ReferenceEquals(owner, local))
+            {
+                // A member store materializes the member's own span.
+                defined = true;
+                var memberWidth = member.AccessSize > 0 ? member.AccessSize
+                    : (int)System.Math.Min(TypeSizes.MinimumUnboxedSize(member.Field.FieldType,
+                        pointerSize), int.MaxValue);
+                covered.Add((member.Offset, member.Offset + memberWidth));
+                continue;
+            }
+            if (instruction.OpCode is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall
+                && instruction.Operands.Count > 1
+                && instruction.Operands[0] is MethodAnalysisContext callee
+                && (callee.Name == ".ctor"
+                    || callee.Parameters.FirstOrDefault()?.ParameterType
+                        is ByRefTypeAnalysisContext)
+                && instruction.Operands[1] is LocalVariable receiver
+                && ReferenceEquals(receiver, local))
+            {
+                // A .ctor or by-ref callee fills the whole referent.
+                return width;
+            }
+            if (instruction.Destination is not LocalVariable destination
+                || !ReferenceEquals(destination, local))
+                continue;
+            defined = true;
+            switch (instruction.OpCode)
+            {
+                case OpCode.Newobj or OpCode.Call or OpCode.IndirectCall:
+                    return width;
+                case OpCode.Move when instruction.Operands.Count > 1:
+                    var moveWidth = instruction.NativeMemoryAccessSize is > 0 and var native
+                        ? native
+                        : instruction.Operands[1] is LocalVariable source && ReferenceEquals(source, local)
+                            ? 0
+                            : OperandProvenWidth(instruction.Operands[1], pointerSize);
+                    if (moveWidth > 0)
+                        covered.Add((0, moveWidth));
+                    break;
+                case OpCode.Phi:
+                    // The value one edge delivers is covered only where every
+                    // edge covers it - a partially materialized input hands the
+                    // phi the same uncovered bytes.
+                    var phiEnd = width;
+                    foreach (var input in instruction.Operands.Skip(1))
+                    {
+                        if (input is LocalVariable inputLocal)
+                        {
+                            if (ReferenceEquals(inputLocal, local))
+                                continue;
+                            phiEnd = System.Math.Min(phiEnd,
+                                LocalDefinedCoverageEnd(inputLocal, width, pointerSize, method, seen));
+                        }
+                        else
+                            phiEnd = System.Math.Min(phiEnd,
+                                OperandProvenWidth(input, pointerSize));
+                        if (phiEnd == 0)
+                            break;
+                    }
+                    if (phiEnd > 0)
+                        covered.Add((0, phiEnd));
+                    break;
+                case OpCode.ShiftStack:
+                    break;
+                default:
+                    // A computed result fills its register's coverage.
+                    covered.Add((0, (int)System.Math.Min(
+                        LaneViewWidth(local.Register.Name)
+                            ?? RegisterCoverageBytes(local.Register.Name, pointerSize),
+                        width)));
+                    break;
+            }
+        }
+        if (!defined)
+            return width;
+        var end = 0;
+        foreach (var (start, spanEnd) in covered.OrderBy(span => span.Start))
+        {
+            if (start > end)
+                break;
+            end = System.Math.Max(end, spanEnd);
+        }
+        return end;
+    }
+
+    // The register window a name addresses: `V0`, `V0_v2` and `V0.S1` are the
+    // same physical register's bytes - a lane-view suffix or an SSA version
+    // number does not open a new window.
+    private static string? RegisterWindowName(string? name)
+    {
+        if (name is null)
+            return null;
+        var dot = name.IndexOf('.');
+        if (dot > 0)
+            name = name[..dot];
+        var version = name.LastIndexOf("_v", System.StringComparison.Ordinal);
+        if (version > 0 && version + 2 < name.Length
+            && name[(version + 2)..].All(char.IsAsciiDigit))
+            name = name[..version];
+        return name;
+    }
+
+    // Whether the operand reads the same register window the local occupies:
+    // the lane byte offset a destination slot applies is only honest for a
+    // source of that window (`v.y = v` reads v's bytes 4-8, `v.y = other`
+    // reads other's low lane).
+    private static bool SourceSharesRegisterWindow(IOperand source, LocalVariable local)
+    {
+        var window = RegisterWindowName(local.Register.Name);
+        return window != null
+            && OperandLocals(source).Any(operand => RegisterWindowName(operand.Register.Name) == window);
     }
 
     // The bytes an operand's value provably occupies: a typed operand's own
