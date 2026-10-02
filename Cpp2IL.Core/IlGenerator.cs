@@ -1137,7 +1137,14 @@ public static class IlGenerator
                                 or GenericParameterTypeAnalysisContext)
                             && !IsAssignableToLoose(boxedType, boxContract) && CanEmitTypeToken(boxContract))
                         {
-                            if (TypeTokenUsableFrom(boxContract, context))
+                            // Same rule as EmitStackCoerce: a cast the boxed value can never pass is no conversion.
+                            if (boxedType.IsValueType && !CanHoldBoxed(boxContract, boxedType))
+                            {
+                                instructions.Add(CilOpCodes.Pop);
+                                PushDefaultOf(boxContract, method, instructions, context,
+                                    SlotDefaultReason(boxedType, boxContract));
+                            }
+                            else if (TypeTokenUsableFrom(boxContract, context))
                                 instructions.Add(CilOpCodes.Castclass, boxContract.ToTypeSignature().ToTypeDefOrRef());
                             else
                             {
@@ -1942,18 +1949,24 @@ public static class IlGenerator
                     || !StackContractSatisfied(emitted2, contract2, context, isComparison)
                     || !operandsUsable)
                 {
-                    if (unrecoverableIntegerOperation)
-                        EmitUnrecoverableOperation(method, writeLine, $"Unrecoverable integer operation: {instruction}");
                     // No shared stack kind exists for this operation (e.g. a Vector3
                     // tested against an int, or a struct fed to add). Equality still
                     // has honest answers - a shared native-int lowering covers
                     // integral/pointer operands, and a zero literal on a managed or
                     // generic operand is the null test - while ordering and
-                    // arithmetic have none, so they default to false/zero.
-                    else if (instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual)
+                    // arithmetic have none, so they default to false/zero: the
+                    // zero after the throw keeps the store below stack-consistent
+                    // (IL2CPP's stack analysis walks that dead tail too).
+                    if (unrecoverableIntegerOperation
+                        || instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual)
                         || !(TryEmitNativeIntEquality(instruction, context, method, locals, writeLine)
                             || TryEmitReferenceEquality(instruction, context, method, locals, writeLine)))
-                        EmitUnrecoverableOperation(method, writeLine, $"Unrecoverable operation: {instruction}");
+                    {
+                        EmitUnrecoverableOperation(method, writeLine, unrecoverableIntegerOperation
+                            ? $"Unrecoverable integer operation: {instruction}"
+                            : $"Unrecoverable operation: {instruction}");
+                        instructions.Add(CilOpCodes.Ldc_I4_0);
+                    }
                     EmitStackCoerceOrDefault(context.AppContext.SystemTypes.SystemInt32Type,
                         StoreContract(instruction.Operands[0], context), method, context);
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
@@ -8120,6 +8133,12 @@ public static class IlGenerator
             "System.Double" => factory.Double,
             _ => null
         };
+        // A boxed value whose type the slot can never hold makes the cast throw
+        // on every execution - that is no conversion, so the slot is defaulted.
+        if ((primitive != null || from.IsValueType) && !to.IsValueType
+            && to is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext)
+            && !CanHoldBoxed(to, from))
+            return false;
         if (primitive != null && !to.IsValueType
             && to is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext))
         {
@@ -8173,8 +8192,9 @@ public static class IlGenerator
 
         if (!from.IsValueType && to.IsValueType)
         {
-            // unbox.any on a ref struct is not legal IL either.
-            if (IsByRefLike(to))
+            // unbox.any on a ref struct is not legal IL either, nor is it a
+            // conversion when the source's type can never hold a boxed `to`.
+            if (IsByRefLike(to) || !CanHoldBoxed(from, to))
                 return false;
             if (!CanEmitTypeToken(to))
                 return true;
@@ -8428,6 +8448,11 @@ public static class IlGenerator
         // never made, so the slot takes the diagnosed default instead.
         if (from.IsValueType && to is Analysis.BooleanClaimVetoedSlotTypeAnalysisContext)
             return false;
+        // Mirrors EmitStackCoerce: boxing into a slot that can never hold the
+        // boxed value is a guaranteed InvalidCastException, not a coercion.
+        if ((from.IsValueType || fromWidth > 0 || from.FullName is "System.Single" or "System.Double")
+            && !to.IsValueType && !CanHoldBoxed(to, from))
+            return false;
         if (from.IsValueType && !to.IsValueType)
             // box, plus castclass when the reference target narrows - both need
             // tokens the caller can legally name. A byref-like source cannot be
@@ -8448,8 +8473,10 @@ public static class IlGenerator
             && SpanArrayConstructor(spanSlot) != null)
             return true;
         if (!from.IsValueType && to.IsValueType)
-            // unbox.any accepts any managed reference - but not a byref-like target
-            return !IsByRefLike(to) && (!CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context));
+            // unbox.any accepts a managed reference that can hold a boxed `to` -
+            // but not a byref-like target
+            return !IsByRefLike(to) && CanHoldBoxed(from, to)
+                && (!CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context));
         if (!from.IsValueType && !to.IsValueType)
             // castclass narrows any reference pair - unless the caller cannot name it
             return IsAssignableToLoose(from, to) || !CanEmitTypeToken(to) || TypeTokenUsableFrom(to, context);
@@ -10080,6 +10107,31 @@ public static class IlGenerator
         }
 
         return derivedType.InterfaceContexts.Any(@interface => IsAssignableToLoose(@interface, baseType));
+    }
+
+    // Can a reference of static type `reference` ever hold a boxed `value`? A boxed
+    // value type is only an Object, a ValueType, an Enum (when it is an enum) and the
+    // interfaces it implements; any other class or array makes box+castclass and
+    // unbox.any throw on every execution. Nullable<T> boxes to T or null, and a
+    // reference kind without a metadata definition (type parameter, boxed wrapper,
+    // injected or sentinel type) cannot be classified, so both stay permitted.
+    private static bool CanHoldBoxed(TypeAnalysisContext reference, TypeAnalysisContext value)
+    {
+        if (value is GenericInstanceTypeAnalysisContext { GenericType.FullName: "System.Nullable`1" }
+            || reference.FullName is "System.Object" or "System.ValueType")
+            return true;
+        if (reference.FullName == "System.Enum")
+            return value.IsEnumType;
+        var definition = reference is GenericInstanceTypeAnalysisContext instance ? instance.GenericType : reference;
+        if (reference is not (SzArrayTypeAnalysisContext or ArrayTypeAnalysisContext) && definition.Definition == null)
+            return true;
+        if (!reference.IsInterface)
+            return false;
+        // An implemented instantiation of the same generic interface may still
+        // match through variance, so only an unimplemented definition refuses.
+        return IsAssignableToLoose(value, reference)
+            || reference is GenericInstanceTypeAnalysisContext { GenericType: var interfaceDefinition }
+            && IsAssignableToLoose(value, interfaceDefinition);
     }
 
     // True when ToTypeSignature can produce a usable operand for box/unbox/castclass.

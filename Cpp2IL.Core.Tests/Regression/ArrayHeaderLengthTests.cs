@@ -152,6 +152,48 @@ public class ArrayHeaderLengthTests
         });
     }
 
+    // #289: the header address a folded length load went through has no IL
+    // spelling; ArrayRecovery drops it once nothing reads it, and keeps it when
+    // anything still does.
+    [TestCase(false)]
+    [TestCase(true)]
+    public void FoldedLengthWordDropsOnlyDeadHeaderAddress(bool pointerStillRead)
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("DeadHeaderAddress.dll");
+        var int32 = app.SystemTypes.SystemInt32Type;
+        SeedCorLibTypes(app, module, int32, app.SystemTypes.SystemVoidType);
+        var array = new LocalVariable("array", new Register(null, "array"))
+            { Type = new SzArrayTypeAnalysisContext(int32) };
+        var header = new LocalVariable("header", new Register(null, "header"));
+        var pointer = new LocalVariable("pointer", new Register(null, "pointer"));
+        var value = new LocalVariable("value", new Register(null, "value")) { Type = int32 };
+        // `header = array + 0x10; pointer = header + 8; value = [pointer]`
+        var headerAdd = new Instruction(0, OpCode.Add, header, array, new Immediate(0x10));
+        var pointerAdd = new Instruction(1, OpCode.Add, pointer, header, new Immediate(8));
+        var (caller, _) = ForeignCaller(app, module, [
+            headerAdd,
+            pointerAdd,
+            new(2, OpCode.Move, value, new MemoryOperand(pointer)),
+            pointerStillRead ? new Instruction(3, OpCode.Return, pointer) : new Instruction(3, OpCode.Return)],
+            [array, header, pointer, value]);
+        caller.ParameterLocals = [array];
+        caller.DominatorInfo = new DominatorInfo(caller.ControlFlowGraph!);
+
+        ArrayRecovery.Run(caller);
+
+        var expected = pointerStillRead ? OpCode.Add : OpCode.Nop;
+        Assert.Multiple(() =>
+        {
+            Assert.That(caller.ControlFlowGraph!.Instructions.Any(i => i.Operands.OfType<ArrayLength>().Any()),
+                Is.True);
+            Assert.That(pointerAdd.OpCode, Is.EqualTo(expected));
+            Assert.That(headerAdd.OpCode, Is.EqualTo(expected));
+        });
+    }
+
     [Test]
     public void LengthWordStoreKeepsDiagnostic()
     {
