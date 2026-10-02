@@ -932,6 +932,22 @@ public static class IlGenerator
                 // Try and fuse our Newobj + the follow up constructor CallVoid into one IL newobj.
                 // If we can't, just fall back to an Ldnull.
                 var allocatedDestination = StoreContract(instruction.Operands[0], context);
+                // object_new handed a class pointer that differs by path allocates a different
+                // type on each path; no single newobj says that, so the site degrades to a
+                // diagnostic and the destination's default instead of picking one class.
+                if (instruction.Operands.Count > 1
+                    && PathDependentAllocatedClasses(context, instruction.Operands[1]) is { } pathClasses)
+                {
+                    EmitNullOrDefault(allocatedDestination, method, instructions, context,
+                        $"Allocated class differs by path ({string.Join(", ", pathClasses.Select(type => type.FullName))}): no single newobj constructs it");
+                    StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
+                    if (constructorPairs.TryGetValue(instruction, out var pathConstructorCall))
+                    {
+                        pathConstructorCall.OpCode = OpCode.Nop;
+                        pathConstructorCall.SetOperands();
+                    }
+                    break;
+                }
                 if (constructorPairs.TryGetValue(instruction, out var constructorCall)
                     && constructorCall.Operands is [MethodAnalysisContext constructor, _, ..])
                 {
@@ -3404,6 +3420,8 @@ public static class IlGenerator
         {
             RuntimeClassTypeAnalysisContext { RepresentedType: { } represented } => represented,
             TypeAnalysisContext type => type,
+            // The definitions decide before the static type a join gave the local.
+            LocalVariable local when PathDependentAllocatedClasses(context, local) != null => null,
             LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { } represented } } => represented,
             MemoryOperand { Base: null, Index: null, Scale: 0 } memory => ResolveTypeGlobal(context, (ulong)memory.Addend),
             Immediate immediate => ResolveTypeGlobal(context, immediate.UnsignedValue),
@@ -3422,23 +3440,44 @@ public static class IlGenerator
             if (!ReferenceEquals(instruction.Destination, local))
                 continue;
 
-            var candidate = instruction switch
-            {
-                { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext type] }
-                    => type is RuntimeClassTypeAnalysisContext { RepresentedType: { } represented } ? represented : type,
-                { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: null, Index: null, Scale: 0 } memory] }
-                    => ResolveTypeGlobal(context, (ulong)memory.Addend),
-                { OpCode: OpCode.Move, Operands: [_, Immediate immediate] }
-                    => ResolveTypeGlobal(context, immediate.UnsignedValue),
-                _ => null,
-            };
-
+            var candidate = DefinedClass(context, instruction);
             if (candidate == null || (resolved != null && !ReferenceEquals(resolved, candidate)))
                 return null;
             resolved = candidate;
         }
 
         return resolved;
+    }
+
+    private static TypeAnalysisContext? DefinedClass(MethodAnalysisContext context, Instruction definition) =>
+        definition switch
+        {
+            { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext type] }
+                => type is RuntimeClassTypeAnalysisContext { RepresentedType: { } represented } ? represented : type,
+            { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: null, Index: null, Scale: 0 } memory] }
+                => ResolveTypeGlobal(context, (ulong)memory.Addend),
+            { OpCode: OpCode.Move, Operands: [_, Immediate immediate] }
+                => ResolveTypeGlobal(context, immediate.UnsignedValue),
+            _ => null,
+        };
+
+    // A class-pointer local that paths load with different type globals - a phi of class
+    // pointers - names no single allocated type, whatever static type the join gave it.
+    // Definitions that are not type globals (method/field metadata, computed values) are
+    // not class evidence and do not count.
+    private static List<TypeAnalysisContext>? PathDependentAllocatedClasses(MethodAnalysisContext context,
+        IOperand classOperand)
+    {
+        if (classOperand is not LocalVariable local)
+            return null;
+        var classes = new List<TypeAnalysisContext>();
+        foreach (var instruction in context.ControlFlowGraph!.Instructions)
+            if (ReferenceEquals(instruction.Destination, local)
+                && DefinedClass(context, instruction) is { } candidate
+                and not RuntimeMethodInfoAnalysisContext and not RuntimeFieldInfoAnalysisContext
+                && !classes.Any(known => ReferenceEquals(known, candidate)))
+                classes.Add(candidate);
+        return classes.Count > 1 ? classes : null;
     }
 
     private static TypeAnalysisContext? ResolveTypeGlobal(MethodAnalysisContext context, ulong address) =>
