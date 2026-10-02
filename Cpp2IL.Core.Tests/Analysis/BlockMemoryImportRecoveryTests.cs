@@ -1000,4 +1000,328 @@ public class BlockMemoryImportRecoveryTests
             i.OpCode == OpCode.Call && i.Operands[0] is MethodAnalysisContext), Is.False,
             "no managed math call may be emitted when the out pointer is unproven");
     }
+
+    // ---------- Whole-value block ops (castle-recovery#292) ----------
+
+    private TypeAnalysisContext ValueType(string name, params (string Name, TypeAnalysisContext Type, int Offset)[] fields)
+    {
+        var type = new InjectedTypeAnalysisContext(_app.AssembliesByName["mscorlib"], "Tests", name,
+            _app.SystemTypes.SystemValueTypeType, R.TypeAttributes.Public | R.TypeAttributes.SequentialLayout);
+        foreach (var (fieldName, fieldType, offset) in fields)
+            type.Fields.Add(new InjectedFieldAnalysisContext(fieldName, fieldType, R.FieldAttributes.Public, type, offset));
+        return type;
+    }
+
+    // Something in the method writes the struct temporary a copy reads (a call's
+    // hidden return, here a plain move), as every real copy source has.
+    private static void ProduceFirst(MethodAnalysisContext caller, LocalVariable temporary) =>
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(-1, OpCode.Move, temporary,
+                new LocalVariable("produced", new Register(null, "X0", 99), temporary.Type)),
+            .. caller.ControlFlowGraph!.Instructions]);
+
+    // A class holding a 16-byte struct at 0x10 and an int right after it - the
+    // PoseRecorder shape: `Last = new Pose(); Frames = 0;` is one memset over both.
+    private (TypeAnalysisContext Holder, TypeAnalysisContext Pose, FieldAnalysisContext Last,
+        FieldAnalysisContext First, FieldAnalysisContext Frames) Recorder()
+    {
+        var pose = ValueType("Pose", ("A", _int64, 0), ("B", _int64, 8));
+        var holder = PodClass(("Last", pose, 0x10), ("Frames", _int32, 0x20));
+        EmitModule(pose, holder);
+        return (holder, pose, holder.Fields[0], pose.Fields[0], holder.Fields[1]);
+    }
+
+    [Test]
+    public void MemsetOverStructAndScalarFieldsSplitsIntoTheirDefaults()
+    {
+        var (holder, _, last, first, frames) = Recorder();
+        var caller = CallerWithUnresolvedCall(out var call);
+        var owner = Reg("X19", holder, 1);
+        caller.Locals!.Add(owner);
+        // The resolver spells `owner + 0x10` as the first leaf there.
+        call.SetOperand(2, new AddressOf(new FieldReference(first, owner, 0x10, [last])));
+        call.SetOperand(3, new Immediate(0));
+        call.SetOperand(4, new Immediate(0x14));
+
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memset"), Is.True);
+
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.MemorySet));
+        Assert.That(call.Operands[0], Is.TypeOf<AddressOf>());
+        var zeroed = (FieldReference)((AddressOf)call.Operands[0]).Target;
+        Assert.That(zeroed.Field, Is.SameAs(last), "the struct field is zeroed whole, not from its first leaf");
+        Assert.That(zeroed.Containers, Is.Empty);
+        Assert.That(call.Operands[2], Is.EqualTo(new Immediate(16)));
+        var block = caller.ControlFlowGraph!.Blocks.First(b => b.Instructions.Contains(call));
+        var next = block.Instructions[block.Instructions.IndexOf(call) + 1];
+        Assert.That(next.OpCode, Is.EqualTo(OpCode.Move));
+        Assert.That(((FieldReference)next.Operands[0]).Field, Is.SameAs(frames));
+        Assert.That(next.Operands[1], Is.EqualTo(new Immediate(0)));
+    }
+
+    [Test]
+    public void MemsetCuttingAFieldInHalfStaysACall()
+    {
+        var (holder, _, last, first, _) = Recorder();
+        var caller = CallerWithUnresolvedCall(out var call);
+        var owner = Reg("X19", holder, 1);
+        caller.Locals!.Add(owner);
+        call.SetOperand(2, new AddressOf(new FieldReference(first, owner, 0x10, [last])));
+        call.SetOperand(3, new Immediate(0));
+        call.SetOperand(4, new Immediate(0x12));
+
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memset"), Is.False);
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+    }
+
+    [Test]
+    public void MemmoveOfOneStructFieldAddressesTheWholeField()
+    {
+        var (holder, pose, last, first, _) = Recorder();
+        var caller = CallerWithUnresolvedCall(out var call, srcType: new ByRefTypeAnalysisContext(pose));
+        var owner = Reg("X19", holder, 1);
+        caller.Locals!.Add(owner);
+        call.SetOperand(2, new AddressOf(new FieldReference(first, owner, 0x10, [last])));
+        call.SetOperand(4, new Immediate(16));
+
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memmove"), Is.True);
+
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.MemoryMove));
+        var copied = (FieldReference)((AddressOf)call.Operands[0]).Target;
+        Assert.That(copied.Field, Is.SameAs(last));
+        Assert.That(copied.Containers, Is.Empty);
+    }
+
+    // A struct holding a reference is never reference-free, but assigning it whole
+    // through managed pointers to it is a typed copy, which keeps the barriers.
+    [Test]
+    public void WholeCopyOfStructWithReferenceRewrites()
+    {
+        var tagged = ValueType("Tagged", ("Name", _app.SystemTypes.SystemStringType, 0), ("Id", _int64, 8));
+        EmitModule(tagged);
+        var byRef = new ByRefTypeAnalysisContext(tagged);
+        var caller = CallerWithUnresolvedCall(out var call, dstType: byRef, srcType: byRef);
+        call.SetOperand(4, new Immediate(16));
+
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memcpy"), Is.True);
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.MemoryCopy));
+    }
+
+    [Test]
+    public void PartialCopyOfStructWithReferenceStaysACall()
+    {
+        var tagged = ValueType("Tagged", ("Name", _app.SystemTypes.SystemStringType, 0), ("Id", _int64, 8));
+        EmitModule(tagged);
+        var byRef = new ByRefTypeAnalysisContext(tagged);
+        var caller = CallerWithUnresolvedCall(out var call, dstType: byRef, srcType: byRef);
+        call.SetOperand(4, new Immediate(8));
+
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memcpy"), Is.False);
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+    }
+
+    [Test]
+    public void WholeCopyOfStructWithReferenceEmitsLdobjStobj()
+    {
+        var tagged = ValueType("Tagged", ("Name", _app.SystemTypes.SystemStringType, 0), ("Id", _int64, 8));
+        var byRef = new ByRefTypeAnalysisContext(tagged);
+        var parameters = new (TypeAnalysisContext Type, string Name)[] { (byRef, "dst"), (byRef, "src") };
+        var caller = RunnerMethod("TaggedCopy", _app.SystemTypes.SystemVoidType, parameters, out var locals);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.MemoryCopy, locals[0], locals[1], new Immediate(16)),
+            new Instruction(1, OpCode.Return),
+        ]);
+
+        var module = NewModule(tagged);
+        var def = tagged.GetExtraData<TypeDefinition>("AsmResolverType")!;
+        def.Fields.Add(new FieldDefinition("Name", FieldAttributes.Public, module.CorLibTypeFactory.String));
+        def.Fields.Add(new FieldDefinition("Id", FieldAttributes.Public, module.CorLibTypeFactory.Int64));
+        var definition = Definition(module, "TaggedCopy", _app.SystemTypes.SystemVoidType, parameters);
+        var (loaded, method) = EmitAssembly(caller, definition, module);
+
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stobj), Is.True,
+            "a whole copy of a reference-holding struct is a typed assignment");
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr), Is.False, "no unproven-operand diagnostic");
+
+        var runtimeTagged = loaded.GetType("Tests.Tagged")!;
+        var dst = Activator.CreateInstance(runtimeTagged)!;
+        var src = Activator.CreateInstance(runtimeTagged)!;
+        runtimeTagged.GetField("Name")!.SetValue(src, "castle");
+        runtimeTagged.GetField("Id")!.SetValue(src, 42L);
+        object[] args = [dst, src];
+        method.Invoke(null, args);
+        Assert.That(runtimeTagged.GetField("Name")!.GetValue(args[0]), Is.EqualTo("castle"));
+        Assert.That(runtimeTagged.GetField("Id")!.GetValue(args[0]), Is.EqualTo(42L));
+    }
+
+    // `memcpy(x8, &tmp, sizeof(T))` in a method returning T through the hidden
+    // buffer writes the returned value; the returned dst is that value.
+    [Test]
+    public void CopyIntoReturnBufferAssignsTheReturnedValue()
+    {
+        var wide = ValueType("Wide", ("A", _int64, 0), ("B", _int64, 8), ("C", _int64, 16));
+        EmitModule(wide);
+        _app.InstructionSet = new NewArmV8InstructionSet();
+        var caller = new InjectedMethodAnalysisContext(_app.SystemTypes.SystemObjectType, "F", wide,
+            R.MethodAttributes.Public | R.MethodAttributes.Static, [])
+        {
+            ParameterLocals = [],
+            AnalysisWarnings = [],
+        };
+        var buffer = new LocalVariable("returnBuffer", new Register(null, "X8"), wide);
+        var temporary = Reg("HRET_1", wide, 1);
+        var result = Reg("X0", wide, 3);
+        var call = new Instruction(0, OpCode.Call, new StringLiteral("memcpy"), result, buffer,
+            new AddressOf(temporary), new Immediate(24), Reg("X3"), Reg("X4"));
+        caller.ControlFlowGraph = new ISILControlFlowGraph([call, new Instruction(1, OpCode.Return, result)]);
+        caller.Locals = [buffer, temporary, result];
+        ProduceFirst(caller, temporary);
+
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memcpy"), Is.True);
+
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.MemoryCopy));
+        Assert.That(call.Operands[0], Is.TypeOf<AddressOf>());
+        Assert.That(((AddressOf)call.Operands[0]).Target, Is.SameAs(buffer));
+        var block = caller.ControlFlowGraph!.Blocks.First(b => b.Instructions.Contains(call));
+        var next = block.Instructions[block.Instructions.IndexOf(call) + 1];
+        Assert.That(next.OpCode, Is.EqualTo(OpCode.Move));
+        Assert.That(next.Operands[0], Is.SameAs(result));
+        Assert.That(next.Operands[1], Is.SameAs(buffer));
+    }
+
+    [Test]
+    public void UntypedFrameSlotTakesTheCopiedStructType()
+    {
+        var wide = ValueType("Wide", ("A", _int64, 0), ("B", _int64, 8), ("C", _int64, 16));
+        EmitModule(wide);
+        var caller = CallerWithUnresolvedCall(out var call);
+        var slot = new LocalVariable("slot", new Register(null, "stack_-108"), null);
+        var temporary = Reg("HRET_1", wide, 1);
+        caller.Locals!.AddRange([slot, temporary]);
+        call.SetOperand(2, new AddressOf(slot));
+        call.SetOperand(3, new AddressOf(temporary));
+        call.SetOperand(4, new Immediate(24));
+        ProduceFirst(caller, temporary);
+
+        BlockMemoryImportRecovery.Run(caller, _ => "memcpy");
+
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.MemoryCopy));
+        Assert.That(slot.Type, Is.SameAs(wide));
+    }
+
+    // A by-reference struct argument mapped to the wrong frame slot leaves the
+    // copy reading a local nothing writes: spelling it would read unassigned bytes.
+    [Test]
+    public void CopyFromAnUnwrittenLocalStaysACall()
+    {
+        var wide = ValueType("Wide", ("A", _int64, 0), ("B", _int64, 8), ("C", _int64, 16));
+        EmitModule(wide);
+        var caller = CallerWithUnresolvedCall(out var call);
+        var destination = Reg("HRET_2", wide, 1);
+        var unwritten = new LocalVariable("unwritten", new Register(null, "stack_-150"), wide);
+        caller.Locals!.AddRange([destination, unwritten]);
+        call.SetOperand(2, new AddressOf(destination));
+        call.SetOperand(3, new AddressOf(unwritten));
+        call.SetOperand(4, new Immediate(24));
+
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memcpy"), Is.False);
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+    }
+
+    // Struct temporaries copied slot to slot type from the one slot whose type is
+    // known, whichever order the copies come in.
+    [Test]
+    public void ChainOfFrameSlotCopiesTypesFromOneAnchor()
+    {
+        var wide = ValueType("Wide", ("A", _int64, 0), ("B", _int64, 8), ("C", _int64, 16));
+        EmitModule(wide);
+        var caller = CallerWithUnresolvedCall(out var first);
+        var outer = new LocalVariable("outer", new Register(null, "stack_-200"), null);
+        var inner = new LocalVariable("inner", new Register(null, "stack_-100"), null);
+        var temporary = Reg("HRET_1", wide, 1);
+        caller.Locals!.AddRange([outer, inner, temporary]);
+        first.SetOperand(2, new AddressOf(outer));
+        first.SetOperand(3, new AddressOf(inner));
+        first.SetOperand(4, new Immediate(24));
+        var second = new Instruction(1, OpCode.Call, new Immediate(0x10000), Reg("X0", version: 2),
+            new AddressOf(inner), new AddressOf(temporary), new Immediate(24), Reg("X3"), Reg("X4"));
+        var rest = caller.ControlFlowGraph!.Instructions.ToList();
+        caller.ControlFlowGraph = new ISILControlFlowGraph([rest[0], second, .. rest.Skip(1)]);
+        ProduceFirst(caller, temporary);
+
+        BlockMemoryImportRecovery.Run(caller, _ => "memcpy");
+
+        Assert.That(inner.Type, Is.SameAs(wide));
+        Assert.That(outer.Type, Is.SameAs(wide));
+        Assert.That(first.OpCode, Is.EqualTo(OpCode.MemoryCopy));
+        Assert.That(second.OpCode, Is.EqualTo(OpCode.MemoryCopy));
+    }
+
+    [Test]
+    public void FrameSlotOverlappingAnotherLocalIsNotRetyped()
+    {
+        var wide = ValueType("Wide", ("A", _int64, 0), ("B", _int64, 8), ("C", _int64, 16));
+        EmitModule(wide);
+        var caller = CallerWithUnresolvedCall(out var call);
+        var slot = new LocalVariable("slot", new Register(null, "stack_-108"), null);
+        var inside = new LocalVariable("inside", new Register(null, "stack_-100"), _int64);
+        var temporary = Reg("HRET_1", wide, 1);
+        caller.Locals!.AddRange([slot, inside, temporary]);
+        call.SetOperand(2, new AddressOf(slot));
+        call.SetOperand(3, new AddressOf(temporary));
+        call.SetOperand(4, new Immediate(24));
+        ProduceFirst(caller, temporary);
+
+        BlockMemoryImportRecovery.Run(caller, _ => "memcpy");
+
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+        Assert.That(slot.Type, Is.Null, "a slot whose bytes have a second name stays untyped");
+    }
+
+    // A frame slot typed by its first field (an int here) is not the whole struct
+    // the native copy writes: initblk/cpblk over it would run past the local.
+    [Test]
+    public void BlockOpLongerThanTheLocalStaysACall()
+    {
+        var caller = CallerWithUnresolvedCall(out var call);
+        var slot = new LocalVariable("slot", new Register(null, "stack_-48"), _int32);
+        caller.Locals!.Add(slot);
+        call.SetOperand(2, new AddressOf(slot));
+        call.SetOperand(3, new Immediate(0));
+        call.SetOperand(4, new Immediate(72));
+
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memset"), Is.False);
+        Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+
+        call.SetOperand(4, new Immediate(4));
+        Assert.That(BlockMemoryImportRecovery.TryRewriteCall(caller, call, "memset"), Is.True,
+            "a fill inside the local's own bytes is still a block op");
+    }
+
+    // In SSA a memcpy result nothing reads is dead; it gets its own local so later
+    // copy coalescing cannot merge it into a live register's local.
+    [Test]
+    public void NameImportsNamesTheImportAndDetachesADeadResult()
+    {
+        var caller = CallerWithUnresolvedCall(out var call);
+        var result = call.Operands[1];
+
+        BlockMemoryImportRecovery.NameImports(caller, va => va == 0x10000 ? "memcpy" : null);
+
+        Assert.That(call.Operands[0], Is.EqualTo(new StringLiteral("memcpy")));
+        Assert.That(call.Operands[1], Is.Not.SameAs(result));
+        Assert.That(caller.Locals, Does.Contain(call.Operands[1]));
+    }
+
+    [Test]
+    public void NameImportsKeepsAReadResult()
+    {
+        var caller = CallerWithUnresolvedCall(out var call, resultUsed: true);
+        var result = call.Operands[1];
+
+        BlockMemoryImportRecovery.NameImports(caller, va => va == 0x10000 ? "memcpy" : null);
+
+        Assert.That(call.Operands[0], Is.EqualTo(new StringLiteral("memcpy")));
+        Assert.That(call.Operands[1], Is.SameAs(result));
+    }
 }
