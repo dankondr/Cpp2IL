@@ -1046,6 +1046,49 @@ public static class IlGenerator
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                     break;
                 }
+
+                // A move can only carry its own width: the register the copy
+                // reaches (or the decoded access size), while a stack-homed
+                // slot stores its declared type's whole span. When the operand
+                // declares an aggregate wider than that, the move delivers only
+                // the covered bytes - `v566 <- enumerator` copies the
+                // register's 16 bytes of a 24-byte struct, not the whole
+                // Enumerator. The covered span having no single field to read,
+                // the slot keeps an implicit fill named by what the copy really
+                // carries instead of a whole type it cannot hold.
+                if (moveDestinationType is { IsValueType: true } moveContract
+                    && instruction.Operands[0] is LocalVariable moveDestinationLocal
+                    && instruction.Operands[1] is LocalVariable
+                        { Type: { IsValueType: true } moveSourceType }
+                    && moveSourceType.FullName != moveContract.FullName)
+                {
+                    var movePointerSize = context.AppContext.Binary.PointerSizeBytes;
+                    // A `NativeMemoryAccessSize` of 0 is the float/vector
+                    // convention for an unmarked move, not a proven width.
+                    var moveBytes = instruction.NativeMemoryAccessSize is > 0
+                            and var nativeAccess
+                        ? (long)nativeAccess
+                        : (Analysis.LocalVariables.TryStackOffset(moveDestinationLocal.Register.Name) != null
+                            ? TypeSizes.MinimumUnboxedSize(moveContract, movePointerSize)
+                            : Analysis.LocalVariables.LaneViewWidth(moveDestinationLocal.Register.Name)
+                                ?? Analysis.LocalVariables.RegisterCoverageBytes(moveDestinationLocal.Register.Name,
+                                    movePointerSize));
+                    if (TypeSizes.MinimumUnboxedSize(moveSourceType, movePointerSize) > moveBytes)
+                    {
+                        var coveredMembers = InstanceFields(moveSourceType)
+                            .Where(field => !field.IsStatic && field.Offset >= 0 && field.Offset < moveBytes)
+                            .OrderBy(field => field.Offset)
+                            .Select(field => field.Name)
+                            .ToList();
+                        EmitNullOrDefault(moveDestinationType, method, instructions, context,
+                            $"A {moveBytes}-byte move covers only part of the {TypeSizes.MinimumUnboxedSize(moveSourceType, movePointerSize)}-byte {moveSourceType.FullName} value"
+                            + (coveredMembers.Count > 0 ? $" ({string.Join(", ", coveredMembers)})" : "")
+                            + ": the uncovered span is an implicit fill, not a stored value.");
+                        StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
+                        break;
+                    }
+                }
+
                 if (LoadOperandIntoSlot(instruction.Operands[1], moveDestinationType, context, method, locals, writeLine))
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
                 break;
@@ -5570,7 +5613,7 @@ public static class IlGenerator
     // Shape-only mirrors of the TryEmit* inlined-member checks: when a leaf is
     // an enumerator `_current` or list `_size` backing an inline-able getter,
     // the slot load must reach LoadOperand so those paths can still spell it.
-    private static bool InlinedEnumeratorCurrentCandidate(FieldReference field,
+    internal static bool InlinedEnumeratorCurrentCandidate(FieldReference field,
         MethodAnalysisContext context)
     {
         var current = field.Field.Name == "_current" && field.Containers.Count == 0
@@ -12204,6 +12247,90 @@ public static class IlGenerator
         return null;
     }
 
+    // An entry-version local sitting on a register a struct parameter occupies
+    // is that parameter's register window - the register read sees the bytes of
+    // the parameter the register covers (`v11 @ X1` on a parameter spanning
+    // `X1:X2` reads its second register's bytes). The window is honest only
+    // while the register still holds the caller's bytes: SSA versioning
+    // distinguishes every store the ISIL models (a later write would produce a
+    // versioned register), so the only silent clobber is a call-family
+    // instruction, whose unmodeled result lanes and argument registers are
+    // caller-saved. When every use of the local precedes the first such call
+    // and the local's width lands on a field of the parameter's aggregate that
+    // is nameable from the method, the window is that field of the parameter;
+    // otherwise there is no proven spelling.
+    private static (AsmResolver.DotNet.Collections.Parameter Parameter,
+            TypeAnalysisContext ReceiverType,
+            (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers) Path)?
+        ParameterWindowField(LocalVariable local, MethodDefinition method, MethodAnalysisContext context)
+    {
+        if (local is not { IsThis: false, IsReturn: false, IsMethodInfo: false,
+                IsExceptionHandlerLocal: false, Type: { } localType }
+            || local.Register.Version != -1)
+            return null;
+
+        var instructions = context.ControlFlowGraph?.Instructions;
+        if (instructions == null)
+            return null;
+        var lastRead = -1;
+        var firstCall = int.MaxValue;
+        var defined = false;
+        for (var i = 0; i < instructions.Count; i++)
+        {
+            var instruction = instructions[i];
+            if (instruction.OpCode is OpCode.Call or OpCode.CallVoid
+                    or OpCode.IndirectCall or OpCode.Newobj or OpCode.NewArr)
+                firstCall = System.Math.Min(firstCall, i);
+            if (ReferenceEquals(instruction.Destination, local))
+                defined = true;
+            if (instruction.Operands.Any(operand =>
+                    Analysis.LocalVariables.OperandLocals(operand).Contains(local)))
+                lastRead = i;
+        }
+        if (defined || lastRead < 0 || firstCall <= lastRead)
+            return null;
+
+        var pointerSize = context.AppContext.Binary.PointerSizeBytes;
+        var laneWidth = (int)System.Math.Min(
+            TypeSizes.MinimumUnboxedSize(localType, pointerSize), int.MaxValue);
+        if (laneWidth <= 0
+            || context.AppContext.InstructionSet?.CallingConventionResolver is not { } resolver)
+            return null;
+        foreach (var parameterLocal in context.ParameterLocals)
+        {
+            if (parameterLocal.IsThis || parameterLocal.IsMethodInfo
+                || parameterLocal.Type is not { IsValueType: true } parameterType)
+                continue;
+            int byteOffset;
+            if (local.Register.Name == parameterLocal.Register.Name
+                && local.Register.Number == parameterLocal.Register.Number)
+                byteOffset = 0;
+            else if (resolver.ExtraLanes(parameterType, parameterLocal.Register)
+                    .FirstOrDefault(lane => lane.Register.Name == local.Register.Name
+                        && lane.Register.Number == local.Register.Number) is { Register.Name: not null } lane)
+                byteOffset = lane.ByteOffset;
+            else
+                continue;
+            if (byteOffset + laneWidth > TypeSizes.MinimumUnboxedSize(parameterType, pointerSize))
+                continue;
+            var path = Analysis.MetadataResolver.FindCoveredInstanceFieldPathAtOffset(
+                parameterType, byteOffset, laneWidth);
+            if (path is not { Field: { } coveredField })
+                continue;
+            if (!ThisConstructorCallPlan.SameTypeIdentity(coveredField.FieldType, localType))
+                continue;
+            var parameter = ParameterForLocal(parameterLocal, method, context);
+            if (parameter == null)
+                continue;
+            if (!FieldReferenceUsableFrom(
+                    new FieldReference(coveredField, parameterLocal, byteOffset,
+                        path.Value.Containers, laneWidth), context))
+                continue;
+            return (parameter, parameterType, path.Value);
+        }
+        return null;
+    }
+
     private static readonly ConditionalWeakTable<MethodAnalysisContext, HashSet<Register>> DefinedLocalRegisterCache = new();
 
     // Registers provably holding a value wherever they are read: parameter
@@ -12362,6 +12489,24 @@ public static class IlGenerator
         if (parameter != null)
         {
             instructions.Add(CilOpCodes.Ldarg, parameter);
+            return true;
+        }
+
+        // A no-definition local on a register a multi-register struct parameter
+        // occupies is that parameter's register window (`v11 @ X1` reads the
+        // bytes X1 covers of a parameter spanning X1:X2). When the field the
+        // window covers is proven, the read is that field of the parameter.
+        if (ParameterWindowField(local, method, context) is { } window)
+        {
+            instructions.Add(CilOpCodes.Ldarga, window.Parameter);
+            var receiverType = window.ReceiverType;
+            foreach (var container in window.Path.Containers)
+            {
+                instructions.Add(CilOpCodes.Ldflda, FieldDescriptorFor(container, receiverType));
+                receiverType = container.FieldType;
+            }
+            instructions.Add(CilOpCodes.Ldfld,
+                FieldDescriptorFor(window.Path.Field, receiverType));
             return true;
         }
 

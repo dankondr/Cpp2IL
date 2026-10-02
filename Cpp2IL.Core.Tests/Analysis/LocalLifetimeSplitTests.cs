@@ -293,10 +293,13 @@ public class LocalLifetimeSplitTests
     }
 
     [Test]
-    public void ScalarCopyIntoAggregateLocalWritesLaneZeroField()
+    public void ScalarCopyIntoAggregateLocalKeepsDiagnostic()
     {
-        // fmov s0, s8 as a plain move into a vector-typed local: only the low lane is
-        // defined, so the store targets x, leaving y/z at the local's initial zeroes.
+        // fmov s0, s8 as a plain move into a vector-typed local: only the low
+        // lane is defined, so the other twelve bytes were never materialized.
+        // Rewriting the destination to `vec.x` would emit `default` plus a
+        // partial field store with no word for the uncovered lanes - the
+        // store keeps its conversion diagnostic instead.
         var app = App;
         var vector = Vector3(app);
         var parameter = new LocalVariable("arg0", new Register(0, "X0"), app.SystemTypes.SystemSingleType);
@@ -314,27 +317,15 @@ public class LocalLifetimeSplitTests
         LocalVariables.ResolveTypesAndFields(context);
 
         var move = context.ControlFlowGraph.Instructions.First(i => i.OpCode == OpCode.Move);
-        Assert.Multiple(() =>
-        {
-            Assert.That(move.Operands[0], Is.TypeOf<FieldReference>());
-            Assert.That(((FieldReference)move.Operands[0]).Field.Name, Is.EqualTo("x"));
-        });
+        Assert.That(move.Operands[0], Is.SameAs((IOperand)vec));
 
         var (module, signatures) = EmitModule(app, vector, app.SystemTypes.SystemSingleType,
             app.SystemTypes.SystemVoidType);
         var definition = Runner(module, signatures, vector, [app.SystemTypes.SystemSingleType], ["arg0"]);
-        var loaded = EmitAssembly(context, definition, module);
+        EmitAssembly(context, definition, module);
 
-        Assert.That(definition.CilMethodBody!.Instructions.Any(i => i.OpCode == CilOpCodes.Stfld), Is.True);
-
-        var vectorType = loaded.GetType("UnityEngine.Vector3")!;
-        var result = loaded.GetType("Tests.Runner")!.GetMethod("Run")!.Invoke(null, [7.5f]);
-        Assert.Multiple(() =>
-        {
-            Assert.That(vectorType.GetField("x")!.GetValue(result), Is.EqualTo(7.5f));
-            Assert.That(vectorType.GetField("y")!.GetValue(result), Is.EqualTo(0f));
-            Assert.That(vectorType.GetField("z")!.GetValue(result), Is.EqualTo(0f));
-        });
+        Assert.That(definition.CilMethodBody!.Instructions.Any(i => i.OpCode == CilOpCodes.Ldstr
+            && i.Operand is string text && text.Contains("synthetic default")), Is.True);
     }
 
     [Test]

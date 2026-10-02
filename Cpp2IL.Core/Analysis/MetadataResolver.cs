@@ -1785,6 +1785,14 @@ public static class MetadataResolver
         FindInstanceFieldPathAtOffset(TypeAnalysisContext owner, long offset, int accessSize)
         => ResolveFieldPath(owner, offset, accessSize, false);
 
+    // The field a fixed-width read honestly names: a leaf - flat or nested
+    // through value-typed containers - exactly `accessSize` wide at `offset`.
+    // A narrower or wider member at the offset covers different bytes, so it
+    // cannot be the read's name.
+    internal static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)?
+        FindCoveredInstanceFieldPathAtOffset(TypeAnalysisContext owner, long offset, int accessSize)
+        => ResolveFieldPath(owner, offset, accessSize, true);
+
     // A flat hit is an exact-offset match; a nested hit additionally requires the load's
     // width to match the leaf member's storage so a wider read is not silently narrowed
     // to its first member. sizeMatchedLeaf applies the same width rule to a top-level

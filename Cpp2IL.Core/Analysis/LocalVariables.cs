@@ -919,6 +919,51 @@ public static class LocalVariables
         _ => pointerSize,
     };
 
+    // The bytes a value occupies when proven: a typed operand's own storage
+    // width, a floating literal's encoding, or a decode-proven immediate. An
+    // unproven operand (an immediate with no width mark) reports 0 - its
+    // actual write width is undetermined, so no lane store may be read from it.
+    private static int ProvenOperandSize(IOperand operand, int pointerSize) => operand switch
+    {
+        LocalVariable { Type: { } } or FieldReference
+            => StoredOperandSize(operand, pointerSize),
+        FloatLiteral => 4,
+        DoubleLiteral => 8,
+        Immediate { ProvenBytes: > 0 } immediate => immediate.ProvenBytes.Value,
+        _ => 0,
+    };
+
+    // The managed type an operand's value carries, when one is named: a
+    // local's inferred type or a field read's leaf type. Literals and
+    // untyped shapes carry none.
+    private static TypeAnalysisContext? OperandValueType(IOperand operand) => operand switch
+    {
+        LocalVariable local => local.Type,
+        FieldReference field => field.Field.FieldType,
+        _ => null,
+    };
+
+    // A covered store spells `agg.<field> = value` only when the value can
+    // honestly fill the member's slot. A typed source must carry a type the
+    // field accepts (`v482.Item1 = transform`); an untyped write - an
+    // immediate, an `&x` address, unmanaged bytes - can only honestly land in
+    // a storage primitive, never in a reference or nested-struct member whose
+    // bytes it could not have produced (`v482.Item1 = &tuple` would claim a
+    // pointer as a Transform reference).
+    private static bool CoveredStoreValueCompatible(TypeAnalysisContext leafType,
+        IOperand source)
+    {
+        if (OperandValueType(source) is { } sourceType)
+            return leafType.IsValueType
+                ? sourceType.FullName == leafType.FullName
+                : sourceType.IsAssignableTo(leafType);
+        return leafType.IsEnumType
+            || leafType.FullName is "System.Byte" or "System.SByte" or "System.Int16"
+                or "System.UInt16" or "System.Int32" or "System.UInt32" or "System.Int64"
+                or "System.UInt64" or "System.Single" or "System.Double" or "System.Boolean"
+                or "System.Char" or "System.IntPtr" or "System.UIntPtr";
+    }
+
     // A FieldReference materialized while its owner local still typed the erased shared
     // instantiation (e.g. `Dictionary<K,V>.Enumerator<object,object>` under generic
     // sharing) keeps that instantiation even though the local emits as the sharpened
@@ -2156,8 +2201,14 @@ public static class LocalVariables
                 destLocal.Type = sourceType;
                 return true;
             }
-            return SetTypeRespectingBooleanClaim(destLocal, sourceLocal.Type, method, allDefinitions)
-                || SetTypeRespectingBooleanClaim(sourceLocal, destLocal.Type, method, allDefinitions);
+            var changed = sourceLocal.Type is { } forwardType
+                && TypeFitsRegisterLane(forwardType, destLocal, pointerSize)
+                && SetTypeRespectingBooleanClaim(destLocal, forwardType, method, allDefinitions);
+            if (destLocal.Type is { } backwardType
+                && TypeFitsRegisterLane(backwardType, sourceLocal, pointerSize))
+                changed |= SetTypeRespectingBooleanClaim(sourceLocal, backwardType, method,
+                    allDefinitions);
+            return changed;
         }
 
         // Move local, field: a field load types its result with the field's type. This is the edge
@@ -2166,6 +2217,8 @@ public static class LocalVariables
         {
             var fieldType = loadField.Field.FieldType;
             if (loadDest.Type?.FullName == fieldType.FullName)
+                return false;
+            if (!TypeFitsRegisterLane(fieldType, loadDest, pointerSize))
                 return false;
             if (fieldType.FullName == "System.Boolean")
                 return TryClaimBoolean(loadDest, method, allDefinitions)
@@ -2177,6 +2230,8 @@ public static class LocalVariables
         if (destination is LocalVariable selectedDest && source is SelectedFieldReference selectedField)
         {
             if (selectedDest.Type?.FullName == selectedField.FieldType.FullName)
+                return false;
+            if (!TypeFitsRegisterLane(selectedField.FieldType, selectedDest, pointerSize))
                 return false;
             if (selectedField.FieldType.FullName == "System.Boolean")
                 return TryClaimBoolean(selectedDest, method, allDefinitions)
@@ -2193,7 +2248,9 @@ public static class LocalVariables
         // turn a spellable whole vector into a diagnosed coercion.
         if (destination is FieldReference storeField && source is LocalVariable storeSource
             && !VectorLanePacking.IsPackLocal(storeField.Local))
-            return SetTypeRespectingBooleanClaim(storeSource, storeField.Field.FieldType, method, allDefinitions);
+            return TypeFitsRegisterLane(storeField.Field.FieldType, storeSource, pointerSize)
+                && SetTypeRespectingBooleanClaim(storeSource, storeField.Field.FieldType, method,
+                    allDefinitions);
 
         // ArrayLength is emitted as ldlen/conv.i4, so its result is always Int32 when the
         // source is a recovered managed array. Do not infer this from arbitrary references.
@@ -2205,7 +2262,8 @@ public static class LocalVariables
         if (destination is LocalVariable { Type: null } elementDest
             && source is MemoryOperand { Base: LocalVariable { Type: SzArrayTypeAnalysisContext { ElementType: { } elementType } } } elementAccess
             && (elementAccess.Index != null || elementAccess.Addend >= 4L * pointerSize))
-            return SetTypeIfUnknown(elementDest, elementType);
+            return TypeFitsRegisterLane(elementType, elementDest, pointerSize)
+                && SetTypeIfUnknown(elementDest, elementType);
 
         // A load at the array data offset through pointer arithmetic is also an element load:
         // the base proves `array + scaled index` rather than naming the array local directly.
@@ -2280,6 +2338,7 @@ public static class LocalVariables
         if (phi.Operands[0] is not LocalVariable destination)
             return false;
 
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
         var changed = false;
 
         if (destination.Type?.FullName == "System.Object")
@@ -2311,7 +2370,8 @@ public static class LocalVariables
                 {
                     if (inputType.FullName != "System.Boolean"
                         || TryClaimBoolean(destination, method, allDefinitions))
-                        changed = SetTypeIfUnknown(destination, inputType);
+                        changed = TypeFitsRegisterLane(inputType, destination, pointerSize)
+                            && SetTypeIfUnknown(destination, inputType);
                     break;
                 }
             }
@@ -2330,7 +2390,8 @@ public static class LocalVariables
                 if (phi.Operands[i] is LocalVariable input
                     && !(definitions.TryGetValue(input, out var inputDefinition)
                         && inputDefinition.OpCode is OpCode.Move or OpCode.Phi))
-                    changed |= SetTypeIfUnknown(input, destination.Type);
+                    changed |= TypeFitsRegisterLane(destination.Type, input, pointerSize)
+                        && SetTypeIfUnknown(input, destination.Type);
             }
         }
 
@@ -2671,6 +2732,46 @@ public static class LocalVariables
     }
 
     /// <summary>
+    /// The byte offset inside its register a `Vn.Lk` lane-view name addresses:
+    /// lane k at element width L (B=1, H=2, S=4, D=8) starts at k*L bytes.
+    /// Whole-register and non-lane names return 0.
+    /// </summary>
+    internal static int LaneViewByteOffset(string? name)
+    {
+        if (name is null || !IsLaneViewName(name))
+            return 0;
+        var dot = name.IndexOf('.');
+        var width = name[dot + 1] switch
+        {
+            'B' => 1,
+            'H' => 2,
+            'S' => 4,
+            'D' => 8,
+            _ => 0,
+        };
+        var index = 0;
+        for (var i = dot + 2; i < name.Length && char.IsDigit(name[i]); i++)
+            index = index * 10 + (name[i] - '0');
+        return index * width;
+    }
+
+    /// <summary>
+    /// The byte width a `Vn.Lk` lane-view name covers: the element width L
+    /// (B=1, H=2, S=4, D=8). Whole-register and non-lane names return null.
+    /// </summary>
+    internal static int? LaneViewWidth(string? name)
+        => name is null || !IsLaneViewName(name)
+            ? null
+            : name[name.IndexOf('.') + 1] switch
+            {
+                'B' => 1,
+                'H' => 2,
+                'S' => 4,
+                'D' => 8,
+                _ => null,
+            };
+
+    /// <summary>
     /// Whether an operand slot expects the whole vector value, where a
     /// lane-viewed local retargets to the `_vec` local itself instead of one
     /// lane leaf: a `Move` destination typed vector, a vector call argument, a
@@ -2903,7 +3004,39 @@ public static class LocalVariables
             // definite-assignment proof for the whole destination, the
             // destination keeps the diagnostic.
             if (!ReceiverIsByRefParameter(destinationField.Local, method))
-                SplitScalarSources(method, instruction, fieldType);
+            {
+                var storePointerSize = method.AppContext.Binary.PointerSizeBytes;
+                // The emitter prefers the whole-value store through an outer
+                // container whose field type is the source's own type
+                // (`part.endBuildingTime._dateData = now` writes `stfld
+                // endBuildingTime`, never the private leaf) - but only when the
+                // leaf's bytes are the container's whole content. stfld writes
+                // the whole container, so a leaf that covers part of it
+                // (`vec.x = v` where the store touched .x alone) would let the
+                // emit write bytes the store never covered. There the lane form
+                // is honest, and a run of lane stores covering the container is
+                // the shape inlined-member recovery collapses to the whole-
+                // aggregate store.
+                if (IlGenerator.EmittedOperandType(instruction.Operands[1], method) is not { } storeType
+                    || IlGenerator.WholeValueContainerReference(destinationField, storeType, method)
+                        is not { } wholeValue
+                    || (int)System.Math.Min(TypeSizes.MinimumUnboxedSize(wholeValue.Field.FieldType,
+                            storePointerSize), int.MaxValue)
+                        > (destinationField.AccessSize > 0 ? destinationField.AccessSize
+                            : (int)System.Math.Min(TypeSizes.MinimumUnboxedSize(fieldType,
+                                storePointerSize), int.MaxValue))
+                    || !AggregateFieldWritableFrom(wholeValue.Field, method))
+                    // A lane slot inside a value-type local's own register
+                    // window reads the source at the byte offset the slot
+                    // occupies (`v.y = v` touches v's bytes 4-8); a store fed
+                    // by another register's local reads that source's low lane.
+                    SplitScalarSources(method, instruction, fieldType,
+                        destinationField.Local.Type is { IsValueType: true }
+                            && SourceSharesRegisterWindow(instruction.Operands[1],
+                                destinationField.Local)
+                            ? destinationField.Offset
+                            : 0);
+            }
             return;
         }
 
@@ -2912,26 +3045,59 @@ public static class LocalVariables
 
         if (IsScalarLaneType(destination.Type))
         {
-            SplitScalarSources(method, instruction);
+            SplitScalarSources(method, instruction,
+                LaneViewByteOffset(destination.Register.Name));
             return;
         }
 
-        // The destination is an aggregate while the source is a scalar: only the low
-        // lane is being defined, so the slot written is that lane's field, emitted
-        // as a field store on the local.
+        // The destination is an aggregate while the source is narrower: only the
+        // low lane is being defined, so the slot written is the field covering
+        // the lane's bytes, emitted as a member store on the local. The split
+        // needs the write's proven width - an untyped immediate or unproven
+        // operand fills the whole destination, so `Move agg, 0` stays the
+        // whole-struct default its diagnostic names - plus a settled aggregate
+        // type on the destination and a member path the method can legally
+        // write (no private member, no initonly field outside its .ctor).
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        // A `NativeMemoryAccessSize` of 0 is the float/vector convention for an
+        // unmarked store, not a proven width - fall through to the operand's own.
+        var sourceSize = instruction.NativeMemoryAccessSize is > 0 and var nativeWidth
+            ? nativeWidth
+            : ProvenOperandSize(instruction.Operands[1], pointerSize);
         if (destination.Type is { IsValueType: true } destinationType
-            && instruction.Operands[1] is LocalVariable { Type: { } sourceType }
-            && IsScalarLaneType(sourceType)
-            && LaneZeroField(destinationType, sourceType) is { } lane)
-            instruction.SetOperand(0, new FieldReference(lane, destination, 0));
+            && destinationType is not PointerTypeAnalysisContext)
+        {
+            var destinationSize = (int)System.Math.Min(
+                TypeSizes.MinimumUnboxedSize(destinationType, pointerSize), int.MaxValue);
+            if (sourceSize > 0 && sourceSize < destinationSize
+                && LocalAggregateTypeSettled(destination, 0, sourceSize, method)
+                && MetadataResolver.FindCoveredInstanceFieldPathAtOffset(destinationType, 0,
+                        sourceSize) is { } covered
+                && CoveredStoreValueCompatible(covered.Field.FieldType, instruction.Operands[1])
+                && covered.Containers.All(container => AggregateFieldWritableFrom(container, method))
+                && AggregateFieldWritableFrom(covered.Field, method)
+                && LocalDefinedBytesCover(destination, destinationSize, pointerSize, method))
+            {
+                instruction.SetOperand(0, new FieldReference(covered.Field, destination, 0,
+                    covered.Containers, sourceSize));
+            }
+            // The destination is an aggregate narrower than the source: only
+            // the source's low lane is read, so the operand narrows to the
+            // field covering the lane's bytes - the same covered-field rule a
+            // scalar slot applies.
+            else if (destinationSize > 0 && destinationSize < sourceSize
+                && LaneOperand(instruction.Operands[1], destinationType, method) is { } narrowed)
+                instruction.SetOperand(1, narrowed);
+        }
     }
 
-    private static void SplitScalarSources(MethodAnalysisContext method, Instruction instruction)
+    private static void SplitScalarSources(MethodAnalysisContext method, Instruction instruction,
+        int slotByteOffset = 0)
     {
         if (instruction.Operands[0] is not LocalVariable destination
             || !IsScalarLaneType(destination.Type))
             return;
-        SplitScalarSources(method, instruction, destination.Type!);
+        SplitScalarSources(method, instruction, destination.Type!, slotByteOffset);
     }
 
     // A `ref`/`out` parameter's local is byref-typed and sits in the parameter
@@ -2975,10 +3141,11 @@ public static class LocalVariables
         return source;
     }
 
-    private static void SplitScalarSources(MethodAnalysisContext method, Instruction instruction, TypeAnalysisContext laneType)
+    private static void SplitScalarSources(MethodAnalysisContext method, Instruction instruction,
+        TypeAnalysisContext laneType, int slotByteOffset = 0)
     {
         for (var i = 1; i < instruction.Operands.Count; i++)
-            if (LaneOperand(instruction.Operands[i], laneType, method) is { } lane)
+            if (LaneOperand(instruction.Operands[i], laneType, method, slotByteOffset) is { } lane)
                 instruction.SetOperand(i, lane);
     }
 
@@ -2997,6 +3164,17 @@ public static class LocalVariables
         var laneType = left is LocalVariable { Type: { } leftType } && IsScalarLaneType(leftType) ? leftType
             : right is LocalVariable { Type: { } rightType } && IsScalarLaneType(rightType) ? rightType
             : ScalarLiteralLaneType(left, method) ?? ScalarLiteralLaneType(right, method);
+        // When both operands carry the same aggregate type the register
+        // comparison reads their offset-0 lane - spell it as the covered
+        // field's type there (a `v3 == v3` compare is `v3.x == v3.x`).
+        if (laneType == null
+            && left is LocalVariable { Type: { IsValueType: true } sameAggregateType }
+            && right is LocalVariable { Type: { } rightLocalType }
+            && sameAggregateType.FullName == rightLocalType.FullName
+            && (MetadataResolver.FindCoveredInstanceFieldPathAtOffset(sameAggregateType, 0, 4)
+                ?? MetadataResolver.FindCoveredInstanceFieldPathAtOffset(sameAggregateType, 0, 8)) is { } firstField
+            && IsScalarLaneType(firstField.Field.FieldType))
+            laneType = firstField.Field.FieldType;
         if (laneType == null)
             return;
 
@@ -3030,19 +3208,43 @@ public static class LocalVariables
         };
 
     private static IOperand? LaneOperand(IOperand operand, TypeAnalysisContext laneType,
-        MethodAnalysisContext method)
+        MethodAnalysisContext method, int slotByteOffset = 0)
     {
-        // A scalar view of a 128-bit vector constant is its first element:
-        // `fneg s1, s0` with `movi v0.4s, #x` reads lane S0 = X.
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        var laneWidth = (int)System.Math.Min(
+            TypeSizes.MinimumUnboxedSize(laneType, pointerSize), int.MaxValue);
+        if (laneWidth <= 0)
+            return null;
+
+        // A scalar view of a 128-bit vector constant reads the covered lane's
+        // element: `fneg s1, s0` with `movi v0.4s, #x` reads lane S0 = X.
         if (operand is Vector128Literal literal)
-            return new FloatLiteral(literal.X);
+            return laneWidth == 4
+                ? slotByteOffset switch
+                {
+                    0 => new FloatLiteral(literal.X),
+                    4 => new FloatLiteral(literal.Y),
+                    8 => new FloatLiteral(literal.Z),
+                    12 => new FloatLiteral(literal.W),
+                    _ => null,
+                }
+                : null;
+
+        // The byte offset the operand itself addresses: a lane-view local reads
+        // its own window; any other operand reads at the slot's lane.
+        var byteOffset = slotByteOffset;
+        if (operand is LocalVariable { Register.Name: { } viewName }
+            && LaneViewByteOffset(viewName) is var ownOffset
+            && ownOffset > 0)
+            byteOffset = ownOffset;
 
         // A scalar read of a resolved aggregate host (a struct field or a
-        // register-view local) sees the host's lane-0 field: `ldr s0, [vec]`
-        // reads `vec`'s first lane.
+        // register-view local) sees the field covering the lane's bytes:
+        // `ldr s0, [vec]` reads `vec`'s first lane, `ins v0.s[2]` its third.
         if (operand is FieldReference { Field.FieldType: { } fieldType } fieldRef
             && fieldType.IsValueType && !IsScalarLaneType(fieldType)
-            && LaneZeroField(fieldType, laneType) is { } nestedLane)
+            && MetadataResolver.FindCoveredInstanceFieldPathAtOffset(fieldType, byteOffset,
+                    laneWidth) is { } nested)
         {
             // A read on a receiver that can only spell as raw metadata (an
             // Il2CppClass/static-fields pointer or metadata handle)
@@ -3064,91 +3266,307 @@ public static class LocalVariables
                 && !MetadataResolver.BackingAccessorVisible(fieldRef.Field, method,
                     store: false))
                 return null;
-            return new FieldReference(nestedLane, fieldRef.Local, fieldRef.Offset,
-                [.. fieldRef.Containers, fieldRef.Field], fieldRef.AccessSize);
+            var nestedRef = new FieldReference(nested.Field, fieldRef.Local,
+                fieldRef.Offset + byteOffset,
+                [.. fieldRef.Containers, fieldRef.Field, .. nested.Containers],
+                laneWidth);
+            // The nested leaf must be nameable from this method: a private member
+            // (the raw slot inside a scalar wrapper) covers the same bytes but
+            // emits nothing, where the shallower path still spelled.
+            return IlGenerator.FieldReferenceUsableFrom(nestedRef, method,
+                requireToken: false) ? nestedRef : null;
         }
 
         if (operand is not LocalVariable { Type: { } aggregateType } local
-            || !aggregateType.IsValueType || IsScalarLaneType(aggregateType)
-            || LaneZeroField(aggregateType, laneType) is not { } lane
-            || !LaneValueSpellable(local, method))
+            || !aggregateType.IsValueType || IsScalarLaneType(aggregateType))
+            return null;
+        if (!LocalAggregateTypeSettled(local, byteOffset, laneWidth, method))
+            return null;
+        if (MetadataResolver.FindCoveredInstanceFieldPathAtOffset(aggregateType, byteOffset,
+                laneWidth) is not { } path)
             return null;
 
-        return new FieldReference(lane, local, 0);
+        var coveredRef = new FieldReference(path.Field, local, byteOffset, path.Containers,
+            laneWidth);
+        // The covered leaf must be nameable from this method: a private member
+        // covers the same bytes but emits nothing, where the shallower read
+        // still spelled.
+        return IlGenerator.FieldReferenceUsableFrom(coveredRef, method,
+            requireToken: false) ? coveredRef : null;
     }
 
-    // The lane read only spells when the host local does. A local whose
-    // definitions all move in an operand the emitter cannot spell (a field
-    // read on a metadata-internal receiver, a raw pointer expression, an
-    // unmanaged load) defaults at the slot; splitting a store's source would
-    // only move the default onto the member (`referent.lane = default(T).lane`),
-    // so the whole operand is kept for the referent-level fallback control
-    // emits. A non-Move definition spells the local directly and reads fine.
-    private static bool LaneValueSpellable(LocalVariable local, MethodAnalysisContext method)
+    // The covered-field projection binds to the local's aggregate type, so the
+    // bytes the read touches must carry that type proof: a computed definition
+    // (arithmetic, bitwise, shifts, conversions, lane packing) only proves the
+    // lane its operands actually write, and a read past that write cannot take
+    // the operand-carried claim - the emitter would substitute a default where
+    // control read the real slot. The question is asked per byte range: a
+    // scalar `fsub.s` inside a vector-typed register settles the lane it
+    // writes without claiming the lanes it leaves alone. Copies and
+    // signature-defined values carry their provenance through at the same
+    // range, so only computed producers can veto.
+    private static bool LocalAggregateTypeSettled(LocalVariable local, int byteOffset,
+        int laneWidth, MethodAnalysisContext method)
     {
-        var seen = new HashSet<LocalVariable>();
-        var work = new Stack<LocalVariable>();
-        work.Push(local);
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        var seen = new HashSet<(LocalVariable, int, int)>();
+        var work = new Stack<(LocalVariable Local, int ByteOffset, int LaneWidth)>();
+        work.Push((local, byteOffset, laneWidth));
         while (work.Count > 0)
         {
-            var current = work.Pop();
-            if (!seen.Add(current))
+            var (current, offset, width) = work.Pop();
+            if (!seen.Add((current, offset, width)))
                 continue;
+            var rangeEnd = offset + width;
             foreach (var instruction in method.ControlFlowGraph!.Instructions)
             {
                 if (!ReferenceEquals(instruction.Destination, current))
                     continue;
-                // A call whose callee cannot be invoked assigns no managed
-                // value - the lane would read a default where control keeps
-                // the whole operand (and its own named diagnostic).
-                if (instruction.OpCode is OpCode.Call or OpCode.IndirectCall
-                    && VectorLanePacking.ResolveCallee(method.AppContext,
-                        instruction.Operands[0]) is { } callee
-                    && !IlGenerator.CalleeUsableFrom(callee, method))
-                    return false;
-                if (instruction.OpCode != OpCode.Move
-                    || instruction.Operands.Count < 2)
-                    continue;
-                switch (instruction.Operands[1])
+                if (instruction.OpCode is OpCode.Move or OpCode.Phi)
                 {
-                    case LocalVariable copy when ReferenceEquals(copy, current):
-                        break;
-                    case LocalVariable copy:
-                        work.Push(copy);
-                        break;
-                    // A field read spells only when the member path itself can be
-                    // named from this method. A static member emits ldsfld -
-                    // its receiver is unused, so a metadata-internal holder (the
-                    // Il2CppStaticFields block) does not veto it; an instance
-                    // read still needs a managed receiver and a usable member.
-                    case FieldReference field
-                        when (field.Field.IsStatic || ManagedLaneReceiver(field))
-                        && SpellableField(field, method):
-                    // Loads materialize the local either as the resolved read or
-                    // as their own named diagnostic; either way `local.lane`
-                    // reads a real declared local.
-                    case MemoryOperand or ArrayAccess or ArrayElementFieldReference
-                        or ArrayLength or AddressOf or ReferenceCast
-                        or SelectedFieldReference:
-                    // Constants, callee/type operands and literals always emit a
-                    // concrete value.
-                    case Immediate or FloatLiteral or DoubleLiteral or StringLiteral
-                        or TypeAnalysisContext or MethodAnalysisContext
-                        or Vector128Literal:
-                        break;
-                    default:
+                    // A copy carries the type claim only when the source holds the
+                    // same type (`v3 = otherV3` takes the claim through); a
+                    // mismatched source feeds nothing (`v3 = scalar` takes its
+                    // claim from the slot it stores into, not from `scalar`), so
+                    // that source's own definitional provenance is irrelevant.
+                    for (var i = 0; i < instruction.Operands.Count; i++)
+                    {
+                        if (instruction.Operands[i] is LocalVariable source
+                            && !ReferenceEquals(source, current)
+                            && source.Type is { } sourceType && current.Type is { } currentType
+                            && sourceType.FullName == currentType.FullName)
+                            work.Push((source, offset, width));
+                    }
+                    continue;
+                }
+                if (instruction.OpCode is OpCode.Add or OpCode.Subtract or OpCode.Multiply
+                    or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight
+                    or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
+                    or OpCode.VectorMin or OpCode.VectorMax or OpCode.Convert
+                    or OpCode.ShiftStack)
+                {
+                    // A conversion's result type is its own target - the
+                    // operands are converted, not carried through, so the type
+                    // claim is proven by construction for the bytes the result
+                    // type covers.
+                    var scalarScaling = instruction.OpCode is OpCode.Multiply or OpCode.Divide;
+                    if (instruction.OpCode is OpCode.Convert)
+                    {
+                        if (current.Type is not { IsValueType: true } convertedType
+                            || rangeEnd > TypeSizes.MinimumUnboxedSize(convertedType, pointerSize))
+                            return false;
+                        continue;
+                    }
+                    if (instruction.OpCode is OpCode.ShiftStack
+                        || current.Type is not { IsValueType: true })
                         return false;
+                    // The definition writes only as many proven bytes as its
+                    // narrowest non-scalar input: a SIMD-wide op on vector
+                    // operands covers the vector (`fmul.4s` writes all lanes),
+                    // a scalar op through an aggregate-typed operand covers
+                    // only the lane the scalar inputs bound (`fsub.s` writes
+                    // its lane, not the vector's). Reads past that write
+                    // cannot take the operand-carried type claim. An operand
+                    // is scalar when it is an immediate, carries a scalar lane
+                    // type, or is an untyped local; every other operand
+                    // (typed aggregate, memory load, field read) bounds the
+                    // write to its proven width.
+                    var operands = instruction.Operands.Skip(1).ToList();
+                    var nonScalar = operands.Where(operand => operand switch
+                    {
+                        Immediate => false,
+                        LocalVariable { Type: null } => false,
+                        _ => OperandValueType(operand) is not { } operandType
+                            || !IsScalarLaneType(operandType),
+                    }).ToList();
+                    var writeWidth = (nonScalar.Count > 0 ? nonScalar : operands)
+                        .Select(operand => OperandProvenWidth(operand, pointerSize))
+                        .DefaultIfEmpty(0).Min();
+                    if (rangeEnd > writeWidth)
+                        return false;
+                    // Each operand must carry the read's range: a typed operand
+                    // needs a value type whose storage covers it, an unproven
+                    // operand (an immediate, an `&x` address) only ever fills a
+                    // scaling step's other lane - an additive step against a
+                    // literal is address arithmetic and carries no claim.
+                    if (!operands.All(operand =>
+                            OperandValueType(operand) is { } operandType
+                                ? operandType.IsValueType
+                                    && StoredOperandSize(operand, pointerSize) >= rangeEnd
+                                : OperandProvenWidth(operand, pointerSize) >= rangeEnd
+                                    || scalarScaling && operand is Immediate or LocalVariable))
+                        return false;
+                    // The derived lane is only as settled as the bytes its
+                    // operands read - check them at the same range.
+                    foreach (var operand in operands)
+                    {
+                        if (operand is LocalVariable source && !ReferenceEquals(source, current))
+                            work.Push((source, offset, width));
+                    }
                 }
             }
         }
         return true;
     }
 
-    // The emitter's own predicate, minus the emitted-token gate: analysis runs
-    // before fields gain their AsmResolver definitions, so requiring the token
-    // here would call every field unspellable.
-    private static bool SpellableField(FieldReference field, MethodAnalysisContext method)
-        => IlGenerator.FieldReferenceUsableFrom(field, method, requireToken: false);
+    // Whether a local's definitions materialize every byte of `width`: a
+    // whole-value store fills what its source proves, a member store fills
+    // the member's span, a phi fills what every input fills, a constructor or
+    // by-ref callee fills its receiver, and a computed result fills the
+    // register's coverage. A local with no definitions is entry-defined - a
+    // parameter or signature value carries its bytes by convention. The check
+    // answers "did the binary write this value", not "is this type claim
+    // proven", so a local whose only write is a 4-byte store does not cover a
+    // 16-byte aggregate's slot.
+    private static bool LocalDefinedBytesCover(LocalVariable local, int width, int pointerSize,
+        MethodAnalysisContext method)
+        => LocalDefinedCoverageEnd(local, width, pointerSize, method,
+            new HashSet<LocalVariable>()) >= width;
+
+    // The length of `local`'s leading materialized byte run: a write never
+    // removes bytes another definition stored, so the union of every
+    // definition's covered span bounds the run. A phi contributes the run its
+    // inputs all share; a cycle contributes nothing and the phi's other
+    // inputs decide.
+    private static int LocalDefinedCoverageEnd(LocalVariable local, int width, int pointerSize,
+        MethodAnalysisContext method, HashSet<LocalVariable> seen)
+    {
+        if (!seen.Add(local))
+            return 0;
+        var covered = new List<(int Start, int End)>();
+        var defined = false;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction.OpCode == OpCode.Move
+                && instruction.Operands is [FieldReference { Local: { } owner } member, ..]
+                && ReferenceEquals(owner, local))
+            {
+                // A member store materializes the member's own span.
+                defined = true;
+                var memberWidth = member.AccessSize > 0 ? member.AccessSize
+                    : (int)System.Math.Min(TypeSizes.MinimumUnboxedSize(member.Field.FieldType,
+                        pointerSize), int.MaxValue);
+                covered.Add((member.Offset, member.Offset + memberWidth));
+                continue;
+            }
+            if (instruction.OpCode is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall
+                && instruction.Operands.Count > 1
+                && instruction.Operands[0] is MethodAnalysisContext callee
+                && (callee.Name == ".ctor"
+                    || callee.Parameters.FirstOrDefault()?.ParameterType
+                        is ByRefTypeAnalysisContext)
+                && instruction.Operands[1] is LocalVariable receiver
+                && ReferenceEquals(receiver, local))
+            {
+                // A .ctor or by-ref callee fills the whole referent.
+                return width;
+            }
+            if (instruction.Destination is not LocalVariable destination
+                || !ReferenceEquals(destination, local))
+                continue;
+            defined = true;
+            switch (instruction.OpCode)
+            {
+                case OpCode.Newobj or OpCode.Call or OpCode.IndirectCall:
+                    return width;
+                case OpCode.Move when instruction.Operands.Count > 1:
+                    var moveWidth = instruction.NativeMemoryAccessSize is > 0 and var native
+                        ? native
+                        : instruction.Operands[1] is LocalVariable source && ReferenceEquals(source, local)
+                            ? 0
+                            : OperandProvenWidth(instruction.Operands[1], pointerSize);
+                    if (moveWidth > 0)
+                        covered.Add((0, moveWidth));
+                    break;
+                case OpCode.Phi:
+                    // The value one edge delivers is covered only where every
+                    // edge covers it - a partially materialized input hands the
+                    // phi the same uncovered bytes.
+                    var phiEnd = width;
+                    foreach (var input in instruction.Operands.Skip(1))
+                    {
+                        if (input is LocalVariable inputLocal)
+                        {
+                            if (ReferenceEquals(inputLocal, local))
+                                continue;
+                            phiEnd = System.Math.Min(phiEnd,
+                                LocalDefinedCoverageEnd(inputLocal, width, pointerSize, method, seen));
+                        }
+                        else
+                            phiEnd = System.Math.Min(phiEnd,
+                                OperandProvenWidth(input, pointerSize));
+                        if (phiEnd == 0)
+                            break;
+                    }
+                    if (phiEnd > 0)
+                        covered.Add((0, phiEnd));
+                    break;
+                case OpCode.ShiftStack:
+                    break;
+                default:
+                    // A computed result fills its register's coverage.
+                    covered.Add((0, (int)System.Math.Min(
+                        LaneViewWidth(local.Register.Name)
+                            ?? RegisterCoverageBytes(local.Register.Name, pointerSize),
+                        width)));
+                    break;
+            }
+        }
+        if (!defined)
+            return width;
+        var end = 0;
+        foreach (var (start, spanEnd) in covered.OrderBy(span => span.Start))
+        {
+            if (start > end)
+                break;
+            end = System.Math.Max(end, spanEnd);
+        }
+        return end;
+    }
+
+    // The register window a name addresses: `V0`, `V0_v2` and `V0.S1` are the
+    // same physical register's bytes - a lane-view suffix or an SSA version
+    // number does not open a new window.
+    private static string? RegisterWindowName(string? name)
+    {
+        if (name is null)
+            return null;
+        var dot = name.IndexOf('.');
+        if (dot > 0)
+            name = name[..dot];
+        var version = name.LastIndexOf("_v", System.StringComparison.Ordinal);
+        if (version > 0 && version + 2 < name.Length
+            && name[(version + 2)..].All(char.IsAsciiDigit))
+            name = name[..version];
+        return name;
+    }
+
+    // Whether the operand reads the same register window the local occupies:
+    // the lane byte offset a destination slot applies is only honest for a
+    // source of that window (`v.y = v` reads v's bytes 4-8, `v.y = other`
+    // reads other's low lane).
+    private static bool SourceSharesRegisterWindow(IOperand source, LocalVariable local)
+    {
+        var window = RegisterWindowName(local.Register.Name);
+        return window != null
+            && OperandLocals(source).Any(operand => RegisterWindowName(operand.Register.Name) == window);
+    }
+
+    // The bytes an operand's value provably occupies: a typed operand's own
+    // storage width, a floating literal's encoding, a decode-proven immediate,
+    // or a memory operand's marked access width. Unproven shapes report 0 -
+    // their actual write width is undetermined, so no range may be read from
+    // them.
+    private static int OperandProvenWidth(IOperand operand, int pointerSize) => operand switch
+    {
+        LocalVariable { Type: { } } or FieldReference
+            => StoredOperandSize(operand, pointerSize),
+        FloatLiteral => 4,
+        DoubleLiteral => 8,
+        Immediate { ProvenBytes: > 0 } immediate => immediate.ProvenBytes.Value,
+        MemoryOperand { AccessSize: > 0 } memory => memory.AccessSize,
+        _ => 0,
+    };
 
     // A field read spells only when its receiver does. Reads through metadata
     // internals (the Il2CppClass/static-fields block or a runtime metadata
@@ -3275,16 +3693,28 @@ public static class LocalVariables
         return ReceiverProvenMismatched(EmittedSlotLocalType(replacement, method), element);
     }
 
-    // The low lane of an aggregate local is its publicly visible offset-0 field of
-    // the scalar's exact type - `Vector3.x` for a Single view, a leading int for an
-    // I4 view. A private or mismatched field is no lane the operand could honestly
-    // name, so the operand stays whole and the emitter keeps its diagnostic.
-    private static FieldAnalysisContext? LaneZeroField(TypeAnalysisContext aggregateType,
-        TypeAnalysisContext laneType)
-        => aggregateType.Fields.FirstOrDefault(field => !field.IsStatic
-            && field.Offset == 0
-            && field.Visibility == FieldAttributes.Public
-            && (ReferenceEquals(field.FieldType, laneType) || field.FieldType.FullName == laneType.FullName));
+    // A Move/Phi copy onto a vector-lane register transfers the lane's own
+    // coverage, never the whole aggregate: a local's claimed value type wider
+    // than a `Vn`/`Vn.Sk`/`Qn` lane is a smear that names the aggregate in
+    // every mismatched edge the register feeds, where the honest register
+    // content was the covered field's bytes. Scalar (X/W/S/D/...) registers
+    // and virtual names carry by-convention types - the register may hold a
+    // pointer to the aggregate or the value itself - and stack cells model
+    // memory of any size, so only vector lanes bound a type's proven width.
+    private static bool TypeFitsRegisterLane(TypeAnalysisContext type, LocalVariable local,
+        int pointerSize)
+    {
+        if (!type.IsValueType || IsScalarLaneType(type))
+            return true;
+        var registerName = local.Register.Name;
+        if (TryStackOffset(registerName) != null
+            || registerName.Length <= 1 || !char.IsAsciiDigit(registerName[1])
+            || registerName[0] is not ('V' or 'Q' or 'v' or 'q'))
+            return true;
+        var laneBytes = LaneViewWidth(registerName)
+            ?? RegisterCoverageBytes(registerName, pointerSize);
+        return TypeSizes.MinimumUnboxedSize(type, pointerSize) <= laneBytes;
+    }
 
     // The CLR stack kinds a scalar register lane can carry: a `w`/`s` lane-0 view
     // sees 4 bytes, a `d`/`x` view sees 8.
