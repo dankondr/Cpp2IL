@@ -1065,7 +1065,7 @@ public static class LocalVariables
             var rivals = HiddenReturnRivals(hiddenReturns, call, buffer, blockOf);
 
             bool Covered(Instruction next, int index) => InsideHiddenReturnWindow(
-                index, callIndex, endIndex, blockOf[next], callBlock, rivals, dominance);
+                index, callIndex, endIndex, callIndex, blockOf[next], callBlock, rivals, dominance);
 
             // The same native stack slot is routinely reused for several different
             // generic struct returns. A CLR local has one fixed type, so model each
@@ -1115,28 +1115,35 @@ public static class LocalVariables
     // branch interleave with the next arm's call in the flat list, and a copy in a
     // merge block reads the cell after the join where no single producer dominates it.
     // The window is therefore the flat list range extended by every block the call
-    // dominates, minus anything a rival call on the same cell dominates without
-    // dominating this call — such a rival writes the cell last on every path to the
-    // read, so the read is its result's, never this call's.
+    // dominates, minus anything a rival call on the same cell reaches without this
+    // call standing between — such a rival writes the cell last on every path to the
+    // read, so the read is its result's, never this call's. Inside one block the
+    // order is the instruction order: a rival ahead of the read and behind the call
+    // shadows it, a rival behind the read or ahead of the call does not.
     private static bool InsideHiddenReturnWindow(
         int index,
-        int callIndex,
+        int windowStart,
         int endIndex,
+        int callFlatIndex,
         Block nextBlock,
         Block callBlock,
-        List<Block> rivals,
+        List<(Block Block, int Index)> rivals,
         DominatorInfo dominance)
     {
-        foreach (var rival in rivals)
-            if (dominance.Dominates(rival, nextBlock) && !dominance.Dominates(rival, callBlock))
+        foreach (var (rivalBlock, rivalIndex) in rivals)
+            if (dominance.Dominates(rivalBlock, nextBlock)
+                    && (rivalBlock != nextBlock || rivalIndex <= index)
+                && !(dominance.Dominates(rivalBlock, callBlock)
+                    && (rivalBlock != callBlock || rivalIndex < callFlatIndex)))
                 return false;
 
-        return index > callIndex && index < endIndex || dominance.Dominates(callBlock, nextBlock);
+        return index > windowStart && index < endIndex || dominance.Dominates(callBlock, nextBlock);
     }
 
     // Other calls writing through the same cell; a read one's block dominates may
-    // belong to it rather than to the earlier call in the list.
-    private static List<Block> HiddenReturnRivals(
+    // belong to it rather than to the earlier call in the list. Each rival keeps its
+    // flat index so calls sharing a block can be ordered against the read.
+    private static List<(Block Block, int Index)> HiddenReturnRivals(
         List<(Instruction Call, LocalVariable Buffer, MethodAnalysisContext Target,
             TypeAnalysisContext ResultType, int Index)> hiddenReturns,
         Instruction call,
@@ -1148,8 +1155,7 @@ public static class LocalVariables
                 && (ReferenceEquals(candidate.Buffer, buffer)
                     || TryStackOffset(candidate.Buffer.Register.Name) is { } candidateOffset
                     && TryStackOffset(buffer.Register.Name) == candidateOffset))
-            .Select(candidate => blockOf[candidate.Call])
-            .Distinct()
+            .Select(candidate => (blockOf[candidate.Call], candidate.Index))
             .ToList();
     }
 
@@ -1209,7 +1215,7 @@ public static class LocalVariables
                     ? result.HiddenReturnBuffer == null || operandIndex == 0 && instruction.IsAssignment
                       || operand is AddressOf && index <= callIndex
                       || !InsideHiddenReturnWindow(index, -1, instructions.Count,
-                          blockOf[instruction], callBlock, rivals, dominance)
+                          callIndex, blockOf[instruction], callBlock, rivals, dominance)
                         ? null
                         : RewriteHiddenReturnStackOperand(operand, result.HiddenReturnBuffer, result,
                             resultType, instruction.NativeMemoryAccessSize ?? 0,
