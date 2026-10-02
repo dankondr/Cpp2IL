@@ -1964,9 +1964,8 @@ public static class IlGenerator
                     // has honest answers - a shared native-int lowering covers
                     // integral/pointer operands, and a zero literal on a managed or
                     // generic operand is the null test - while ordering and
-                    // arithmetic have none, so they default to false/zero: the
-                    // zero after the throw keeps the store below stack-consistent
-                    // (IL2CPP's stack analysis walks that dead tail too).
+                    // arithmetic have none, so they throw; the store below is then
+                    // dead and RemoveDeadThrowTails cuts it.
                     if (unrecoverableIntegerOperation
                         || instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual)
                         || !(TryEmitNativeIntEquality(instruction, context, method, locals, writeLine)
@@ -1975,7 +1974,6 @@ public static class IlGenerator
                         EmitUnrecoverableOperation(method, writeLine, unrecoverableIntegerOperation
                             ? $"Unrecoverable integer operation: {instruction}"
                             : $"Unrecoverable operation: {instruction}");
-                        instructions.Add(CilOpCodes.Ldc_I4_0);
                     }
                     EmitStackCoerceOrDefault(context.AppContext.SystemTypes.SystemInt32Type,
                         StoreContract(instruction.Operands[0], context), method, context);
