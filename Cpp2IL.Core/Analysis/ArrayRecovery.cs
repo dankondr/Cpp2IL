@@ -560,7 +560,7 @@ public static class ArrayRecovery
         return value is >= 0 and <= int.MaxValue ? new Immediate(value) : null;
     }
 
-    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<ApplicationAnalysisContext,
+    internal static readonly System.Runtime.CompilerServices.ConditionalWeakTable<ApplicationAnalysisContext,
         System.Collections.Concurrent.ConcurrentDictionary<ulong, bool>> ArrayNewStubs = new();
 
     internal static bool IsArrayNewWithoutBounds(ApplicationAnalysisContext app, ulong address)

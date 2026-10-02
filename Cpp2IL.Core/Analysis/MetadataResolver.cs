@@ -2596,7 +2596,10 @@ public static class MetadataResolver
                 continue;
             }
 
-            if (instruction.Operands[0] is not Immediate target)
+            // The array-new stub (`mov x2, xzr; b NewFull`) sets its own x2: a MethodInfo* there
+            // is a stale one from an earlier call, never this call's hidden argument.
+            if (instruction.Operands[0] is not Immediate target
+                || ArrayRecovery.IsArrayNewWithoutBounds(method.AppContext, target.UnsignedValue))
                 continue;
 
             // A concrete MethodInfo* in the exact hidden-argument slot is more
