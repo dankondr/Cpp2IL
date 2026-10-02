@@ -3563,25 +3563,38 @@ internal sealed class Arm64VectorScalarizer
         for (var r = 0; r < (pair ? 2 : 1); r++)
         {
             var state = r == 0 ? first : second!;
-            if (slots == 2)
+            var baseOff = insn.MemOffset + r * bytes;
+            if (slots == 2
+                && WideStoreOperand(state) is { } wideOperand)
             {
-                // A 64-bit scalar store is one wide write when both windows
-                // name the same operand (a whole-register or 64-bit value).
-                // Distinct lane operands are per-lane values — a two-float
-                // copy — so split so each half can resolve its own field in
-                // the store target.
-                var lo = state.Slots[0]!.Value;
-                var hi = state.Slots[1]!.Value;
-                if (lo.BitOffset == 0 && hi.BitOffset == 32 && lo.Operand.Equals(hi.Operand))
-                {
-                    IOperand laneMem = insn.MemBase == Arm64Register.X31
-                        ? new StackOffset((int)(insn.MemOffset + r * bytes))
-                        : new MemoryOperand(Reg(insn.MemBase),
-                            addend: insn.MemOffset + r * bytes, accessSize: 8);
-                    _add(_address, OpCode.Move, [laneMem, lo.Operand]).NativeMemoryAccessSize = 8;
-                    _emitted = true;
-                    continue;
-                }
+                // A 64-bit scalar store is one wide write: the operand naming
+                // the register's value — a whole-register slice, an adjacent
+                // field pair's aggregate, a phi-merged register local or the
+                // composed lane value — so the whole 8-byte write resolves
+                // against the destination instead of splitting into a second
+                // window that lands mid-field on a target with no member
+                // there.
+                IOperand wideMem = insn.MemBase == Arm64Register.X31
+                    ? new StackOffset((int)baseOff)
+                    : new MemoryOperand(Reg(insn.MemBase), addend: baseOff);
+                var wideMove = _add(_address, OpCode.Move, [wideMem, wideOperand]);
+                wideMove.NativeStoreWidthBytes = 8;
+                _emitted = true;
+                continue;
+            }
+            if (slots == 4
+                && WholeVectorStoreOperand(state) is { } vectorOperand)
+            {
+                // All four lanes constant (a vector literal the resolver can
+                // store whole), the register's own slices, or four adjacent
+                // fields of one local — a single whole-register write.
+                IOperand vectorMem = insn.MemBase == Arm64Register.X31
+                    ? new StackOffset((int)baseOff)
+                    : new MemoryOperand(Reg(insn.MemBase), addend: baseOff);
+                var vectorMove = _add(_address, OpCode.Move, [vectorMem, vectorOperand]);
+                vectorMove.NativeStoreWidthBytes = 16;
+                _emitted = true;
+                continue;
             }
             for (var slot = 0; slot < slots; slot++)
             {
@@ -3593,13 +3606,94 @@ internal sealed class Arm64VectorScalarizer
                 // pair-store shape so an address-taken local can still widen
                 // into the aggregate the two windows compose.
                 IOperand mem = insn.MemBase == Arm64Register.X31
-                    ? new StackOffset((int)(insn.MemOffset + r * bytes + slot * 4))
-                    : new MemoryOperand(Reg(insn.MemBase), addend: insn.MemOffset + r * bytes + slot * 4);
+                    ? new StackOffset((int)(baseOff + slot * 4))
+                    : new MemoryOperand(Reg(insn.MemBase), addend: baseOff + slot * 4);
                 _add(_address, OpCode.Move, [mem, op]).NativeStoreWidthBytes = 4;
                 _emitted = true;
             }
         }
         return true;
+    }
+
+    /// <summary>
+    /// The operand naming a 64-bit register's whole value for a wide store:
+    /// a single operand sliced over both windows, the adjacent-field pair's
+    /// aggregate, a phi-merged register pair, or the composed lane value.
+    /// </summary>
+    private IOperand? WideStoreOperand(VectorState state)
+    {
+        var lo = state.Slots[0]!.Value;
+        var hi = state.Slots[1]!.Value;
+        if (lo.BitOffset == 0 && hi.BitOffset == 32 && lo.Operand.Equals(hi.Operand))
+            return lo.Operand;
+        return PairStoreOperand(lo, hi)
+               ?? Lane64Operand(state, 0, floatRead: true);
+    }
+
+    /// <summary>
+    /// The operand naming a 128-bit register's whole value for a wide store:
+    /// a vector literal when every lane is constant, the register local when
+    /// every lane is its own slice, or the aggregate when every lane is a
+    /// field of one local at consecutive 4-byte offsets.
+    /// </summary>
+    private IOperand? WholeVectorStoreOperand(VectorState state)
+    {
+        var slots = new List<LaneSlice>(4);
+        var constants = new float[4];
+        var allConstant = true;
+        var allRegister = true;
+        for (var slot = 0; slot < 4; slot++)
+        {
+            var slice = state.Slots[slot]!.Value;
+            slots.Add(slice);
+            allConstant &= ConstantLaneValue(slice.Operand, slice.BitOffset, out constants[slot]);
+            allRegister &= slice.BitOffset == slot * 32
+                           && slice.Operand is Register { Name: not null } reg
+                           && reg.Name == state.Name;
+        }
+        if (allConstant)
+            return new Vector128Literal(constants[0], constants[1], constants[2], constants[3]);
+        if (allRegister)
+            return new Register(null, state.Name);
+        // every lane a field of one local, at consecutive 4-byte offsets:
+        // the store writes the aggregate whole.
+        if (CopyOrigin(slots[0].Operand) is FieldReference { Containers.Count: 0, Local: { } owner } firstField)
+        {
+            var baseOffset = firstField.Offset;
+            var adjacent = true;
+            for (var slot = 1; slot < 4; slot++)
+                adjacent &= CopyOrigin(slots[slot].Operand) is FieldReference
+                            {
+                                Containers.Count: 0, Local: { } other, Offset: var off
+                            }
+                            && ReferenceEquals(other, owner) && off == baseOffset + slot * 4;
+            if (adjacent)
+                return owner;
+        }
+        return null;
+    }
+
+    /// <summary>A lane slice's value as a 32-bit float, when it is constant.</summary>
+    private static bool ConstantLaneValue(IOperand operand, int bitOffset, out float value)
+    {
+        switch (operand)
+        {
+            case Immediate imm when bitOffset == 0:
+                value = BitConverter.Int32BitsToSingle(unchecked((int)imm.UnsignedValue));
+                return true;
+            case Immediate imm when bitOffset == 32:
+                value = BitConverter.Int32BitsToSingle(unchecked((int)(imm.UnsignedValue >> 32)));
+                return true;
+            case FloatLiteral single when bitOffset == 0:
+                value = single.Value;
+                return true;
+            case DoubleLiteral doubleLiteral when bitOffset == 0:
+                value = unchecked((float)doubleLiteral.Value);
+                return true;
+            default:
+                value = 0;
+                return false;
+        }
     }
 
     private static int RegisterBytes(Arm64Register reg) => reg switch
