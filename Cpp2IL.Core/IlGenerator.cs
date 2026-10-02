@@ -12430,13 +12430,17 @@ public static class IlGenerator
                     instructions.Add(CilOpCodes.Call, writeLine);
                     break;
                 }
+                // A struct local stands for its own storage: `[s] = 0` is `s = default`.
                 if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
-                    && memory.Base is LocalVariable local2)
+                    && memory.Base is LocalVariable { Type: { IsValueType: true } structType } structLocal
+                    && IntegralStackWidth(structType) == 0
+                    && structType.FullName is not ("System.Single" or "System.Double"))
                 {
-                    // Can pointer assignments just be ignored because it's C#? (Move [local], 123)
-                    instructions.Add(CilOpCodes.Stloc, locals[local2]);
+                    instructions.Add(CilOpCodes.Stloc, locals[structLocal]);
                     break;
                 }
+                // `[p] = v` through a pointer writes the memory p points at; storing v into p
+                // itself would be a silent wrong value. A store nothing resolved is dropped, said so.
                 instructions.Add(CilOpCodes.Pop);
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Store through unmanaged memory form {memory} could not be emitted; the value was dropped."));
                 instructions.Add(CilOpCodes.Call, writeLine);

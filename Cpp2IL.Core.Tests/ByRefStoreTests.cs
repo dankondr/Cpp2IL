@@ -109,7 +109,12 @@ public class ByRefStoreTests
             if (kind is not ("ordinary" or "unmanaged"))
                 Assert.That(instructions.Any(i => i.Operand is string text && text.StartsWith("Unsupported managed-pointer store")), Is.True);
             else
-                Assert.That(instructions.Any(i => i.OpCode == CilOpCodes.Stloc), Is.True, "Existing non-byref path unchanged");
+            {
+                // A store through a pointer nothing resolved is dropped with its diagnostic -
+                // never stored into the pointer itself.
+                Assert.That(instructions.Any(i => i.OpCode == CilOpCodes.Stloc), Is.False, "Do not overwrite the address local");
+                Assert.That(instructions.Any(i => i.Operand is string text && text.Contains("could not be emitted")), Is.True);
+            }
             return;
         }
         Assert.That(instructions.Any(i => i.OpCode == CilOpCodes.Stloc), Is.False, "Do not overwrite the address local");
