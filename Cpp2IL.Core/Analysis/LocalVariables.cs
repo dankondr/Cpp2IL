@@ -3153,8 +3153,9 @@ public static class LocalVariables
         // comparison reads their offset-0 lane - spell it as the covered
         // field's type there (a `v3 == v3` compare is `v3.x == v3.x`).
         if (laneType == null
-            && left.Type is { IsValueType: true } sameAggregateType
-            && sameAggregateType.FullName == right.Type?.FullName
+            && left is LocalVariable { Type: { IsValueType: true } sameAggregateType }
+            && right is LocalVariable { Type: { } rightLocalType }
+            && sameAggregateType.FullName == rightLocalType.FullName
             && (MetadataResolver.FindCoveredInstanceFieldPathAtOffset(sameAggregateType, 0, 4)
                 ?? MetadataResolver.FindCoveredInstanceFieldPathAtOffset(sameAggregateType, 0, 8)) is { } firstField
             && IsScalarLaneType(firstField.Field.FieldType))
