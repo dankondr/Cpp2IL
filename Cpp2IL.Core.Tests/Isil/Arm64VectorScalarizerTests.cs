@@ -12,14 +12,16 @@ namespace Cpp2IL.Core.Tests.Isil;
 
 public class Arm64VectorScalarizerTests
 {
-    private static List<Instruction> Lift(params uint[] words)
+    private static List<Instruction> Lift(params uint[] words) => LiftAt(0, words);
+
+    private static List<Instruction> LiftAt(ulong baseAddress, params uint[] words)
     {
         Cpp2IlApi.ResetInternalState();
         var app = TestGameLoader.LoadSimple2019Game();
         var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Test",
             app.SystemTypes.SystemVoidType, MethodAttributes.Public | MethodAttributes.Static, []);
         return new NewArmV8InstructionSet().ConvertInstructions(
-            Disassembler.Disassemble(words.SelectMany(BitConverter.GetBytes).ToArray(), 0), context);
+            Disassembler.Disassemble(words.SelectMany(BitConverter.GetBytes).ToArray(), baseAddress), context);
     }
 
     private static bool IsMove(Instruction i, string dest, string src)
@@ -151,15 +153,34 @@ public class Arm64VectorScalarizerTests
     }
 
     [Test]
-    public void UnprovenLaneConsumptionIsDiagnosed()
+    public void SingleStructureLoadProvesLanes()
     {
-        // An LD1 load discards the broadcast's lane provenance (its element
-        // locals are never materialized); extracting a lane afterwards must
-        // leave an explicit diagnostic rather than guess.
+        // A single-structure LD1 materializes every element as a lane local,
+        // so a later extract reads the loaded lane rather than guessing it.
         var il = Lift(
             0x0e040d00, // dup v0.2s, w8
             0x4c407880, // ld1 {v0.4s}, [x4]
             0x0e0c3c08); // mov w8, v0.s[1]
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == OpCode.Move
+                && i.Operands[0] is Register { Name: "V0.S1" }
+                && i.Operands[1] is MemoryOperand { Base: Register { Name: "X4" }, Addend: 4 }), Is.True);
+            Assert.That(il.Any(i => IsMove(i, "X8", "V0.S1")), Is.True,
+                "the extract reads the lane local the load materialized");
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        });
+    }
+
+    [Test]
+    public void UnprovenLaneConsumptionIsDiagnosed()
+    {
+        // A single-element LD1 proves only the lane it writes; extracting a
+        // lane it never loaded must leave an explicit diagnostic, not a guess.
+        var il = Lift(
+            0x4d409140, // ld1 {v0.s}[3], [x10]
+            0x0e043c08); // mov w8, v0.s[0]
 
         Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented
             && i.Operands[0] is StringLiteral s && s.Value.Contains("unproven")), Is.True);
@@ -207,20 +228,246 @@ public class Arm64VectorScalarizerTests
     }
 
     [Test]
-    public void HighLaneOfAReloadedRegisterIsShiftedAgain()
+    public void StoreOfReloadedRegisterReadsReloadedValue()
     {
-        // Two 8-byte copies through d0, each a pair of 4-byte fields. The second
-        // store's high lane is the high half of the second value: reusing the first
-        // store's shifted temporary would copy the first value's lane without a word.
+        // Two 8-byte copies through d0: each store reads the register local —
+        // any carry-over of the first sequence (a cached high-half temporary,
+        // a stale lane) would show the second store reading the first load's
+        // source.
         var il = Lift(
             0xfd402520, // ldr d0, [x9, #0x48]
             0xfc024260, // stur d0, [x19, #0x24]
             0xfd402500, // ldr d0, [x8, #0x48]
             0xfd001a60); // str d0, [x19, #0x30]
 
-        var shifts = il.Where(i => i.OpCode == OpCode.ShiftRight && i.Operands[2] is Immediate { Value: 32 }).ToList();
-        Assert.That(shifts, Has.Count.EqualTo(2), () => string.Join("\n", il));
-        Assert.That(((Register)shifts[0].Operands[0]).Name, Is.Not.EqualTo(((Register)shifts[1].Operands[0]).Name));
+        var stores = il.Where(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand { Base: Register { Name: "X19" } }).ToList();
+        Assert.Multiple(() =>
+        {
+            // each 8-byte store spills its two proven windows: the low window
+            // reads the register local, the high one a shift temp derived from
+            // it — SSA dominance makes the second store's V0 the second load's
+            // value, never a stale temp.
+            Assert.That(stores, Has.Count.EqualTo(4), () => string.Join("\n", il));
+            Assert.That(stores[0].Operands[1], Is.EqualTo(new Register(null, "V0")));
+            Assert.That(stores[2].Operands[1], Is.EqualTo(new Register(null, "V0")));
+            Assert.That(stores.Select(s => ((MemoryOperand)s.Operands[0]).Addend),
+                Is.EqualTo(new long[] { 0x24, 0x28, 0x30, 0x34 }));
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        });
+    }
+
+    [Test]
+    public void StoreOfLaneMixedValueWritesEachWindow()
+    {
+        // A d-store of a value written per lane (fmul .2s) is a two-float copy:
+        // split it so an adjacent-float-fields target resolves each half.
+        // The lane op itself is a Single result and is marked so — without the
+        // mark the element local can inherit an aggregate operand's type.
+        var il = Lift(
+            0xfd402520, // ldr d0, [x9, #0x48]
+            0x0e040d02, // dup v2.2s, w8
+            0x2e22dc00, // fmul v0.2s, v0.2s, v2.2s
+            0xfd001a60); // str d0, [x19, #0x30]
+
+        var stores = il.Where(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand { Base: Register { Name: "X19" } }).ToList();
+        Assert.That(stores, Has.Count.EqualTo(2), () => string.Join("\n", il));
+        Assert.Multiple(() =>
+        {
+            Assert.That(stores[0].Operands[1], Is.EqualTo(new Register(null, "V0.S0")));
+            Assert.That(stores[1].Operands[1], Is.EqualTo(new Register(null, "V0.S1")));
+            var mul = FindOp(il, OpCode.Multiply, "V0.S0");
+            Assert.That(mul, Is.Not.Null);
+            Assert.That(mul!.NativeFloatWidthBits, Is.EqualTo(32));
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        });
+    }
+
+    [Test]
+    public void PairedStoreOfLanesFromOneVectorWritesOneWideStore()
+    {
+        // STP S,S is one 8-byte store: when both lanes were copied out of the
+        // two 32-bit halves of one register, the store names that register so
+        // an aggregate target keeps its type rather than two Single locals.
+        var dup = MakeInsn(m =>
+        {
+            Set(m, "Mnemonic", Arm64Mnemonic.DUP);
+            Set(m, "Op0Kind", Arm64OperandKind.Register);
+            Set(m, "Op0Reg", Arm64Register.V0);
+            Set(m, "Op0Arrangement", Arm64ArrangementSpecifier.TwoS);
+            Set(m, "Op1Kind", Arm64OperandKind.Register);
+            Set(m, "Op1Reg", Arm64Register.W8);
+        });
+        var fmov = MakeInsn(m =>
+        {
+            Set(m, "Mnemonic", Arm64Mnemonic.FMOV);
+            Set(m, "Address", (ulong)4);
+            Set(m, "Op0Kind", Arm64OperandKind.Register);
+            Set(m, "Op0Reg", Arm64Register.S9);
+            Set(m, "Op1Kind", Arm64OperandKind.Register);
+            Set(m, "Op1Reg", Arm64Register.S0);
+        });
+        var ins = MakeInsn(m =>
+        {
+            Set(m, "Mnemonic", Arm64Mnemonic.INS);
+            Set(m, "Address", (ulong)8);
+            Set(m, "Op0Kind", Arm64OperandKind.VectorRegisterElement);
+            Set(m, "Op0Reg", Arm64Register.V8);
+            Set(m, "Op0VectorElement", new Arm64VectorElement(Arm64VectorElementWidth.S, 0));
+            Set(m, "Op1Kind", Arm64OperandKind.VectorRegisterElement);
+            Set(m, "Op1Reg", Arm64Register.V0);
+            Set(m, "Op1VectorElement", new Arm64VectorElement(Arm64VectorElementWidth.S, 1));
+        });
+        var stp = MakeInsn(m =>
+        {
+            Set(m, "Mnemonic", Arm64Mnemonic.STP);
+            Set(m, "Address", (ulong)12);
+            Set(m, "Op0Kind", Arm64OperandKind.Register);
+            Set(m, "Op0Reg", Arm64Register.S9);
+            Set(m, "Op1Kind", Arm64OperandKind.Register);
+            Set(m, "Op1Reg", Arm64Register.S8);
+            Set(m, "MemBase", Arm64Register.X19);
+            Set(m, "MemOffset", (long)8);
+            Set(m, "MemIndexMode", Arm64MemoryIndexMode.Offset);
+            Set(m, "MemAddendReg", Arm64Register.INVALID);
+        });
+
+        var emitted = new List<Instruction>();
+        Instruction Add(ulong address, OpCode opCode, List<IOperand> operands)
+        {
+            var insn = new Instruction(emitted.Count, opCode, operands);
+            emitted.Add(insn);
+            return insn;
+        }
+        // operand conversion names the register each operand position reads
+        Func<Arm64Instruction, int, IOperand> conv = (insn, op) => new Register(null,
+            (op == 0 ? insn.Op0Reg : insn.Op1Reg) switch
+            {
+                Arm64Register.S9 => "V9",
+                Arm64Register.S8 => "V8",
+                Arm64Register.S0 => "V0",
+                Arm64Register.S1 => "V1",
+                var r => r.ToString()
+            });
+
+        var scalarizer = new Arm64VectorScalarizer();
+        scalarizer.Begin([dup, fmov, ins, stp]);
+        scalarizer.TryBroadcastDup(dup, Add, conv);
+        scalarizer.BeginInstruction(fmov, Add);
+        scalarizer.TryConvert(fmov, Add, conv);
+        scalarizer.BeginInstruction(ins, Add);
+        scalarizer.TryConvert(ins, Add, conv);
+        scalarizer.BeginInstruction(stp, Add);
+        scalarizer.TryConvert(stp, Add, conv);
+
+        var stores = emitted.Where(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand { Base: Register { Name: "X19" } }).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(stores, Has.Count.EqualTo(1), () => string.Join("\n", emitted));
+            Assert.That(stores[0].Operands[1], Is.EqualTo(new Register(null, "V0")));
+            Assert.That(stores[0].NativeMemoryAccessSize, Is.EqualTo(8));
+            Assert.That(emitted.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        });
+    }
+
+    [Test]
+    public void PairedStoreOfUnrelatedLanesWritesEachWindow()
+    {
+        // Two singles that did not come from one value are still one 8-byte
+        // hardware store, but no single operand names them: split so each
+        // half resolves its own field in the store target.
+        var dup0 = MakeInsn(m =>
+        {
+            Set(m, "Mnemonic", Arm64Mnemonic.DUP);
+            Set(m, "Op0Kind", Arm64OperandKind.Register);
+            Set(m, "Op0Reg", Arm64Register.V0);
+            Set(m, "Op0Arrangement", Arm64ArrangementSpecifier.TwoS);
+            Set(m, "Op1Kind", Arm64OperandKind.Register);
+            Set(m, "Op1Reg", Arm64Register.W8);
+        });
+        var dup1 = MakeInsn(m =>
+        {
+            Set(m, "Mnemonic", Arm64Mnemonic.DUP);
+            Set(m, "Address", (ulong)4);
+            Set(m, "Op0Kind", Arm64OperandKind.Register);
+            Set(m, "Op0Reg", Arm64Register.V1);
+            Set(m, "Op0Arrangement", Arm64ArrangementSpecifier.TwoS);
+            Set(m, "Op1Kind", Arm64OperandKind.Register);
+            Set(m, "Op1Reg", Arm64Register.W9);
+        });
+        var fmovLo = MakeInsn(m =>
+        {
+            Set(m, "Mnemonic", Arm64Mnemonic.FMOV);
+            Set(m, "Address", (ulong)8);
+            Set(m, "Op0Kind", Arm64OperandKind.Register);
+            Set(m, "Op0Reg", Arm64Register.S9);
+            Set(m, "Op1Kind", Arm64OperandKind.Register);
+            Set(m, "Op1Reg", Arm64Register.S0);
+        });
+        var fmovHi = MakeInsn(m =>
+        {
+            Set(m, "Mnemonic", Arm64Mnemonic.FMOV);
+            Set(m, "Address", (ulong)12);
+            Set(m, "Op0Kind", Arm64OperandKind.Register);
+            Set(m, "Op0Reg", Arm64Register.S8);
+            Set(m, "Op1Kind", Arm64OperandKind.Register);
+            Set(m, "Op1Reg", Arm64Register.S1);
+        });
+        var stp = MakeInsn(m =>
+        {
+            Set(m, "Mnemonic", Arm64Mnemonic.STP);
+            Set(m, "Address", (ulong)16);
+            Set(m, "Op0Kind", Arm64OperandKind.Register);
+            Set(m, "Op0Reg", Arm64Register.S9);
+            Set(m, "Op1Kind", Arm64OperandKind.Register);
+            Set(m, "Op1Reg", Arm64Register.S8);
+            Set(m, "MemBase", Arm64Register.X19);
+            Set(m, "MemOffset", (long)8);
+            Set(m, "MemIndexMode", Arm64MemoryIndexMode.Offset);
+            Set(m, "MemAddendReg", Arm64Register.INVALID);
+        });
+
+        var emitted = new List<Instruction>();
+        Instruction Add(ulong address, OpCode opCode, List<IOperand> operands)
+        {
+            var insn = new Instruction(emitted.Count, opCode, operands);
+            emitted.Add(insn);
+            return insn;
+        }
+        // operand conversion names the register each operand position reads
+        Func<Arm64Instruction, int, IOperand> conv = (insn, op) => new Register(null,
+            (op == 0 ? insn.Op0Reg : insn.Op1Reg) switch
+            {
+                Arm64Register.S9 => "V9",
+                Arm64Register.S8 => "V8",
+                Arm64Register.S0 => "V0",
+                Arm64Register.S1 => "V1",
+                var r => r.ToString()
+            });
+
+        var scalarizer = new Arm64VectorScalarizer();
+        scalarizer.Begin([dup0, dup1, fmovLo, fmovHi, stp]);
+        scalarizer.TryBroadcastDup(dup0, Add, conv);
+        scalarizer.BeginInstruction(dup1, Add);
+        scalarizer.TryBroadcastDup(dup1, Add, conv);
+        scalarizer.BeginInstruction(fmovLo, Add);
+        scalarizer.TryConvert(fmovLo, Add, conv);
+        scalarizer.BeginInstruction(fmovHi, Add);
+        scalarizer.TryConvert(fmovHi, Add, conv);
+        scalarizer.BeginInstruction(stp, Add);
+        scalarizer.TryConvert(stp, Add, conv);
+
+        var stores = emitted.Where(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand { Base: Register { Name: "X19" } }).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(stores, Has.Count.EqualTo(2), () => string.Join("\n", emitted));
+            Assert.That(stores[0].Operands[1], Is.EqualTo(new Register(null, "V9")));
+            Assert.That(stores[1].Operands[1], Is.EqualTo(new Register(null, "V8")));
+            Assert.That(emitted.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        });
     }
 
     [Test]
@@ -244,7 +491,8 @@ public class Arm64VectorScalarizerTests
     {
         // v1 is never written and the post-indexed ldr v0 has no lane
         // provenance: the fold must not fire and the caller's whole-register
-        // path runs unchanged.
+        // path runs unchanged. The extract of v1's never-written lane 1 is
+        // diagnosed at the instruction — an unwritten lane has no proven value.
         var il = Lift(
             0x3cc01500, // ldr v0, [x8], #0x1
             0x0e201c23, // and v3.8b, v1.8b, v0.8b
@@ -254,38 +502,37 @@ public class Arm64VectorScalarizerTests
         {
             Assert.That(il.Any(i => i.OpCode == OpCode.And
                 && i.Operands[0] is Register r && r.Name == "V3"), Is.True);
-            Assert.That(il.Any(i => IsMove(i, "X8", "V1.S1")), Is.True);
-            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+            Assert.That(il.Any(i => IsMove(i, "X8", "V1.S1")), Is.False);
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.True);
         });
     }
 
     [Test]
-    public void PermutedVectorIsNotScalarized()
+    public void PermutedVectorScalarizes()
     {
-        // zip1 permutes lanes; the scalarizer cannot describe it, so the
-        // destination stays opaque and a later extract hits the normal path.
+        // zip1 interleaves lanes: v2 = [v1.s0, v2.s0] — each destination lane
+        // names a proven source lane, so a later extract reads the element local
         var il = Lift(
             0x0e040d02, // dup v2.2s, w8
             0x0e823822, // zip1 v2.2s, v1.2s, v2.2s
             0x0e0c3c48); // mov w8, v2.s[1]
 
-        // tracked-then-poisoned: explicit diagnostic, no guessed extraction
-        Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.True);
-        Assert.That(il.Any(i => IsMove(i, "X8", "V2.S1")), Is.False);
+        Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        Assert.That(il.Any(i => IsMove(i, "X8", "V2.S1")), Is.True);
     }
 
     [Test]
-    public void DupOfElementBroadcastsTheSourceLane()
+    public void DupOfUnwrittenElementIsDiagnosed()
     {
-        // dup v0.4s, v9.s[2]: v9 is opaque, so the broadcast reads its element
-        // local — but every produced lane is still proven (each equals that source).
+        // dup v0.4s, v9.s[2]: element 2 of a never-written register has no
+        // proven value — the broadcast is diagnosed, not guessed into lanes.
         var il = Lift(0x4e140520);
 
         Assert.Multiple(() =>
         {
-            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
-            for (var lane = 0; lane < 4; lane++)
-                Assert.That(il.Any(i => IsMove(i, $"V0.S{lane}", "V9.S2")), Is.True);
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.True);
+            Assert.That(il.Any(i => i.OpCode == OpCode.Move
+                && i.Operands[0] is Register { Name: { } n } && n.StartsWith("V0.")), Is.False);
         });
     }
 
@@ -306,14 +553,26 @@ public class Arm64VectorScalarizerTests
     }
 
     [Test]
-    public void ProvenanceResetsAtMergeTargets()
+    public void MergeOfWrittenAndEntryEdgesStaysUnproven()
     {
-        // A branch target may be reached by a path that never built the vector,
-        // so provenance must drop there: the extract at the target returns to
-        // the normal path instead of folding.
+        // A lane merged from two predecessors: the CBZ edge never wrote V0 so
+        // its lane 1 is only the entry value — it can name the element local
+        // V0.S1 only if that local is defined at method entry, which is a
+        // lane:types-ssa question — while the B edge wrote it via DUP. The
+        // merge cannot express that phi, so the window stays unproven and the
+        // extract diagnoses rather than guessing.
+        var entryBranch = MakeInsn(m =>
+        {
+            Set(m, "Mnemonic", Arm64Mnemonic.CBZ);
+            Set(m, "Address", (ulong)0);
+            Set(m, "Op0Kind", Arm64OperandKind.Register);
+            Set(m, "Op0Reg", Arm64Register.W9);
+            Set(m, "Op1Imm", (long)16); // target = Address + Op1Imm = 16
+        });
         var dup = MakeInsn(m =>
         {
             Set(m, "Mnemonic", Arm64Mnemonic.DUP);
+            Set(m, "Address", (ulong)4);
             Set(m, "Op0Kind", Arm64OperandKind.Register);
             Set(m, "Op0Reg", Arm64Register.V0);
             Set(m, "Op0Arrangement", Arm64ArrangementSpecifier.TwoS);
@@ -323,14 +582,14 @@ public class Arm64VectorScalarizerTests
         var branch = MakeInsn(m =>
         {
             Set(m, "Mnemonic", Arm64Mnemonic.B);
-            Set(m, "Address", (ulong)4);
+            Set(m, "Address", (ulong)8);
             Set(m, "Op0Kind", Arm64OperandKind.ImmediatePcRelative);
-            Set(m, "Op0Imm", (long)4); // BranchTarget = Address + Op0Imm = 8
+            Set(m, "Op0Imm", (long)8); // BranchTarget = Address + Op0Imm = 16
         });
         var extract = MakeInsn(m =>
         {
             Set(m, "Mnemonic", Arm64Mnemonic.MOV);
-            Set(m, "Address", (ulong)8);
+            Set(m, "Address", (ulong)16);
             Set(m, "Op0Kind", Arm64OperandKind.Register);
             Set(m, "Op0Reg", Arm64Register.W8);
             Set(m, "Op1Kind", Arm64OperandKind.VectorRegisterElement);
@@ -348,15 +607,19 @@ public class Arm64VectorScalarizerTests
         Func<Arm64Instruction, int, IOperand> conv = (_, _) => new Register(null, "X8");
 
         var scalarizer = new Arm64VectorScalarizer();
-        scalarizer.Begin([dup, branch, extract]);
+        scalarizer.Begin([entryBranch, dup, branch, extract]);
+        scalarizer.BeginInstruction(entryBranch, Add);
         scalarizer.TryBroadcastDup(dup, Add, conv);
-        scalarizer.BeginInstruction(4); // the branch itself
-        scalarizer.BeginInstruction(8); // merge target: provenance dropped
+        scalarizer.BeginInstruction(branch, Add);
+        scalarizer.BeginInstruction(extract, Add); // merge target: V0.S1 meets an unwritten edge
         Assert.Multiple(() =>
         {
-            Assert.That(scalarizer.TryConvert(extract, Add, conv), Is.False,
-                "extract at a merge target must fall back to the normal path");
-            Assert.That(emitted.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+            Assert.That(scalarizer.TryConvert(extract, Add, conv), Is.True,
+                "an unproven merge lane is diagnosed, not left to guess");
+            Assert.That(emitted.Any(i => i.OpCode == OpCode.NotImplemented
+                && i.Operands[0] is StringLiteral s && s.Value.Contains("unproven")), Is.True);
+            Assert.That(emitted.Any(i => i.OpCode == OpCode.Move
+                && i.Operands[1] is Register { Name: "V0.S1" }), Is.False);
         });
     }
 
@@ -398,7 +661,7 @@ public class Arm64VectorScalarizerTests
         var scalarizer = new Arm64VectorScalarizer();
         scalarizer.Begin([]);
         scalarizer.TryBroadcastDup(dup, Add, (_, _) => new Register(null, "X8"));
-        scalarizer.BeginInstruction(4);
+        scalarizer.BeginInstruction(ushr, Add);
         Assert.That(scalarizer.TryConvert(ushr, Add, (_, _) => throw new InvalidOperationException()), Is.True);
 
         Assert.Multiple(() =>
@@ -483,9 +746,9 @@ public class Arm64VectorScalarizerTests
         var scalarizer = new Arm64VectorScalarizer();
         scalarizer.Begin([dup, call, add]);
         scalarizer.TryBroadcastDup(dup, Add, conv);
-        scalarizer.BeginInstruction(4);
+        scalarizer.BeginInstruction(call, Add);
         scalarizer.NoteUnhandled(call);
-        scalarizer.BeginInstruction(8); // BL just invalidated every tracked lane
+        scalarizer.BeginInstruction(add, Add); // BL just invalidated every tracked lane
         Assert.That(scalarizer.TryConvert(add, Add, conv), Is.False,
             "the consumer after a direct call must fall back, not reuse stale v0 lanes");
     }
@@ -534,9 +797,9 @@ public class Arm64VectorScalarizerTests
         var scalarizer = new Arm64VectorScalarizer();
         scalarizer.Begin([dup, undecoded, add]);
         scalarizer.TryBroadcastDup(dup, Add, conv);
-        scalarizer.BeginInstruction(4);
+        scalarizer.BeginInstruction(undecoded, Add);
         scalarizer.NoteUnhandled(undecoded); // Op0Kind None — unidentifiable destination
-        scalarizer.BeginInstruction(8);
+        scalarizer.BeginInstruction(add, Add);
         Assert.That(scalarizer.TryConvert(add, Add, conv), Is.False,
             "the consumer after an undecoded word must fall back, not reuse stale v0 lanes");
     }
@@ -563,6 +826,206 @@ public class Arm64VectorScalarizerTests
         });
     }
 
+    [Test]
+    public void MergedLaneFromTwoPredecessorsFeedsPackedMultiply()
+    {
+        // A vector register is a tuple of lanes: two paths build V0/V2
+        // differently (a DUP broadcast versus an LDR D pair), and the FMUL
+        // below the merge still lifts as one scalar multiply per lane.
+        // Lane 0's canonical home is the register local itself — its low
+        // 32 bits are the lane and the field-recovery layer resolves a
+        // whole-register read as that window — so the merged lane-0 op
+        // reads V0/V2 while lane 1 reads the element locals V0.S1/V2.S1.
+        var il = Lift(
+            0x34000088, // cbz w8, #0x10        -> else-path
+            0x0e040d00, // dup v0.2s, w8         then: broadcast
+            0x0e040d02, // dup v2.2s, w8
+            0x54000061, // b.ne #0x18            -> merge (ConditionalJump, not a tail call)
+            0xfd400100, // ldr d0, [x8]          else: two floats
+            0xfd400902, // ldr d2, [x8, #0x10]
+            0x2e22dc00, // fmul v0.2s, v0.2s, v2.2s   merge: both preds prove V0/V2
+            0xfd000100); // str d0, [x8]
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+            var lo = FindOp(il, OpCode.Multiply, "V0.S0");
+            var hi = FindOp(il, OpCode.Multiply, "V0.S1");
+            Assert.That(lo, Is.Not.Null);
+            Assert.That(hi, Is.Not.Null);
+            Assert.That(lo!.Operands[1], Is.EqualTo(new Register(null, "V0")));
+            Assert.That(lo.Operands[2], Is.EqualTo(new Register(null, "V2")));
+            Assert.That(hi!.Operands[1], Is.EqualTo(new Register(null, "V0.S1")));
+            Assert.That(hi.Operands[2], Is.EqualTo(new Register(null, "V2.S1")));
+        });
+    }
+
+    [Test]
+    public void InsAndDupFeedPackedDivide()
+    {
+        // INS copies one element across registers, DUP broadcasts an element
+        // over a register, and the packed FDIV reads each lane's value.
+        var il = Lift(
+            0xfd400100, // ldr d0, [x8]
+            0xfd400902, // ldr d2, [x8, #0x10]
+            0xfd401101, // ldr d1, [x8, #0x20]
+            0xfd401903, // ldr d3, [x8, #0x30]
+            0x6e0c0462, // mov v2.s[1], v3.s[0]
+            0x0e040420, // dup v0.2s, v1.s[0]
+            0x2e20fc40, // fdiv v0.2s, v2.2s, v0.2s
+            0xfd000100); // str d0, [x8]
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+            Assert.That(il.Any(i => IsMove(i, "V2.S1", "V3")), Is.True); // INS
+            Assert.That(il.Any(i => IsMove(i, "V0.S0", "V1")), Is.True); // DUP
+            Assert.That(il.Any(i => IsMove(i, "V0.S1", "V1")), Is.True);
+            var lo = FindOp(il, OpCode.Divide, "V0.S0");
+            var hi = FindOp(il, OpCode.Divide, "V0.S1");
+            Assert.That(lo, Is.Not.Null);
+            Assert.That(hi, Is.Not.Null);
+            Assert.That(lo!.Operands[1], Is.EqualTo(new Register(null, "V2")));
+            Assert.That(lo.Operands[2], Is.EqualTo(new Register(null, "V0.S0")));
+            Assert.That(hi!.Operands[1], Is.EqualTo(new Register(null, "V2.S1")));
+            Assert.That(hi.Operands[2], Is.EqualTo(new Register(null, "V0.S1")));
+        });
+    }
+
+    [Test]
+    public void DoubleFieldLoadIsNotSplit()
+    {
+        // ldr d0 on an untyped location could carry a double — it must stay
+        // one wide register-local value; only a location proven to hold
+        // adjacent float fields may split into lanes.
+        var il = Lift(
+            0xfd400000, // ldr d0, [x0]
+            0xfd000020); // str d0, [x1]
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == OpCode.Move
+                && i.Operands[0] is Register { Name: "V0" }
+                && i.Operands[1] is MemoryOperand), Is.True,
+                "the D load stays one wide move into the register local");
+            Assert.That(il.Any(i => i.OpCode == OpCode.Move
+                && i.Operands[0] is Register { Name: "V0.S0" }
+                && i.Operands[1] is MemoryOperand), Is.False,
+                "an untyped 8-byte location must not split into lane loads");
+        });
+    }
+
+    [Test]
+    public void PermutesMoveLanesIntoElementLocals()
+    {
+        // EXT/ZIP/UZP/TRN/REV are pure permutations: each destination lane is a
+        // verbatim copy of one source lane — the element local that holds it.
+        var il = Lift(
+            0x4e040d01, // dup v1.4s, w8
+            0x4e040d22, // dup v2.4s, w9
+            0x6e026024, // ext v4.16b, v1.16b, v2.16b, #0xc -> [v1.s3, v2.s0..s2]
+            0x4e823826, // zip1 v6.4s, v1.4s, v2.4s          -> [v1.s0, v2.s0, v1.s1, v2.s1]
+            0x4e82184c, // uzp1 v12.4s, v2.4s, v2.4s        -> [v2.s0, v2.s2, v2.s0, v2.s2]
+            0x4ea0082a); // rev64 v10.4s, v1.4s             -> [v1.s1, v1.s0, v1.s3, v1.s2]
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+            Assert.That(il.Any(i => IsMove(i, "V4.S0", "V1.S3")), Is.True); // EXT
+            Assert.That(il.Any(i => IsMove(i, "V4.S1", "V2.S0")), Is.True);
+            Assert.That(il.Any(i => IsMove(i, "V6.S0", "V1.S0")), Is.True); // ZIP1
+            Assert.That(il.Any(i => IsMove(i, "V6.S1", "V2.S0")), Is.True);
+            Assert.That(il.Any(i => IsMove(i, "V12.S0", "V2.S0")), Is.True); // UZP1
+            Assert.That(il.Any(i => IsMove(i, "V12.S1", "V2.S2")), Is.True);
+            Assert.That(il.Any(i => IsMove(i, "V10.S0", "V1.S1")), Is.True); // REV64
+            Assert.That(il.Any(i => IsMove(i, "V10.S1", "V1.S0")), Is.True);
+        });
+    }
+
+    [Test]
+    public void ReplicateLoadBroadcastsEveryLane()
+    {
+        // LD1R loads one element into every lane: one memory read feeds each
+        // element local.
+        var il = Lift(
+            0x4d40c900, // ld1r {v0.4s}, [x8]
+            0xfd000100); // str d0, [x8]
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+            for (var lane = 0; lane < 4; lane++)
+                Assert.That(il.Any(i => i.OpCode == OpCode.Move
+                    && i.Operands[0] is Register { Name: var n } && n == $"V0.S{lane}"
+                    && i.Operands[1] is MemoryOperand { Addend: 0 }), Is.True,
+                    $"lane {lane} must read the same memory");
+        });
+    }
+
+    [Test]
+    public void StructureLoadMaterializesLanes()
+    {
+        // LD1 (multiple structures) is a contiguous fill: register k's window
+        // j reads mem + k*regBytes + 4*j.
+        var il = Lift(
+            0x0c40a900, // ld1 {v0.2s, v1.2s}, [x8]
+            0xfd000100); // str d0, [x8]
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+            Assert.That(il.Any(i => i.OpCode == OpCode.Move
+                && i.Operands[0] is Register { Name: "V0.S1" }
+                && i.Operands[1] is MemoryOperand { Addend: 4 }), Is.True);
+            Assert.That(il.Any(i => i.OpCode == OpCode.Move
+                && i.Operands[0] is Register { Name: "V1.S0" }
+                && i.Operands[1] is MemoryOperand { Addend: 8 }), Is.True);
+            Assert.That(il.Any(i => i.OpCode == OpCode.Move
+                && i.Operands[0] is Register { Name: "V1.S1" }
+                && i.Operands[1] is MemoryOperand { Addend: 12 }), Is.True);
+        });
+    }
+
+    [Test]
+    public void BackwardEdgeLeavesLanesUnproven()
+    {
+        // A lane whose value is not proven stays diagnosed: a backward edge
+        // (a loop) has no converted predecessor state to merge, so extracting
+        // a lane under the loop head reports rather than guessing an element
+        // local no edge materialized.
+        var il = Lift(
+            0xfd400100, // ldr d0, [x8]
+            0xfd400902, // ldr d2, [x8, #0x10]
+            0x2e22dc00, // fmul v0.2s, v0.2s, v2.2s   loop head: back-edge pred unconverted
+            0x35ffffe9, // cbnz w9, #-4            -> the fmul: a backward edge
+            0x0e0c3c08); // mov w8, v0.s[1]         consumes the loop-carried lane
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented
+                && i.Operands[0] is StringLiteral s && s.Value.Contains("unproven")), Is.True,
+                () => string.Join("\n", il));
+            Assert.That(il.Any(i => IsMove(i, "X8", "V0.S1")), Is.False,
+                "a lane under an unconverted backward edge must not be guessed");
+        });
+    }
+
+    [Test]
+    public void EntryScalarReadUsesRegisterLocal()
+    {
+        // Element 0 of a never-written register is its own scalar home: a
+        // signature's float/aggregate argument lives in the register local,
+        // so the extract reads it — higher lanes have no proven value.
+        var il = Lift(
+            0x0e043c08); // mov w8, v0.s[0]
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => IsMove(i, "X8", "V0")), Is.True);
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        });
+    }
+
     // Arm64Instruction is a struct with internal setters: build it boxed so
     // the properties mutate the same instance that gets returned.
     private static Arm64Instruction MakeInsn(Action<object> init)
@@ -574,4 +1037,446 @@ public class Arm64VectorScalarizerTests
 
     private static void Set(object insn, string property, object value)
         => typeof(Arm64Instruction).GetProperty(property)!.SetValue(insn, value);
+
+    [Test]
+    public void ConditionalBranchKeepsFallThroughLanes()
+    {
+        // b.cond shares the B mnemonic with the unconditional branch in Disarm
+        // — only the conditional-branch category separates them. Treating it
+        // as unconditional clears lane state on the fall-through path, so the
+        // next instruction's edge snapshot is empty and the merge reports the
+        // insert's source lane unproven.
+        var il = LiftAt(0x180001000,
+            0x2f00e400, // movi d0, #0            seeds V0's lanes
+            0x7100011f, // cmp w8, #0
+            0x54000060, // b.eq +0x0c           one edge into the merge
+            0x14000002, // b +0x08             the other edge — its snapshot
+                        //                    was empty when b.eq cleared
+            0x52800028, // mov w8, #1          dead bytes after the branch
+            0x6e0c0401, // mov v1.s[1], v0.s[0] reads the merged lane
+            0xd65f03c0); // ret
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented
+                && i.Operands[0] is StringLiteral s && s.Value.Contains("unproven")), Is.False,
+                () => string.Join("\n", il));
+            Assert.That(il.Any(i => IsMove(i, "V1.S1", "V0")), Is.True,
+                "both edges carry the lane through the conditional branch");
+        });
+    }
+
+    [Test]
+    public void ScalarDoubleStoreSpillsAsTwoWindowStores()
+    {
+        // A `str d` of a register an `ldr d` just filled spills each 32-bit
+        // window to its own store — a scratch-base load keeps no memory
+        // provenance, but the register's own lanes are proven, and the
+        // resolver narrows each window back to the loaded field: adjacent
+        // float members get their two member stores.
+        var il = Lift(
+            0xfd400e60, // ldr d0, [x19, #0x18]
+            0xfd402100, // ldr d0, [x8, #0x40]
+            0xfd001280); // str d0, [x20, #0x20]
+
+        var stores = il.Where(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand { Base: Register { Name: "X20" } }).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(stores, Has.Count.EqualTo(2), () => string.Join("\n", il));
+            Assert.That(stores.Select(s => ((MemoryOperand)s.Operands[0]).Addend),
+                Is.EqualTo(new long[] { 0x20, 0x24 }));
+            foreach (var store in stores)
+                Assert.That(((MemoryOperand)store.Operands[0]).AccessSize, Is.EqualTo(4));
+            Assert.That(stores[0].Operands[1], Is.EqualTo(new Register(null, "V0")));
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False,
+                () => string.Join("\n", il));
+        });
+    }
+
+    [Test]
+    public void PairStoreOfAdjacentVectorLoadsIsOneStructCopy()
+    {
+        // `ldp q1, q0` + `stp q1, q0` copies 32 bytes of one range to another —
+        // the classic struct copy a C compiler emits for `dst = src` on a
+        // 32-byte struct. Emit a single memory-to-memory move so the resolver
+        // stores the whole aggregate instead of truncating to one field.
+        var il = Lift(
+            0xad410001, // ldp q1, q0, [x0, #0x20]
+            0xad000021); // stp q1, q0, [x1]
+
+        var stores = il.Where(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand { Base: Register { Name: "X1" } }).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(stores, Has.Count.EqualTo(1), () => string.Join("\n", il));
+            Assert.That((MemoryOperand)stores[0].Operands[0],
+                Is.EqualTo(new MemoryOperand(new Register(null, "X1"), accessSize: 32)));
+            Assert.That(stores[0].Operands[1], Is.EqualTo(
+                new MemoryOperand(new Register(null, "X0"), addend: 0x20, accessSize: 32)));
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        });
+    }
+
+    [Test]
+    public void VectorStoreOfReloadedRegisterIsMemoryCopy()
+    {
+        var il = Lift(
+            0x3dc00400, // ldr q0, [x0, #0x10]
+            0x3d800020); // str q0, [x1]
+
+        var stores = il.Where(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand { Base: Register { Name: "X1" } }).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(stores, Has.Count.EqualTo(1), () => string.Join("\n", il));
+            Assert.That((MemoryOperand)stores[0].Operands[0],
+                Is.EqualTo(new MemoryOperand(new Register(null, "X1"), accessSize: 16)));
+            Assert.That(stores[0].Operands[1], Is.EqualTo(
+                new MemoryOperand(new Register(null, "X0"), addend: 0x10, accessSize: 16)));
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        });
+    }
+
+    [Test]
+    public void ZeroVectorStoresEmitPerWindowImmediates()
+    {
+        // `movi` + vector stores is the compiler's struct/array zero-fill: the
+        // store is spelled one 4-byte Move per window — a base whose element
+        // type is not yet proven resolves each window to its own field (a
+        // 16-byte store would resolve to the single field at its addend and
+        // drop the rest), and a typed base still merges the run into initobj.
+        var il = Lift(
+            0x6f00e400, // movi v0.2d, #0
+            0xad008120, // stp q0, q0, [x9, #0x10]
+            0x3d800120); // str q0, [x9]
+
+        var stores = il.Where(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand { Base: Register { Name: "X9" } }).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(stores, Has.Count.EqualTo(12), () => string.Join("\n", il));
+            Assert.That(stores.Select(s => ((MemoryOperand)s.Operands[0]).Addend),
+                Is.EqualTo(new long[] {
+                    0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C,
+                    0x00, 0x04, 0x08, 0x0C }));
+            foreach (var store in stores)
+            {
+                Assert.That(((MemoryOperand)store.Operands[0]).AccessSize, Is.EqualTo(4));
+                Assert.That(store.Operands[1], Is.EqualTo(new Immediate(0, 4)));
+            }
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        });
+    }
+
+    [Test]
+    public void CalleeSavedVectorLaneStaysProvableThroughLoopWithCall()
+    {
+        // `scvtf s8` before the loop writes a callee-saved lane: a call in the
+        // loop body clobbers only V8-V15's upper halves, and the join merge
+        // sees both edges still prove the lane — `str s8` inside the loop
+        // stores it instead of diagnosing an unproven lane.
+        var il = Lift(
+            0x1e220008, // scvtf s8, w0
+            0x34000041, // cbz w1, ->join
+            0xd63f0100, // blr x8
+            0xbd000028, // join: str s8, [x1]
+            0x54ffffa1, // b.ne ->scvtf+4 (loop)
+            0xd65f03c0); // ret
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == OpCode.Move
+                && i.Operands[0] is MemoryOperand { Base: Register { Name: "X1" } }), Is.True,
+                () => string.Join("\n", il));
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False,
+                () => string.Join("\n", il));
+        });
+    }
+
+    [Test]
+    public void DoubleLoadAndStoreSpillsAsTwoWindowStores()
+    {
+        // `ldr d8` of two adjacent floats keeps its lanes proven: `str d8`
+        // stores each 32-bit window separately, so the resolver narrows every
+        // window back to the loaded field — a single eight-byte copy could
+        // only name the first covered member.
+        var il = Lift(
+            0xfd401408, // ldr d8, [x0, #0x28]
+            0xfd001428); // str d8, [x1, #0x28]
+
+        var stores = il.Where(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand { Base: Register { Name: "X1" } }).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(stores, Has.Count.EqualTo(2), () => string.Join("\n", il));
+            Assert.That((MemoryOperand)stores[0].Operands[0],
+                Is.EqualTo(new MemoryOperand(new Register(null, "X1"), addend: 0x28, accessSize: 4)));
+            Assert.That((MemoryOperand)stores[1].Operands[0],
+                Is.EqualTo(new MemoryOperand(new Register(null, "X1"), addend: 0x2c, accessSize: 4)));
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        });
+    }
+
+    [Test]
+    public void DoubleStoreOfScalarValueWritesOneWideStore()
+    {
+        // `fmov d0, x0` leaves v0 holding one 64-bit scalar: `str d` stores the
+        // register's low and high halves of that one operand, so emit the
+        // eight-byte store a double member resolves whole.
+        var il = Lift(
+            0x9e670000, // fmov d0, x0
+            0xfd000420); // str d0, [x1, #0x8]
+
+        var stores = il.Where(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand { Base: Register { Name: "X1" } }).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(stores, Has.Count.EqualTo(1), () => string.Join("\n", il));
+            Assert.That((MemoryOperand)stores[0].Operands[0],
+                Is.EqualTo(new MemoryOperand(new Register(null, "X1"), addend: 0x8, accessSize: 8)));
+            Assert.That(stores[0].Operands[1], Is.EqualTo(new Register(null, "V0")));
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        });
+    }
+}
+
+public class Arm64VectorScalarizerIndexedStoreTests
+{
+    private static List<Instruction> Lift(params uint[] words) => LiftAt(0, words);
+
+    private static List<Instruction> LiftAt(ulong baseAddress, params uint[] words)
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Test",
+            app.SystemTypes.SystemVoidType, MethodAttributes.Public | MethodAttributes.Static, []);
+        return new NewArmV8InstructionSet().ConvertInstructions(
+            Disassembler.Disassemble(words.SelectMany(BitConverter.GetBytes).ToArray(), baseAddress), context);
+    }
+
+    [Test]
+    public void PairedVectorLoadStoreCopiesWholeRange()
+    {
+        // ldp q1,q0 loads a 32-byte range; stp q1,q0 stores it back — one
+        // memory-to-memory move, not per-field stores that truncate the copy.
+        var il = Lift(
+            0xad410001, // ldp q1, q0, [x0, #0x20]
+            0xad000021); // stp q1, q0, [x1]
+
+        var copies = il.Where(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand && i.Operands[1] is MemoryOperand).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(copies, Has.Count.EqualTo(1), () => string.Join("\n", il));
+            var dst = (MemoryOperand)copies[0].Operands[0];
+            var src = (MemoryOperand)copies[0].Operands[1];
+            Assert.That(dst.Base, Is.EqualTo(new Register(null, "X1")));
+            Assert.That(dst.Addend, Is.EqualTo(0));
+            Assert.That(dst.AccessSize, Is.EqualTo(32));
+            Assert.That(src.Base, Is.EqualTo(new Register(null, "X0")));
+            Assert.That(src.Addend, Is.EqualTo(0x20));
+            Assert.That(src.AccessSize, Is.EqualTo(32));
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        });
+    }
+
+    [Test]
+    public void PostIndexedVectorStoreWritesBaseThenAdvancesBase()
+    {
+        // str q0,[x9],#0x30 stores at [x9] — not [x9+0x30] — and the writeback
+        // must be emitted after the store since the scalarizer's path replaces
+        // the caller's (which owns EmitWriteback).
+        var il = Lift(
+            0x6f00e400, // movi v0.2d, #0
+            0x3c830520); // str q0, [x9], #0x30
+
+        var storeIndex = il.FindIndex(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand { Base: Register { Name: "X9" }, Addend: 0 });
+        var bumpIndex = il.FindIndex(i => i.OpCode == OpCode.Add
+            && i.Operands[0] is Register { Name: "X9" });
+        Assert.Multiple(() =>
+        {
+            Assert.That(storeIndex, Is.GreaterThanOrEqualTo(0), () => string.Join("\n", il));
+            var store = il[storeIndex];
+            Assert.That(((MemoryOperand)store.Operands[0]).AccessSize, Is.EqualTo(4));
+            Assert.That(store.Operands[1], Is.EqualTo(new Immediate(0, 4)));
+            Assert.That(il.Any(i => i.OpCode == OpCode.Move
+                && i.Operands[0] is MemoryOperand { Base: Register { Name: "X9" }, Addend: 0x30 }),
+                Is.False, "post-index offset must not be used as the store addend");
+            Assert.That(bumpIndex, Is.GreaterThan(storeIndex),
+                () => "writeback must follow the store\n" + string.Join("\n", il));
+            var bump = il[bumpIndex];
+            Assert.That(bump.Operands[1], Is.EqualTo(new Register(null, "X9")));
+            Assert.That(bump.Operands[2], Is.EqualTo(new Immediate(0x30)));
+        });
+    }
+
+    [Test]
+    public void PreIndexedVectorStoreAdvancesBaseFirst()
+    {
+        // str q0,[x9,#0x30]! bumps x9 first, then stores at [x9].
+        var il = Lift(
+            0x6f00e400, // movi v0.2d, #0
+            0x3c830d20); // str q0, [x9, #0x30]!
+
+        var storeIndex = il.FindIndex(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand { Base: Register { Name: "X9" }, Addend: 0 });
+        var bumpIndex = il.FindIndex(i => i.OpCode == OpCode.Add
+            && i.Operands[0] is Register { Name: "X9" });
+        Assert.Multiple(() =>
+        {
+            Assert.That(storeIndex, Is.GreaterThanOrEqualTo(0), () => string.Join("\n", il));
+            Assert.That(bumpIndex, Is.GreaterThanOrEqualTo(0).And.LessThan(storeIndex),
+                () => "pre-index writeback must precede the store\n" + string.Join("\n", il));
+            Assert.That(il[bumpIndex].Operands[2], Is.EqualTo(new Immediate(0x30)));
+        });
+    }
+
+    [Test]
+    public void ScalarCompareDoesNotWipeTrackedRegister()
+    {
+        // fcmp reads its operands without writing: the register's proven
+        // windows must survive so a later 64-bit read still resolves the
+        // lane pair instead of being diagnosed.
+        var il = Lift(
+            0xfd400120, // ldr d0, [x9]
+            0x1e612000, // fcmp d0, d1
+            0x9e660009); // fmov x9, d0
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False,
+                () => string.Join("\n", il));
+            Assert.That(il.Any(i => i.OpCode == OpCode.Move
+                && i.Operands[0] is Register { Name: "X9" }), Is.True,
+                () => string.Join("\n", il));
+        });
+    }
+
+    [Test]
+    public void ConditionalScalarSelectMaterializesLanesOnEdge()
+    {
+        // fcsel writes the scalar register — a conditional-select, not a
+        // compare — so its edge must canonicalize the high window like every
+        // other scalar write; a merge reading V0.S1 on this path must find
+        // the local defined.
+        var il = LiftNative(
+            0xfd400120, // ldr d0, [x9]
+            0x1e610c00, // fcsel d0, d0, d1, eq
+            0x14000001, // b +4
+            0xfd400120); // ldr d0, [x9]
+
+        Assert.That(il.Any(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is Register { Name: "V0.S1" }), Is.True,
+            () => "fcsel edge must materialize V0.S1\n" + string.Join("\n", il));
+    }
+
+    [Test]
+    public void EdgeMaterializesLaneWrittenByPreviousInstruction()
+    {
+        // fmov s0 leaves only the low window proven; ldr d0 widens the register's
+        // proven value to 64 bits. The branch edge must materialize V0.S1 from
+        // the value ldr produced — a stale pre-write snapshot would read it as
+        // 32-bit and skip the mirror, leaving the element local undefined on
+        // this edge.
+        var il = LiftNative(
+            0x1e270000, // fmov s0, w0
+            0xfd400120, // ldr d0, [x9]
+            0x14000001, // b +4
+            0xfd400120); // ldr d0, [x9]
+
+        Assert.That(il.Any(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is Register { Name: "V0.S1" }), Is.True,
+            () => "edge after a widening write must materialize V0.S1\n" + string.Join("\n", il));
+    }
+
+    [Test]
+    public void CalleeSavedRegisterSurvivingCallReadsAsRegisterLocal()
+    {
+        // fmov d9 keeps the double in callee-saved d9 across a merge and a
+        // call, then fmov d0 restores it. The register local is proven for
+        // the low 64 bits on every path, so the restore is a register copy —
+        // splitting it into a Convert/ShiftLeft/Or recomposition only feeds
+        // the reader a temp whose write can sink after its use.
+        var il = LiftNative(
+            0x1e604009, // fmov d9, d0
+            0x34000068, // cbz w8, +12
+            0xf94003a0, // ldr x0, [x29]
+            0xd63f0100, // blr x8
+            0x1e604120); // fmov d0, d9
+
+        Assert.That(il.Any(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is Register { Name: "V0" }
+            && i.Operands[1] is Register { Name: "V9" }), Is.True,
+            () => "restore must read the proven register local\n" + string.Join("\n", il));
+        Assert.That(il.Any(i => i.OpCode is OpCode.ShiftLeft or OpCode.Or
+            && i.Operands[0] is Register { Name: { } t } && t.StartsWith("TEMP_VEC")), Is.False,
+            () => "no recomposition temps when the register local is proven\n" + string.Join("\n", il));
+    }
+
+    [Test]
+    public void LoopInvariantZeroVectorStoresPerWindow()
+    {
+        // `MOVI V0.2D,#0` above a loop that stores it through a post-indexed
+        // pointer: the back edge reconverges on the compare, but the loop body
+        // never writes V0, so its proven constant lanes reach the STP/STR and
+        // each 32-bit window stores Immediate 0. A whole-width zero store would
+        // let an untyped base resolve the single field at its addend and drop
+        // the rest.
+        var il = Lift(
+            0xd503201f, // nop
+            0x6f00e400, // movi v0.2d, #0
+            0xaa1f03e8, // mov x8, xzr
+            0x91008009, // add x9, x0, #0x20
+            0x92407d4a, // and x10, x10, #0xffffffff
+            0xeb2a411f, // cmp x8, w10, uxtw        <- merge target
+            0x54000122, // b.cs +9 (exit)
+            0xad008120, // stp q0, q0, [x9, #0x10]
+            0x91000508, // add x8, x8, #1
+            0x3c830520, // str q0, [x9], #0x30
+            0xb940180a, // ldr w10, [x0, #0x18]
+            0xeb2ac11f, // cmp x8, w10, sxtw
+            0x54ffff2b, // b.lt -7 (back edge)
+            0xf84107fe, // ldr x30, [x31], #0x10
+            0xd65f03c0, // ret
+            0xd503201f); // nop (b.cs exit landing)
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False,
+                () => "loop-invariant lanes must keep the zero stores honest\n" + string.Join("\n", il));
+            foreach (var addend in new[] { 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x28, 0x2c, 0, 4, 8, 0xc })
+                Assert.That(il.Any(i => i.OpCode == OpCode.Move
+                    && i.Operands[0] is MemoryOperand { Base: Register { Name: "X9" }, Addend: { } a }
+                    && a == addend
+                    && i.Operands[1] is Immediate { Value: 0 }), Is.True,
+                    () => $"expected a zero 32-bit window store at +0x{addend:x}\n" + string.Join("\n", il));
+            Assert.That(il.Any(i => i.OpCode == OpCode.Add
+                && i.Operands[0] is Register { Name: "X9" }
+                && i.Operands[2] is Immediate { Value: 0x30 }), Is.True,
+                () => "the post-index writeback survives\n" + string.Join("\n", il));
+        });
+    }
+
+    private sealed class NativeMethod(TypeAnalysisContext owner, ulong address)
+        : InjectedMethodAnalysisContext(owner, "Test", owner.AppContext.SystemTypes.SystemVoidType,
+            MethodAttributes.Public | MethodAttributes.Static, [])
+    {
+        public override ulong UnderlyingPointer => address;
+    }
+
+    private static List<Instruction> LiftNative(params uint[] words)
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        var bytes = words.SelectMany(BitConverter.GetBytes).ToArray();
+        var context = new NativeMethod(app.SystemTypes.SystemObjectType, 0x1000)
+        {
+            RawBytes = new BinarySlice(bytes)
+        };
+        return new NewArmV8InstructionSet().ConvertInstructions(
+            Disassembler.Disassemble(bytes, 0x1000), context);
+    }
+
 }

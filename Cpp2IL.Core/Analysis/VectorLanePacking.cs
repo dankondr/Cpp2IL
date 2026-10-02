@@ -433,13 +433,22 @@ internal static class VectorLanePacking
                 && ParameterTypeForRegister(method, name) != null;
 
         if (definition.OpCode is not (OpCode.Move or OpCode.Call or OpCode.IndirectCall)
-            && !FloatMathOps.Contains(definition.OpCode))
+            && !FloatMathOps.Contains(definition.OpCode)
+            && !LaneCompositionOps.Contains(definition.OpCode))
             return false;
 
         return definition.Operands.All(o => o is not LocalVariable l
             || ReferenceEquals(l, definition.Destination)
             || LaneTreeProvable(method, definitions, o, depth + 1));
     }
+
+    // Bit compositions the scalarizer emits to spell a lane view of a wider
+    // value: `>>` for an upper window, `<<`/`|` for a 64-bit lane, `>>`/`&`
+    // for a narrow element, `convert` for the widening and reinterpretation
+    // of a lane pair. They keep nothing of their own — every operand
+    // recurses, so a leaf is still a kept def or a parameter local.
+    private static readonly HashSet<OpCode> LaneCompositionOps =
+        [OpCode.ShiftRight, OpCode.ShiftLeft, OpCode.Or, OpCode.And, OpCode.Convert];
 
     private static bool TryFloatLaneOperand(MethodAnalysisContext method,
         Dictionary<LocalVariable, Instruction> definitions, IOperand operand, int depth,
@@ -508,11 +517,15 @@ internal static class VectorLanePacking
                     return ResolveCallee(method.AppContext, definition.Operands[0]) is { } callee
                         && IsFloatScalar(callee.ReturnType);
                 // A bare `Vn` destination is a scalar floating-point op
-                // (`fadd s0`, `fmul s1`): integer adds write `Xn`/lane-view
-                // (`Vn.Sk`) destinations, never a whole-register view.
+                // (`fadd s0`, `fmul s1`), and a `Vn.Sk`/`Vn.Dk` destination
+                // carrying the float-width mark is the scalarizer's per-lane
+                // spelling of the same op. Integer adds write `Xn`/lane-view
+                // destinations with the integer-width mark, never a float one.
                 return FloatMathOps.Contains(definition.OpCode)
                     && definition.Destination is LocalVariable { Register.Name: { } destName }
-                    && TryRegisterNumber(destName, out _);
+                    && (TryRegisterNumber(destName, out _)
+                        || (definition.NativeFloatWidthBits is not null
+                            && TryElementRegisterName(destName, out _)));
             }
             default:
                 return false;
@@ -720,6 +733,23 @@ internal static class VectorLanePacking
         if (i != name.Length)
             return false;
         return int.TryParse(name[1..], out register) && register < 32;
+    }
+
+    /// `V<n>.<B|H|S|D><i>` element-register names: the scalarizer writes a
+    /// lane op's result to its element register rather than the register's
+    /// whole-local view.
+    private static bool TryElementRegisterName(string name, out int register)
+    {
+        register = 0;
+        var dot = name.IndexOf('.');
+        if (dot < 2 || dot + 2 >= name.Length
+            || !TryRegisterNumber(name[..dot], out register)
+            || name[dot + 1] is not ('B' or 'H' or 'S' or 'D'))
+            return false;
+        var i = dot + 2;
+        while (i < name.Length && char.IsDigit(name[i]))
+            i++;
+        return i > dot + 2 && i == name.Length;
     }
 
     private static bool IsVolatileRegister(string registerName)
