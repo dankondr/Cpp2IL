@@ -30,13 +30,13 @@ whole-register local, which may be a managed aggregate.
   registers (`Vn.Si`). At every branch target the incoming edges meet window
   by window — a window survives only when every converted predecessor proves
   it. A not-yet-converted (backward) edge contributes only what the loop body
-  can change: the registers the span between the merge target and the
-  back-edge's source may write — a vector destination, a call's clobber, an
-  undecoded word, or a reachable inner merge — stay unproven, and every
-  other register's proven lanes merge over the converted edges alone (the
-  back-edge hands the same lanes back at the fixpoint). A span that cannot
-  be bounded leaves the whole register unproven: consumers diagnose rather
-  than guess.
+  can change: the registers the span from the merge target through the
+  back-edge's source may write — the header op itself, a vector
+  destination, a call's clobber, an undecoded word, or a reachable inner
+  merge — stay unproven, and every other register's proven lanes merge
+  over the converted edges alone (the back-edge hands the same lanes back
+  at the fixpoint). A span that cannot be bounded leaves the whole
+  register unproven: consumers diagnose rather than guess.
 - A constant window's bits ride beside the lane slice, so canonicalization
   rewriting an `Immediate`/`FloatLiteral` lane into its element register
   keeps the constant's provenance: merges meet window constants by equality
