@@ -29,8 +29,21 @@ whole-register local, which may be a managed aggregate.
   whole-register read as that window); windows 1-3 live in their element
   registers (`Vn.Si`). At every branch target the incoming edges meet window
   by window — a window survives only when every converted predecessor proves
-  it. An edge from a not-yet-converted (backward) branch leaves the whole
-  register tracked-but-unproven: consumers diagnose rather than guess.
+  it. A not-yet-converted (backward) edge contributes only what the loop body
+  can change: the registers the span between the merge target and the
+  back-edge's source may write — a vector destination, a call's clobber, an
+  undecoded word, or a reachable inner merge — stay unproven, and every
+  other register's proven lanes merge over the converted edges alone (the
+  back-edge hands the same lanes back at the fixpoint). A span that cannot
+  be bounded leaves the whole register unproven: consumers diagnose rather
+  than guess.
+- A constant window's bits ride beside the lane slice, so canonicalization
+  rewriting an `Immediate`/`FloatLiteral` lane into its element register
+  keeps the constant's provenance: merges meet window constants by equality
+  across edges, and a store whose windows all carry equal bits stores the
+  constant per 32-bit window rather than dropping to a diagnosed SIMD
+  store — `MOVI Vn.2D,#0` feeding a loop of `STP`/`STR` zero stores writes
+  each field window.
 - Until the first clobber, an unwritten register's lanes are the entry lanes:
   window 0 is the register local itself, higher windows the entry element
   locals (undefined ones report `undefined local`, never guessed). A `BL`/call
@@ -55,3 +68,7 @@ words through the real conversion path:
   `ReplicateLoadBroadcastsEveryLane`, `PermutesMoveLanesIntoElementLocals`.
 - `ProvenanceResetsAtMergeTargets`, `BackwardEdgeLeavesLanesUnproven` — a
   window unproven on any edge stays diagnosed; nothing is guessed.
+- `LoopInvariantZeroVectorStoresPerWindow` — `MOVI V0.2D,#0` above a loop
+  whose only stores are `STP`/`STR` of `V0`: the back edge does not clobber
+  it, every 32-bit window stores `Immediate 0`, and the post-index
+  writeback survives.

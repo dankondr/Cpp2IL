@@ -1359,6 +1359,50 @@ public class Arm64VectorScalarizerIndexedStoreTests
             () => "no recomposition temps when the register local is proven\n" + string.Join("\n", il));
     }
 
+    [Test]
+    public void LoopInvariantZeroVectorStoresPerWindow()
+    {
+        // `MOVI V0.2D,#0` above a loop that stores it through a post-indexed
+        // pointer: the back edge reconverges on the compare, but the loop body
+        // never writes V0, so its proven constant lanes reach the STP/STR and
+        // each 32-bit window stores Immediate 0. A whole-width zero store would
+        // let an untyped base resolve the single field at its addend and drop
+        // the rest.
+        var il = Lift(
+            0xd503201f, // nop
+            0x6f00e400, // movi v0.2d, #0
+            0xaa1f03e8, // mov x8, xzr
+            0x91008009, // add x9, x0, #0x20
+            0x92407d4a, // and x10, x10, #0xffffffff
+            0xeb2a411f, // cmp x8, w10, uxtw        <- merge target
+            0x54000122, // b.cs +9 (exit)
+            0xad008120, // stp q0, q0, [x9, #0x10]
+            0x91000508, // add x8, x8, #1
+            0x3c830520, // str q0, [x9], #0x30
+            0xb940180a, // ldr w10, [x0, #0x18]
+            0xeb2ac11f, // cmp x8, w10, sxtw
+            0x54ffff2b, // b.lt -7 (back edge)
+            0xf84107fe, // ldr x30, [x31], #0x10
+            0xd65f03c0, // ret
+            0xd503201f); // nop (b.cs exit landing)
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False,
+                () => "loop-invariant lanes must keep the zero stores honest\n" + string.Join("\n", il));
+            foreach (var addend in new[] { 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x28, 0x2c, 0, 4, 8, 0xc })
+                Assert.That(il.Any(i => i.OpCode == OpCode.Move
+                    && i.Operands[0] is MemoryOperand { Base: Register { Name: "X9" }, Addend: { } a }
+                    && a == addend
+                    && i.Operands[1] is Immediate { Value: 0 }), Is.True,
+                    () => $"expected a zero 32-bit window store at +0x{addend:x}\n" + string.Join("\n", il));
+            Assert.That(il.Any(i => i.OpCode == OpCode.Add
+                && i.Operands[0] is Register { Name: "X9" }
+                && i.Operands[2] is Immediate { Value: 0x30 }), Is.True,
+                () => "the post-index writeback survives\n" + string.Join("\n", il));
+        });
+    }
+
     private sealed class NativeMethod(TypeAnalysisContext owner, ulong address)
         : InjectedMethodAnalysisContext(owner, "Test", owner.AppContext.SystemTypes.SystemVoidType,
             MethodAttributes.Public | MethodAttributes.Static, [])

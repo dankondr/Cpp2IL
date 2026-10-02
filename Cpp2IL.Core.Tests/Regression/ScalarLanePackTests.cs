@@ -129,6 +129,77 @@ public class ScalarLanePackTests
     }
 
     [Test]
+    public void ScalarizedLaneResultsPackVectorArgument()
+    {
+        // `fmul v3.2s,…` scalarizes to per-lane multiplies on `Vn.Sk` element
+        // registers, and `mov s1,v3.s[1]`/`fmov s0,s3` reach the argument
+        // registers as `Move`s. An upper window of a 64-bit load reads through
+        // a `>>32` temp. The pack must see both shapes or it bails wholesale
+        // and the sibling lane writes die - the argument's y/z fields are
+        // then silently dropped (Translate::Update).
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var vector = Vector3(app);
+        var module = new ModuleDefinition("LanePack.dll");
+        SeedCorLibTypes(app, module, vector, app.SystemTypes.SystemObjectType,
+            app.SystemTypes.SystemSingleType, app.SystemTypes.SystemInt32Type,
+            app.SystemTypes.SystemVoidType);
+        var echo = Echo(app, module, vector);
+        var holder = new LocalVariable("holder", new Register(null, "holder"), vector);
+        var fields = vector.Fields.OfType<InjectedFieldAnalysisContext>().ToList();
+
+        // The producers stay off the argument registers: the synthetic harness
+        // keeps one local per register name rather than SSA-versioning a
+        // redefinition, so `V0` used twice would fold into a self-cycle the
+        // real pipeline never sees.
+        var (caller, method) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, new Register(null, "V9"), new FieldReference(fields[0], holder, 0)),
+            new(1, OpCode.Move, new Register(null, "V8"), new FieldReference(fields[2], holder, 8)),
+            new(2, OpCode.Move, new Register(null, "V2.S0"), new FieldReference(fields[1], holder, 4)),
+            new(3, OpCode.Move, new Register(null, "V10"), new FieldReference(fields[1], holder, 4)),
+            new(4, OpCode.ShiftRight, new Register(null, "TEMP0"), new Register(null, "V9"),
+                new Immediate(32)),
+            new Instruction(5, OpCode.Multiply, new Register(null, "V1.S0"),
+                new Register(null, "V9"), new Register(null, "V2.S0")) { NativeFloatWidthBits = 32 },
+            new Instruction(6, OpCode.Multiply, new Register(null, "V1.S1"),
+                new Register(null, "TEMP0"), new Register(null, "V2.S0")) { NativeFloatWidthBits = 32 },
+            new Instruction(7, OpCode.Multiply, new Register(null, "V3.S0"),
+                new Register(null, "V1.S0"), new Register(null, "V10")) { NativeFloatWidthBits = 32 },
+            new Instruction(8, OpCode.Multiply, new Register(null, "V3.S1"),
+                new Register(null, "V1.S1"), new Register(null, "V10")) { NativeFloatWidthBits = 32 },
+            new Instruction(9, OpCode.Multiply, new Register(null, "V11"),
+                new Register(null, "V8"), new Register(null, "V2.S0")) { NativeFloatWidthBits = 32 },
+            new Instruction(10, OpCode.Multiply, new Register(null, "V2"),
+                new Register(null, "V11"), new Register(null, "V10")) { NativeFloatWidthBits = 32 },
+            new(11, OpCode.Move, new Register(null, "V1"), new Register(null, "V3.S1")),
+            new(12, OpCode.Move, new Register(null, "V0"), new Register(null, "V3.S0")),
+            new(13, OpCode.CallVoid, echo, new Register(null, "V0")),
+            new(14, OpCode.Return)], [holder]);
+        caller.DominatorInfo = new DominatorInfo(caller.ControlFlowGraph!);
+
+        LocalVariables.CreateAll(caller);
+        LocalVariables.ResolveTypesAndFields(caller);
+        IlGenerator.GenerateIl(caller, method);
+
+        var il = method.CilMethodBody!.Instructions;
+        Assert.Multiple(() =>
+        {
+            var stores = il.Where(i => i.OpCode == CilOpCodes.Stfld).ToList();
+            Assert.That(stores.Select(i => (i.Operand as IFieldDescriptor)?.Name?.ToString())
+                    .Order(), Is.EqualTo(new[] { "x", "y", "z" }),
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call
+                    && i.Operand is IMethodDescriptor named
+                    && named.Name?.ToString() == "Echo"), Is.True,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr && i.Operand is string text
+                    && text.Contains("synthetic default value")), Is.False,
+                () => string.Join("\n", il.Select(i => i.ToString())));
+        });
+    }
+
+    [Test]
     public void ScalarLanesPackVectorArgumentFieldByField()
     {
         // `ldr s0, [holder]; ldr s1, [holder+4]; ldr s2, [holder+8]; bl Echo` -

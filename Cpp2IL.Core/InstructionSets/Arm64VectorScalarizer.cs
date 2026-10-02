@@ -86,8 +86,37 @@ internal sealed class Arm64VectorScalarizer
         public void SetSlot(int slot, LaneSlice? slice)
         {
             Slots[slot] = slice;
+            SlotConstants[slot] = slice is { } s && IsSlotConstant(s) ? SlotConstantBits(s) : null;
             LoadMemory = null;
         }
+
+        /// <summary>
+        /// Sets a slot to a slice whose runtime value is a known constant —
+        /// e.g. a canonical element register just written with a literal.
+        /// </summary>
+        public void SetConstantSlot(int slot, LaneSlice slice, ulong constantBits)
+        {
+            Slots[slot] = slice;
+            SlotConstants[slot] = constantBits;
+            LoadMemory = null;
+        }
+
+        /// <summary>
+        /// The 32-bit constant the slot provably holds on this path: the
+        /// slice's own literal, or the constant its canonical element
+        /// register was last written with. Null for an unproven or
+        /// non-constant slot.
+        /// </summary>
+        public ulong? WindowConstant(int slot)
+            => Slots[slot] != null ? SlotConstants[slot] : null;
+
+        /// <summary>
+        /// Constant bits parallel to <see cref="Slots"/>: canonicalization
+        /// rewrites a literal lane into its element register, and merges
+        /// canonicalize proven slots, so the literal travels here instead —
+        /// a wide zero/constant store still sees the real bits.
+        /// </summary>
+        public readonly ulong?[] SlotConstants = new ulong?[4];
 
         /// <summary>
         /// The register's normalized name ("V0"), set when the state is
@@ -116,6 +145,7 @@ internal sealed class Arm64VectorScalarizer
                 MaterializedBits = MaterializedBits
             };
             Array.Copy(Slots, clone.Slots, Slots.Length);
+            Array.Copy(SlotConstants, clone.SlotConstants, SlotConstants.Length);
             return clone;
         }
     }
@@ -200,6 +230,9 @@ internal sealed class Arm64VectorScalarizer
 
     /// <summary>Address of each instruction's recorded intra-method branch target.</summary>
     private readonly Dictionary<ulong, ulong> _branchTargets = new();
+
+    /// <summary>The method's instruction stream, kept for loop-span scans.</summary>
+    private IReadOnlyList<Arm64Instruction> _instructions = [];
 
     /// <summary>
     /// Instructions some control-flow path can reach: bytes after an
@@ -327,6 +360,7 @@ internal sealed class Arm64VectorScalarizer
         _tempCounter = 0;
         _clearProvenanceNext = false;
         _prevAddress = 0;
+        _instructions = instructions;
 
         foreach (var insn in instructions)
         {
@@ -464,7 +498,13 @@ internal sealed class Arm64VectorScalarizer
                     canonicalMove.NativeFloatWriteBits = 32;
                     ImmediateWriteWidth.ApplyToMove(canonicalMove);
                     _emitted = true;
-                    state.SetSlot(slot,  new LaneSlice(CanonicalSlot(name, slot), 0));
+                    // a literal lane stays constant through its canonical
+                    // local — record the bits so wide stores still see zeroes
+                    if (IsSlotConstant(slice))
+                        state.SetConstantSlot(slot, new LaneSlice(CanonicalSlot(name, slot), 0),
+                            SlotConstantBits(slice));
+                    else
+                        state.SetSlot(slot,  new LaneSlice(CanonicalSlot(name, slot), 0));
                     if (slot == 0)
                         state.Whole = false;
                 }
@@ -507,20 +547,23 @@ internal sealed class Arm64VectorScalarizer
             foreach (var edge in branchEdges)
                 names.UnionWith(edge.Keys);
 
-        if (backwardEdge)
-        {
-            // A predecessor that has not converted yet (a loop back-edge)
-            // carries lane values this pass never saw: keep each name tracked
-            // with every window unproven so a later lane consumer diagnoses
-            // instead of reading element locals no edge materialized.
-            foreach (var name in names)
-                merged[name] = new VectorState { Name = name };
-        }
-        else
-        {
+        // A predecessor that has not been converted yet (a loop back-edge)
+        // carries lane values this pass never saw. A register no instruction
+        // in the loop writes is loop-invariant: its back-edge hands the
+        // header's own merged value back, so meeting the converted edges is
+        // the fixpoint. A name the loop may write — or an inner merge or a
+        // call can clobber — stays fully unproven: nothing is guessed.
+        var loopWritten = backwardEdge ? LoopWrittenRegisters(target) : null;
+        var allUnproven = backwardEdge && loopWritten == null;
 
+        {
             foreach (var name in names)
             {
+                if (allUnproven || loopWritten is { } loopWrites && loopWrites.Contains(name))
+                {
+                    merged[name] = new VectorState { Name = name };
+                    continue;
+                }
                 var state = new VectorState { Name = name };
                 var window0Clobbered = false;
                 // top-down like CanonicalizeLanes: materializing window 0
@@ -555,7 +598,32 @@ internal sealed class Arm64VectorScalarizer
                         if (slot == 0)
                             window0Clobbered = true;
                     }
-                    state.SetSlot(slot,  new LaneSlice(canonical, 0));
+                    // a lane holding the same constant on every edge keeps
+                    // it — wide stores still see zeroes behind a canonical local
+                    ulong? constant = null;
+                    var constantFirst = true;
+                    void MeetConstant(Dictionary<string, VectorState> edge)
+                    {
+                        var edgeConstant = edge.TryGetValue(name, out var edgeState)
+                            ? edgeState.WindowConstant(slot)
+                            : null;
+                        if (constantFirst)
+                        {
+                            constant = edgeConstant;
+                            constantFirst = false;
+                        }
+                        else if (edgeConstant != constant)
+                            constant = null;
+                    }
+                    if (fallThrough != null)
+                        MeetConstant(fallThrough);
+                    if (branchEdges != null)
+                        foreach (var edge in branchEdges)
+                            MeetConstant(edge);
+                    if (constant is { } bits)
+                        state.SetConstantSlot(slot, new LaneSlice(canonical, 0), bits);
+                    else
+                        state.SetSlot(slot,  new LaneSlice(canonical, 0));
                 }
                 var whole = fallThrough == null
                     || (fallThrough.TryGetValue(name, out var wholeState) && wholeState.Whole);
@@ -586,6 +654,57 @@ internal sealed class Arm64VectorScalarizer
         _vectors.Clear();
         foreach (var (name, state) in merged)
             _vectors[name] = state;
+    }
+
+    /// <summary>
+    /// Register names the unconverted predecessors of a loop header may
+    /// write: scans every instruction in (target, lastBackEdgeSource] —
+    /// a destination-register write, a call's clobber, or a reachable inner
+    /// merge that can meet provenance away all count. Null when no
+    /// unconverted edge remains (the merge degenerates to the usual case).
+    /// </summary>
+    private HashSet<string>? LoopWrittenRegisters(ulong target)
+    {
+        if (!_mergePreds.TryGetValue(target, out var preds))
+            return null;
+        var hi = 0UL;
+        foreach (var pred in preds)
+            if (_reachable.Contains(pred) && !_edgeExit.ContainsKey(pred) && pred > hi)
+                hi = pred;
+        if (hi == 0)
+            return null;
+
+        var written = new HashSet<string>();
+        foreach (var insn in _instructions)
+        {
+            if (insn.Address <= target || !_reachable.Contains(insn.Address))
+                continue;
+            if (insn.Address > hi)
+                break;
+            if (_mergeTargets.Contains(insn.Address)
+                || insn.Mnemonic is Arm64Mnemonic.BL or Arm64Mnemonic.BLR
+                || insn.Op0Kind == Arm64OperandKind.None)
+            {
+                // an inner merge meets provenance away just like a write; a
+                // call clobbers caller-saved vectors; an undecoded word may
+                // write anything — refuse invariance for every name
+                for (var i = 0; i < 32; i++)
+                    written.Add("V" + i);
+                continue;
+            }
+            if (insn.Op0Kind != Arm64OperandKind.Register
+                || insn.Mnemonic is Arm64Mnemonic.FCMP or Arm64Mnemonic.FCMPE
+                    or Arm64Mnemonic.FCCMP or Arm64Mnemonic.FCCMPE
+                || insn.Mnemonic.ToString().StartsWith("ST", StringComparison.Ordinal))
+                continue; // compares set flags, stores read the register
+            if (IsVectorRegister(insn.Op0Reg))
+                written.Add(Normalize(insn.Op0Reg));
+            // pair/multi-destination loads also write the second register
+            if (insn.Op1Kind == Arm64OperandKind.Register && IsVectorRegister(insn.Op1Reg)
+                && insn.Mnemonic.ToString().StartsWith("LD", StringComparison.Ordinal))
+                written.Add(Normalize(insn.Op1Reg));
+        }
+        return written;
     }
 
     /// true when the instruction was fully handled — folded to lane ops or
@@ -3918,18 +4037,24 @@ internal sealed class Arm64VectorScalarizer
         {
             if (bytes == 16 && IsAllZero(state, slots))
             {
-                // one whole-width zero: the resolver merges adjacent runs into
-                // initobj or splits the range per field.
-                var zero = _add(_address, OpCode.Move,
-                    [StoreMem(insn, baseOff, 16), new Immediate(0, 16)]);
-                zero.NativeStoreWidthBytes = 16;
+                // one 4-byte store per window, not a whole-width store: a base
+                // whose element type is not yet proven resolves a wide store to
+                // the single field at its addend and drops the rest, while a
+                // typed base merges adjacent zero windows into initobj or the
+                // per-field split all the same.
+                for (var slot = 0; slot < slots; slot++)
+                {
+                    var zero = _add(_address, OpCode.Move,
+                        [StoreMem(insn, baseOff + slot * 4, 4), new Immediate(0, 4)]);
+                    zero.NativeStoreWidthBytes = 4;
+                }
             }
             else
             {
                 for (var group = 0; group < slots / 2; group++)
                 {
-                    var bits = SlotConstantBits(state.Slots[group * 2]!.Value)
-                               | SlotConstantBits(state.Slots[group * 2 + 1]!.Value) << 32;
+                    var bits = state.WindowConstant(group * 2)!.Value
+                               | state.WindowConstant(group * 2 + 1)!.Value << 32;
                     var constant = _add(_address, OpCode.Move,
                         [StoreMem(insn, baseOff + group * 8, 8),
                          new Immediate(unchecked((long)bits), 8)]);
@@ -3996,7 +4121,7 @@ internal sealed class Arm64VectorScalarizer
     private static bool AllSlotsConstant(VectorState state, int slots)
     {
         for (var slot = 0; slot < slots; slot++)
-            if (state.Slots[slot] is not { } slice || !IsSlotConstant(slice))
+            if (state.WindowConstant(slot) == null)
                 return false;
         return true;
     }
@@ -4004,7 +4129,7 @@ internal sealed class Arm64VectorScalarizer
     private static bool IsAllZero(VectorState state, int slots)
     {
         for (var slot = 0; slot < slots; slot++)
-            if (SlotConstantBits(state.Slots[slot]!.Value) != 0)
+            if (state.WindowConstant(slot) != 0)
                 return false;
         return true;
     }
