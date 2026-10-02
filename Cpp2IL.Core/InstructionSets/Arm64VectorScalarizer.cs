@@ -206,8 +206,10 @@ internal sealed class Arm64VectorScalarizer
     private void ClobberCall()
     {
         var dropped = new List<string>();
-        foreach (var (name, state) in _vectors)
+        foreach (var pair in _vectors)
         {
+            var name = pair.Key;
+            var state = pair.Value;
             var reg = name is ['V', ..] && int.TryParse(name[1..], out var n) ? n : -1;
             if (reg is >= 8 and <= 15)
             {
