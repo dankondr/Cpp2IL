@@ -10287,20 +10287,23 @@ public static class IlGenerator
         // unverifiable IL. A block write to a numeric literal has no provable
         // managed meaning: keep the named diagnostic rather than emit
         // guaranteed-invalid IL.
-        if (destination is Immediate
-            || !Analysis.BlockMemoryImportRecovery.IsProvablyReferenceFreeRegion(destination, count, context)
-            || !contentProvable
-            || !Analysis.BlockMemoryImportRecovery.IsScalarOperand(count, context))
+        var operandsProvable = destination is not Immediate && contentProvable
+            && Analysis.BlockMemoryImportRecovery.IsScalarOperand(count, context);
+
+        // A block write covering exactly a proven value type through managed
+        // pointers to that type is the type's assignment - verifiable IL, and
+        // barrier-correct where cpblk would skip a managed-reference field, so
+        // it needs no reference-free region.
+        var typed = operandsProvable && TryEmitTypedBlockOperation(instruction, destination, content, count,
+            context, method, locals, writeLine);
+        if (!typed && (!operandsProvable
+            || !Analysis.BlockMemoryImportRecovery.IsProvablyReferenceFreeRegion(destination, count, context)))
         {
             EmitUnrecoverableOperation(method, writeLine, $"Unproven block memory operand: {instruction}");
             return;
         }
 
-        // A block write covering exactly a proven value type through managed
-        // pointers to that type is the type's assignment - verifiable IL, and
-        // barrier-correct where cpblk would skip a managed-reference field.
-        if (!TryEmitTypedBlockOperation(instruction, destination, content, count, context, method, locals,
-                writeLine))
+        if (!typed)
             switch (instruction.OpCode)
             {
             case OpCode.MemoryCopy:
@@ -10402,9 +10405,33 @@ public static class IlGenerator
         IOperand content, IOperand count, MethodAnalysisContext context, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
     {
+        if (TypedBlockPointee(instruction.OpCode, ref destination, ref content, count, context) is not { } pointee)
+            return false;
+
+        var instructions = method.CilMethodBody!.Instructions;
+        var pointeeRef = pointee.ToTypeSignature().ToTypeDefOrRef();
+        EmitBlockPointerOperand(destination, false, context, method, locals, writeLine);
+        if (instruction.OpCode == OpCode.MemorySet)
+        {
+            instructions.Add(CilOpCodes.Initobj, pointeeRef);
+            return true;
+        }
+        EmitBlockPointerOperand(content, false, context, method, locals, writeLine);
+        instructions.Add(CilOpCodes.Ldobj, pointeeRef);
+        instructions.Add(CilOpCodes.Stobj, pointeeRef);
+        return true;
+    }
+
+    // The value type a block op assigns whole - TryEmitTypedBlockOperation's
+    // proof, shared with the recovery pass so a rewrite it accepts for a
+    // struct holding references is one emission spells typed. The operands
+    // come back in the form emission loads.
+    internal static TypeAnalysisContext? TypedBlockPointee(OpCode opCode, ref IOperand destination,
+        ref IOperand content, IOperand count, MethodAnalysisContext context)
+    {
         // `&local.first` of a struct local is `&local` when that makes the two sides one type:
         // value-type field addresses are canonicalized to the first field upstream.
-        if (instruction.OpCode is OpCode.MemoryCopy or OpCode.MemoryMove)
+        if (opCode is OpCode.MemoryCopy or OpCode.MemoryMove)
         {
             destination = WholeStorage(destination, BlockCopyPointee(content, context));
             content = WholeStorage(content, BlockCopyPointee(destination, context));
@@ -10420,26 +10447,15 @@ public static class IlGenerator
             || ManagedSize(pointee, context) is not { } pointeeSize
             || byteCount.Value != pointeeSize
             || !TypeTokenUsableFrom(pointee, context))
-            return false;
+            return null;
 
-        var instructions = method.CilMethodBody!.Instructions;
-        var pointeeRef = pointee.ToTypeSignature().ToTypeDefOrRef();
-        switch (instruction.OpCode)
+        return opCode switch
         {
-            case OpCode.MemoryCopy or OpCode.MemoryMove
-                when ThisConstructorCallPlan.SameTypeIdentity(pointee, BlockCopyPointee(content, context)):
-                EmitBlockPointerOperand(destination, false, context, method, locals, writeLine);
-                EmitBlockPointerOperand(content, false, context, method, locals, writeLine);
-                instructions.Add(CilOpCodes.Ldobj, pointeeRef);
-                instructions.Add(CilOpCodes.Stobj, pointeeRef);
-                return true;
-            case OpCode.MemorySet when content is Immediate { Value: 0 }:
-                EmitBlockPointerOperand(destination, false, context, method, locals, writeLine);
-                instructions.Add(CilOpCodes.Initobj, pointeeRef);
-                return true;
-            default:
-                return false;
-        }
+            OpCode.MemoryCopy or OpCode.MemoryMove
+                when ThisConstructorCallPlan.SameTypeIdentity(pointee, BlockCopyPointee(content, context)) => pointee,
+            OpCode.MemorySet when content is Immediate { Value: 0 } => pointee,
+            _ => null,
+        };
     }
 
     // The managed size (instance size less the object header), not the marshaled native size,
