@@ -244,14 +244,15 @@ public class Arm64VectorScalarizerTests
             && i.Operands[0] is MemoryOperand { Base: Register { Name: "X19" } }).ToList();
         Assert.Multiple(() =>
         {
-            // each 8-byte store writes the whole d-register: a scratch-base
-            // load keeps no memory provenance, so the store reads the local
-            // the load defined — SSA dominance makes the second store read
-            // the second load's value, never a stale temp.
-            Assert.That(stores, Has.Count.EqualTo(2), () => string.Join("\n", il));
+            // each 8-byte store spills its two proven windows: the low window
+            // reads the register local, the high one a shift temp derived from
+            // it — SSA dominance makes the second store's V0 the second load's
+            // value, never a stale temp.
+            Assert.That(stores, Has.Count.EqualTo(4), () => string.Join("\n", il));
             Assert.That(stores[0].Operands[1], Is.EqualTo(new Register(null, "V0")));
-            Assert.That(stores[1].Operands[1], Is.EqualTo(new Register(null, "V0")));
-            Assert.That(((MemoryOperand)stores[0].Operands[0]).AccessSize, Is.EqualTo(8));
+            Assert.That(stores[2].Operands[1], Is.EqualTo(new Register(null, "V0")));
+            Assert.That(stores.Select(s => ((MemoryOperand)s.Operands[0]).Addend),
+                Is.EqualTo(new long[] { 0x24, 0x28, 0x30, 0x34 }));
             Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
         });
     }
@@ -1066,13 +1067,13 @@ public class Arm64VectorScalarizerTests
     }
 
     [Test]
-    public void ScalarDoubleStoreIsOneWideStore()
+    public void ScalarDoubleStoreSpillsAsTwoWindowStores()
     {
-        // A `str d` of a register an `ldr d` just filled is one eight-byte
-        // store of the register local: a scratch-base load keeps no memory
-        // provenance, but the local's definition does — the resolver spells
-        // the whole aggregate, a double member resolves the double, and
-        // adjacent float members resolve their two halves.
+        // A `str d` of a register an `ldr d` just filled spills each 32-bit
+        // window to its own store — a scratch-base load keeps no memory
+        // provenance, but the register's own lanes are proven, and the
+        // resolver narrows each window back to the loaded field: adjacent
+        // float members get their two member stores.
         var il = Lift(
             0xfd400e60, // ldr d0, [x19, #0x18]
             0xfd402100, // ldr d0, [x8, #0x40]
@@ -1082,9 +1083,11 @@ public class Arm64VectorScalarizerTests
             && i.Operands[0] is MemoryOperand { Base: Register { Name: "X20" } }).ToList();
         Assert.Multiple(() =>
         {
-            Assert.That(stores, Has.Count.EqualTo(1), () => string.Join("\n", il));
-            Assert.That((MemoryOperand)stores[0].Operands[0],
-                Is.EqualTo(new MemoryOperand(new Register(null, "X20"), addend: 0x20, accessSize: 8)));
+            Assert.That(stores, Has.Count.EqualTo(2), () => string.Join("\n", il));
+            Assert.That(stores.Select(s => ((MemoryOperand)s.Operands[0]).Addend),
+                Is.EqualTo(new long[] { 0x20, 0x24 }));
+            foreach (var store in stores)
+                Assert.That(((MemoryOperand)store.Operands[0]).AccessSize, Is.EqualTo(4));
             Assert.That(stores[0].Operands[1], Is.EqualTo(new Register(null, "V0")));
             Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False,
                 () => string.Join("\n", il));
@@ -1162,6 +1165,30 @@ public class Arm64VectorScalarizerTests
                 Assert.That(((MemoryOperand)store.Operands[0]).AccessSize, Is.EqualTo(4));
                 Assert.That(store.Operands[1], Is.EqualTo(new Immediate(0, 4)));
             }
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
+        });
+    }
+
+    [Test]
+    public void DoubleLoadAndStoreSpillsAsTwoWindowStores()
+    {
+        // `ldr d8` of two adjacent floats keeps its lanes proven: `str d8`
+        // stores each 32-bit window separately, so the resolver narrows every
+        // window back to the loaded field — a single eight-byte copy could
+        // only name the first covered member.
+        var il = Lift(
+            0xfd401408, // ldr d8, [x0, #0x28]
+            0xfd001428); // str d8, [x1, #0x28]
+
+        var stores = il.Where(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand { Base: Register { Name: "X1" } }).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(stores, Has.Count.EqualTo(2), () => string.Join("\n", il));
+            Assert.That((MemoryOperand)stores[0].Operands[0],
+                Is.EqualTo(new MemoryOperand(new Register(null, "X1"), addend: 0x28, accessSize: 4)));
+            Assert.That((MemoryOperand)stores[1].Operands[0],
+                Is.EqualTo(new MemoryOperand(new Register(null, "X1"), addend: 0x2c, accessSize: 4)));
             Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
         });
     }

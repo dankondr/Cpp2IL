@@ -88,6 +88,7 @@ internal sealed class Arm64VectorScalarizer
             Slots[slot] = slice;
             SlotConstants[slot] = slice is { } s && IsSlotConstant(s) ? SlotConstantBits(s) : null;
             LoadMemory = null;
+            Loaded = false;
         }
 
         /// <summary>
@@ -99,6 +100,7 @@ internal sealed class Arm64VectorScalarizer
             Slots[slot] = slice;
             SlotConstants[slot] = constantBits;
             LoadMemory = null;
+            Loaded = false;
         }
 
         /// <summary>
@@ -126,6 +128,14 @@ internal sealed class Arm64VectorScalarizer
         public string? Name;
 
         /// <summary>
+        /// The register local's current materialization came from a memory
+        /// load on every path reaching this point: its lane slices spell
+        /// windows of that load, so a store of the register resolves as the
+        /// covered fields — not as one wide value the load happened to pack.
+        /// </summary>
+        public bool Loaded;
+
+        /// <summary>
         /// Low bits of the register local that provably hold this register's
         /// current value on every path reaching the state's point: 128 for a
         /// whole-vector load, the scalar width for an FMOV/LDR of S or D, 32
@@ -142,7 +152,7 @@ internal sealed class Arm64VectorScalarizer
             var clone = new VectorState
             {
                 Whole = Whole, Name = Name, LoadMemory = LoadMemory,
-                MaterializedBits = MaterializedBits
+                MaterializedBits = MaterializedBits, Loaded = Loaded
             };
             Array.Copy(Slots, clone.Slots, Slots.Length);
             Array.Copy(SlotConstants, clone.SlotConstants, SlotConstants.Length);
@@ -644,6 +654,14 @@ internal sealed class Arm64VectorScalarizer
                             edge.TryGetValue(name, out var edgeState) ? edgeState.MaterializedBits : 0);
                 state.MaterializedBits = Math.Max(
                     materialized == int.MaxValue ? 0 : materialized, whole ? 128 : 0);
+                // load provenance survives only where every reaching edge
+                // still holds the register's bytes from a load
+                var loaded = fallThrough == null
+                    || (fallThrough.TryGetValue(name, out var loadedState) && loadedState.Loaded);
+                if (loaded && branchEdges != null)
+                    foreach (var edge in branchEdges)
+                        loaded &= edge.TryGetValue(name, out var exit) && exit.Loaded;
+                state.Loaded = loaded;
                 // a name live on any edge stays tracked even when no window is
                 // proven: a lane consumer must diagnose rather than read an
                 // element local no edge materialized
@@ -820,6 +838,7 @@ internal sealed class Arm64VectorScalarizer
             for (var i = 0; i < 4; i++)
                 state.SetSlot(i,  32 * i < writtenBits ? new LaneSlice(Reg(insn.Op0Reg), 32 * i) : new LaneSlice(Zero, 0));
             state.Whole = false; // the local now holds only the narrow scalar
+            state.Loaded = insn.Mnemonic is Arm64Mnemonic.LDR or Arm64Mnemonic.LDUR or Arm64Mnemonic.LDP;
             state.MaterializedBits = writtenBits;
             _clobbered.Remove(Normalize(insn.Op0Reg));
             ClearCopyOrigin(Normalize(insn.Op0Reg));
@@ -843,6 +862,7 @@ internal sealed class Arm64VectorScalarizer
                     for (var i = 0; i < 4; i++)
                         second.SetSlot(i,  32 * i < secondBits ? new LaneSlice(Reg(insn.Op1Reg), 32 * i) : new LaneSlice(Zero, 0));
                     second.Whole = false;
+                    second.Loaded = true;
                     second.MaterializedBits = secondBits;
                     _clobbered.Remove(Normalize(insn.Op1Reg));
                     if (insn.MemBase is not (Arm64Register.INVALID or Arm64Register.X31)
@@ -985,6 +1005,7 @@ internal sealed class Arm64VectorScalarizer
             for (var i = 0; i < 4; i++)
                 state.SetSlot(i,  null); // lanes opaque, but the local itself is current
             state.Whole = true;
+            state.Loaded = true;
             // the caller's normal-path Move writes the whole register local
             state.MaterializedBits = RegisterBytes(reg) * 8;
             if (insn.MemBase != Arm64Register.X31 && RegisterBytes(reg) is > 0 and var loadBytes
@@ -1005,6 +1026,7 @@ internal sealed class Arm64VectorScalarizer
             state.SetSlot(i,  new LaneSlice(laneReg, 0));
         }
         state.Whole = true; // the caller's normal-path Move materialized Vn too
+        state.Loaded = true;
         state.MaterializedBits = RegisterBytes(reg) * 8;
         if (insn.MemBase != Arm64Register.X31 && RegisterBytes(reg) is > 0 and var wholeBytes
             && IsArgumentBase(insn.MemBase))
@@ -4009,17 +4031,21 @@ internal sealed class Arm64VectorScalarizer
 
     /// <summary>
     /// Emits one register's part of a store. Wide forms first: a memory-to-
-    /// memory copy for a register that still holds a whole-load's source, a
-    /// single whole-value move when every lane names the same operand or
-    /// adjacent fields of one aggregate, whole-width zero/immediate stores
-    /// for constant lanes (the resolver splits them per field or merges zero
-    /// runs into initobj). Anything else keeps the per-window writes so an
-    /// adjacent-fields target resolves each member. Returns false only for an
+    /// memory copy for a 128-bit register that still holds a whole-load's
+    /// source, a single whole-value move when every lane names the same
+    /// operand or adjacent fields of one aggregate, whole-width
+    /// zero/immediate stores for constant lanes (the resolver splits them per
+    /// field or merges zero runs into initobj). Anything else keeps the
+    /// per-window writes so an adjacent-fields target resolves each member.
+    /// A 64-bit register whose lanes came from a load also stores per-window:
+    /// the resolver narrows each window back to the loaded field, which a
+    /// single eight-byte copy could not name. Returns false only for an
     /// opaque whole-register store the caller's normal path must emit.
     /// </summary>
     private bool EmitStore(Arm64Instruction insn, VectorState state, long baseOff, int bytes, int slots)
     {
-        if (state.LoadMemory is { AccessSize: var loaded } source && loaded >= bytes
+        if (bytes == 16
+            && state.LoadMemory is { AccessSize: var loaded } source && loaded >= bytes
             && insn.MemBase != Arm64Register.X31)
         {
             var copy = _add(_address, OpCode.Move,
@@ -4079,11 +4105,15 @@ internal sealed class Arm64VectorScalarizer
 
         // a 64-bit store whose two lanes are the low and high halves of one
         // operand names that operand whole — an 8-byte field or aggregate
-        // resolves without reading a lane-typed local.
+        // resolves without reading a lane-typed local. A register the lanes
+        // came from by loading keeps the per-window stores instead: its
+        // windows narrow back to the fields the load covered.
         if (slots == 2
             && state.Slots[0] is { } low && state.Slots[1] is { } high
             && low.BitOffset == 0 && high.BitOffset == 32
             && SameOperand(low.Operand, high.Operand)
+            && !(low.Operand is Register { Name: { } laneReg }
+                 && _vectors.TryGetValue(laneReg, out var laneState) && laneState.Loaded)
             && RegisterReadable(low.Operand, 64))
         {
             var wide = _add(_address, OpCode.Move, [StoreMem(insn, baseOff, 8), low.Operand]);
@@ -4097,12 +4127,13 @@ internal sealed class Arm64VectorScalarizer
             var op = SlotOperand(state, slot);
             if (op == null)
                 continue;
-            // accessSize stays unset: the window's 4-byte width goes on
-            // NativeStoreWidthBytes instead, matching the base lifter's
-            // pair-store shape so an address-taken local can still widen
-            // into the aggregate the two windows compose.
-            _add(_address, OpCode.Move, [StoreMem(insn, baseOff + slot * 4, 0), op])
-                .NativeStoreWidthBytes = 4;
+            // every proven 32-bit window is its own four-byte store: a window
+            // that is itself a slice of a wider load narrows back to the field
+            // it covered, and an element local already carries the field's
+            // float width — either way the destination member resolves.
+            var window = _add(_address, OpCode.Move, [StoreMem(insn, baseOff + slot * 4, 4), op]);
+            window.NativeMemoryAccessSize = 4;
+            window.NativeStoreWidthBytes = 4;
             _emitted = true;
         }
         return true;
