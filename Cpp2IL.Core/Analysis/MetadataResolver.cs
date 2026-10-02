@@ -1591,8 +1591,24 @@ public static class MetadataResolver
         return IsCompilerGeneratedBackingField(leaf)
             && (addressed
                 || !(BackingAccessorVisible(leaf, caller, store)
-                     || IsOwnBackingAccessor(leaf, caller, store)));
+                     || IsOwnBackingAccessor(leaf, caller, store)
+                     || store && IsOwnInitializer(leaf, caller)));
     }
+
+    // A get-only auto-property is assigned only in its own type's constructor of the same
+    // kind: `static P { get; } = v` is `stsfld <P>k__BackingField` in the .cctor, and
+    // `P { get; } = v` or `P = v` is `stfld` in an instance .ctor. That store is the
+    // property assignment the source made, not a setter call.
+    private static bool IsOwnInitializer(FieldAnalysisContext field, MethodAnalysisContext caller)
+        => caller.Name == (field.IsStatic ? ".cctor" : ".ctor")
+           && caller.IsStatic == field.IsStatic
+           && FindBackingAccessor(field, store: true) == null
+           && FindBackingAccessor(field, store: false) != null
+           && GenericDefinition(field.DeclaringType) is { } owner
+           && ReferenceEquals(owner, GenericDefinition(caller.DeclaringType));
+
+    private static TypeAnalysisContext? GenericDefinition(TypeAnalysisContext? type)
+        => type is GenericInstanceTypeAnalysisContext instance ? instance.GenericType : type;
 
     internal static bool IsCompilerGeneratedBackingField(FieldAnalysisContext field) =>
         field.Name.StartsWith("<", System.StringComparison.Ordinal)
