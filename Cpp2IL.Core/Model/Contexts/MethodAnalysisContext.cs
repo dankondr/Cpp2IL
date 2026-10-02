@@ -611,6 +611,11 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     // pipeline see the same instructions.
     internal InlinedMemberRecovery.BodyFacts? MemberBodyFacts;
 
+    // Frame spans witnessed to be one whole copy of a source value, proven while
+    // the per-cell fills still exist (dead code drops fills nothing reads).
+    // ByReferenceArgumentRecovery spells a by-value argument from the source.
+    internal Dictionary<LocalVariable, Analysis.CopiedFrameSpanRecovery.SpanCopy>? CopiedSpans;
+
     [MemberNotNull(nameof(ConvertedIsil))]
     public void Analyze()
     {
@@ -710,6 +715,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Create locals
         SsaForm.Build(this);
         LocalVariables.CreateAll(this);
+
+        // Witness whole-copy frame spans while every per-cell fill still exists:
+        // the first dead-code sweep below drops fills nothing else reads.
+        Analysis.CopiedFrameSpanRecovery.Run(this);
 
         // Fold the explicit per-comparison flag arithmetic back into single relational comparisons,
         // then eliminate the now-dead flag computations. Both run in SSA form, where each
