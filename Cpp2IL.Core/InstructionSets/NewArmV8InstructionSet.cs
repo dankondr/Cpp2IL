@@ -1289,17 +1289,18 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     // a discarded result means this is only about the flags
                     var dest = IsReg31(instruction.Op0Reg) ? new Register(null, "TEMP") : ConvertOperand(instruction, 0);
 
+                    // A subtract's flags describe its input operands, so they must be evaluated
+                    // before the result register is written: for `subs wD, wD, #k` (and the
+                    // src2-aliased forms) the operands read afterwards are already the result.
+                    if (setsFlags && isSubtract)
+                        EmitCompareFlags(src1, src2);
+
                     // A following numeric conversion is still represented as a Move and can
                     // coalesce back into this result, so direct ADD/SUB width is not stable yet.
                     Add(address, isSubtract ? OpCode.Subtract : OpCode.Add, dest, src1, src2);
 
-                    if (setsFlags)
-                    {
-                        if (isSubtract)
-                            EmitCompareFlags(src1, src2);
-                        else
-                            EmitResultFlags(dest);
-                    }
+                    if (setsFlags && !isSubtract)
+                        EmitResultFlags(dest);
 
                     break;
                 }
