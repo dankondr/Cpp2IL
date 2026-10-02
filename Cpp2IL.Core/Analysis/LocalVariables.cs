@@ -1054,20 +1054,28 @@ public static class LocalVariables
         {
             var (call, buffer, _, resultType, callIndex) = hiddenReturn;
             var callBlock = blockOf[call];
-            var callPosition = callBlock.Instructions.IndexOf(call);
-            var shadows = HiddenReturnShadows(hiddenReturns, call, buffer, callBlock, blockOf, dominance);
+            var endIndex = hiddenReturns
+                .Where(candidate => candidate.Index > callIndex
+                    && (ReferenceEquals(candidate.Buffer, buffer)
+                        || TryStackOffset(candidate.Buffer.Register.Name) is { } candidateOffset
+                        && TryStackOffset(buffer.Register.Name) == candidateOffset))
+                .Select(candidate => candidate.Index)
+                .DefaultIfEmpty(instructions.Count)
+                .Min();
+            var rivals = HiddenReturnRivals(hiddenReturns, call, buffer, blockOf);
 
-            bool Covered(Instruction next) => InsideHiddenReturnWindow(
-                next, blockOf, dominance, callBlock, callPosition, shadows);
+            bool Covered(Instruction next, int index) => InsideHiddenReturnWindow(
+                index, callIndex, endIndex, blockOf[next], callBlock, rivals, dominance);
 
             // The same native stack slot is routinely reused for several different
             // generic struct returns. A CLR local has one fixed type, so model each
             // hidden return as its own local and reconnect only its own lifetime.
             LocalVariable? result = null;
             var aliases = new HashSet<LocalVariable> { buffer };
-            foreach (var next in instructions.Where(Covered))
-                if (next is { OpCode: OpCode.Move,
+            for (var i = callIndex + 1; i < instructions.Count; i++)
+                if (instructions[i] is { OpCode: OpCode.Move,
                         Operands: [LocalVariable destination, LocalVariable source] }
+                    && Covered(instructions[i], i)
                     && !ReferenceEquals(destination, source) && aliases.Contains(source))
                 {
                     aliases.Add(destination);
@@ -1086,7 +1094,7 @@ public static class LocalVariables
             for (var i = callIndex + 1; i < instructions.Count; i++)
             {
                 var next = instructions[i];
-                if (!Covered(next))
+                if (!Covered(next, i))
                     continue;
                 var destination = next.Destination;
                 for (var operandIndex = 0; operandIndex < next.Operands.Count; operandIndex++)
@@ -1102,55 +1110,46 @@ public static class LocalVariables
         }
     }
 
-    // A call's rewrite window must follow control flow, not the linear instruction list:
-    // the copies on one arm of a branch interleave with the next arm's call in the flat
-    // list, so an index bound steals reads from other arms and rebinds them to the wrong
-    // result. A read belongs to a call only while the call's block dominates it, and a
-    // later hidden return into the same cell shadows everything it dominates.
+    // A read belongs to a call's rewrite window while the cell still holds that call's
+    // returned bytes. List order alone cannot tell this: the copies on one arm of a
+    // branch interleave with the next arm's call in the flat list, and a copy in a
+    // merge block reads the cell after the join where no single producer dominates it.
+    // The window is therefore the flat list range extended by every block the call
+    // dominates, minus anything a rival call on the same cell dominates without
+    // dominating this call — such a rival writes the cell last on every path to the
+    // read, so the read is its result's, never this call's.
     private static bool InsideHiddenReturnWindow(
-        Instruction next,
-        Dictionary<Instruction, Block> blockOf,
-        DominatorInfo dominance,
+        int index,
+        int callIndex,
+        int endIndex,
+        Block nextBlock,
         Block callBlock,
-        int callPosition,
-        List<(Block ShadowBlock, int ShadowPosition)> shadows)
+        List<Block> rivals,
+        DominatorInfo dominance)
     {
-        if (!blockOf.TryGetValue(next, out var nextBlock)
-            || !dominance.Dominates(callBlock, nextBlock))
-            return false;
-
-        if (ReferenceEquals(nextBlock, callBlock) && nextBlock.Instructions.IndexOf(next) <= callPosition)
-            return false;
-
-        foreach (var (shadowBlock, shadowPosition) in shadows)
-            if (dominance.Dominates(shadowBlock, nextBlock)
-                && (!ReferenceEquals(nextBlock, shadowBlock)
-                    || nextBlock.Instructions.IndexOf(next) >= shadowPosition))
+        foreach (var rival in rivals)
+            if (dominance.Dominates(rival, nextBlock) && !dominance.Dominates(rival, callBlock))
                 return false;
 
-        return true;
+        return index > callIndex && index < endIndex || dominance.Dominates(callBlock, nextBlock);
     }
 
-    // Later calls writing through the same cell end this call's claim on the buffer.
-    // "Later" means dominated by this call's block: it can only execute after the call
-    // on every path that reaches it.
-    private static List<(Block ShadowBlock, int ShadowPosition)> HiddenReturnShadows(
+    // Other calls writing through the same cell; a read one's block dominates may
+    // belong to it rather than to the earlier call in the list.
+    private static List<Block> HiddenReturnRivals(
         List<(Instruction Call, LocalVariable Buffer, MethodAnalysisContext Target,
             TypeAnalysisContext ResultType, int Index)> hiddenReturns,
         Instruction call,
         LocalVariable buffer,
-        Block callBlock,
-        Dictionary<Instruction, Block> blockOf,
-        DominatorInfo dominance)
+        Dictionary<Instruction, Block> blockOf)
     {
         return hiddenReturns
             .Where(candidate => !ReferenceEquals(candidate.Call, call)
                 && (ReferenceEquals(candidate.Buffer, buffer)
                     || TryStackOffset(candidate.Buffer.Register.Name) is { } candidateOffset
-                    && TryStackOffset(buffer.Register.Name) == candidateOffset)
-                && dominance.Dominates(callBlock, blockOf[candidate.Call]))
-            .Select(candidate => (blockOf[candidate.Call],
-                blockOf[candidate.Call].Instructions.IndexOf(candidate.Call)))
+                    && TryStackOffset(buffer.Register.Name) == candidateOffset))
+            .Select(candidate => blockOf[candidate.Call])
+            .Distinct()
             .ToList();
     }
 
@@ -1190,9 +1189,8 @@ public static class LocalVariables
             call.SetOperand(0, concreteTarget);
             var callIndex = instructions.IndexOf(call);
             var callBlock = blockOf[call];
-            var callPosition = callBlock.Instructions.IndexOf(call);
-            var shadows = HiddenReturnShadows(hiddenReturns, call, result.HiddenReturnBuffer,
-                callBlock, blockOf, dominance);
+            var rivals = HiddenReturnRivals(hiddenReturns, call, result.HiddenReturnBuffer,
+                blockOf);
             for (var index = 0; index < instructions.Count; index++)
             for (var operandIndex = 0; operandIndex < instructions[index].Operands.Count; operandIndex++)
             {
@@ -1210,8 +1208,8 @@ public static class LocalVariables
                 IOperand? replacement = field == null
                     ? result.HiddenReturnBuffer == null || operandIndex == 0 && instruction.IsAssignment
                       || operand is AddressOf && index <= callIndex
-                      || !InsideHiddenReturnWindow(instruction, blockOf, dominance, callBlock,
-                          callPosition, shadows)
+                      || !InsideHiddenReturnWindow(index, -1, instructions.Count,
+                          blockOf[instruction], callBlock, rivals, dominance)
                         ? null
                         : RewriteHiddenReturnStackOperand(operand, result.HiddenReturnBuffer, result,
                             resultType, instruction.NativeMemoryAccessSize ?? 0,
