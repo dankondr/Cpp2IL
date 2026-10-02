@@ -61,15 +61,18 @@ public class InlinedListAddRecoveryTests
             yield return new Instruction(-1, OpCode.Move, items, previousItems!);
     }
 
-    private List<Instruction> Check(LocalVariable items, Instruction slow)
+    // `if (size >= items.Length)`; where the game's List<T> has get_Count alone, an earlier
+    // pass has already turned the `_size` read into a get_Count call.
+    private List<Instruction> Check(LocalVariable items, Instruction slow, bool sizeThroughGetter = false)
     {
         var size = Int($"size{_index}");
         var fits = Local($"fits{_index}", App.SystemTypes.SystemBooleanType);
         var full = Local($"full{_index}", App.SystemTypes.SystemBooleanType);
+        var getCount = ((GenericInstanceTypeAnalysisContext)_list.Type!).GenericType.Methods.First(method => method.Name == "get_Count");
         return
         [
-            At(OpCode.Move, size, Field("_size")),
-            At(OpCode.CheckLess, fits, Field("_size"), new ArrayLength(items)),
+            sizeThroughGetter ? At(OpCode.Call, getCount, size, _list) : At(OpCode.Move, size, Field("_size")),
+            At(OpCode.CheckLess, fits, sizeThroughGetter ? size : Field("_size"), new ArrayLength(items)),
             At(OpCode.Not, full, fits),
             At(OpCode.ConditionalJump, slow, full),
         ];
@@ -181,6 +184,30 @@ public class InlinedListAddRecoveryTests
             Assert.That(targets, Is.Not.Empty);
             Assert.That(targets, Has.All.Matches<Block>(target => target != null && blocks.Contains(target) && target.Instructions.Count > 0));
             Assert.That(blocks.SelectMany(block => block.Instructions), Does.Contain(slow));
+        });
+    }
+
+    // The size read is a get_Count call: it is the body's own read and goes with it.
+    [Test]
+    public void SizeReadThroughGetCountCollapses()
+    {
+        var items = Local("items", null);
+        var exit = new Instruction(1000, OpCode.Return);
+        var slow = new Instruction(500, OpCode.CallVoid, _addWithResize, _list, new Immediate(7));
+        var instructions = Prologue(items, fastCopy: false).ToList();
+        instructions.AddRange(Check(items, slow, sizeThroughGetter: true));
+        instructions.AddRange(FastPath(items, new Immediate(7)));
+        instructions.Add(At(OpCode.Jump, exit));
+        instructions.Add(slow);
+        instructions.Add(exit);
+
+        var recovered = Recover(1, instructions);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(recovered, Does.Contain(slow));
+            Assert.That(recovered.Where(TouchesListInternals), Is.Empty);
+            Assert.That(recovered.Where(instruction => instruction.OpCode == OpCode.Call), Is.Empty);
         });
     }
 
