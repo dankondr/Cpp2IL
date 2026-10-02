@@ -84,6 +84,67 @@ public class AddressAliasRecoveryTests
     }
 
     [Test]
+    public void StoreThroughMergeOfOneFieldAddressFoldsToNeighbourField()
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        var ownerType = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Owner",
+            app.SystemTypes.SystemObjectType, TypeAttributes.Public);
+        var state = new InjectedFieldAnalysisContext("state", app.SystemTypes.SystemInt32Type,
+            FieldAttributes.Public, ownerType, 16);
+        var current = new InjectedFieldAnalysisContext("current", app.SystemTypes.SystemObjectType,
+            FieldAttributes.Public, ownerType, 24);
+        ownerType.Fields.Add(state);
+        ownerType.Fields.Add(current);
+        var owner = new LocalVariable("owner", new Register(null, "owner"), ownerType);
+        var left = new LocalVariable("left", new Register(null, "left"));
+        var right = new LocalVariable("right", new Register(null, "right"));
+        var merged = new LocalVariable("merged", new Register(null, "merged"));
+        // `str x0, [x19, #0x18]!` on two paths leaves x19 = owner + 24 on both; the
+        // `stur w8, [x19, #-8]` after the join is owner.state.
+        var store = new Instruction(3, OpCode.Move, new MemoryOperand(merged, addend: -8, accessSize: 4),
+            new Immediate(1));
+        var method = Method(ownerType, app, [
+            new(0, OpCode.Add, left, owner, new Immediate(24)),
+            new(1, OpCode.Add, right, owner, new Immediate(24)),
+            new(2, OpCode.Phi, merged, left, right),
+            store, new(4, OpCode.Return)]);
+
+        MetadataResolver.ResolveFieldOffsets(method);
+
+        Assert.That(store.Operands[0], Is.TypeOf<FieldReference>(), () => store.Operands[0]?.ToString() ?? "<null>");
+        Assert.That(((FieldReference)store.Operands[0]).Field, Is.SameAs(state));
+    }
+
+    [Test]
+    public void MergeOfDifferentAddressesIsNotFolded()
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        var ownerType = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Owner",
+            app.SystemTypes.SystemObjectType, TypeAttributes.Public);
+        ownerType.Fields.Add(new InjectedFieldAnalysisContext("a", app.SystemTypes.SystemInt32Type,
+            FieldAttributes.Public, ownerType, 16));
+        ownerType.Fields.Add(new InjectedFieldAnalysisContext("b", app.SystemTypes.SystemInt32Type,
+            FieldAttributes.Public, ownerType, 20));
+        var owner = new LocalVariable("owner", new Register(null, "owner"), ownerType);
+        var left = new LocalVariable("left", new Register(null, "left"));
+        var right = new LocalVariable("right", new Register(null, "right"));
+        var merged = new LocalVariable("merged", new Register(null, "merged"));
+        var load = new Instruction(3, OpCode.Move, new LocalVariable("value", new Register(null, "value")),
+            new MemoryOperand(merged, accessSize: 4));
+        var method = Method(ownerType, app, [
+            new(0, OpCode.Add, left, owner, new Immediate(16)),
+            new(1, OpCode.Add, right, owner, new Immediate(20)),
+            new(2, OpCode.Phi, merged, left, right),
+            load, new(4, OpCode.Return)]);
+
+        MetadataResolver.ResolveFieldOffsets(method);
+
+        Assert.That(load.Operands[1], Is.TypeOf<MemoryOperand>());
+    }
+
+    [Test]
     public void TypedAddressAliasStillFoldsToField()
     {
         Cpp2IlApi.ResetInternalState();
