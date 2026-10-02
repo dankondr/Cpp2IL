@@ -39,21 +39,26 @@ public static class Il2CppCheckRecovery
     public static void Run(MethodAnalysisContext method)
     {
         var lengthCalls = new HashSet<Instruction>();
+        // The accesses whose checks are gone, by the exception each now raises on its own: a check
+        // of the other kind may not be moved past one, or the two exceptions would swap order.
+        var guarded = new Dictionary<Instruction, string>();
         // The access is the innermost: a T[,]'s second-dimension check sits between its first and
         // the element, and the null check before them all, so peel outwards one round at a time.
-        for (var round = 0; round < 8 && RemoveRound(method, IndexOutOfRange, lengthCalls); round++)
+        for (var round = 0; round < 8 && RemoveRound(method, IndexOutOfRange, lengthCalls, guarded); round++)
         {
         }
 
-        for (var round = 0; round < 8 && RemoveRound(method, NullReference, lengthCalls); round++)
+        for (var round = 0; round < 8 && RemoveRound(method, NullReference, lengthCalls, guarded); round++)
         {
         }
     }
 
-    private static bool RemoveRound(MethodAnalysisContext method, string exception, HashSet<Instruction> lengthCalls)
+    private static bool RemoveRound(MethodAnalysisContext method, string exception, HashSet<Instruction> lengthCalls,
+        Dictionary<Instruction, string> guarded)
     {
         var cfg = method.ControlFlowGraph!;
         var removed = false;
+        var facts = new MethodFacts(cfg);
         foreach (var block in cfg.Blocks.ToList())
         {
             if (block.Instructions.LastOrDefault() is not { OpCode: OpCode.ConditionalJump, Operands: [Block target, _] } branch
@@ -66,7 +71,7 @@ public static class Il2CppCheckRecovery
             if (!throwsOnTrue && Raises(fallThrough) != exception)
                 continue;
             var raise = throwsOnTrue ? target : fallThrough;
-            var trace = new Trace(block, throwsOnTrue ? fallThrough : target, cfg);
+            var trace = new Trace(block, throwsOnTrue ? fallThrough : target, cfg, facts, guarded);
             var usedLengths = new HashSet<Instruction>();
             Instruction? checkedCall = null;
             if ((exception == IndexOutOfRange ? !trace.ProvesBoundsCheck(throwsOnTrue, usedLengths)
@@ -80,6 +85,7 @@ public static class Il2CppCheckRecovery
             cfg.RemovePredecessor(raise, block);
             block.CalculateBlockType();
             lengthCalls.UnionWith(usedLengths);
+            guarded[trace.Access!] = exception;
             if (checkedCall != null)
                 NullCheckedCalls(method).Add(checkedCall);
             removed = true;
@@ -100,6 +106,16 @@ public static class Il2CppCheckRecovery
                 call.SetOperands();
             }
         return true;
+    }
+
+    // InjectedCheckRemover drops null checks without proving what they guarded. When one guarded a
+    // direct instance call on the checked reference, the source made that call with callvirt.
+    internal static void MarkCheckedReceiver(MethodAnalysisContext method, Block block, Block raise)
+    {
+        if (block.Successors.FirstOrDefault(successor => successor != raise) is not { } next)
+            return;
+        if (new Trace(block, next, method.ControlFlowGraph!, null, []).ProvesNullCheck(true, out var call) && call != null)
+            NullCheckedCalls(method).Add(call);
     }
 
     // A method with landing pads has its regions proven on the native code, where
@@ -181,8 +197,17 @@ public static class Il2CppCheckRecovery
         private readonly int _branch;
         private readonly HashSet<Instruction> _lengthCalls = [];
 
-        public Trace(Block block, Block next, ISILControlFlowGraph cfg)
+        private readonly MethodFacts? _facts;
+        private readonly Dictionary<Instruction, string> _guarded;
+        private string _exception = "";
+
+        // The access a proven check guards.
+        public Instruction? Access { get; private set; }
+
+        public Trace(Block block, Block next, ISILControlFlowGraph cfg, MethodFacts? facts, Dictionary<Instruction, string> guarded)
         {
+            _facts = facts;
+            _guarded = guarded;
             var before = new List<Block>();
             for (var current = block; before.Count < TraceBlocks && current.Predecessors is [var single]
                                       && single != cfg.EntryBlock && single != block && !before.Contains(single);
@@ -207,6 +232,7 @@ public static class Il2CppCheckRecovery
         public bool ProvesNullCheck(bool throwsOnTrue, out Instruction? checkedCall)
         {
             checkedCall = null;
+            _exception = NullReference;
             var condition = _code[_branch].Operands[1];
             var at = _branch;
             while (Definition(condition, at) is { } negation && _code[negation] is { OpCode: OpCode.Not, Operands: [_, var inner] })
@@ -223,6 +249,7 @@ public static class Il2CppCheckRecovery
             if (FirstEffect(position => Dereferenced(_code[position], operand => Same(operand, position))) is not { } access)
                 return false;
             var instruction = _code[access];
+            Access = instruction;
             bool SameHere(IOperand operand) => Same(operand, access);
 
             if (instruction.IsCall && instruction.Operands[0] is MethodAnalysisContext { IsStatic: false } target)
@@ -250,6 +277,7 @@ public static class Il2CppCheckRecovery
         // that index of that length's array and dimension.
         public bool ProvesBoundsCheck(bool throwsOnTrue, HashSet<Instruction> lengthCalls)
         {
+            _exception = IndexOutOfRange;
             if (Compare(new Term(_code[_branch].Operands[1], _branch), 0) is not { } condition)
                 return false;
             var raised = throwsOnTrue ? condition : condition.Negate();
@@ -259,6 +287,10 @@ public static class Il2CppCheckRecovery
                 Relation.LessOrEqual => (raised.Right, raised.Left),
                 Relation.Equal when raised.Right.Operand is Immediate { Value: 0 } => (raised.Right, raised.Left),
                 Relation.Equal when raised.Left.Operand is Immediate { Value: 0 } => (raised.Left, raised.Right),
+                // A counter that starts at or above 0 and steps by 1 meets its length before it can
+                // pass it, so clang checks it with `cmp len, i; b.eq`.
+                Relation.Equal when CountsUp(raised.Right) && LengthOf(raised.Left) != null => (raised.Right, raised.Left),
+                Relation.Equal when CountsUp(raised.Left) && LengthOf(raised.Right) != null => (raised.Left, raised.Right),
                 _ => (default, default),
             };
             if (index.Operand == null || LengthOf(length) is not { } bound || LengthOf(index) != null)
@@ -284,6 +316,7 @@ public static class Il2CppCheckRecovery
 
             if (FirstEffect(Accesses) is not { } access || !Accesses(access))
                 return false;
+            Access = _code[access];
             lengthCalls.UnionWith(_lengthCalls);
             return true;
         }
@@ -321,7 +354,7 @@ public static class Il2CppCheckRecovery
         private int? FirstEffect(System.Func<int, bool> isAccess)
         {
             for (var i = _branch + 1; i < _code.Count; i++)
-                if (isAccess(i) || !Pure(_code[i]))
+                if (isAccess(i) || !Pure(_code[i]) || _guarded.TryGetValue(_code[i], out var raised) && raised != _exception)
                     return i;
             return null;
         }
@@ -418,11 +451,14 @@ public static class Il2CppCheckRecovery
                 if (operand is ArrayLength length)
                     return ValueOf(length.Array, at) is { } array ? (array, 0) : null;
                 if (Definition(operand, at) is not { } definition)
-                    return null;
+                    return GlobalLengthOf(operand, 0);
                 switch (_code[definition])
                 {
                     case { OpCode: OpCode.Move, Operands: [_, var source] }:
                         (operand, at) = (source, definition);
+                        continue;
+                    case { OpCode: OpCode.And, Operands: [_, var masked, Immediate { Value: -1 or 0xFFFFFFFF }] }:
+                        (operand, at) = (masked, definition);
                         continue;
                     case { OpCode: OpCode.Call, Operands: [MethodAnalysisContext { Name: "GetLength", DeclaringType.FullName: "System.Array" },
                         _, var array, Immediate dimension, ..] } call when ValueOf(array, definition) is { } owner:
@@ -434,6 +470,35 @@ public static class Il2CppCheckRecovery
             }
             return null;
         }
+
+        // The length a local holds when the path does not define it: its one definition, made outside
+        // any loop, reads the length of an array that holds one value too (a parameter, or another
+        // local written once outside any loop) - the same value the path sees on entry.
+        private (Value Array, int Dimension)? GlobalLengthOf(IOperand operand, int depth)
+        {
+            if (operand is ArrayLength { Array: var lengthOf })
+                return _facts!.IsStable(lengthOf) ? (new Value(lengthOf, -1), 0) : null;
+            if (depth > 8 || operand is not LocalVariable local || _facts!.StableDefinition(local) is not { } definition)
+                return null;
+            switch (definition)
+            {
+                case { OpCode: OpCode.Move, Operands: [_, var source] }:
+                    return GlobalLengthOf(source, depth + 1);
+                case { OpCode: OpCode.And, Operands: [_, var masked, Immediate { Value: -1 or 0xFFFFFFFF }] }:
+                    return GlobalLengthOf(masked, depth + 1);
+                case { OpCode: OpCode.Call, Operands: [MethodAnalysisContext { Name: "GetLength", DeclaringType.FullName: "System.Array" },
+                    _, LocalVariable array, Immediate dimension, ..] } call when _facts!.IsStable(array):
+                    _lengthCalls.Add(call);
+                    return (new Value(array, -1), (int)dimension.Value);
+                default:
+                    return null;
+            }
+        }
+
+        // An index the path does not define, written exactly twice in the method: `i = s` with s >= 0,
+        // and `i = i + 1`, directly or through a copy of `i + 1`.
+        private bool CountsUp(Term term)
+            => ValueOf(term.Operand, term.At) is { Root: LocalVariable counter, Definition: -1 } && _facts!.CountsUp(counter);
 
         // The comparison a condition local computes, from the lifted flag arithmetic: ARM's C is
         // `!(a < b)` and Z is `(a - b) == 0` after `cmp a, b`, so b.ls is `!C || Z`, b.hs is C;
@@ -511,6 +576,59 @@ public static class Il2CppCheckRecovery
         private bool SameTerm(Term a, Term b)
             => ValueOf(a.Operand, a.At) is { } x && x.Equals(ValueOf(b.Operand, b.At))
                || LengthOf(a) is { } la && LengthOf(b) is { } lb && la.Equals(lb);
+    }
+
+    // Whole-method facts about locals, out of SSA: how often each is written, and where.
+    private sealed class MethodFacts
+    {
+        private readonly Dictionary<LocalVariable, List<(Instruction Instruction, Block Block)>> _definitions = [];
+        private readonly Dictionary<Block, bool> _cyclic = [];
+
+        public MethodFacts(ISILControlFlowGraph cfg)
+        {
+            foreach (var block in cfg.Blocks)
+            foreach (var instruction in block.Instructions)
+                if (instruction.Destination is LocalVariable local)
+                    (_definitions.TryGetValue(local, out var list) ? list : _definitions[local] = []).Add((instruction, block));
+        }
+
+        // Never written (a parameter), or written once in a block no loop runs again.
+        public bool IsStable(LocalVariable local)
+            => !_definitions.TryGetValue(local, out var definitions) || definitions is [var only] && !OnCycle(only.Block);
+
+        public Instruction? StableDefinition(LocalVariable local)
+            => _definitions.TryGetValue(local, out var definitions) && definitions is [var only] && !OnCycle(only.Block)
+                ? only.Instruction
+                : null;
+
+        public bool CountsUp(LocalVariable counter)
+        {
+            if (!_definitions.TryGetValue(counter, out var definitions) || definitions.Count != 2)
+                return false;
+            Instruction? Single(LocalVariable local)
+                => _definitions.TryGetValue(local, out var list) && list is [var only] ? only.Instruction : null;
+            return definitions.Any(d => d.Instruction is { OpCode: OpCode.Move, Operands: [_, Immediate { Value: >= 0 }] })
+                   && definitions.Any(d => (d.Instruction is { OpCode: OpCode.Move, Operands: [_, LocalVariable copy] } ? Single(copy) : d.Instruction)
+                       is { OpCode: OpCode.Add, Operands: [_, LocalVariable from, Immediate { Value: 1 }] }
+                       && ReferenceEquals(from, counter));
+        }
+
+        private bool OnCycle(Block block)
+        {
+            if (_cyclic.TryGetValue(block, out var cyclic))
+                return cyclic;
+            var seen = new HashSet<Block>();
+            var work = new Stack<Block>(block.Successors);
+            while (work.TryPop(out var current))
+            {
+                if (current == block)
+                    return _cyclic[block] = true;
+                if (seen.Add(current))
+                    foreach (var successor in current.Successors)
+                        work.Push(successor);
+            }
+            return _cyclic[block] = false;
+        }
     }
 
     private static HashSet<Instruction> NullCheckedCalls(MethodAnalysisContext method)
