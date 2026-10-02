@@ -178,6 +178,47 @@ public class PackedRegisterFieldTests
     }
 
     [Test]
+    public void WidthlessAddOfPackedPairReadsTheLowField()
+    {
+        // `add w10, w9, w2` with a Vector2Int in x2 lifts with no width: a 64-bit add has no
+        // meaning on two packed ints, so the 32-bit result reads `v.x`. A result typed as an
+        // eight-byte integer keeps the whole-register read diagnosed. A W-source conversion
+        // reads the low field too.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var int32 = app.SystemTypes.SystemInt32Type;
+        var vector2Int = InjectStruct(app, "Vector2Int");
+        InjectField("x", int32, vector2Int, 0);
+        InjectField("y", int32, vector2Int, 4);
+        var module = new ModuleDefinition("Packed.dll");
+        Seed(module, app, vector2Int);
+        SeedCorLibTypes(app, module, int32, app.SystemTypes.SystemInt64Type, app.SystemTypes.SystemVoidType);
+
+        var packed = new LocalVariable("packed", new Register(null, "X2"), vector2Int);
+        var other = Local("other", int32);
+        var sum = Local("sum");
+        var wide = Local("wide", app.SystemTypes.SystemInt64Type);
+        var add = new Instruction(0, OpCode.Add, sum, other, packed);
+        var wideAdd = new Instruction(1, OpCode.Add, wide, other, packed);
+        // `scvtf s0, w2` converts the same low word.
+        var converted = Local("converted", app.SystemTypes.SystemSingleType);
+        var convert = new Instruction(2, OpCode.Convert, converted, packed) { ConversionSourceWidthBits = 32 };
+        var (caller, _) = ForeignCaller(app, module,
+            [add, wideAdd, convert, new Instruction(3, OpCode.Return)], [packed, other, sum, wide, converted]);
+        caller.ParameterLocals = [packed, other];
+
+        LocalVariables.ResolveTypesAndFields(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(add.Operands[2], Is.InstanceOf<FieldReference>());
+            Assert.That(((FieldReference)add.Operands[2]).Field.Name, Is.EqualTo("x"));
+            Assert.That(wideAdd.Operands[2], Is.SameAs(packed));
+            Assert.That(convert.Operands[1], Is.InstanceOf<FieldReference>());
+            Assert.That(((FieldReference)convert.Operands[1]).Field.Name, Is.EqualTo("x"));
+        });
+    }
+
+    [Test]
     public void Vector2IntYLaneIndexesTwoDimensionalArray()
     {
         // lsr w8, x0, #32 (Vector2Int.y) as the second index of grid[x, y]:

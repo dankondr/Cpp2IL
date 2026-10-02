@@ -160,6 +160,100 @@ public class Il2CppCheckRecoveryTests
         Assert.That(All(method).Count(i => i.OpCode is OpCode.ConditionalJump or OpCode.Throw), Is.EqualTo(kept), () => Dump(method));
     }
 
+    // for (i = 0; ...; i++) x = a[i] with len loaded before the loop: a counter that starts at 0
+    // and steps by 1 meets len before it can pass it, so clang checks `len == i` (`cmp len, i; b.eq`).
+    [TestCase(1, 0)]
+    [TestCase(2, 2)]
+    public void InductionCounterEqualityIsTheBoundsCheck(int step, int kept)
+    {
+        var int32 = App.SystemTypes.SystemInt32Type;
+        var boolean = App.SystemTypes.SystemBooleanType;
+        var array = Local("array", new SzArrayTypeAnalysisContext(int32));
+        LocalVariable i = Local("i", int32), length = Local("length", int32), n = Local("n", int32),
+            atEnd = Local("atEnd", boolean), more = Local("more", boolean), value = Local("value", int32);
+        var raise = Raise(9, "System.IndexOutOfRangeException");
+        var header = new Instruction(2, OpCode.CheckEqual, atEnd, length, i);
+        var method = Method([
+            new(0, OpCode.Move, i, new Immediate(0)),
+            new(1, OpCode.Move, length, new ArrayLength(array)),
+            header,
+            new(3, OpCode.ConditionalJump, raise, atEnd),
+            new(4, OpCode.Move, value, new ArrayAccess(array, i)),
+            new(5, OpCode.Add, i, i, new Immediate(step)),
+            new(6, OpCode.CheckLess, more, i, n),
+            new(7, OpCode.ConditionalJump, header, more),
+            new(8, OpCode.Return, value),
+            raise,
+        ], array, i, length, n, atEnd, more, value);
+
+        Il2CppCheckRecovery.Run(method);
+
+        Assert.That(All(method).Count(x => x.OpCode == OpCode.Throw || x is { OpCode: OpCode.ConditionalJump, Operands: [_, LocalVariable c] } && c == atEnd),
+            Is.EqualTo(kept), () => Dump(method));
+    }
+
+    // if (x == null) raise NRE; if (i >= a.Length) raise IOOR; v = a[i]; w = x.f. Once a[i] raises on its
+    // own, x's check may not move past it: with both failing, the native raises NRE first.
+    [Test]
+    public void NullCheckStaysBeforeAnAccessThatRaisesAnotherException()
+    {
+        var int32 = App.SystemTypes.SystemInt32Type;
+        var boolean = App.SystemTypes.SystemBooleanType;
+        var node = Local("node", App.SystemTypes.SystemObjectType);
+        var array = Local("array", new SzArrayTypeAnalysisContext(int32));
+        LocalVariable i = Local("i", int32), length = Local("length", int32), isNull = Local("isNull", boolean),
+            outside = Local("outside", boolean), element = Local("element", int32), field = Local("field", int32),
+            sum = Local("sum", int32);
+        var nullRaise = Raise(8, "System.NullReferenceException");
+        var indexRaise = Raise(9, "System.IndexOutOfRangeException");
+        var method = Method([
+            new(0, OpCode.CheckEqual, isNull, node, new Immediate(0)),
+            new(1, OpCode.ConditionalJump, nullRaise, isNull),
+            new(2, OpCode.Move, length, new ArrayLength(array)),
+            new(3, OpCode.CheckGreaterOrEqual, outside, i, length),
+            new(4, OpCode.ConditionalJump, indexRaise, outside),
+            new(5, OpCode.Move, element, new ArrayAccess(array, i)),
+            new(6, OpCode.Move, field, new MemoryOperand(node, null, 0x10, 0, 4)),
+            new(7, OpCode.Add, sum, element, field),
+            new(10, OpCode.Return, sum),
+            nullRaise,
+            indexRaise,
+        ], node, array, i, length, isNull, outside, element, field, sum);
+
+        Il2CppCheckRecovery.Run(method);
+
+        Assert.That(All(method).Where(x => x.OpCode == OpCode.ConditionalJump).Select(x => x.Operands[1]),
+            Is.EqualTo(new IOperand[] { isNull }), () => Dump(method));
+    }
+
+    // InjectedCheckRemover drops the null check of a direct call's receiver too: that call was a callvirt.
+    [Test]
+    public void CheckDroppedByInjectedCheckRemoverMarksItsCallForCallvirt()
+    {
+        var text = Local("text", App.SystemTypes.SystemStringType);
+        var trimmed = Local("trimmed", App.SystemTypes.SystemStringType);
+        var flag = Local("flag", App.SystemTypes.SystemBooleanType);
+        var trim = App.SystemTypes.SystemStringType.Methods.First(m => m.Name == "Trim" && !m.IsStatic && m.Parameters.Count == 0);
+        var raise = Raise(3, "System.NullReferenceException");
+        raise.ThrowFromNonReturningCall = false;
+        var call = new Instruction(2, OpCode.Call, trim, trimmed, text);
+        var method = Method([
+            new(0, OpCode.CheckEqual, flag, text, new Immediate(0)),
+            new(1, OpCode.ConditionalJump, raise, flag),
+            call,
+            new(4, OpCode.Return, trimmed),
+            raise,
+        ], text, trimmed, flag);
+
+        InjectedCheckRemover.Run(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(All(method).Any(i => i.OpCode is OpCode.ConditionalJump or OpCode.Throw), Is.False, () => Dump(method));
+            Assert.That(Il2CppCheckRecovery.ReceiverWasNullChecked(method, call), Is.True);
+        });
+    }
+
     // grid[i, j] after ArrayRecovery: a null check, then per dimension `GetLength(d) <= index`
     // (unsigned) raising, then Get. Each check is removed from the access outwards.
     [Test]

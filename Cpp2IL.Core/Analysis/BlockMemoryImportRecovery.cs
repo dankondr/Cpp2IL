@@ -65,6 +65,18 @@ public static class BlockMemoryImportRecovery
                 imports.Add((instruction, name));
         }
 
+        // A by-reference struct parameter's register holds the address of the
+        // caller's copy (AAPCS64 B.4); as a block-op pointer it is the parameter's
+        // own storage.
+        if (method.AppContext.InstructionSet.CallingConventionResolver is { } resolver)
+            foreach (var (call, name) in imports)
+                if (name is "memcpy" or "memset" or "memmove" && call is { OpCode: OpCode.Call, Operands.Count: >= 5 })
+                    for (var i = 2; i <= (name == "memset" ? 2 : 3); i++)
+                        if (call.Operands[i] is LocalVariable { IsThis: false, Type: { } parameterType } parameter
+                            && method.ParameterLocals.Contains(parameter)
+                            && resolver.PassesByReference(parameterType))
+                            call.SetOperand(i, new AddressOf(parameter));
+
         TypeCopiedFrameSlots(method, imports);
 
         var unresolvedOther = 0;

@@ -715,6 +715,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // then eliminate the now-dead flag computations. Both run in SSA form, where each
         // flag/temporary has a single, version-stable definition.
         FlagConditionRecovery.Run(this);
+        // Stack-built boxes (Il2CppFakeBox) before the dead-code pass drops their value store.
+        FakeBoxRecovery.Run(this);
         DeadCodeEliminator.Run(this);
 
         // PLT imports are named before call resolution can mistake one for a managed method.
@@ -743,6 +745,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Runtime class targets become available only after type resolution.
         KeyFunctionRecovery.Run(this);
+        FakeBoxRecovery.ResolveTypes(this);
         ArrayRecovery.RecoverObjectFieldAddresses(this);
 
         // Needs the MethodInfo* receivers typed, so runs after resolution unlike the class-init guards
@@ -818,6 +821,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         ReferenceCastRecovery.Run(this);
         ReferenceCompareExchangeRecovery.Run(this);
         CallArgumentTrimmer.Run(this);
+        // Struct arguments the ABI passes as an address are spelled as the value they name.
+        ByReferenceArgumentRecovery.Run(this);
         InlinedListClearRecovery.Run(this);
         InlinedListAddRecovery.Run(this);
 

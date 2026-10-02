@@ -184,8 +184,40 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     public override List<Instruction> GetIsilFromMethod(MethodAnalysisContext context)
         => ConvertInstructions(NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext, context.UnderlyingPointer), context);
 
+    // LLD's Cortex-A53 erratum-843419 fix moves one instruction out of line and leaves `b veneer` in its place,
+    // the veneer being `<that instruction>; b <branch + 4>`. Such a branch is that instruction, decoded at the
+    // branch's address; PC-relative instructions would change meaning there, so they are left alone.
+    internal static IReadOnlyList<Arm64Instruction> FollowRelocationVeneers(IReadOnlyList<Arm64Instruction> insns,
+        ulong start, ulong end, Func<ulong, uint?> readWord)
+    {
+        List<Arm64Instruction>? result = null;
+        for (var i = 0; i < insns.Count; i++)
+        {
+            var branch = insns[i];
+            if (branch.Mnemonic != Arm64Mnemonic.B || branch.MnemonicConditionCode is not (Arm64ConditionCode.NONE or Arm64ConditionCode.AL))
+                continue;
+            var target = branch.BranchTarget;
+            if (target >= start && target < end
+                || readWord(target) is not { } word
+                || NewArm64KeyFunctionAddresses.MatchTailCallVeneerTarget(target + 4, readWord) != branch.Address + 4)
+                continue;
+
+            var moved = Disassembler.Disassemble(BitConverter.GetBytes(word), branch.Address, new Disassembler.Options(true, true, false)).ToList();
+            if (moved is not [var insn]
+                || insn.Mnemonic == Arm64Mnemonic.INVALID
+                || insn.MnemonicCategory is Arm64MnemonicCategory.Branch or Arm64MnemonicCategory.ConditionalBranch
+                    or Arm64MnemonicCategory.Return or Arm64MnemonicCategory.LoadAddress
+                || new[] { insn.Op0Kind, insn.Op1Kind, insn.Op2Kind, insn.Op3Kind }.Contains(Arm64OperandKind.ImmediatePcRelative))
+                continue;
+
+            (result ??= insns.ToList())[i] = insn;
+        }
+
+        return result ?? insns;
+    }
+
     internal List<Instruction> ConvertInstructions(IEnumerable<Arm64Instruction> insns, MethodAnalysisContext context,
-        Func<ulong, string?>? importNameResolver = null)
+        Func<ulong, string?>? importNameResolver = null, Func<ulong, uint?>? readWord = null)
     {
         if (adrpOffsets == null) // initializers for ThreadStatic fields only run on the first thread
             adrpOffsets = new();
@@ -197,7 +229,11 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         var instructions = new List<Instruction>();
         var addresses = new List<ulong>();
 
-        var instructionList = insns as IReadOnlyList<Arm64Instruction> ?? insns.ToList();
+        var binary = context.AppContext.Binary;
+        var instructionList = FollowRelocationVeneers(insns as IReadOnlyList<Arm64Instruction> ?? insns.ToList(),
+            context.UnderlyingPointer, context.UnderlyingPointer + (ulong)context.RawBytes.Length,
+            readWord ?? (va => binary.TryMapVirtualAddressToRaw(va, out var raw) && raw >= 0 && raw + 4 <= binary.RawLength
+                ? BitConverter.ToUInt32(binary.GetRawBinaryContent().Slice((int)raw, 4)) : null));
         var scalarizer = new Arm64VectorScalarizer();
         scalarizer.Begin(instructionList);
 
@@ -667,7 +703,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 return;
             }
 
-            IOperand source = ConvertOperand(insn, 1);
+            IOperand source = scalarizer.ScalarLaneOperand(insn.Op1Reg) ?? ConvertOperand(insn, 1);
             var fixedPoint = insn.Op2Kind == Arm64OperandKind.Immediate;
             var sourceIsDouble = insn.Op1Reg is >= Arm64Register.D0 and <= Arm64Register.D31;
             if (fixedPoint && mnemonic is not (Arm64Mnemonic.SCVTF or Arm64Mnemonic.UCVTF))
@@ -741,16 +777,22 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 return false;
 
             var result = new Register(null, "V0");
+            var arg0 = scalarizer.ScalarLaneOperand(import.IsDouble ? Arm64Register.D0 : Arm64Register.S0)
+                ?? new Register(null, "V0");
             if (import.Method is not { } managedName)
             {
-                Add(address, OpCode.Modulo, result, new Register(null, "V0"), new Register(null, "V1"))
+                Add(address, OpCode.Modulo, result, arg0,
+                        scalarizer.ScalarLaneOperand(import.IsDouble ? Arm64Register.D1 : Arm64Register.S1)
+                            ?? new Register(null, "V1"))
                     .NativeFloatWidthBits = import.IsDouble ? 64 : 32;
                 return true;
             }
             if (import.ArgumentCount == 2)
-                EmitMathBinary(managedName, result, new Register(null, "V0"), new Register(null, "V1"), import.IsDouble);
+                EmitMathBinary(managedName, result, arg0,
+                    scalarizer.ScalarLaneOperand(import.IsDouble ? Arm64Register.D1 : Arm64Register.S1)
+                        ?? new Register(null, "V1"), import.IsDouble);
             else
-                EmitMathUnary(managedName, result, new Register(null, "V0"), import.IsDouble);
+                EmitMathUnary(managedName, result, arg0, import.IsDouble);
             return true;
         }
 
@@ -777,14 +819,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         void EmitScalarCompareMask()
         {
             var compareDest = ConvertOperand(instruction, 0);
-            var left = ConvertOperand(instruction, 1);
+            var left = scalarizer.ScalarLaneOperand(instruction.Op1Reg) ?? ConvertOperand(instruction, 1);
             IOperand right;
             if (instruction.Op2Kind == Arm64OperandKind.FloatingPointImmediate)
                 right = instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31
                     ? new DoubleLiteral(0)
                     : new FloatLiteral(0f);
             else if (instruction.Op2Kind == Arm64OperandKind.Register)
-                right = ConvertOperand(instruction, 2);
+                right = scalarizer.ScalarLaneOperand(instruction.Op2Reg) ?? ConvertOperand(instruction, 2);
             else
             {
                 Add(address, OpCode.NotImplemented,
@@ -810,7 +852,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         }
 
         var preserveAdrpOffset = false;
-        scalarizer.BeginInstruction(address);
+        scalarizer.BeginInstruction(instruction, Add);
         // lane-wise SIMD chains (DUP broadcast + following integer lanes) are
         // scalarized by the helper when lane provenance is fully proven; it
         // returns false for anything it cannot prove, leaving the normal path
@@ -835,7 +877,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     };
                     if (IsScalarFloatRegister(instruction.Op0Reg))
                     {
-                        EmitMathUnary(name, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1),
+                        EmitMathUnary(name, ConvertOperand(instruction, 0),
+                            scalarizer.ScalarLaneOperand(instruction.Op1Reg) ?? ConvertOperand(instruction, 1),
                             instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31);
                         break;
                     }
@@ -853,7 +896,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     if (IsScalarFloatRegister(instruction.Op0Reg))
                     {
                         var difference = new Register(null, "TEMP_FABD");
-                        Add(address, OpCode.Subtract, difference, ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                        Add(address, OpCode.Subtract, difference,
+                            scalarizer.ScalarLaneOperand(instruction.Op1Reg) ?? ConvertOperand(instruction, 1),
+                            scalarizer.ScalarLaneOperand(instruction.Op2Reg) ?? ConvertOperand(instruction, 2));
                         EmitMathUnary("Abs", ConvertOperand(instruction, 0), difference,
                             instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31);
                         break;
@@ -876,7 +921,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     if (IsScalarFloatRegister(instruction.Op0Reg))
                     {
                         EmitMathBinary(instruction.Mnemonic == Arm64Mnemonic.FMAXNM ? "Max" : "Min",
-                            ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2),
+                            ConvertOperand(instruction, 0),
+                            scalarizer.ScalarLaneOperand(instruction.Op1Reg) ?? ConvertOperand(instruction, 1),
+                            scalarizer.ScalarLaneOperand(instruction.Op2Reg) ?? ConvertOperand(instruction, 2),
                             instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31);
                         break;
                     }
@@ -1438,7 +1485,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.UMULL:
                 // Integer-to-float conversions are still represented as moves and can be
                 // coalesced into this result, so a direct MUL width is not yet stable here.
-                Add(address, OpCode.Multiply, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                Add(address, OpCode.Multiply, ConvertOperand(instruction, 0),
+                    scalarizer.ScalarLaneOperand(instruction.Op1Reg) ?? ConvertOperand(instruction, 1),
+                    scalarizer.ScalarLaneOperand(instruction.Op2Reg) ?? ConvertOperand(instruction, 2));
                 break;
             case Arm64Mnemonic.MNEG:
             case Arm64Mnemonic.SMNEGL:
@@ -1487,13 +1536,19 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.SDIV:
             case Arm64Mnemonic.UDIV:
             case Arm64Mnemonic.FDIV:
-                AddInteger(address, OpCode.Divide, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                AddInteger(address, OpCode.Divide, ConvertOperand(instruction, 0),
+                    scalarizer.ScalarLaneOperand(instruction.Op1Reg) ?? ConvertOperand(instruction, 1),
+                    scalarizer.ScalarLaneOperand(instruction.Op2Reg) ?? ConvertOperand(instruction, 2));
                 break;
             case Arm64Mnemonic.FADD:
-                Add(address, OpCode.Add, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                Add(address, OpCode.Add, ConvertOperand(instruction, 0),
+                    scalarizer.ScalarLaneOperand(instruction.Op1Reg) ?? ConvertOperand(instruction, 1),
+                    scalarizer.ScalarLaneOperand(instruction.Op2Reg) ?? ConvertOperand(instruction, 2));
                 break;
             case Arm64Mnemonic.FSUB:
-                Add(address, OpCode.Subtract, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                Add(address, OpCode.Subtract, ConvertOperand(instruction, 0),
+                    scalarizer.ScalarLaneOperand(instruction.Op1Reg) ?? ConvertOperand(instruction, 1),
+                    scalarizer.ScalarLaneOperand(instruction.Op2Reg) ?? ConvertOperand(instruction, 2));
                 break;
             case Arm64Mnemonic.BL:
                 AddCallAt(instruction.BranchTarget);
