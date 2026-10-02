@@ -172,14 +172,18 @@ internal static class InaccessibleCalleeRecovery
         // A virtual call narrowed onto a declaring type the caller cannot see
         // dispatches to the same target through the slot's visible base
         // declaration: callvirt on the base-declared member names the same
-        // override.
+        // override. A non-virtual callee has no same-slot substitute - a
+        // `call` must run that exact body.
+        if (!callee.IsVirtual)
+            return null;
         return BaseDeclarations(callee)
             .FirstOrDefault(candidate => caller == null || IsVisibleFrom(candidate, caller));
     }
 
     // The methods whose vtable slot the callee occupies, nearest first: the
-    // override chain where metadata has one, then the same-signature match each
-    // base type declares (injected contexts have no definition to chain).
+    // override chain where metadata has one, then the same-signature virtual
+    // match each base type declares (injected contexts have no definition to
+    // chain).
     private static IEnumerable<MethodAnalysisContext> BaseDeclarations(MethodAnalysisContext callee)
     {
         var chained = false;
