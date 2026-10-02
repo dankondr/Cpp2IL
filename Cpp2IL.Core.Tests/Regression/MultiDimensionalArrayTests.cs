@@ -581,4 +581,45 @@ public class MultiDimensionalArrayTests
             Assert.That(upper.OpCode, Is.EqualTo(OpCode.Nop), () => string.Join("\n", Instructions(caller)));
         });
     }
+
+    [Test]
+    public void ElementAddressMergedWithAnArrayIsItsOwnElement()
+    {
+        // `p = arr + (i << 3)` on one path, `p = other` on the other, then `v = [p + 0x20]`: the load
+        // is arr[i] or other[0], never p[0].
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("Merged.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemBooleanType,
+            app.SystemTypes.SystemObjectType);
+        var objects = new SzArrayTypeAnalysisContext(app.SystemTypes.SystemObjectType);
+        LocalVariable arr = Local("arr", objects), other = Local("other", objects), i = Local("i", app.SystemTypes.SystemInt32Type),
+            c = Local("c", app.SystemTypes.SystemBooleanType), s = Local("s"), p = Local("p", objects),
+            v = Local("v", app.SystemTypes.SystemObjectType);
+        var address = new Instruction(2, OpCode.Add, p, arr, s);
+        var alternative = new Instruction(4, OpCode.Move, p, other);
+        var load = new Instruction(5, OpCode.Move, v, new MemoryOperand(p, null, 0x20, 0, 8));
+        var (caller, _) = ForeignCaller(app, module, [
+            new(0, OpCode.ConditionalJump, alternative, c),
+            new(1, OpCode.ShiftLeft, s, i, new Immediate(3)),
+            address,
+            new(3, OpCode.Jump, load),
+            alternative,
+            load,
+            new(6, OpCode.Return, v)], [arr, other, i, c, s, p, v]);
+        caller.ParameterLocals = [arr, other, i, c];
+
+        ArrayRecovery.RecoverMergedElementAddresses(caller);
+
+        Assert.That(load.Operands[1], Is.InstanceOf<ArrayAccess>(), () => string.Join("\n", Instructions(caller)));
+        var access = (ArrayAccess)load.Operands[1];
+        var writes = Instructions(caller).Where(w => w.OpCode == OpCode.Move && w.Operands[0] is LocalVariable written
+            && (ReferenceEquals(written, access.Array) || ReferenceEquals(written, access.Index))).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(writes.Select(w => w.Operands[1]), Is.EquivalentTo(new IOperand[] { arr, i, other, new Immediate(0) }),
+                () => string.Join("\n", Instructions(caller)));
+            Assert.That(access.Array, Is.Not.SameAs(p));
+            Assert.That(address.OpCode, Is.EqualTo(OpCode.Nop), "the element address has no reader left");
+        });
+    }
 }
