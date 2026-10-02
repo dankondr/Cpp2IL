@@ -796,6 +796,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Runs late so array and runtime-class operands reach their helpers after copy propagation has inlined them.
         ArrayRecovery.Run(this);
+        // Needs the array accesses recovered, and a T[,] index is only recovered while its bounds check proves it.
+        Il2CppCheckRecovery.Run(this);
         LocalVariables.ResolveLateGeneratedTypes(this);
         KeyFunctionRecovery.Run(this);
 

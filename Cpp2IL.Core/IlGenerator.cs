@@ -1656,7 +1656,7 @@ public static class IlGenerator
                 instructions.Add(!targetMethod.IsStatic && retargetedBaseConstructor == null
                         && structCallee == null
                         && (instruction.IsVirtualDispatch || targetMethod.DeclaringType?.IsInterface == true
-                            || directCallToVirtual)
+                            || directCallToVirtual || Analysis.Il2CppCheckRecovery.ReceiverWasNullChecked(context, instruction))
                     ? CilOpCodes.Callvirt
                     : CilOpCodes.Call, importedMethod);
                 if (retargetedBaseConstructor != null || (isOwnThis && targetMethod.Name == ".ctor"))
