@@ -7557,8 +7557,21 @@ public static class IlGenerator
                         notes.AddRange([instructions[k], instructions[++k]]);
                 for (var k = end - 1; k > i; k--)
                     instructions.RemoveAt(k);
+                // Ahead of the thrown value's straight-line producer, so a
+                // `throw new E(...)` keeps its shape; else right before the throw.
+                var at = i;
+                var need = 1;
+                while (need > 0 && at > 0 && !referenced.Contains(instructions[at])
+                       && instructions[at - 1].OpCode.FlowControl is CilFlowControl.Next or CilFlowControl.Call)
+                {
+                    at--;
+                    need += instructions[at].GetStackPopCount(body) - instructions[at].GetStackPushCount();
+                }
+                if (need != 0)
+                    at = i;
                 foreach (var note in notes)
-                    instructions.Insert(i++, note);
+                    instructions.Insert(at++, note);
+                i += notes.Count;
                 removed = true;
             }
         } while (removed);
