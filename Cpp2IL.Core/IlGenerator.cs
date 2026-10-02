@@ -1656,7 +1656,7 @@ public static class IlGenerator
                 instructions.Add(!targetMethod.IsStatic && retargetedBaseConstructor == null
                         && structCallee == null
                         && (instruction.IsVirtualDispatch || targetMethod.DeclaringType?.IsInterface == true
-                            || directCallToVirtual)
+                            || directCallToVirtual || Analysis.Il2CppCheckRecovery.ReceiverWasNullChecked(context, instruction))
                     ? CilOpCodes.Callvirt
                     : CilOpCodes.Call, importedMethod);
                 if (retargetedBaseConstructor != null || (isOwnThis && targetMethod.Name == ".ctor"))
@@ -1805,6 +1805,10 @@ public static class IlGenerator
                     break;
 
                 if (TryEmitUnityVectorOperation(instruction, context, method, locals, writeLine))
+                    break;
+
+                // `p = arr + dataOffset` read only by Span slots, which spell it `new Span(arr)`.
+                if (OnlyFeedsSpanSlots(instruction, context))
                     break;
 
                 // Integer ops on operands that cannot legally sit in an integer slot are
@@ -8836,18 +8840,11 @@ public static class IlGenerator
         // pointer; for a Span<T>/ReadOnlySpan<T> slot the honest operand is the
         // array itself - `new Span(arr)` writes the same pointer plus the
         // array's length. Only fires when the operand is not already span-kind.
-        if (contract is GenericInstanceTypeAnalysisContext
-                { GenericType.FullName: "System.Span`1" or "System.ReadOnlySpan`1" } spanContract
-            && emitted is not GenericInstanceTypeAnalysisContext
+        if (emitted is not GenericInstanceTypeAnalysisContext
                 { GenericType.FullName: "System.Span`1" or "System.ReadOnlySpan`1" }
-            && Analysis.LocalVariables.TryUnwrapArrayDataPointer(operand, context,
-                context.AppContext.Binary.PointerSizeBytes, out var spanArrayOperand)
-            && EmittedOperandType(spanArrayOperand!, context) is SzArrayTypeAnalysisContext
-                { ElementType: { } spanArrayElement }
-            && ThisConstructorCallPlan.SameTypeIdentity(spanArrayElement,
-                spanContract.GenericArguments[0]))
+            && SpanSlotArray(operand, contract, context) is { } spanArrayOperand)
         {
-            resolved = spanArrayOperand!;
+            resolved = spanArrayOperand;
             emitted = EmittedOperandType(resolved, context, contract);
         }
         // An operand emitting &S is already the address of S's offset-0 field: when
@@ -8892,6 +8889,67 @@ public static class IlGenerator
             return false;
         }
         return contract == null || StackContractSatisfied(emitted, contract, context, convertByRef);
+    }
+
+    // The array a Span<T>/ReadOnlySpan<T> slot spells `new Span(arr)` from when the
+    // operand is that array's data pointer (`arr + dataOffset`, traced through copies).
+    private static IOperand? SpanSlotArray(IOperand operand, TypeAnalysisContext? contract,
+        MethodAnalysisContext context)
+        => contract is GenericInstanceTypeAnalysisContext
+                { GenericType.FullName: "System.Span`1" or "System.ReadOnlySpan`1" } spanContract
+            && Analysis.LocalVariables.TryUnwrapArrayDataPointer(operand, context,
+                context.AppContext.Binary.PointerSizeBytes, out var arrayOperand)
+            && EmittedOperandType(arrayOperand!, context) is SzArrayTypeAnalysisContext { ElementType: { } element }
+            && ThisConstructorCallPlan.SameTypeIdentity(element, spanContract.GenericArguments[0])
+                ? arrayOperand
+                : null;
+
+    // `p = arr + dataOffset` is the array's data pointer; a managed reference takes no
+    // `+`, so the add has no honest emission. When no read of p is left - its stores
+    // already respelled as `new Span(arr)` - or every read of p (directly, or through
+    // phi/copy locals read the same way) is a Span slot that SpanSlotArray respells,
+    // nothing in the IL needs the add: it emits nothing instead of a throwing
+    // unrecoverable operation that would make the rest of the block dead.
+    private static bool OnlyFeedsSpanSlots(Instruction instruction, MethodAnalysisContext context)
+    {
+        if (instruction is not { OpCode: OpCode.Add,
+                Operands: [LocalVariable pointer, var arrayBase, Immediate { Value: var offset }] }
+            || offset != context.AppContext.Binary.PointerSizeBytes * 4
+            || EmittedOperandType(arrayBase, context) is not SzArrayTypeAnalysisContext)
+            return false;
+
+        var visited = new HashSet<LocalVariable>();
+        var work = new Stack<LocalVariable>([pointer]);
+        while (work.Count > 0)
+        {
+            var local = work.Pop();
+            if (!visited.Add(local))
+                continue;
+            foreach (var reader in context.ControlFlowGraph!.Instructions)
+            {
+                if (ReferenceEquals(reader, instruction)
+                    || !Analysis.DeadCodeEliminator.UsedLocals(reader).Contains(local))
+                    continue;
+                if (reader is { OpCode: OpCode.Move, Operands: [var slot, LocalVariable stored] }
+                    && ReferenceEquals(stored, local))
+                {
+                    if (SpanSlotArray(local, StoreContract(slot, context), context) != null)
+                        continue;
+                    if (slot is LocalVariable copy)
+                        work.Push(copy);
+                    else
+                        return false;
+                    continue;
+                }
+                if (reader is { OpCode: OpCode.Phi, Destination: LocalVariable merged })
+                {
+                    work.Push(merged);
+                    continue;
+                }
+                return false;
+            }
+        }
+        return true;
     }
 
     // A store through a managed pointer is honest only when the value's emitted
@@ -10412,20 +10470,23 @@ public static class IlGenerator
         // unverifiable IL. A block write to a numeric literal has no provable
         // managed meaning: keep the named diagnostic rather than emit
         // guaranteed-invalid IL.
-        if (destination is Immediate
-            || !Analysis.BlockMemoryImportRecovery.IsProvablyReferenceFreeRegion(destination, count, context)
-            || !contentProvable
-            || !Analysis.BlockMemoryImportRecovery.IsScalarOperand(count, context))
+        var operandsProvable = destination is not Immediate && contentProvable
+            && Analysis.BlockMemoryImportRecovery.IsScalarOperand(count, context);
+
+        // A block write covering exactly a proven value type through managed
+        // pointers to that type is the type's assignment - verifiable IL, and
+        // barrier-correct where cpblk would skip a managed-reference field, so
+        // it needs no reference-free region.
+        var typed = operandsProvable && TryEmitTypedBlockOperation(instruction, destination, content, count,
+            context, method, locals, writeLine);
+        if (!typed && (!operandsProvable
+            || !Analysis.BlockMemoryImportRecovery.IsProvablyReferenceFreeRegion(destination, count, context)))
         {
             EmitUnrecoverableOperation(method, writeLine, $"Unproven block memory operand: {instruction}");
             return;
         }
 
-        // A block write covering exactly a proven value type through managed
-        // pointers to that type is the type's assignment - verifiable IL, and
-        // barrier-correct where cpblk would skip a managed-reference field.
-        if (!TryEmitTypedBlockOperation(instruction, destination, content, count, context, method, locals,
-                writeLine))
+        if (!typed)
             switch (instruction.OpCode)
             {
             case OpCode.MemoryCopy:
@@ -10527,9 +10588,33 @@ public static class IlGenerator
         IOperand content, IOperand count, MethodAnalysisContext context, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
     {
+        if (TypedBlockPointee(instruction.OpCode, ref destination, ref content, count, context) is not { } pointee)
+            return false;
+
+        var instructions = method.CilMethodBody!.Instructions;
+        var pointeeRef = pointee.ToTypeSignature().ToTypeDefOrRef();
+        EmitBlockPointerOperand(destination, false, context, method, locals, writeLine);
+        if (instruction.OpCode == OpCode.MemorySet)
+        {
+            instructions.Add(CilOpCodes.Initobj, pointeeRef);
+            return true;
+        }
+        EmitBlockPointerOperand(content, false, context, method, locals, writeLine);
+        instructions.Add(CilOpCodes.Ldobj, pointeeRef);
+        instructions.Add(CilOpCodes.Stobj, pointeeRef);
+        return true;
+    }
+
+    // The value type a block op assigns whole - TryEmitTypedBlockOperation's
+    // proof, shared with the recovery pass so a rewrite it accepts for a
+    // struct holding references is one emission spells typed. The operands
+    // come back in the form emission loads.
+    internal static TypeAnalysisContext? TypedBlockPointee(OpCode opCode, ref IOperand destination,
+        ref IOperand content, IOperand count, MethodAnalysisContext context)
+    {
         // `&local.first` of a struct local is `&local` when that makes the two sides one type:
         // value-type field addresses are canonicalized to the first field upstream.
-        if (instruction.OpCode is OpCode.MemoryCopy or OpCode.MemoryMove)
+        if (opCode is OpCode.MemoryCopy or OpCode.MemoryMove)
         {
             destination = WholeStorage(destination, BlockCopyPointee(content, context));
             content = WholeStorage(content, BlockCopyPointee(destination, context));
@@ -10545,26 +10630,15 @@ public static class IlGenerator
             || ManagedSize(pointee, context) is not { } pointeeSize
             || byteCount.Value != pointeeSize
             || !TypeTokenUsableFrom(pointee, context))
-            return false;
+            return null;
 
-        var instructions = method.CilMethodBody!.Instructions;
-        var pointeeRef = pointee.ToTypeSignature().ToTypeDefOrRef();
-        switch (instruction.OpCode)
+        return opCode switch
         {
-            case OpCode.MemoryCopy or OpCode.MemoryMove
-                when ThisConstructorCallPlan.SameTypeIdentity(pointee, BlockCopyPointee(content, context)):
-                EmitBlockPointerOperand(destination, false, context, method, locals, writeLine);
-                EmitBlockPointerOperand(content, false, context, method, locals, writeLine);
-                instructions.Add(CilOpCodes.Ldobj, pointeeRef);
-                instructions.Add(CilOpCodes.Stobj, pointeeRef);
-                return true;
-            case OpCode.MemorySet when content is Immediate { Value: 0 }:
-                EmitBlockPointerOperand(destination, false, context, method, locals, writeLine);
-                instructions.Add(CilOpCodes.Initobj, pointeeRef);
-                return true;
-            default:
-                return false;
-        }
+            OpCode.MemoryCopy or OpCode.MemoryMove
+                when ThisConstructorCallPlan.SameTypeIdentity(pointee, BlockCopyPointee(content, context)) => pointee,
+            OpCode.MemorySet when content is Immediate { Value: 0 } => pointee,
+            _ => null,
+        };
     }
 
     // The managed size (instance size less the object header), not the marshaled native size,
