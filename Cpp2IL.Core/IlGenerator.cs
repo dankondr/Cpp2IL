@@ -1807,6 +1807,10 @@ public static class IlGenerator
                 if (TryEmitUnityVectorOperation(instruction, context, method, locals, writeLine))
                     break;
 
+                // `p = arr + dataOffset` read only by Span slots, which spell it `new Span(arr)`.
+                if (OnlyFeedsSpanSlots(instruction, context))
+                    break;
+
                 // Integer ops on operands that cannot legally sit in an integer slot are
                 // native idioms the lifter mistyped: `&slot | N`/`&slot + N` names a field
                 // inside a struct local, `packed >> 32`/`packed & mask` selects a field out
@@ -8836,18 +8840,11 @@ public static class IlGenerator
         // pointer; for a Span<T>/ReadOnlySpan<T> slot the honest operand is the
         // array itself - `new Span(arr)` writes the same pointer plus the
         // array's length. Only fires when the operand is not already span-kind.
-        if (contract is GenericInstanceTypeAnalysisContext
-                { GenericType.FullName: "System.Span`1" or "System.ReadOnlySpan`1" } spanContract
-            && emitted is not GenericInstanceTypeAnalysisContext
+        if (emitted is not GenericInstanceTypeAnalysisContext
                 { GenericType.FullName: "System.Span`1" or "System.ReadOnlySpan`1" }
-            && Analysis.LocalVariables.TryUnwrapArrayDataPointer(operand, context,
-                context.AppContext.Binary.PointerSizeBytes, out var spanArrayOperand)
-            && EmittedOperandType(spanArrayOperand!, context) is SzArrayTypeAnalysisContext
-                { ElementType: { } spanArrayElement }
-            && ThisConstructorCallPlan.SameTypeIdentity(spanArrayElement,
-                spanContract.GenericArguments[0]))
+            && SpanSlotArray(operand, contract, context) is { } spanArrayOperand)
         {
-            resolved = spanArrayOperand!;
+            resolved = spanArrayOperand;
             emitted = EmittedOperandType(resolved, context, contract);
         }
         // An operand emitting &S is already the address of S's offset-0 field: when
@@ -8892,6 +8889,67 @@ public static class IlGenerator
             return false;
         }
         return contract == null || StackContractSatisfied(emitted, contract, context, convertByRef);
+    }
+
+    // The array a Span<T>/ReadOnlySpan<T> slot spells `new Span(arr)` from when the
+    // operand is that array's data pointer (`arr + dataOffset`, traced through copies).
+    private static IOperand? SpanSlotArray(IOperand operand, TypeAnalysisContext? contract,
+        MethodAnalysisContext context)
+        => contract is GenericInstanceTypeAnalysisContext
+                { GenericType.FullName: "System.Span`1" or "System.ReadOnlySpan`1" } spanContract
+            && Analysis.LocalVariables.TryUnwrapArrayDataPointer(operand, context,
+                context.AppContext.Binary.PointerSizeBytes, out var arrayOperand)
+            && EmittedOperandType(arrayOperand!, context) is SzArrayTypeAnalysisContext { ElementType: { } element }
+            && ThisConstructorCallPlan.SameTypeIdentity(element, spanContract.GenericArguments[0])
+                ? arrayOperand
+                : null;
+
+    // `p = arr + dataOffset` is the array's data pointer; a managed reference takes no
+    // `+`, so the add has no honest emission. When no read of p is left - its stores
+    // already respelled as `new Span(arr)` - or every read of p (directly, or through
+    // phi/copy locals read the same way) is a Span slot that SpanSlotArray respells,
+    // nothing in the IL needs the add: it emits nothing instead of a throwing
+    // unrecoverable operation that would make the rest of the block dead.
+    private static bool OnlyFeedsSpanSlots(Instruction instruction, MethodAnalysisContext context)
+    {
+        if (instruction is not { OpCode: OpCode.Add,
+                Operands: [LocalVariable pointer, var arrayBase, Immediate { Value: var offset }] }
+            || offset != context.AppContext.Binary.PointerSizeBytes * 4
+            || EmittedOperandType(arrayBase, context) is not SzArrayTypeAnalysisContext)
+            return false;
+
+        var visited = new HashSet<LocalVariable>();
+        var work = new Stack<LocalVariable>([pointer]);
+        while (work.Count > 0)
+        {
+            var local = work.Pop();
+            if (!visited.Add(local))
+                continue;
+            foreach (var reader in context.ControlFlowGraph!.Instructions)
+            {
+                if (ReferenceEquals(reader, instruction)
+                    || !Analysis.DeadCodeEliminator.UsedLocals(reader).Contains(local))
+                    continue;
+                if (reader is { OpCode: OpCode.Move, Operands: [var slot, LocalVariable stored] }
+                    && ReferenceEquals(stored, local))
+                {
+                    if (SpanSlotArray(local, StoreContract(slot, context), context) != null)
+                        continue;
+                    if (slot is LocalVariable copy)
+                        work.Push(copy);
+                    else
+                        return false;
+                    continue;
+                }
+                if (reader is { OpCode: OpCode.Phi, Destination: LocalVariable merged })
+                {
+                    work.Push(merged);
+                    continue;
+                }
+                return false;
+            }
+        }
+        return true;
     }
 
     // A store through a managed pointer is honest only when the value's emitted
