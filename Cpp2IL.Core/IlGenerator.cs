@@ -247,6 +247,19 @@ public static class IlGenerator
                 pendingBlockBranchFixups.Add((bridge, falseSuccessor));
             }
 
+            else if (lastInstruction.OpCode == OpCode.Switch)
+            {
+                // A CIL switch falls through when no case matches: the bridge
+                // carries the out-of-range edge the recovered instruction holds
+                // in operand 0.
+                var defaultBlock = TryResolveJumpTargetBlock(lastInstruction, context.ControlFlowGraph)
+                    ?? block.Successors.FirstOrDefault(s => s != context.ControlFlowGraph.ExitBlock);
+                if (defaultBlock == null) continue;
+                var bridge = new CilInstruction(CilOpCodes.Br, new CilInstructionLabel());
+                definition.CilMethodBody!.Instructions.Add(bridge);
+                pendingBlockBranchFixups.Add((bridge, defaultBlock));
+            }
+
             else if (lastInstruction.OpCode != OpCode.Jump && lastInstruction.OpCode != OpCode.Return && lastInstruction.OpCode != OpCode.IndirectJump)
             {
                 var successor = block.Successors.FirstOrDefault(s => s != context.ControlFlowGraph.ExitBlock);
@@ -323,6 +336,45 @@ public static class IlGenerator
                 }
 
                 ilBranch.Operand = new CilInstructionLabel(mappedTarget);
+            }
+            else if (instruction.OpCode == OpCode.Switch)
+            {
+                var ilSwitch = il.Last(i => i.OpCode == CilOpCodes.Switch);
+                var labels = new List<ICilLabel>(instruction.Operands.Count - 2);
+                var resolved = true;
+                for (var caseIndex = 2; caseIndex < instruction.Operands.Count; caseIndex++)
+                {
+                    if (instruction.Operands[caseIndex] is not Instruction caseTarget)
+                    {
+                        resolved = false;
+                        break;
+                    }
+                    // Fused constructor calls are not serialized as their own IL; retarget
+                    // to the paired allocation that survives emission, as with branches.
+                    caseTarget = ConstructorAllocationForCall(caseTarget, constructorPairs) ?? caseTarget;
+                    var mappedTarget = instructionMap.TryGetValue(caseTarget, out var mapped) && mapped.Count > 0
+                        ? mapped[0]
+                        : skippedThisConstructorRedirects.TryGetValue(caseTarget, out var redirect) ? redirect : null;
+                    if (mappedTarget == null)
+                    {
+                        context.AddWarning($"Switch case target not in ISIL to IL map: {instruction} --- {caseTarget}");
+                        resolved = false;
+                        break;
+                    }
+                    labels.Add(new CilInstructionLabel(mappedTarget));
+                }
+
+                if (resolved)
+                {
+                    ilSwitch.Operand = labels;
+                }
+                else
+                {
+                    // The selector is still on the stack; dropping it and taking the
+                    // default bridge keeps the method's IL stack balanced.
+                    ilSwitch.OpCode = CilOpCodes.Pop;
+                    ilSwitch.Operand = null;
+                }
             }
         }
         
@@ -1672,6 +1724,19 @@ public static class IlGenerator
             case OpCode.IndirectJump:
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Indirect jump: {instruction.Operands[0]} (should have been resolved before IL gen)"));
                 instructions.Add(CilOpCodes.Call, writeLine);
+                break;
+
+            case OpCode.Switch:
+                // Operand 0 is the default target and operands past 1 the case
+                // entry instructions; the labels are attached in the fixup pass.
+                // The selector must be the int32 a switch pops: anything wider
+                // or spelled differently (i64, native int, enum) narrows -
+                // the bound that gated this recovery already proved it in range.
+                LoadOperand(instruction.Operands[1], method, locals, writeLine, null, context);
+                if (EmittedOperandType(instruction.Operands[1], context)?.FullName
+                        is not ("System.Int32" or "System.UInt32"))
+                    instructions.Add(CilOpCodes.Conv_U4);
+                instructions.Add(CilOpCodes.Switch, new List<ICilLabel>());
                 break;
 
             case OpCode.ShiftStack:
