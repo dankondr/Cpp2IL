@@ -41,10 +41,12 @@ linear instruction list instead of control flow.
   it publishes is path-invariant; the new position binds the version the
   dereference actually sees.
 - `LocalVariables.ResolveHiddenReturnBuffers` / `SharpenHiddenReturnBuffers`: the
-  window for result resolution and operand rewriting is the set of instructions
-  in blocks dominated by the call's block, minus whatever a later hidden return
-  into the same cell dominates. A read belongs to a call only while the call's
-  block dominates it.
+  window for result resolution and operand rewriting is the flat list range
+  extended by every block the call's block dominates, minus reads a rival call
+  on the same cell reaches last — a rival shadows a read when its block
+  dominates the read's (or it precedes the read inside the read's block) and it
+  does not precede this call. Inside one block the ordering is the instruction
+  order.
 - `MetadataResolver.AddressAlias`: an alias chains through `Move` copies and
   composes nested `Add`/`Subtract` displacements; a local with no defining
   instruction (a parameter, a live-in) is its own root.
