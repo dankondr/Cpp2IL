@@ -1042,9 +1042,18 @@ public static class LocalVariables
             hiddenReturns.Add((call, buffer, concreteTarget, resultType, instructions.IndexOf(call)));
         }
 
+        var blockOf = new Dictionary<Instruction, Block>();
+        foreach (var graphBlock in method.ControlFlowGraph.Blocks)
+            foreach (var graphInstruction in graphBlock.Instructions)
+                blockOf[graphInstruction] = graphBlock;
+
+        // DominatorInfo is released after SSA construction; rebuild it for the window.
+        var dominance = new DominatorInfo(method.ControlFlowGraph);
+
         foreach (var hiddenReturn in hiddenReturns)
         {
             var (call, buffer, _, resultType, callIndex) = hiddenReturn;
+            var callBlock = blockOf[call];
             var endIndex = hiddenReturns
                 .Where(candidate => candidate.Index > callIndex
                     && (ReferenceEquals(candidate.Buffer, buffer)
@@ -1053,14 +1062,20 @@ public static class LocalVariables
                 .Select(candidate => candidate.Index)
                 .DefaultIfEmpty(instructions.Count)
                 .Min();
+            var rivals = HiddenReturnRivals(hiddenReturns, call, buffer, blockOf);
+
+            bool Covered(Instruction next, int index) => InsideHiddenReturnWindow(
+                index, callIndex, endIndex, callIndex, blockOf[next], callBlock, rivals, dominance);
+
             // The same native stack slot is routinely reused for several different
             // generic struct returns. A CLR local has one fixed type, so model each
             // hidden return as its own local and reconnect only its own lifetime.
             LocalVariable? result = null;
             var aliases = new HashSet<LocalVariable> { buffer };
-            foreach (var next in instructions.Skip(callIndex + 1).Take(endIndex - callIndex - 1))
-                if (next is { OpCode: OpCode.Move,
+            for (var i = callIndex + 1; i < instructions.Count; i++)
+                if (instructions[i] is { OpCode: OpCode.Move,
                         Operands: [LocalVariable destination, LocalVariable source] }
+                    && Covered(instructions[i], i)
                     && !ReferenceEquals(destination, source) && aliases.Contains(source))
                 {
                     aliases.Add(destination);
@@ -1076,9 +1091,11 @@ public static class LocalVariables
             result.HiddenReturnBuffer = buffer;
             call.Destination = result;
 
-            for (var i = callIndex + 1; i < endIndex; i++)
+            for (var i = callIndex + 1; i < instructions.Count; i++)
             {
                 var next = instructions[i];
+                if (!Covered(next, i))
+                    continue;
                 var destination = next.Destination;
                 for (var operandIndex = 0; operandIndex < next.Operands.Count; operandIndex++)
                 {
@@ -1093,11 +1110,73 @@ public static class LocalVariables
         }
     }
 
+    // A read belongs to a call's rewrite window while the cell still holds that call's
+    // returned bytes. List order alone cannot tell this: the copies on one arm of a
+    // branch interleave with the next arm's call in the flat list, and a copy in a
+    // merge block reads the cell after the join where no single producer dominates it.
+    // The window is therefore the flat list range extended by every block the call
+    // dominates, minus anything a rival call on the same cell reaches without this
+    // call standing between — such a rival writes the cell last on every path to the
+    // read, so the read is its result's, never this call's. Inside one block the
+    // order is the instruction order: a rival ahead of the read and behind the call
+    // shadows it, a rival behind the read or ahead of the call does not.
+    private static bool InsideHiddenReturnWindow(
+        int index,
+        int windowStart,
+        int endIndex,
+        int callFlatIndex,
+        Block nextBlock,
+        Block callBlock,
+        List<(Block Block, int Index)> rivals,
+        DominatorInfo dominance)
+    {
+        foreach (var (rivalBlock, rivalIndex) in rivals)
+            if (dominance.Dominates(rivalBlock, nextBlock)
+                    && (rivalBlock != nextBlock || rivalIndex <= index)
+                && !(dominance.Dominates(rivalBlock, callBlock)
+                    && (rivalBlock != callBlock || rivalIndex < callFlatIndex)))
+                return false;
+
+        return index > windowStart && index < endIndex || dominance.Dominates(callBlock, nextBlock);
+    }
+
+    // Other calls writing through the same cell; a read one's block dominates may
+    // belong to it rather than to the earlier call in the list. Each rival keeps its
+    // flat index so calls sharing a block can be ordered against the read.
+    private static List<(Block Block, int Index)> HiddenReturnRivals(
+        List<(Instruction Call, LocalVariable Buffer, MethodAnalysisContext Target,
+            TypeAnalysisContext ResultType, int Index)> hiddenReturns,
+        Instruction call,
+        LocalVariable buffer,
+        Dictionary<Instruction, Block> blockOf)
+    {
+        return hiddenReturns
+            .Where(candidate => !ReferenceEquals(candidate.Call, call)
+                && (ReferenceEquals(candidate.Buffer, buffer)
+                    || TryStackOffset(candidate.Buffer.Register.Name) is { } candidateOffset
+                    && TryStackOffset(buffer.Register.Name) == candidateOffset))
+            .Select(candidate => (blockOf[candidate.Call], candidate.Index))
+            .ToList();
+    }
+
     private static bool SharpenHiddenReturnBuffers(MethodAnalysisContext method)
     {
         var changed = false;
         var instructions = method.ControlFlowGraph!.Instructions;
         var definedAt = DefinitionPositions(instructions);
+        var blockOf = new Dictionary<Instruction, Block>();
+        foreach (var graphBlock in method.ControlFlowGraph.Blocks)
+            foreach (var graphInstruction in graphBlock.Instructions)
+                blockOf[graphInstruction] = graphBlock;
+        var dominance = new DominatorInfo(method.ControlFlowGraph);
+        var hiddenReturns = instructions
+            .Where(candidate => candidate.Destination is LocalVariable { HiddenReturnBuffer: not null })
+            .Select(candidate => (candidate,
+                ((LocalVariable)candidate.Destination!).HiddenReturnBuffer!,
+                (MethodAnalysisContext)null!,
+                (TypeAnalysisContext)null!,
+                instructions.IndexOf(candidate)))
+            .ToList();
         foreach (var call in method.ControlFlowGraph!.Instructions)
         {
             if (call is not { OpCode: OpCode.Call,
@@ -1115,6 +1194,9 @@ public static class LocalVariables
             result.Type = resultType;
             call.SetOperand(0, concreteTarget);
             var callIndex = instructions.IndexOf(call);
+            var callBlock = blockOf[call];
+            var rivals = HiddenReturnRivals(hiddenReturns, call, result.HiddenReturnBuffer,
+                blockOf);
             for (var index = 0; index < instructions.Count; index++)
             for (var operandIndex = 0; operandIndex < instructions[index].Operands.Count; operandIndex++)
             {
@@ -1132,6 +1214,8 @@ public static class LocalVariables
                 IOperand? replacement = field == null
                     ? result.HiddenReturnBuffer == null || operandIndex == 0 && instruction.IsAssignment
                       || operand is AddressOf && index <= callIndex
+                      || !InsideHiddenReturnWindow(index, -1, instructions.Count,
+                          callIndex, blockOf[instruction], callBlock, rivals, dominance)
                         ? null
                         : RewriteHiddenReturnStackOperand(operand, result.HiddenReturnBuffer, result,
                             resultType, instruction.NativeMemoryAccessSize ?? 0,

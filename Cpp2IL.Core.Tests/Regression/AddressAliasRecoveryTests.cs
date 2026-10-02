@@ -173,4 +173,39 @@ public class AddressAliasRecoveryTests
             Assert.That(((FieldReference)load.Operands[1]).Field, Is.SameAs(field));
         });
     }
+
+    // The get-only auto-property shape: a pre-indexed bump chain on a parameter —
+    // `add x19, x20, #0x20` on a scratch copy, then `sub x19, x19, #0x10` — the base
+    // on every path is owner + 0x10, so the copy and the second bump must compose.
+    [Test]
+    public void AddressAliasThroughCopyAndSecondBump()
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        var ownerType = new InjectedTypeAnalysisContext(app.AssembliesByName["mscorlib"], "Tests", "Owner",
+            app.SystemTypes.SystemObjectType, TypeAttributes.Public);
+        var field = new InjectedFieldAnalysisContext("state", app.SystemTypes.SystemInt32Type,
+            FieldAttributes.Public, ownerType, 16);
+        ownerType.Fields.Add(field);
+        var owner = new LocalVariable("owner", new Register(null, "owner"), ownerType);
+        var bump = new LocalVariable("bump", new Register(null, "bump"));
+        var alias = new LocalVariable("alias", new Register(null, "alias"));
+        var copy = new LocalVariable("copy", new Register(null, "copy"));
+        var store = new Instruction(3, OpCode.Move, new MemoryOperand(copy, accessSize: 4),
+            new Immediate(1));
+        var method = Method(ownerType, app, [
+            new(0, OpCode.Add, bump, owner, new Immediate(32)),
+            new(1, OpCode.Subtract, alias, bump, new Immediate(16)),
+            new(2, OpCode.Move, copy, alias),
+            store, new(4, OpCode.Return)]);
+
+        MetadataResolver.ResolveFieldOffsets(method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(store.Operands[0], Is.TypeOf<FieldReference>(),
+                () => store.Operands[0]?.ToString() ?? "<null>");
+            Assert.That(((FieldReference)store.Operands[0]).Field, Is.SameAs(field));
+        });
+    }
 }
