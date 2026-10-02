@@ -4806,8 +4806,10 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldlen);
                 instructions.Add(CilOpCodes.Conv_I4);
                 break;
-            case AddressOf { Target: LocalVariable addressed }
-                when !addressed.IsThis && ParameterForLocal(addressed, method, callingContext) is { } addressedParameter:
+            // A parameter's address is its argument slot: the local the declaration also gets
+            // is never stored, so `ldloca` of it would hand the callee a zeroed struct.
+            case AddressOf { Target: LocalVariable { IsThis: false } addressed }
+                when ParameterForLocal(addressed, method, callingContext) is { } addressedParameter:
                 instructions.Add(CilOpCodes.Ldarga, addressedParameter);
                 break;
             case AddressOf { Target: LocalVariable addressed }:
@@ -4893,6 +4895,8 @@ public static class IlGenerator
                 if (TryEmitInlinedEnumeratorCurrent(field, callingContext, method, locals, writeLine))
                     break;
                 if (TryEmitInlinedListCount(field, callingContext, method, locals))
+                    break;
+                if (TryEmitProvenStructFieldGetter(field, callingContext, method, locals, writeLine))
                     break;
                 if (WholeValueContainerReference(field, expectedType, callingContext) is { } wholeValue
                     && FieldReferenceUsableFrom(wholeValue, callingContext))
@@ -5680,6 +5684,53 @@ public static class IlGenerator
             : receiver is GenericInstanceTypeAnalysisContext instance
                 ? new ConcreteGenericMethodAnalysisContext(getter, instance.GenericArguments, [])
                 : getter;
+    }
+
+    // A private member of a value type another assembly declares (`Vector2Int.m_Y`) has a public
+    // spelling when the type's own getter is proven to return exactly that member: its native
+    // body is one load from [this + offset] and ret (MetadataResolver.GetterProvablyReadsField).
+    // Naming or a matching return type alone are no proof - `get_sqrMagnitude` returns an int
+    // too - so the getter must be the only proven one. Only a member read straight off the
+    // struct qualifies; the read is emitted as `ldarga/ldloca s; call get_y`.
+    internal static MethodAnalysisContext? ProvenStructFieldGetter(FieldReference field, MethodAnalysisContext context)
+    {
+        // Cheapest checks first: this runs for every field read the emitter spells.
+        if (field is not { Containers.Count: 0, Field: { IsStatic: false, DeclaringType: { IsValueType: true } owner } }
+            || field.Local is not LocalVariable { IsThis: false } receiver
+            || FieldReferenceUsableFrom(field, context)
+            || ProvenGetterCache.GetOrAdd((field.Field, field.Offset), key => ProvenGetter(key.Member, key.Offset))
+                is not { } getter
+            || EmittedLocalType(receiver, context) is not { } receiverType
+            || (receiverType is ByRefTypeAnalysisContext byRef ? byRef.ElementType : receiverType).FullName != owner.FullName)
+            return null;
+        return Analysis.InaccessibleCalleeRecovery.IsVisibleFrom(getter, context) ? getter : null;
+
+        static MethodAnalysisContext? ProvenGetter(FieldAnalysisContext member, long offset)
+        {
+            var proven = member.DeclaringType!.Methods
+                .Where(candidate => !candidate.IsStatic && candidate.Parameters.Count == 0
+                    && candidate.Name.StartsWith("get_", System.StringComparison.Ordinal)
+                    && (candidate.Attributes & MethodAttributes.MemberAccessMask) == MethodAttributes.Public
+                    && candidate.ReturnType.FullName == member.FieldType.FullName
+                    && Analysis.MetadataResolver.GetterProvablyReadsField(member.AppContext, candidate, offset))
+                .Take(2)
+                .ToList();
+            return proven.Count == 1 ? proven[0] : null;
+        }
+    }
+
+    // The proven getter per member and the struct offset it was proven at.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(FieldAnalysisContext Member, long Offset),
+        MethodAnalysisContext?> ProvenGetterCache = new();
+
+    private static bool TryEmitProvenStructFieldGetter(FieldReference field, MethodAnalysisContext context,
+        MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        if (ProvenStructFieldGetter(field, context) is not { } getter
+            || !EmitManagedAddress(field.Local, method, context, locals, writeLine, field.Field.DeclaringType))
+            return false;
+        method.CilMethodBody!.Instructions.Add(CilOpCodes.Call, getter.ToMethodDescriptor());
+        return true;
     }
 
     // Every caller reaches this helper only because the recovered operand cannot
@@ -9031,6 +9082,7 @@ public static class IlGenerator
                 || !FieldReferenceUsableFrom(collapsed, context))
             && !InlinedEnumeratorCurrentCandidate(unspellableField, context)
             && !InlinedListCountCandidate(unspellableField, context)
+            && ProvenStructFieldGetter(unspellableField, context) == null
             && unspellableField.Local is LocalVariable referent
             && (unspellableField.Containers.LastOrDefault(link =>
                         link.FieldType?.FullName

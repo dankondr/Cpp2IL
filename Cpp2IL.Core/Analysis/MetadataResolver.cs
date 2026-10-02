@@ -1489,7 +1489,7 @@ public static class MetadataResolver
     // a single load from [this + fieldOffset] into the return register, then ret, with no
     // stores, calls, branches, or arithmetic in between. This is the only acceptable proof that
     // the getter returns this field - anything else is not sound to substitute.
-    private static bool GetterProvablyReadsField(ApplicationAnalysisContext app,
+    internal static bool GetterProvablyReadsField(ApplicationAnalysisContext app,
         MethodAnalysisContext accessor, long fieldOffset)
     {
         // Shared generic methods carry their code on the definition's method pointer.
