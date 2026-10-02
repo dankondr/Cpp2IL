@@ -79,6 +79,8 @@ public class InlinedListClearRecoveryTests
     private System.Collections.Generic.List<Instruction> Recover(int expected, params Instruction[] instructions)
     {
         _method.ControlFlowGraph = new ISILControlFlowGraph(instructions.ToList());
+        // The lifter's graph keeps a call and what follows it in one block.
+        _method.ControlFlowGraph.MergeCallBlocks();
         Assert.That(InlinedListClearRecovery.Run(_method), Is.EqualTo(expected));
         return _method.ControlFlowGraph.Blocks.SelectMany(block => block.Instructions).ToList();
     }
@@ -141,6 +143,35 @@ public class InlinedListClearRecoveryTests
             { OpCode.CheckLess, OpCode.ConditionalJump, OpCode.CallVoid, OpCode.CallVoid, OpCode.Return }));
         AssertClearCall(instructions[2], list);
         Assert.That(instructions[3], Is.SameAs(save));
+    }
+
+    // Where the game's List<T> has get_Count alone, the saved size is a get_Count call: it is
+    // the body's own read and goes with it.
+    [Test]
+    public void SavedSizeThroughGetCountCollapses()
+    {
+        var list = NewList("list", App.SystemTypes.SystemStringType);
+        var size = Local("size", App.SystemTypes.SystemInt32Type);
+        var empty = Local("empty", App.SystemTypes.SystemBooleanType);
+        var getCount = ((GenericInstanceTypeAnalysisContext)list.Type!).GenericType.Methods.First(method => method.Name == "get_Count");
+        var arrayClear = App.SystemTypes.SystemArrayType!.Methods.First(method =>
+            method.Name == "Clear" && method.Parameters.Count == 3);
+        var merge = new Instruction(7, OpCode.CallVoid, _save, _this);
+
+        var instructions = Recover(1,
+        [
+            new(0, OpCode.Call, getCount, size, list),
+            ..ValueTypeClear(list, 1),
+            new(4, OpCode.CheckLess, empty, size, new Immediate(1)),
+            new(5, OpCode.ConditionalJump, merge, empty),
+            new(6, OpCode.CallVoid, arrayClear, Field(list, "_items"), new Immediate(0), size),
+            merge,
+            new(8, OpCode.Return),
+        ]);
+
+        Assert.That(instructions, Has.Count.EqualTo(3));
+        AssertClearCall(instructions[0], list);
+        Assert.That(instructions[1], Is.SameAs(merge));
     }
 
     // Four Clears in a row (two behind the Array.Clear branch), then a call: every
