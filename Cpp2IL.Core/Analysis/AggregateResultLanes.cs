@@ -521,15 +521,22 @@ internal static class AggregateResultLanes
 
             for (var operandIndex = 1; operandIndex < instruction.Operands.Count; operandIndex++)
             {
+                // A lane-view local's own register view is the byte offset the
+                // width read addresses; a whole-register operand reads at 0.
+                var byteOffset = instruction.Operands[operandIndex] is LocalVariable
+                        { Register.Name: { } viewName }
+                    ? LocalVariables.LaneViewByteOffset(viewName)
+                    : 0;
                 if (instruction.Operands[operandIndex] is not LocalVariable { Type: { } type } local
                     || !type.IsValueType
                     || TypeSizes.MinimumUnboxedSize(type, pointerSize) <= width
-                    || MetadataResolver.FindInstanceFieldPathAtOffset(type, 0, width) is not { } path
+                    || MetadataResolver.FindInstanceFieldPathAtOffset(type, byteOffset, width)
+                        is not { } path
                     || TypeSizes.MinimumUnboxedSize(path.Field.FieldType, pointerSize) != width)
                     continue;
 
                 instruction.SetOperand(operandIndex,
-                    new FieldReference(path.Field, local, 0, path.Containers, width));
+                    new FieldReference(path.Field, local, byteOffset, path.Containers, width));
                 changed = true;
             }
         }
