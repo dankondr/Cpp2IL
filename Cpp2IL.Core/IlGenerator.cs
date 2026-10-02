@@ -1938,18 +1938,24 @@ public static class IlGenerator
                     || !StackContractSatisfied(emitted2, contract2, context, isComparison)
                     || !operandsUsable)
                 {
-                    if (unrecoverableIntegerOperation)
-                        EmitUnrecoverableOperation(method, writeLine, $"Unrecoverable integer operation: {instruction}");
                     // No shared stack kind exists for this operation (e.g. a Vector3
                     // tested against an int, or a struct fed to add). Equality still
                     // has honest answers - a shared native-int lowering covers
                     // integral/pointer operands, and a zero literal on a managed or
                     // generic operand is the null test - while ordering and
-                    // arithmetic have none, so they default to false/zero.
-                    else if (instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual)
+                    // arithmetic have none, so they default to false/zero: the
+                    // zero after the throw keeps the store below stack-consistent
+                    // (IL2CPP's stack analysis walks that dead tail too).
+                    if (unrecoverableIntegerOperation
+                        || instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual)
                         || !(TryEmitNativeIntEquality(instruction, context, method, locals, writeLine)
                             || TryEmitReferenceEquality(instruction, context, method, locals, writeLine)))
-                        EmitUnrecoverableOperation(method, writeLine, $"Unrecoverable operation: {instruction}");
+                    {
+                        EmitUnrecoverableOperation(method, writeLine, unrecoverableIntegerOperation
+                            ? $"Unrecoverable integer operation: {instruction}"
+                            : $"Unrecoverable operation: {instruction}");
+                        instructions.Add(CilOpCodes.Ldc_I4_0);
+                    }
                     EmitStackCoerceOrDefault(context.AppContext.SystemTypes.SystemInt32Type,
                         StoreContract(instruction.Operands[0], context), method, context);
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine, context);
