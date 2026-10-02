@@ -123,6 +123,9 @@ public static class KeyFunctionRecovery
 
         // Raises lowered here and by call resolution end control flow.
         NonReturningHelperRecovery.CutThrowFallThrough(method.ControlFlowGraph!);
+
+        // The type tests are isinst now: read the tested subclass's fields through the cast.
+        TypeTestNarrowing.Run(method);
     }
 
     private static void RewriteInlinedClassIsInst(MethodAnalysisContext method)
