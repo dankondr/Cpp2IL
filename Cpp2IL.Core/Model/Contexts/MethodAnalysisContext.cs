@@ -818,6 +818,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         ReferenceCastRecovery.Run(this);
         ReferenceCompareExchangeRecovery.Run(this);
         CallArgumentTrimmer.Run(this);
+        // Struct arguments the ABI passes as an address are spelled as the value they name.
+        ByReferenceArgumentRecovery.Run(this);
         InlinedListClearRecovery.Run(this);
         InlinedListAddRecovery.Run(this);
 

@@ -31,6 +31,10 @@ public abstract class BaseCallingConventionResolver
 
     public abstract IOperand[] ResolveForManaged(MethodAnalysisContext ctx);
 
+    // Whether a by-value parameter of this type travels as the address of a
+    // caller-owned copy instead of its bytes.
+    public virtual bool PassesByReference(TypeAnalysisContext type) => false;
+
     protected abstract (string[] Integer, string[] Float) RawRegisters(ApplicationAnalysisContext app);
 
     // The registers of the receiver, each parameter and the MethodInfo argument, in order, when

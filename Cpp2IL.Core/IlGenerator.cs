@@ -4630,7 +4630,11 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Conv_I4);
                 break;
             case AddressOf { Target: LocalVariable addressed }:
-                instructions.Add(CilOpCodes.Ldloca, locals[addressed]);
+                // A parameter's storage is the argument slot, not its shadow local.
+                if (!addressed.IsThis && ParameterForLocal(addressed, method, callingContext) is { } addressedParameter)
+                    instructions.Add(CilOpCodes.Ldarga, addressedParameter);
+                else
+                    instructions.Add(CilOpCodes.Ldloca, locals[addressed]);
                 break;
             case AddressOf { Target: FieldReference addressedField }:
                 if (!FieldReferenceUsableFrom(addressedField, callingContext, writeAccess: true))
