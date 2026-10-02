@@ -293,6 +293,16 @@ internal sealed class Arm64VectorScalarizer
             or >= Arm64Register.H0 and <= Arm64Register.H31
             or >= Arm64Register.B0 and <= Arm64Register.B31;
 
+    private static int VectorIndex(Arm64Register reg) => reg switch
+    {
+        >= Arm64Register.V0 and <= Arm64Register.V31 => reg - Arm64Register.V0,
+        >= Arm64Register.D0 and <= Arm64Register.D31 => reg - Arm64Register.D0,
+        >= Arm64Register.S0 and <= Arm64Register.S31 => reg - Arm64Register.S0,
+        >= Arm64Register.H0 and <= Arm64Register.H31 => reg - Arm64Register.H0,
+        >= Arm64Register.B0 and <= Arm64Register.B31 => reg - Arm64Register.B0,
+        _ => -1
+    };
+
     private static bool IsGpr(Arm64Register reg) => reg
         is >= Arm64Register.W0 and <= Arm64Register.W31
             or >= Arm64Register.X0 and <= Arm64Register.X31;
@@ -571,11 +581,18 @@ internal sealed class Arm64VectorScalarizer
         {
             foreach (var name in names)
             {
-                if (allUnproven || loopWritten is { } loopWrites && loopWrites.Contains(name))
+                var writeMask = 0;
+                if (loopWritten != null)
+                    loopWritten.TryGetValue(name, out writeMask);
+                if (allUnproven || writeMask == 0xF)
                 {
                     merged[name] = new VectorState { Name = name };
                     continue;
                 }
+                // a partial mask marks only the slots a call can clobber: the
+                // callee-saved low halves keep whatever the converted edges
+                // prove; the unconverted edge is assumed to carry them back
+                var partialWrite = writeMask != 0;
                 var state = new VectorState { Name = name };
                 var window0Clobbered = false;
                 // top-down like CanonicalizeLanes: materializing window 0
@@ -587,8 +604,9 @@ internal sealed class Arm64VectorScalarizer
                     // slice: naming an element local here would let a
                     // consumer read a local that edge never defined — the
                     // merge stays honest and leaves the window unproven
-                    var proven = fallThrough == null
-                        || fallThrough.TryGetValue(name, out var live) && live.Slots[slot] != null;
+                    var proven = (writeMask & (1 << slot)) == 0
+                        && (fallThrough == null
+                            || fallThrough.TryGetValue(name, out var live) && live.Slots[slot] != null);
                     if (proven && branchEdges != null)
                         foreach (var edge in branchEdges)
                             proven &= edge.TryGetValue(name, out var exit) && exit.Slots[slot] != null;
@@ -637,8 +655,8 @@ internal sealed class Arm64VectorScalarizer
                     else
                         state.SetSlot(slot,  new LaneSlice(canonical, 0));
                 }
-                var whole = fallThrough == null
-                    || (fallThrough.TryGetValue(name, out var wholeState) && wholeState.Whole);
+                var whole = !partialWrite && (fallThrough == null
+                    || (fallThrough.TryGetValue(name, out var wholeState) && wholeState.Whole));
                 if (whole && branchEdges != null)
                     foreach (var edge in branchEdges)
                         whole &= edge.TryGetValue(name, out var exit) && exit.Whole;
@@ -654,12 +672,22 @@ internal sealed class Arm64VectorScalarizer
                     foreach (var edge in branchEdges)
                         materialized = Math.Min(materialized,
                             edge.TryGetValue(name, out var edgeState) ? edgeState.MaterializedBits : 0);
+                // the unconverted edge can only have changed what the mask
+                // covers: bits below the lowest written slot stay provable
+                if (partialWrite)
+                {
+                    var lowestWritten = 0;
+                    while ((writeMask & (1 << lowestWritten)) == 0)
+                        lowestWritten++;
+                    materialized = Math.Min(materialized, 32 * lowestWritten);
+                    state.LoadMemory = null;
+                }
                 state.MaterializedBits = Math.Max(
                     materialized == int.MaxValue ? 0 : materialized, whole ? 128 : 0);
                 // load provenance survives only where every reaching edge
                 // still holds the register's bytes from a load
-                var loaded = fallThrough == null
-                    || (fallThrough.TryGetValue(name, out var loadedState) && loadedState.Loaded);
+                var loaded = (writeMask & 0x3) == 0 && (fallThrough == null
+                    || (fallThrough.TryGetValue(name, out var loadedState) && loadedState.Loaded));
                 if (loaded && branchEdges != null)
                     foreach (var edge in branchEdges)
                         loaded &= edge.TryGetValue(name, out var exit) && exit.Loaded;
@@ -677,13 +705,15 @@ internal sealed class Arm64VectorScalarizer
     }
 
     /// <summary>
-    /// Register names the unconverted predecessors of a loop header may
-    /// write: scans every instruction in (target, lastBackEdgeSource] —
-    /// a destination-register write, a call's clobber, or a reachable inner
-    /// merge that can meet provenance away all count. Null when no
-    /// unconverted edge remains (the merge degenerates to the usual case).
+    /// Register-window masks the unconverted predecessors of a loop header
+    /// may write: scans every instruction in (target, lastBackEdgeSource] —
+    /// a destination-register write marks every lane, a call clobbers the
+    /// caller-saved registers whole but only the upper halves of V8-V15, and
+    /// a reachable inner merge or an undecoded word marks all four lanes.
+    /// Values are per-slot bitmasks; null when no unconverted edge remains
+    /// (the merge degenerates to the usual case).
     /// </summary>
-    private HashSet<string>? LoopWrittenRegisters(ulong target)
+    private Dictionary<string, int>? LoopWrittenRegisters(ulong target)
     {
         if (!_mergePreds.TryGetValue(target, out var preds))
             return null;
@@ -694,7 +724,16 @@ internal sealed class Arm64VectorScalarizer
         if (hi == 0)
             return null;
 
-        var written = new HashSet<string>();
+        // mayNull[r] = the bitmask of V<r>'s slots that may reach the
+        // back-edge without a proven lane: a forward may-analysis over the
+        // span. A destination write can leave any lane unproven, a call
+        // clobbers the caller-saved registers whole but only the upper
+        // halves of V8-V15, an undecoded word can write anything, and an
+        // inner merge contributes the OR of the nulls on the edges reaching
+        // it — an inner merge with a backward edge (a nested loop) is its
+        // own unsolved meet and marks every lane.
+        var nullAt = new Dictionary<ulong, uint[]>();
+        var cur = new uint[32];
         foreach (var insn in _instructions)
         {
             // the merge target's own instruction executes inside the loop
@@ -703,15 +742,47 @@ internal sealed class Arm64VectorScalarizer
                 continue;
             if (insn.Address > hi)
                 break;
-            if ((insn.Address != target && _mergeTargets.Contains(insn.Address))
-                || insn.Mnemonic is Arm64Mnemonic.BL or Arm64Mnemonic.BLR
-                || insn.Op0Kind == Arm64OperandKind.None)
+            if (insn.Address != target && _mergeTargets.Contains(insn.Address))
             {
-                // an inner merge meets provenance away just like a write; a
-                // call clobbers caller-saved vectors; an undecoded word may
-                // write anything — refuse invariance for every name
+                if (InnerMergeHasBackwardPred(insn.Address))
+                {
+                    for (var i = 0; i < 32; i++)
+                        cur[i] = 0xF;
+                }
+                else
+                {
+                    // every reaching edge may bring its unproven lanes
+                    var merged = _mergeFallThrough.Contains(insn.Address)
+                        ? (uint[])cur.Clone()
+                        : new uint[32];
+                    if (_mergePreds.TryGetValue(insn.Address, out var innerPreds))
+                        foreach (var pred in innerPreds)
+                            if (_reachable.Contains(pred)
+                                && nullAt.TryGetValue(pred, out var predNull))
+                                for (var r = 0; r < 32; r++)
+                                    merged[r] |= predNull[r];
+                    cur = merged;
+                }
+                nullAt[insn.Address] = (uint[])cur.Clone();
+                continue;
+            }
+            // a predecessor edge reads the nulls at its own address: branch
+            // instructions never write lanes, so entry state is exit state
+            nullAt[insn.Address] = (uint[])cur.Clone();
+            if (insn.Op0Kind == Arm64OperandKind.None)
+            {
+                // an undecoded word may write anything
                 for (var i = 0; i < 32; i++)
-                    written.Add("V" + i);
+                    cur[i] = 0xF;
+                continue;
+            }
+            if (insn.Mnemonic is Arm64Mnemonic.BL or Arm64Mnemonic.BLR)
+            {
+                // a call clobbers V0-V7 and V16-V31 whole; V8-V15 lose only
+                // their upper halves — the callee-saved low lanes stay
+                // provable across the unconverted edge
+                for (var i = 0; i < 32; i++)
+                    cur[i] |= i is >= 8 and <= 15 ? 0xCu : 0xFu;
                 continue;
             }
             if (insn.Op0Kind != Arm64OperandKind.Register
@@ -720,13 +791,33 @@ internal sealed class Arm64VectorScalarizer
                 || insn.Mnemonic.ToString().StartsWith("ST", StringComparison.Ordinal))
                 continue; // compares set flags, stores read the register
             if (IsVectorRegister(insn.Op0Reg))
-                written.Add(Normalize(insn.Op0Reg));
+                cur[VectorIndex(insn.Op0Reg)] |= 0xF;
             // pair/multi-destination loads also write the second register
             if (insn.Op1Kind == Arm64OperandKind.Register && IsVectorRegister(insn.Op1Reg)
                 && insn.Mnemonic.ToString().StartsWith("LD", StringComparison.Ordinal))
-                written.Add(Normalize(insn.Op1Reg));
+                cur[VectorIndex(insn.Op1Reg)] |= 0xF;
         }
+
+        var written = new Dictionary<string, int>();
+        for (var r = 0; r < 32; r++)
+            if (cur[r] != 0)
+                written["V" + r] = (int)cur[r];
         return written;
+    }
+
+    /// <summary>
+    /// Whether an inner merge inside the scanned span has a reaching
+    /// predecessor laid out after it — a nested loop's back-edge, whose
+    /// lane contribution is unsolved here just like the outer header's.
+    /// </summary>
+    private bool InnerMergeHasBackwardPred(ulong address)
+    {
+        if (!_mergePreds.TryGetValue(address, out var preds))
+            return false;
+        foreach (var pred in preds)
+            if (_reachable.Contains(pred) && pred > address)
+                return true;
+        return false;
     }
 
     /// true when the instruction was fully handled — folded to lane ops or

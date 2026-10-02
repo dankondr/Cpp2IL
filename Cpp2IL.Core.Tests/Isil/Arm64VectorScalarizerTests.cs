@@ -1170,6 +1170,31 @@ public class Arm64VectorScalarizerTests
     }
 
     [Test]
+    public void CalleeSavedVectorLaneStaysProvableThroughLoopWithCall()
+    {
+        // `scvtf s8` before the loop writes a callee-saved lane: a call in the
+        // loop body clobbers only V8-V15's upper halves, and the join merge
+        // sees both edges still prove the lane — `str s8` inside the loop
+        // stores it instead of diagnosing an unproven lane.
+        var il = Lift(
+            0x1e220008, // scvtf s8, w0
+            0x34000041, // cbz w1, ->join
+            0xd63f0100, // blr x8
+            0xbd000028, // join: str s8, [x1]
+            0x54ffffa1, // b.ne ->scvtf+4 (loop)
+            0xd65f03c0); // ret
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(il.Any(i => i.OpCode == OpCode.Move
+                && i.Operands[0] is MemoryOperand { Base: Register { Name: "X1" } }), Is.True,
+                () => string.Join("\n", il));
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False,
+                () => string.Join("\n", il));
+        });
+    }
+
+    [Test]
     public void DoubleLoadAndStoreSpillsAsTwoWindowStores()
     {
         // `ldr d8` of two adjacent floats keeps its lanes proven: `str d8`
