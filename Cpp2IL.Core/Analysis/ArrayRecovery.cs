@@ -116,6 +116,8 @@ public static class ArrayRecovery
             instruction.SetOperand(i, field == null
                 ? value
                 : new FieldReference(field, value, (int)field.Offset, [], memory.AccessSize));
+            if (field == null && instruction.IsCall && SizeOf(arrayType.ElementType) == 2L * pointerSize)
+                DropUpperLane(block, instruction, pointer, memory.Addend + pointerSize);
         }
 
         // The address arithmetic the elements no longer read is dead; drop it before the
@@ -474,6 +476,27 @@ public static class ArrayRecovery
             MemoryOperand m => ReferenceEquals(m.Base, local) || ReferenceEquals(m.Index, local),
             _ => false,
         };
+
+        // A two-register element passed whole to a call came in a register pair (`ldp x0, x1, [e]`):
+        // the load of its upper half into the next argument register is part of the same argument,
+        // which the Get now supplies whole. Nothing reads that register before the call, and the
+        // call clobbers it, so the load has no other reader.
+        void DropUpperLane(Block block, Instruction call, LocalVariable pointer, long addend)
+        {
+            var at = block.Instructions.IndexOf(call);
+            for (var k = at - 1; k >= 0; k--)
+            {
+                if (block.Instructions[k] is not { OpCode: OpCode.Move,
+                        Operands: [LocalVariable { Register.Name: "X1" or "X2" or "X3" or "X4" or "X5" or "X6" or "X7" } lane,
+                            MemoryOperand { Index: null, Scale: 0 } upper] } load
+                    || !ReferenceEquals(upper.Base, pointer) || upper.Addend != addend || upper.AccessSize != pointerSize)
+                    continue;
+                if (block.Instructions.Skip(k + 1).Take(at - k - 1).All(between => !DeadCodeEliminator.UsedLocals(between).Contains(lane))
+                    && !DeadCodeEliminator.UsedLocals(call).Contains(lane))
+                    MakeNop(load);
+                return;
+            }
+        }
 
         LocalVariable NewLocal(TypeAnalysisContext type)
         {
