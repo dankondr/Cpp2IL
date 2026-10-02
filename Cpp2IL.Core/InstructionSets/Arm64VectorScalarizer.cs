@@ -3601,27 +3601,24 @@ internal sealed class Arm64VectorScalarizer
 
     /// <summary>
     /// The operand naming a 128-bit register's whole value for a wide store:
-    /// a vector literal when every lane is constant, the register local when
-    /// every lane is its own slice, or the aggregate when every lane is a
-    /// field of one local at consecutive 4-byte offsets.
+    /// the register local when every lane is its own slice (a whole-register
+    /// copy — the local really holds all sixteen bytes), or the aggregate
+    /// when every lane is a field of one local at consecutive 4-byte offsets.
+    /// Constant lanes stay per-window: a Vector128Literal cannot spell into
+    /// a non-vector destination the way four member stores can.
     /// </summary>
     private IOperand? WholeVectorStoreOperand(VectorState state)
     {
         var slots = new List<LaneSlice>(4);
-        var constants = new float[4];
-        var allConstant = true;
         var allRegister = true;
         for (var slot = 0; slot < 4; slot++)
         {
             var slice = state.Slots[slot]!.Value;
             slots.Add(slice);
-            allConstant &= ConstantLaneValue(slice.Operand, slice.BitOffset, out constants[slot]);
             allRegister &= slice.BitOffset == slot * 32
                            && slice.Operand is Register { Name: not null } reg
                            && reg.Name == state.Name;
         }
-        if (allConstant)
-            return new Vector128Literal(constants[0], constants[1], constants[2], constants[3]);
         if (allRegister)
             return new Register(null, state.Name);
         // every lane a field of one local, at consecutive 4-byte offsets:
@@ -3640,29 +3637,6 @@ internal sealed class Arm64VectorScalarizer
                 return owner;
         }
         return null;
-    }
-
-    /// <summary>A lane slice's value as a 32-bit float, when it is constant.</summary>
-    private static bool ConstantLaneValue(IOperand operand, int bitOffset, out float value)
-    {
-        switch (operand)
-        {
-            case Immediate imm when bitOffset == 0:
-                value = BitConverter.Int32BitsToSingle(unchecked((int)imm.UnsignedValue));
-                return true;
-            case Immediate imm when bitOffset == 32:
-                value = BitConverter.Int32BitsToSingle(unchecked((int)(imm.UnsignedValue >> 32)));
-                return true;
-            case FloatLiteral single when bitOffset == 0:
-                value = single.Value;
-                return true;
-            case DoubleLiteral doubleLiteral when bitOffset == 0:
-                value = unchecked((float)doubleLiteral.Value);
-                return true;
-            default:
-                value = 0;
-                return false;
-        }
     }
 
     private static int RegisterBytes(Arm64Register reg) => reg switch
