@@ -306,13 +306,23 @@ public static class IlGenerator
                 }
 
                 var target = (Instruction)instruction.Operands[0];
-                // A fused constructor call is not serialized as its own IL instruction. Retarget
-                // branches that landed on it to the paired allocation that does survive emission.
-                target = ConstructorAllocationForCall(target, constructorPairs) ?? target;
+                // A fused constructor call is not serialized as its own IL instruction: a branch
+                // that lands on it resumes at what runs after the call. Only an allocation directly
+                // before the call in its block is the landing point; anywhere else the allocation
+                // already ran on the way here, and branching back to it allocates in a loop.
+                CilInstruction? fusedResume = null;
+                if (ConstructorAllocationForCall(target, constructorPairs) is { } allocation)
+                {
+                    if (AllocationDirectlyPrecedes(allocation, target, context.ControlFlowGraph))
+                        target = allocation;
+                    else
+                        fusedResume = FirstEmittedAfter(target, context.ControlFlowGraph, instructionMap, blockEntryMap);
+                }
 
-                var mappedTarget = instructionMap.TryGetValue(target, out var mapped) && mapped.Count > 0
-                    ? mapped[0]
-                    : skippedThisConstructorRedirects.TryGetValue(target, out var redirect) ? redirect : null;
+                var mappedTarget = fusedResume
+                    ?? (instructionMap.TryGetValue(target, out var mapped) && mapped.Count > 0
+                        ? mapped[0]
+                        : skippedThisConstructorRedirects.TryGetValue(target, out var redirect) ? redirect : null);
 
                 if (mappedTarget == null)
                 {
@@ -2151,6 +2161,33 @@ public static class IlGenerator
                 return pair.Key;
         }
 
+        return null;
+    }
+
+    private static bool AllocationDirectlyPrecedes(Instruction allocation, Instruction constructorCall,
+        ISILControlFlowGraph cfg)
+    {
+        if (cfg.FindBlockByInstruction(constructorCall) is not { } block)
+            return false;
+        var index = block.Instructions.IndexOf(constructorCall) - 1;
+        while (index >= 0 && block.Instructions[index].OpCode == OpCode.Nop)
+            index--;
+        return index >= 0 && ReferenceEquals(block.Instructions[index], allocation);
+    }
+
+    // The first IL emitted after `instruction` on its path: a later instruction of its block that
+    // emitted something, else the entry of its successor.
+    private static CilInstruction? FirstEmittedAfter(Instruction instruction, ISILControlFlowGraph cfg,
+        Dictionary<Instruction, List<CilInstruction>> instructionMap, Dictionary<Block, CilInstruction> blockEntryMap)
+    {
+        if (cfg.FindBlockByInstruction(instruction) is not { } block)
+            return null;
+        for (var i = block.Instructions.IndexOf(instruction) + 1; i < block.Instructions.Count; i++)
+            if (instructionMap.TryGetValue(block.Instructions[i], out var mapped) && mapped.Count > 0)
+                return mapped[0];
+        foreach (var successor in block.Successors)
+            if (ResolveBlockEntryInstruction(successor, blockEntryMap) is { } entry)
+                return entry;
         return null;
     }
 
