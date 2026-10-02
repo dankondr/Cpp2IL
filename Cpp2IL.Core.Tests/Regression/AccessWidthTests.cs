@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Linq;
 using AsmResolver.DotNet;
 using AsmResolver.PE.DotNet.Cil;
@@ -414,6 +415,77 @@ public class AccessWidthTests
             Assert.That(Stores(method, "a"), Is.False, () => Dump(method));
             Assert.That(Diagnoses(method, "could not be emitted"), Is.True, () => Dump(method));
         });
+    }
+
+    // Flags { bool a @0x10; bool b @0x11; bool c @0x12; bool d @0x13 } (ints 4 bytes apart for a
+    // 16-byte copy); a load of `width` bytes at `from`, stored at `to` on another Flags.
+    private static (MethodAnalysisContext Caller, MethodDefinition Method) FlagCopy(int from, int to, int width,
+        bool simdStore)
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2019Game();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var flags = InjectClass(app, "Flags");
+        var type = width == 16 ? app.SystemTypes.SystemInt32Type : app.SystemTypes.SystemBooleanType;
+        var size = width == 16 ? 4 : 1;
+        foreach (var (name, k) in new[] { ("a", 0), ("b", 1), ("c", 2), ("d", 3) })
+            InjectField(name, type, flags, 0x10 + k * size);
+        var module = new ModuleDefinition("Width.dll");
+        Seed(module, app, flags);
+        SeedCorLibTypes(app, module, type, app.SystemTypes.SystemObjectType);
+
+        var source = Local("source", flags);
+        var target = Local("target", flags);
+        var value = Local("value");
+        return ForeignCaller(app, module, [
+            new(0, OpCode.Move, value, new MemoryOperand(source, null, from, 0, width)) { NativeMemoryAccessSize = width },
+            new(1, OpCode.Move, new MemoryOperand(target, null, to, 0, simdStore ? 0 : width), value)
+                { NativeStoreWidthBytes = width },
+            new(2, OpCode.Return)], [source, target, value]);
+    }
+
+    // The source field each target field is stored from, as "target<-source".
+    private static List<string> FieldCopies(MethodAnalysisContext method)
+    {
+        var instructions = method.ControlFlowGraph!.Instructions;
+        return instructions
+            .Where(i => i is { OpCode: OpCode.Move, Operands: [FieldReference { Local.Name: "target" }, LocalVariable] })
+            .Select(i => ((FieldReference)i.Operands[0]).Field.Name + "<-" + instructions
+                .Where(d => d.OpCode == OpCode.Move && ReferenceEquals(d.Operands[0], i.Operands[1]))
+                .Select(d => (d.Operands[1] as FieldReference)?.Field.Name).Single())
+            .ToList();
+    }
+
+    [Test]
+    public void TwoFieldCopyIsACopyPerField()
+    {
+        // `ldrh w8, [x20, #0x10]; sturh w8, [x21, #0x11]`: two bools copied at once are
+        // target.b = source.a and target.c = source.b, not target.b alone.
+        var (caller, method) = FlagCopy(0x10, 0x11, 2, simdStore: false);
+
+        MetadataResolver.ResolveFieldOffsets(caller);
+        MetadataResolver.ResolveFieldOffsets(caller);
+        IlGenerator.GenerateIl(caller, method);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(FieldCopies(caller), Is.EquivalentTo(new[] { "b<-a", "c<-b" }));
+            Assert.That(Diagnoses(method, "could not be emitted"), Is.False, () => Dump(method));
+        });
+    }
+
+    [Test]
+    public void SimdRegisterCopyKeepsDiagnostic()
+    {
+        // `ldr q0; str q0` of four ints: a SIMD register's lanes can change in place between
+        // the load and the store (`fmul v0.2s`), so the vector lane decodes it, not this split.
+        var (caller, method) = FlagCopy(0x10, 0x10, 16, simdStore: true);
+
+        MetadataResolver.ResolveFieldOffsets(caller);
+        MetadataResolver.ResolveFieldOffsets(caller);
+        IlGenerator.GenerateIl(caller, method);
+
+        Assert.That(Diagnoses(method, "could not be emitted"), Is.True, () => Dump(method));
     }
 
     // Holder { float a @0x10; float b @0x14; float c @0x18 }, read eight bytes at a time.
