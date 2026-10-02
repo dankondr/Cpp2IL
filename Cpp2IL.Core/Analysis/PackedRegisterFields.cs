@@ -354,6 +354,14 @@ internal static class PackedRegisterFields
                         : operandWidth)
                 : null,
             OpCode.Not or OpCode.Negate => operandIndex == 1 ? (0, operandWidth) : null,
+            // An integer-source conversion (`scvtf`/`ucvtf`) reads the low
+            // source-width bytes of the register - a packed leaf when that range
+            // is one field. Float-source reads are lane views, not this pass's.
+            OpCode.Convert => operandIndex == 1 && !instruction.ConversionFromFloat
+                && instruction.ConversionSourceWidthBits is { } sourceBits
+                && sourceBits % 8 == 0
+                ? (0, sourceBits / 8)
+                : null,
             _ => null,
         };
 
@@ -674,21 +682,24 @@ internal static class PackedRegisterFields
                 return null;
             }
         }
-        if (MetadataResolver.MemberPathUnspellable((projected.Field, projected.Containers),
-                method, store: false, addressed: false))
-            return null;
         // Last, the emission contract itself: a field reference whose members
         // are unusable from the caller substitutes a synthetic default at
         // emission, swapping this instruction's own diagnostic for a fabricated
         // value - decline and keep the register read diagnosed instead. The
-        // two inlined-member rewrites emission performs (an enumerator's
-        // `_current` through get_Current, a list's `_size` through get_Count)
-        // keep those reads spellable despite private accessibility.
+        // rescues below keep reads spellable despite private accessibility: the
+        // inlined-member rewrites emission performs (an enumerator's `_current`
+        // through get_Current, a list's `_size` through get_Count), and any leaf
+        // a returned-field accessor of its declaring type exposes - `hasValue`
+        // through `get_HasValue`, a Unity `m_X` through `get_x`.
         var check = new FieldReference(projected.Field, projected.Local, 0,
             projected.Containers);
-        if (!IlGenerator.FieldReferenceUsableFrom(check, method, requireToken: false)
-            && !EmissionRescuesFieldReference(check, method))
-            return null;
+        if (MetadataResolver.MemberPathUnspellable((projected.Field, projected.Containers),
+                method, store: false, addressed: false)
+            || !IlGenerator.FieldReferenceUsableFrom(check, method, requireToken: false))
+        {
+            if (!EmissionRescuesFieldReference(check, method))
+                return null;
+        }
         return (projected, leafType);
     }
 
@@ -713,24 +724,52 @@ internal static class PackedRegisterFields
         var current = field.Field.Name == "_current" && field.Containers.Count == 0
             ? field.Field
             : field.Containers.FirstOrDefault();
-        if (current?.Name != "_current"
-            || IlGenerator.EmittedLocalType(field.Local, method)
-                is not GenericInstanceTypeAnalysisContext enumerator
-            || enumerator.GenericType.Methods.FirstOrDefault(candidate => candidate.Name == "get_Current"
-                && !candidate.IsStatic && candidate.Parameters.Count == 0) is not { } getter)
+        if (current?.Name == "_current"
+            && IlGenerator.EmittedLocalType(field.Local, method)
+                is GenericInstanceTypeAnalysisContext enumerator
+            && enumerator.GenericType.Methods.FirstOrDefault(candidate => candidate.Name == "get_Current"
+                && !candidate.IsStatic && candidate.Parameters.Count == 0) is { } getter)
+        {
+            if (field.Containers.Count == 0)
+                return true;
+            var currentType = IlGenerator.EffectiveCallReturnType(
+                new ConcreteGenericMethodAnalysisContext(getter, enumerator.GenericArguments, []));
+            var nestedReceiverType = field.Containers.Count == 1
+                ? currentType
+                : field.Containers[^1].FieldType;
+            return IlGenerator.TypeTokenUsableFrom(currentType, method)
+                && field.Containers.Skip(1).All(container => IlGenerator.FieldUsableFrom(container, method))
+                && (IlGenerator.FieldUsableFrom(field.Field, method, receiverType: nestedReceiverType)
+                    || (nestedReceiverType != null
+                        && IlGenerator.PublicFieldGetter(nestedReceiverType, field.Field) != null));
+        }
+
+        // A member the caller cannot spell is still recovered when its declaring
+        // type exposes a parameterless instance member whose own lifted body is
+        // exactly `return <that member>` - `Nullable<T>.hasValue` through
+        // `get_HasValue`, a Unity `m_X` through `get_x`, a `KeyValuePair`'s
+        // `value` through `get_Value`. The rescue binds the first unreadable
+        // link and mirrors the receiver resolution RewriteReads performs when
+        // it converts the read into the accessor call.
+        var links = field.Containers.Append(field.Field).ToList();
+        var bad = links.FindIndex(c => !IlGenerator.FieldUsableFrom(c, method, requireToken: false));
+        if (bad < 0)
             return false;
-        if (field.Containers.Count == 0)
-            return true;
-        var currentType = IlGenerator.EffectiveCallReturnType(
-            new ConcreteGenericMethodAnalysisContext(getter, enumerator.GenericArguments, []));
-        var nestedReceiverType = field.Containers.Count == 1
-            ? currentType
-            : field.Containers[^1].FieldType;
-        return IlGenerator.TypeTokenUsableFrom(currentType, method)
-            && field.Containers.Skip(1).All(container => IlGenerator.FieldUsableFrom(container, method))
-            && (IlGenerator.FieldUsableFrom(field.Field, method, receiverType: nestedReceiverType)
-                || (nestedReceiverType != null
-                    && IlGenerator.PublicFieldGetter(nestedReceiverType, field.Field) != null));
+        var readOf = links[bad];
+        if (readOf.IsStatic || readOf.DeclaringType is not { } holderType)
+            return false;
+        IOperand? receiverOperand = bad == 0
+            ? field.Local
+            : new FieldReference(field.Containers[bad - 1], field.Local, field.Offset,
+                field.Containers.Take(bad - 1).ToList());
+        if (receiverOperand == null
+            || (bad > 0
+                && !IlGenerator.FieldReferenceUsableFrom((FieldReference)receiverOperand,
+                    method, requireToken: false))
+            || InlinedMemberRecovery.IsAddressSlot(receiverOperand, method))
+            return false;
+        return InlinedMemberRecovery.FindReturnedFieldAccessor(holderType, readOf,
+            method, staticAccess: false) != null;
     }
 
     // The leaf admissibility a mask needs. An offset-zero mask is a plain read:

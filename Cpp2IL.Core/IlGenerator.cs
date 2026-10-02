@@ -402,6 +402,51 @@ public static class IlGenerator
             branchInstruction.Operand = new CilInstructionLabel(target);
         }
 
+        // A conditional whose two edges reach the same instruction through only
+        // `br`/`nop` hops is dead: the taken edge and the fallthrough edge
+        // merge without work between them. Emitting it produces `if (c) {}` -
+        // a diamond with two empty arms - so the check and the pure operand
+        // loads that fed it emit as nops instead.
+        var bodyInstructions = definition.CilMethodBody!.Instructions;
+        foreach (var (jump, il) in instructionMap)
+        {
+            if (jump.OpCode != OpCode.ConditionalJump)
+                continue;
+            var ilBranch = il.LastOrDefault(i => i.OpCode == CilOpCodes.Brtrue || i.OpCode == CilOpCodes.Brfalse);
+            if (ilBranch?.Operand is not CilInstructionLabel { Instruction: { } takenEntry })
+                continue;
+            // Find the branch's own position by identity: CilInstructionLabel
+            // equality degenerates while offsets are unassigned, so IndexOf
+            // could report an earlier, different brtrue/brfalse.
+            var branchIndex = -1;
+            for (var i = 0; i < bodyInstructions.Count; i++)
+                if (ReferenceEquals(bodyInstructions[i], ilBranch))
+                {
+                    branchIndex = i;
+                    break;
+                }
+            if (branchIndex < 0 || branchIndex + 1 >= bodyInstructions.Count)
+                continue;
+            var fallthroughEntry = bodyInstructions[branchIndex + 1];
+            // The branch is dead only when its taken edge and its fallthrough
+            // edge land on the same instruction once br/nop bridges are
+            // resolved away. A landing that is a real instruction elsewhere in
+            // the method (a loop head, a ret) keeps the test.
+            var takenLanding = EmissionResolveJoinTarget(takenEntry, bodyInstructions);
+            if (takenLanding == null || il.Contains(takenLanding))
+                continue;
+            var fallLanding = EmissionResolveJoinTarget(fallthroughEntry, bodyInstructions);
+            if (!ReferenceEquals(takenLanding, fallLanding))
+                continue;
+            if (il.Any(emitted => emitted != ilBranch && !EmissionIsPureLocalComputation(emitted)))
+                continue;
+            foreach (var emitted in il)
+            {
+                emitted.OpCode = CilOpCodes.Nop;
+                emitted.Operand = null;
+            }
+        }
+
         // A proven unwind landing pad on a finalizer is emitted as the finally clause
         // it was compiled from: exit copies of the base call become leaves out of the
         // try, and the handler carries base.Finalize + endfinally.
@@ -4581,7 +4626,10 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Conv_I4);
                 break;
             case AddressOf { Target: LocalVariable addressed }:
-                instructions.Add(CilOpCodes.Ldloca, locals[addressed]);
+                if (ParameterForLocal(addressed, method, callingContext) is { } addressedParameter)
+                    instructions.Add(CilOpCodes.Ldarga, addressedParameter);
+                else
+                    instructions.Add(CilOpCodes.Ldloca, locals[addressed]);
                 break;
             case AddressOf { Target: FieldReference addressedField }:
                 if (!FieldReferenceUsableFrom(addressedField, callingContext, writeAccess: true))
@@ -9987,6 +10035,69 @@ public static class IlGenerator
                     or OpCode.Divide or OpCode.Modulo
     };
 
+    // Positions must be found by identity: label and nop operands compare equal
+    // while offsets are unassigned, which makes collection IndexOf unreliable.
+    private static int EmissionBodyIndex(CilInstructionCollection body, CilInstruction item)
+    {
+        for (var i = 0; i < body.Count; i++)
+            if (ReferenceEquals(body[i], item))
+                return i;
+        return -1;
+    }
+
+    // Walks forward from `entry` through only `br` targets and `nop`s and
+    // returns the first instruction that does real work - the instruction a
+    // control-flow edge semantically lands on. Null when the walk leaves the
+    // body or exceeds the hop bound (a cycle of pure jumps).
+    private static CilInstruction? EmissionResolveJoinTarget(CilInstruction entry,
+        CilInstructionCollection body)
+    {
+        for (var hops = 0; hops < 8; hops++)
+        {
+            if (entry.OpCode == CilOpCodes.Br && entry.Operand is CilInstructionLabel { Instruction: { } next })
+            {
+                entry = next;
+                continue;
+            }
+            if (entry.OpCode == CilOpCodes.Nop)
+            {
+                var index = EmissionBodyIndex(body, entry);
+                if (index < 0 || index + 1 >= body.Count)
+                    return null;
+                entry = body[index + 1];
+                continue;
+            }
+            return entry;
+        }
+        return null;
+    }
+
+    // Instruction kinds that only read existing state onto the evaluation
+    // stack - no stores, calls, member loads or potentially-throwing
+    // operations - so nop'ing them out with a dead branch keeps the IL
+    // balanced and semantics unchanged.
+    private static bool EmissionIsPureLocalComputation(CilInstruction instruction) => instruction.OpCode.Code switch
+    {
+        CilCode.Ldloc or CilCode.Ldloc_S or CilCode.Ldloca or CilCode.Ldloca_S
+            or CilCode.Ldloc_0 or CilCode.Ldloc_1 or CilCode.Ldloc_2 or CilCode.Ldloc_3
+            or CilCode.Ldarg or CilCode.Ldarg_S or CilCode.Ldarga or CilCode.Ldarga_S
+            or CilCode.Ldarg_0 or CilCode.Ldarg_1 or CilCode.Ldarg_2 or CilCode.Ldarg_3
+            or CilCode.Ldc_I4 or CilCode.Ldc_I4_S or CilCode.Ldc_I8 or CilCode.Ldc_R4 or CilCode.Ldc_R8
+            or CilCode.Ldc_I4_M1 or CilCode.Ldc_I4_0 or CilCode.Ldc_I4_1 or CilCode.Ldc_I4_2
+            or CilCode.Ldc_I4_3 or CilCode.Ldc_I4_4 or CilCode.Ldc_I4_5 or CilCode.Ldc_I4_6
+            or CilCode.Ldc_I4_7 or CilCode.Ldc_I4_8
+            or CilCode.Ldnull
+            or CilCode.Pop or CilCode.Dup
+            or CilCode.Ceq or CilCode.Cgt or CilCode.Cgt_Un or CilCode.Clt or CilCode.Clt_Un
+            or CilCode.Not or CilCode.Neg
+            or CilCode.Add or CilCode.Sub or CilCode.Mul or CilCode.Shl or CilCode.Shr or CilCode.Shr_Un
+            or CilCode.And or CilCode.Or or CilCode.Xor
+            or CilCode.Conv_I or CilCode.Conv_I1 or CilCode.Conv_I2 or CilCode.Conv_I4 or CilCode.Conv_I8
+            or CilCode.Conv_U or CilCode.Conv_U1 or CilCode.Conv_U2 or CilCode.Conv_U4 or CilCode.Conv_U8
+            or CilCode.Conv_R4 or CilCode.Conv_R8 or CilCode.Conv_R_Un => true,
+        _ => false,
+    };
+
     // Equality between integral or pointer operands lowers to ceq on two native
     // ints - every side converts through conv.i (a zero literal is then the
     // native null-address test). Returns false when an operand cannot become a
@@ -10054,6 +10165,14 @@ public static class IlGenerator
                 return false; // a ref struct can never become a reference either
             emitted.Add(emittedType);
         }
+
+        // A boxed value is only reference-comparable against ldnull: box+ceq
+        // against any other operand compares distinct boxes, which is always
+        // false. Such a test has no honest lowering; leave it diagnosed.
+        for (var i = 0; i < emitted.Count; i++)
+            if (emitted[i] is { IsValueType: true }
+                && emitted[(i + 1) % emitted.Count] != null)
+                return false;
 
         for (var i = 0; i < operands.Count; i++)
         {
