@@ -3564,33 +3564,17 @@ internal sealed class Arm64VectorScalarizer
         {
             var state = r == 0 ? first : second!;
             var baseOff = insn.MemOffset + r * bytes;
-            if (slots == 2
-                && WideStoreOperand(state) is { } wideOperand)
-            {
-                // A 64-bit scalar store is one wide write: the operand naming
-                // the register's value — a whole-register slice, an adjacent
-                // field pair's aggregate, a phi-merged register local or the
-                // composed lane value — so the whole 8-byte write resolves
-                // against the destination instead of splitting into a second
-                // window that lands mid-field on a target with no member
-                // there.
-                IOperand wideMem = insn.MemBase == Arm64Register.X31
-                    ? new StackOffset((int)baseOff)
-                    : new MemoryOperand(Reg(insn.MemBase), addend: baseOff);
-                var wideMove = _add(_address, OpCode.Move, [wideMem, wideOperand]);
-                wideMove.NativeStoreWidthBytes = 8;
-                _emitted = true;
-                continue;
-            }
             if (slots == 4
                 && WholeVectorStoreOperand(state) is { } vectorOperand)
             {
                 // All four lanes constant (a vector literal the resolver can
                 // store whole), the register's own slices, or four adjacent
-                // fields of one local — a single whole-register write.
+                // fields of one local — a single whole-register write. Other
+                // mixes keep the per-window writes so an adjacent-fields
+                // target resolves each member.
                 IOperand vectorMem = insn.MemBase == Arm64Register.X31
                     ? new StackOffset((int)baseOff)
-                    : new MemoryOperand(Reg(insn.MemBase), addend: baseOff);
+                    : new MemoryOperand(Reg(insn.MemBase), addend: baseOff, accessSize: 16);
                 var vectorMove = _add(_address, OpCode.Move, [vectorMem, vectorOperand]);
                 vectorMove.NativeStoreWidthBytes = 16;
                 _emitted = true;
@@ -3613,21 +3597,6 @@ internal sealed class Arm64VectorScalarizer
             }
         }
         return true;
-    }
-
-    /// <summary>
-    /// The operand naming a 64-bit register's whole value for a wide store:
-    /// a single operand sliced over both windows, the adjacent-field pair's
-    /// aggregate, a phi-merged register pair, or the composed lane value.
-    /// </summary>
-    private IOperand? WideStoreOperand(VectorState state)
-    {
-        var lo = state.Slots[0]!.Value;
-        var hi = state.Slots[1]!.Value;
-        if (lo.BitOffset == 0 && hi.BitOffset == 32 && lo.Operand.Equals(hi.Operand))
-            return lo.Operand;
-        return PairStoreOperand(lo, hi)
-               ?? Lane64Operand(state, 0, floatRead: true);
     }
 
     /// <summary>

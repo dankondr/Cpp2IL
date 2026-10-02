@@ -242,11 +242,18 @@ public class Arm64VectorScalarizerTests
 
         var stores = il.Where(i => i.OpCode == OpCode.Move
             && i.Operands[0] is MemoryOperand { Base: Register { Name: "X19" } }).ToList();
-        Assert.That(stores, Has.Count.EqualTo(2), () => string.Join("\n", il));
         Assert.Multiple(() =>
         {
+            // each 8-byte store writes the register's low window, then the
+            // shifted-out high window — the second store's windows must read
+            // operands the second load produced
+            Assert.That(stores, Has.Count.EqualTo(4), () => string.Join("\n", il));
             Assert.That(stores[0].Operands[1], Is.EqualTo(new Register(null, "V0")));
-            Assert.That(stores[1].Operands[1], Is.EqualTo(new Register(null, "V0")));
+            Assert.That(stores[2].Operands[1], Is.EqualTo(new Register(null, "V0")));
+            Assert.That(stores[0].Operands[1], Is.Not.EqualTo(stores[1].Operands[1]));
+            Assert.That(stores[2].Operands[1], Is.Not.EqualTo(stores[3].Operands[1]));
+            Assert.That(stores[1].Operands[1], Is.Not.EqualTo(stores[3].Operands[1]),
+                "the second high window must not reuse the first store's temp");
             Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
         });
     }
@@ -1057,6 +1064,30 @@ public class Arm64VectorScalarizerTests
                 () => string.Join("\n", il));
             Assert.That(il.Any(i => IsMove(i, "V1.S1", "V0")), Is.True,
                 "both edges carry the lane through the conditional branch");
+        });
+    }
+
+    [Test]
+    public void ScalarDoubleStoreWritesBothWindows()
+    {
+        // A `str d` is an eight-byte store: the low window carries the
+        // register's value and the high window its upper half, so a target
+        // made of two adjacent float members resolves both fields.
+        var il = Lift(
+            0xfd400e60, // ldr d0, [x19, #0x18]
+            0xfd402100, // ldr d0, [x8, #0x40]
+            0xfd001280); // str d0, [x20, #0x20]
+
+        var stores = il.Where(i => i.OpCode == OpCode.Move
+            && i.Operands[0] is MemoryOperand { Base: Register { Name: "X20" } }).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(stores, Has.Count.EqualTo(2),
+                () => string.Join("\n", il));
+            Assert.That(((MemoryOperand)stores[0].Operands[0]).Addend, Is.EqualTo(0x20));
+            Assert.That(((MemoryOperand)stores[1].Operands[0]).Addend, Is.EqualTo(0x24));
+            Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False,
+                () => string.Join("\n", il));
         });
     }
 }
