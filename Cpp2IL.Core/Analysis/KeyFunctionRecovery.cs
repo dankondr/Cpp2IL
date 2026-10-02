@@ -120,6 +120,9 @@ public static class KeyFunctionRecovery
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.il2cpp_codegen_get_thread_static_data))
                 RewriteThreadStaticData(instruction, method);
         }
+
+        // Raises lowered here and by call resolution end control flow.
+        NonReturningHelperRecovery.CutThrowFallThrough(method.ControlFlowGraph!);
     }
 
     private static void RewriteInlinedClassIsInst(MethodAnalysisContext method)

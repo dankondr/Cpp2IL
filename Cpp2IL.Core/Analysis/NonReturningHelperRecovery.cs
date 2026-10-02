@@ -85,6 +85,49 @@ internal static class NonReturningHelperRecovery
         }
     }
 
+    // A Throw ends control flow, but the lifted CFG keeps the native fall-through after the
+    // noreturn call it came from. Through that impossible edge a throw block shared by many
+    // checks feeds a join's phis whatever each register held on the way in - a method-init flag
+    // page, a class-init flag - and the join reads them as values. Edges into joins go, with their
+    // phi inputs. ponytail: a successor only the throw reaches keeps its dead edge - deleting that
+    // code drops a catch-rethrow a raise inside a protected range natively falls into (UniTask's
+    // WhenAnyLRPromise); cut it too once exception recovery stops relying on it.
+    internal static void CutThrowFallThrough(ISILControlFlowGraph cfg)
+    {
+        foreach (var block in cfg.Blocks)
+        {
+            if (block == cfg.EntryBlock || !block.Instructions.Any(i => i.OpCode == OpCode.Throw))
+                continue;
+
+            var joins = block.Successors.Where(successor => successor != cfg.ExitBlock
+                && successor.Predecessors.Any(predecessor => predecessor != block)).Distinct().ToList();
+            if (joins.Count == 0)
+                continue;
+
+            foreach (var join in joins)
+            {
+                while (join.Predecessors.Contains(block))
+                    cfg.RemovePredecessor(join, block);
+                block.Successors.RemoveAll(successor => successor == join);
+            }
+
+            // A branch after the throw would name a block this one no longer reaches.
+            foreach (var jump in block.Instructions.Where(i => i.OpCode is OpCode.Jump or OpCode.ConditionalJump
+                         && i.Operands[0] is Block target && joins.Contains(target)))
+            {
+                jump.OpCode = OpCode.Nop;
+                jump.SetOperands();
+            }
+
+            if (block.Successors.Count == 0)
+            {
+                block.Successors.Add(cfg.ExitBlock);
+                cfg.ExitBlock.Predecessors.Add(block);
+            }
+            block.CalculateBlockType();
+        }
+    }
+
     internal static ulong BranchTarget(ulong pc, uint word)
         => unchecked((ulong)((long)pc + ((int)(word << 6) >> 4)));
 
