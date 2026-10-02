@@ -186,6 +186,14 @@ internal sealed class Arm64VectorScalarizer
     /// lane tuple, so only a Move counts as materializing it.
     /// </summary>
     private readonly HashSet<string> _emittedVectorMoves = new();
+
+    /// <summary>
+    /// The call instruction the current statement emitted, if any. A call's
+    /// signature is only visible on the emitted instruction — the clobber
+    /// pass reads which V registers the callee's result fills from it.
+    /// </summary>
+    private Instruction? _emittedCall;
+
     private readonly Dictionary<string, Register> _shiftTemps = new();
     private readonly HashSet<ulong> _mergeTargets = new();
     private readonly HashSet<string> _claimedDests = new();
@@ -225,14 +233,38 @@ internal sealed class Arm64VectorScalarizer
         foreach (var name in dropped)
             _vectors.Remove(name);
         _clobbered.UnionWith(dropped);
-        // the call lands its result in V0: the caller's Move materializes the
-        // register local at scalar width, while every lane stays opaque.
-        if (dropped.Contains("V0"))
+        // The call's result registers survive the clobber with a value: V0 for
+        // a scalar float result, V0-V3 for a homogeneous aggregate, X0 for
+        // anything else. Which registers the emitted call defines is readable
+        // off its destination and its implicit lane definitions — an indirect
+        // or non-vector call defines none and leaves them all clobbered.
+        var defined = new List<string>();
+        switch (_emittedCall)
         {
-            _vectors["V0"] = new VectorState { Name = "V0", MaterializedBits = 32 };
-            _clobbered.Remove("V0");
+            case { OpCode: OpCode.Call } call:
+                if (call.Operands.Count > 1 && call.Operands[1] is Register { Name: { } ret } && ret.StartsWith('V'))
+                    defined.Add(ret);
+                foreach (var lane in call.ImplicitDefinitions)
+                    if (lane.Name.StartsWith('V'))
+                        defined.Add(lane.Name);
+                break;
+            case null:
+                // the statement emitted no call at all (unreachable): the old
+                // rule presumed the result lived in V0
+                defined.Add("V0");
+                break;
+            // an IndirectCall or CallVoid defines no V register: every
+            // caller-saved register stays clobbered
+        }
+        foreach (var name in defined)
+        {
+            _vectors[name] = new VectorState { Name = name, MaterializedBits = 32 };
+            _clobbered.Remove(name);
         }
     }
+
+    /// <summary>Records the call instruction a statement emitted so <see cref="ClobberCall"/> can read its result registers.</summary>
+    public void NoteCall(Instruction call) => _emittedCall = call;
 
     /// <summary>Branch instruction addresses that target each merge point.</summary>
     private readonly Dictionary<ulong, List<ulong>> _mergePreds = new();
@@ -445,6 +477,7 @@ internal sealed class Arm64VectorScalarizer
     {
         _claimedDests.Clear();
         _emittedVectorMoves.Clear();
+        _emittedCall = null;
         // A cached shift names its source by register, not by value: once the next
         // instruction may have redefined that register, the temporary holds the high
         // half of the old value. It is only reused within one instruction.
@@ -771,9 +804,12 @@ internal sealed class Arm64VectorScalarizer
             nullAt[insn.Address] = (uint[])cur.Clone();
             if (insn.Op0Kind == Arm64OperandKind.None)
             {
-                // an undecoded word may write anything
-                for (var i = 0; i < 32; i++)
-                    cur[i] = 0xF;
+                // only a word the disassembler could not name may write
+                // anything — a decoded instruction with no operand (ret, nop,
+                // a hint) carries no destination and writes no lanes
+                if (insn.Mnemonic is Arm64Mnemonic.INVALID or Arm64Mnemonic.UNIMPLEMENTED)
+                    for (var i = 0; i < 32; i++)
+                        cur[i] = 0xF;
                 continue;
             }
             if (insn.Mnemonic is Arm64Mnemonic.BL or Arm64Mnemonic.BLR)
@@ -883,12 +919,17 @@ internal sealed class Arm64VectorScalarizer
 
         if (insn.Op0Kind == Arm64OperandKind.None)
         {
-            // no identifiable destination: undecoded words (UNIMPLEMENTED) or
-            // exotic forms may still write any vector register — drop all
-            // provenance rather than fold against stale lanes
-            _vectors.Clear();
-            for (var i = 0; i < 32; i++)
-                _clobbered.Add($"V{i}");
+            // Only a word the disassembler could not name (INVALID /
+            // UNIMPLEMENTED) may write any vector register — for those, drop
+            // all provenance rather than fold against stale lanes. A decoded
+            // instruction with no operand (ret, nop, hints, barriers) has no
+            // destination register and writes nothing, so provenance survives.
+            if (insn.Mnemonic is Arm64Mnemonic.INVALID or Arm64Mnemonic.UNIMPLEMENTED)
+            {
+                _vectors.Clear();
+                for (var i = 0; i < 32; i++)
+                    _clobbered.Add($"V{i}");
+            }
             return;
         }
 
