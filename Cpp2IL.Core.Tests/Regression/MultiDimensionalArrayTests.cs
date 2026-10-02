@@ -535,4 +535,91 @@ public class MultiDimensionalArrayTests
         Assert.That(store.OpCode, Is.EqualTo(OpCode.CallVoid), () => string.Join("\n", Instructions(caller)));
         Assert.That(store.Operands.Skip(1), Is.EqualTo(new IOperand[] { grid, i, new Immediate(0), i }));
     }
+
+    [Test]
+    public void PairPassedElementTakesItsUpperHalfLoad()
+    {
+        // A 16-byte element passed by value: `ldp x0, x1, [p + 0x20]; bl Consume`. The Get supplies
+        // the whole argument, so the load of its upper half into x1 goes with it.
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var int32 = app.SystemTypes.SystemInt32Type;
+        var wide = InjectStruct(app, "Wide");
+        InjectField("a", int32, wide, 0);
+        InjectField("b", int32, wide, 4);
+        InjectField("c", int32, wide, 8);
+        InjectField("d", int32, wide, 12);
+        var consume = new InjectedMethodAnalysisContext(wide, "Consume", app.SystemTypes.SystemVoidType,
+            System.Reflection.MethodAttributes.Public | System.Reflection.MethodAttributes.Static, [wide]);
+        var module = new ModuleDefinition("Grid.dll");
+        Seed(module, app, wide);
+        SeedCorLibTypes(app, module, int32, app.SystemTypes.SystemBooleanType, app.SystemTypes.SystemObjectType);
+        var grid = Local("grid", new ArrayTypeAnalysisContext(wide, 2));
+        LocalVariable b = Local("bounds"), x = Local("x", int32), y = Local("y", int32),
+            cx = Local("cx", app.SystemTypes.SystemBooleanType), cy = Local("cy", app.SystemTypes.SystemBooleanType),
+            product = Local("product"), flat = Local("flat"), scaled = Local("scaled"), p = Local("p");
+        var lane = new LocalVariable("lane", new Register(null, "X1"));
+        var upper = new Instruction(7, OpCode.Move, lane, new MemoryOperand(p, null, 0x28, 0, 8));
+        var call = new Instruction(8, OpCode.CallVoid, consume, new MemoryOperand(p, null, 0x20, 0, 8));
+        var (caller, _) = ForeignCaller(app, module, [
+            new(0, OpCode.Move, b, new MemoryOperand(grid, null, 0x10, 0, 8)),
+            new(1, OpCode.CheckLess, cx, x, new MemoryOperand(b, null, 0, 0, 4)),
+            new(2, OpCode.CheckLess, cy, y, new MemoryOperand(b, null, 0x10, 0, 4)),
+            new(3, OpCode.Multiply, product, new MemoryOperand(b, null, 0x10, 0, 4), x),
+            new(4, OpCode.Add, flat, y, product),
+            new(5, OpCode.ShiftLeft, scaled, flat, new Immediate(4)),
+            new(6, OpCode.Add, p, grid, scaled),
+            upper,
+            call,
+            new(9, OpCode.Return)], [grid, b, x, y, cx, cy, product, flat, scaled, p, lane]);
+        caller.ParameterLocals = [grid, x, y];
+
+        ArrayRecovery.RecoverMultiDimensionalAccesses(caller);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(call.Operands[1], Is.InstanceOf<LocalVariable>(), () => string.Join("\n", Instructions(caller)));
+            Assert.That(upper.OpCode, Is.EqualTo(OpCode.Nop), () => string.Join("\n", Instructions(caller)));
+        });
+    }
+
+    [Test]
+    public void ElementAddressMergedWithAnArrayIsItsOwnElement()
+    {
+        // `p = arr + (i << 3)` on one path, `p = other` on the other, then `v = [p + 0x20]`: the load
+        // is arr[i] or other[0], never p[0].
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("Merged.dll");
+        SeedCorLibTypes(app, module, app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemBooleanType,
+            app.SystemTypes.SystemObjectType);
+        var objects = new SzArrayTypeAnalysisContext(app.SystemTypes.SystemObjectType);
+        LocalVariable arr = Local("arr", objects), other = Local("other", objects), i = Local("i", app.SystemTypes.SystemInt32Type),
+            c = Local("c", app.SystemTypes.SystemBooleanType), s = Local("s"), p = Local("p", objects),
+            v = Local("v", app.SystemTypes.SystemObjectType);
+        var address = new Instruction(2, OpCode.Add, p, arr, s);
+        var alternative = new Instruction(4, OpCode.Move, p, other);
+        var load = new Instruction(5, OpCode.Move, v, new MemoryOperand(p, null, 0x20, 0, 8));
+        var (caller, _) = ForeignCaller(app, module, [
+            new(0, OpCode.ConditionalJump, alternative, c),
+            new(1, OpCode.ShiftLeft, s, i, new Immediate(3)),
+            address,
+            new(3, OpCode.Jump, load),
+            alternative,
+            load,
+            new(6, OpCode.Return, v)], [arr, other, i, c, s, p, v]);
+        caller.ParameterLocals = [arr, other, i, c];
+
+        ArrayRecovery.RecoverMergedElementAddresses(caller);
+
+        Assert.That(load.Operands[1], Is.InstanceOf<ArrayAccess>(), () => string.Join("\n", Instructions(caller)));
+        var access = (ArrayAccess)load.Operands[1];
+        var writes = Instructions(caller).Where(w => w.OpCode == OpCode.Move && w.Operands[0] is LocalVariable written
+            && (ReferenceEquals(written, access.Array) || ReferenceEquals(written, access.Index))).ToList();
+        Assert.Multiple(() =>
+        {
+            Assert.That(writes.Select(w => w.Operands[1]), Is.EquivalentTo(new IOperand[] { arr, i, other, new Immediate(0) }),
+                () => string.Join("\n", Instructions(caller)));
+            Assert.That(access.Array, Is.Not.SameAs(p));
+            Assert.That(address.OpCode, Is.EqualTo(OpCode.Nop), "the element address has no reader left");
+        });
+    }
 }
