@@ -9,9 +9,14 @@ namespace Cpp2IL.Core.Analysis;
 // Merge the copies left behind by SSA destruction.
 public static class CopyCoalescer
 {
-    public static void Run(MethodAnalysisContext method) => Run(method.ControlFlowGraph!);
+    public static void Run(MethodAnalysisContext method) => Run(method.ControlFlowGraph!, method.ParameterLocals);
 
-    public static void Run(ISILControlFlowGraph cfg)
+    // A parameter is read with ldarg, and the emitter has no store into one. So a group holding a
+    // parameter's entry value is represented by that parameter (anything else would turn its reads
+    // into reads of a local nothing assigns where the entry value flowed), and it only takes in
+    // versions that are copies of the group: a version with a value of its own (the other arm of
+    // `x = c ? x : k`) keeps its own local, and the copy of the entry value stays a real store.
+    public static void Run(ISILControlFlowGraph cfg, IReadOnlyCollection<LocalVariable>? parameters = null)
     {
         var copies = FindSameSlotCopies(cfg);
         var escapedSlots = FindEscapedSlotGroups(cfg);
@@ -29,7 +34,9 @@ public static class CopyCoalescer
             candidates.UnionWith(group);
 
         var interference = BuildInterference(cfg, candidates);
-        var groups = new DisjointSet(candidates);
+        var groups = new DisjointSet(candidates, parameters ?? []);
+        var definitions = cfg.Instructions.Where(i => Defined(i) is { } d && candidates.Contains(d))
+            .ToLookup(i => Defined(i)!);
 
         foreach (var group in escapedSlots)
         {
@@ -39,7 +46,7 @@ public static class CopyCoalescer
                 var b = groups.Find(group[i]);
 
                 var (same, type) = SlotType(a.Type, b.Type);
-                if (a == b || !same)
+                if (a == b || !same || StoresIntoParameter(groups, definitions, a, b))
                     continue;
 
                 groups.Union(a, b);
@@ -56,7 +63,7 @@ public static class CopyCoalescer
             if (a.Type != null && b.Type != null && !ReferenceEquals(a.Type, b.Type))
                 continue;
 
-            if (a == b || Interferes(interference, groups, a, b))
+            if (a == b || Interferes(interference, groups, a, b) || StoresIntoParameter(groups, definitions, a, b))
                 continue;
 
             groups.Union(a, b);
@@ -151,6 +158,19 @@ public static class CopyCoalescer
         return bySlot.Values.Where(versions => versions.Count > 1).ToList();
     }
 
+    // Whether merging the groups of a and b would give a parameter a definition other than a copy
+    // of the merged group itself (those become no-ops).
+    private static bool StoresIntoParameter(DisjointSet groups, ILookup<LocalVariable, Instruction> definitions,
+        LocalVariable a, LocalVariable b)
+    {
+        if (!groups.Members(a).Concat(groups.Members(b)).Any(groups.IsParameter))
+            return false;
+
+        var members = groups.Members(a).Concat(groups.Members(b)).ToHashSet();
+        return members.SelectMany(member => definitions[member]).Any(definition =>
+            definition is not { OpCode: OpCode.Move, Operands: [_, LocalVariable source] } || !members.Contains(source));
+    }
+
     private static bool Interferes(Dictionary<LocalVariable, HashSet<LocalVariable>> interference, DisjointSet groups, LocalVariable a, LocalVariable b)
     {
         foreach (var member in groups.Members(a))
@@ -218,6 +238,21 @@ public static class CopyCoalescer
         return interference;
     }
 
+    // Locals read on some path from the method entry before anything assigns them: their value
+    // on that path is whatever they held on entry (a parameter's argument), one more definition.
+    internal static HashSet<LocalVariable> LiveIntoEntry(ISILControlFlowGraph cfg)
+    {
+        var live = new HashSet<LocalVariable>(ComputeBlockLiveOut(cfg)[cfg.EntryBlock]);
+        for (var i = cfg.EntryBlock.Instructions.Count - 1; i >= 0; i--)
+        {
+            var instruction = cfg.EntryBlock.Instructions[i];
+            if (Defined(instruction) is { } defined)
+                live.Remove(defined);
+            live.UnionWith(Used(instruction));
+        }
+        return live;
+    }
+
     private static Dictionary<Block, HashSet<LocalVariable>> ComputeBlockLiveOut(ISILControlFlowGraph cfg)
     {
         var liveIn = new Dictionary<Block, HashSet<LocalVariable>>();
@@ -268,13 +303,18 @@ public static class CopyCoalescer
 
     private static IEnumerable<LocalVariable> Used(Instruction instruction)
     {
+        // only the destination slot itself is not a read: `x = x + 1` reads x
         var defined = Defined(instruction);
+        var destinationIndex = -1;
+        for (var i = 0; defined != null && i < instruction.Operands.Count && destinationIndex < 0; i++)
+            if (ReferenceEquals(instruction.Operands[i], defined))
+                destinationIndex = i;
 
-        foreach (var operand in instruction.Operands)
+        for (var i = 0; i < instruction.Operands.Count; i++)
         {
-            switch (operand)
+            switch (instruction.Operands[i])
             {
-                case LocalVariable local when !ReferenceEquals(local, defined):
+                case LocalVariable local when i != destinationIndex:
                     yield return local;
                     break;
                 case MemoryOperand memory:
@@ -315,7 +355,7 @@ public static class CopyCoalescer
                     if (elementField.Index is LocalVariable addressedElementIndex)
                         yield return addressedElementIndex;
                     break;
-                case ReferenceCast cast when !ReferenceEquals(cast.Value, defined):
+                case ReferenceCast cast:
                     yield return cast.Value;
                     break;
             }
@@ -396,7 +436,7 @@ public static class CopyCoalescer
         }
     }
 
-    private class DisjointSet(IEnumerable<LocalVariable> locals)
+    private class DisjointSet(IEnumerable<LocalVariable> locals, IReadOnlyCollection<LocalVariable> parameters)
     {
         private readonly Dictionary<LocalVariable, LocalVariable> _parent = locals.ToDictionary(l => l, l => l);
         private readonly Dictionary<LocalVariable, List<LocalVariable>> _members = locals.ToDictionary(l => l, l => new List<LocalVariable> { l });
@@ -415,10 +455,12 @@ public static class CopyCoalescer
 
         public IEnumerable<LocalVariable> Members(LocalVariable representative) => _members[representative];
 
+        public bool IsParameter(LocalVariable local) => parameters.Contains(local);
+
         public void Union(LocalVariable a, LocalVariable b)
         {
-            // keep whichever already carries a type
-            var (keep, drop) = a.Type != null || b.Type == null ? (a, b) : (b, a);
+            // keep the parameter, else whichever already carries a type
+            var (keep, drop) = IsParameter(b) || !IsParameter(a) && a.Type == null && b.Type != null ? (b, a) : (a, b);
 
             _parent[drop] = keep;
             _members[keep].AddRange(_members[drop]);

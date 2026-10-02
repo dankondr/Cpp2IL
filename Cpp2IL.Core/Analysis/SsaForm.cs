@@ -628,10 +628,21 @@ public class SsaForm
                     // destination's reads on this path stay unassigned (CS0165);
                     // when no surviving edge stores the destination at all, its
                     // own reads carry the named Undefined local diagnostic.
+                    // Unless the branch into this edge proved the source null (`a?.b ?? c`:
+                    // `cbz x9` jumps to the join that would have held the loaded `b`): then
+                    // the edge carries null, which any reference slot holds.
                     if (destination is LocalVariable destinationLocal
                         && source is LocalVariable sourceLocal
                         && LocalVariables.NoLegalManagedCopy(destinationLocal, sourceLocal))
+                    {
+                        if (destinationLocal.Type is { IsValueType: false, Type: LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_CLASS
+                                or LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_STRING or LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_OBJECT
+                                or LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_SZARRAY or LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_ARRAY
+                                or LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST }
+                            && NullOnEdge(predecessor, block, sourceLocal))
+                            moves.Add(new Instruction(-1, OpCode.Move, destination, new Immediate(0)));
                         continue;
+                    }
 
                     moves.Add(new Instruction(-1, OpCode.Move, destination, source));
                 }
@@ -648,6 +659,33 @@ public class SsaForm
 
         cfg.RemoveNops();
         cfg.RemoveEmptyBlocks();
+
+        // Whether `value` is null on the edge from `predecessor` into `successor`: the branch
+        // ending `predecessor` tests `value == 0` (through any `Not`s) and this edge is the side
+        // where the test holds.
+        bool NullOnEdge(Block predecessor, Block successor, LocalVariable value)
+        {
+            if (predecessor.Instructions.LastOrDefault() is not { OpCode: OpCode.ConditionalJump, Operands: [Block target, LocalVariable condition] }
+                || predecessor.Successors.Distinct().Count() != 2)
+                return false;
+
+            var holds = ReferenceEquals(target, successor);
+            while (cfg.Instructions.FirstOrDefault(i => ReferenceEquals(i.Destination, condition)) is { } test)
+            {
+                switch (test)
+                {
+                    case { OpCode: OpCode.Not, Operands: [_, LocalVariable inner] }:
+                        condition = inner;
+                        holds = !holds;
+                        continue;
+                    case { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual, Operands: [_, LocalVariable tested, Immediate { Value: 0 }] }
+                        when ReferenceEquals(tested, value):
+                        return holds == (test.OpCode == OpCode.CheckEqual);
+                }
+                break;
+            }
+            return false;
+        }
     }
 
     /// <summary>

@@ -311,6 +311,12 @@ public static class Simplifier
                     counts[local] = counts.TryGetValue(local, out var count) ? count + 1 : 1;
             }
 
+            // A local read before any assignment on some path from the entry (a parameter) holds
+            // its entry value there, and that value reaches the joins its assignments do: in
+            // `if (c) x = k; use(x)` the one explicit assignment is not the only definition.
+            foreach (var local in CopyCoalescer.LiveIntoEntry(_graph))
+                counts[local] = counts.TryGetValue(local, out var count) ? count + 1 : 1;
+
             return counts;
         }
 
@@ -321,6 +327,10 @@ public static class Simplifier
             // past `p = p + 4` would read the next element. A path ends where one of them is written,
             // and a join that merges another definition of one of them ends it too.
             var replacementLocals = LocalVariables.OperandLocals(replacement).ToHashSet();
+            // `n = n.Next` has already overwritten what its source read: past it, `n.Next` is the
+            // next node's Next.
+            if (replacementLocals.Contains(local))
+                return;
             stopAtJoins |= replacementLocals.Any(read => definitionCounts.TryGetValue(read, out var count) && count > 1);
             // A value read from memory is only that value until a write that can reach the same
             // location: `x = o.f; o.f = 5; return x` must not become `return o.f`.
