@@ -102,7 +102,8 @@ internal static class DecompilerMemberAccessRewrites
     private static void FuseUnboxLoad(CilMethodBody body)
     {
         var instructions = body.Instructions;
-        var jumpTargets = new HashSet<CilInstruction>();
+        // By identity: CilInstruction equality is opcode, operand and offset.
+        var jumpTargets = new HashSet<CilInstruction>(ReferenceEqualityComparer.Instance);
         var foreignLabel = false;
         foreach (var instruction in instructions)
             switch (instruction.Operand)

@@ -2025,9 +2025,8 @@ public static class IlGenerator
                     // has honest answers - a shared native-int lowering covers
                     // integral/pointer operands, and a zero literal on a managed or
                     // generic operand is the null test - while ordering and
-                    // arithmetic have none, so they default to false/zero: the
-                    // zero after the throw keeps the store below stack-consistent
-                    // (IL2CPP's stack analysis walks that dead tail too).
+                    // arithmetic have none, so they throw; the store below is then
+                    // dead and RemoveDeadThrowTails cuts it.
                     if (unrecoverableIntegerOperation
                         || instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual)
                         || !(TryEmitNativeIntEquality(instruction, context, method, locals, writeLine)
@@ -2036,7 +2035,6 @@ public static class IlGenerator
                         EmitUnrecoverableOperation(method, writeLine, unrecoverableIntegerOperation
                             ? $"Unrecoverable integer operation: {instruction}"
                             : $"Unrecoverable operation: {instruction}");
-                        instructions.Add(CilOpCodes.Ldc_I4_0);
                     }
                     EmitStackCoerceOrDefault(context.AppContext.SystemTypes.SystemInt32Type,
                         StoreContract(instruction.Operands[0], context), method, context);
@@ -7897,12 +7895,14 @@ public static class IlGenerator
     // A label or handler boundary landing on a removed instruction is
     // redirected to the first kept instruction after it: the removed pushes
     // are dead, so jumping to one is jumping past them. Returns false when a
-    // removed instruction has no kept successor to land on.
+    // removed instruction has no kept successor to land on. Keyed by identity:
+    // CilInstruction equality is opcode, operand and offset, so a label on a
+    // kept `ldnull` would otherwise follow a removed one.
     private static bool RetargetRemoved(MethodDefinition? method,
         CilInstructionCollection instructions, List<int> remove)
     {
         var removeSet = new HashSet<int>(remove);
-        var afterOf = new Dictionary<CilInstruction, CilInstruction>();
+        var afterOf = new Dictionary<CilInstruction, CilInstruction>(ReferenceEqualityComparer.Instance);
         foreach (var k in remove)
         {
             var next = k + 1;
