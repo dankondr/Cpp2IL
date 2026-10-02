@@ -70,7 +70,21 @@ Four gates keep the projection honest:
   container reference the emitter substitutes for the member, per
   `IlGenerator.WholeValueContainerReference`) stays a whole-value store
   instead of being re-split onto the member's lane; only genuinely
-  narrower sources split the scalar sources.
+  narrower sources split the scalar sources. The deferral applies only
+  when the leaf the store targets covers the container's whole minimum
+  size and the container field is writable from the method — a 4-byte
+  `x` leaf does not cover a 12-byte `Vector3` container, so `x/y/z`
+  lane-store runs stay split where `InlinedMemberRecovery` can re-pack
+  them into one whole-struct store.
+- `LocalDefinedBytesCover` — a scalar store narrows to the covered
+  member only when the destination local's bytes were all materialized
+  by the program: member stores union their written spans, whole-value
+  `Move`/`Call`/`Newobj` definitions cover the slot, a `Phi` contributes
+  the bytes every input covers, and a computed op contributes its
+  proven width. When uncovered bytes remain — e.g. the second lane of
+  an `FMOV`/`FCSEL` pair the decoder never emitted — the operand keeps
+  its aggregate type and the conversion stays diagnosed instead of
+  emitting `default` plus partial field stores as clean.
 
 Reads and stores whose covered field is *not* proven — private members
 the method cannot spell, whole-struct phi merges (`Enumerator→Vector3`,
@@ -106,83 +120,74 @@ stored value`, and the slot gets `default` instead of a
 whole-type conversion the move cannot satisfy. Same-type copies are
 whole copies and are exempt.
 
-## Numbers (control `0589ade7` vs branch, r241 / Castle Busters 1.11.1)
+## Numbers (gate control `18a7d759` vs branch `5b4a2b47`, r241 /
+Castle Busters 1.11.1 — re-measured after `origin/development`
+adopted #200 vector-register lanes)
 
-Milestone scope (`CastleBuildingController`,
-`TimedCastleBuildingController`, `CastleMaker`, `EngineersController`
-+ nested, `CastleClashers.Game` — 286 methods):
+Pre-merge gate (`tools/codeverify/gate.py`, control = merge base
+`18a7d759`, branch = `5b4a2b47`): **Verdict PASS** — game-owned
+methods **cleared 20, regressed 57** (every regressed method named
+below); ILVerify transitions **none**; silent wrong-recovery compare
+`empty-diamond` **4 → 3 (0 new, 1 gone)**, `uninit-read` 16 → 16,
+no new silent hits in any class; corpus oracle **0 match→mismatch**
+(359/623 matched on both, per-lane deltas all 0).
 
-- methods with diagnostics: **67 → 66**; newly clean:
-  `CastleMaker::Paint`; newly dirty: **0**
-- `CastleMaker::SpawnShields`: diagnostics 439 → 365;
-  `Enumerator→scalar`-family conversions **67 → 7** (+17 covered-span
-  notes)
-- `CastleMaker::SpawnShieldsFromPlacements`: 424 → 374;
-  `Enumerator→scalar`-family **47 → 1** (+8 covered-span notes)
-- survivors are non-`Move` unproven edges (`Enumerator→ShieldType`,
-  `Enumerator→Int32`, `Enumerator→Vector2Int`, `Int32→Enumerator` on
-  Convert/field-store/call-arg shapes) — the covered-field rule cannot
-  prove them, so they stay diagnosed by design; the `→Vector3`
-  direction is fully gone.
+Every cleared method is a genuine covered-field recovery: control's
+diagnostics on each were `Aggregate→scalar`/`scalar→Aggregate`
+conversions or `Unrecoverable` ops on vector-typed operands that the
+covered-field typing resolves (`EnemyAimController::IsFinite`,
+`GetXPos`, `FromUnitData`, `GetMinMaxX`, `TriggerShoot`,
+`EncodeMovement`, `ScreenSizeUtils::GetResolutionUnityToNativeRatio`,
+the `ChestRewardManager` pair, `SegInt`/`OnSeg`, `CacheCastleBounds`
+×2, `ProcessFragment`, `CheckAndAutoClaimPendingReward`,
+`WheelUpgradeAvailable`, `EnforceCategoryDiversity`,
+`CleanCastleTopSweepMovement::Init`, `AddPartAtIndex`,
+`<ToggleLogType>b__0` — an enum-slot recovery). No previously
+diagnosed method moved to clean through the partial-materialization
+path — the `default`+partial-store toggle form is gone.
+
+Regressions (57 game-owned, all exposure of defects control hid):
+
+- **52 conversion notes** on previously-clean methods —
+  `Single→Vector3` ×24, `Single→Vector2` ×12, `Single→Color` ×4,
+  `Single→Vector4` ×1, `Vector2/Vector3→Single` ×4, `Object→Single`
+  combinations ×6, `ObscuredFloat↔ObscuredInt` ×1
+  (`HumanLikeBotController::UpdateWinIndex`). These are the
+  `Color color = default; color.r = 1f` fabrications the control
+  emitted silently: the aggregate's uncovered lanes were never
+  materialized by the binary (the `FMOV`/`FCSEL` lane-materialization
+  gap, `lane:decode`), so the operand keeps its conversion note.
+  Includes the coordinator-named `AddProjectileToPortal` and
+  `<PlayAutomatedAiming>d__9::MoveNext`: on `development` both emit
+  the silently-wrong `Vector2 v = default; v.x = x` form, so their
+  honest note is the required outcome of the materialization rule.
+- **3 covered-span notes** — `AttributionAdsDebugScreen::CreateWidgets`,
+  `AmplitudeProvider::GetDebugInfo`, `ConditionParser::ReadValue`:
+  same wrong-width emission family as round 0, still diagnosed.
+- **1 unmanaged-memory family** — `ProductUI::IsVisible`: `Vector3[]`
+  element reads at intra-element offsets (+0x20/0x24/0x38/0x3C) now
+  name the unmanaged loads the covered-field split makes explicit
+  where control emitted a silent whole-element copy.
+- **1** `CastleMaker::WhereCanUpgrade` (`Single→Vector3`) — same
+  partial-materialization family; stays `ilverify-valid`.
+
+Milestone scope (the four castle-building types + nested,
+`CastleClashers.Game` — 280 methods):
+
+- methods with diagnostics: **52 → 52**; newly clean:
+  `CastleBuildingController::AddPartAtIndex`; newly dirty (1):
+  `CastleMaker::WhereCanUpgrade` (`Single→Vector3`, partial
+  materialization — exposure).
+- `CastleMaker::SpawnShields`: `Enumerator→scalar`-family conversions
+  **24 → 16**; total diagnostics 314 → 314.
+- `CastleMaker::SpawnShieldsFromPlacements`: `Enumerator→scalar`-family
+  **8 → 1**.
+- `CastleMaker::MarkCastleShieldPositionsInUpgradeData`: 3 → 0;
+  `CastleMaker::Build`: 2 → 2.
 
 `CastleClashers.Game` (`diag_families --assemblies`): methods with
-diagnostics **2236 → 2154**; `no legal conversion` 1184 → 1075
-methods (5316 → 4388 occurrences); `synthetic default` 467 → 440;
-`unrecoverable op` 443 → 414; `zero on phi edge` 90 → 66; `receiver
-not recovered` 39 → 75 (async `d__` receivers now typed and named —
-see Exposure); `undefined local` 515 → 516.
-
-Assembly-wide (`codeverify`, control vs branch):
-
-- `verified` **31515 → 31859 (+344)**, `compiles_unverified` 21188 →
-  21397, `incomplete` 15604 → 15050 (−554), `fails_compile` 226 → 227
-  (+1, named), `invalid_il` **388 → 388 — 0 valid→invalid transitions,
-  membership identical**; `missing`/`no_body`/`stub` flat.
-- cluster nets: `No legal conversion` −4100 occurrences, phi-edge
-  zero −836, `Unmanaged memory load` −430, `Operand slot synthetic
-  default` −388, `Unrecoverable` Add/Multiply/ShiftRight/comparisons
-  −104/−92/−82/−76/−60; covered-span notes +~780 (new family);
-  `Receiver instance` +420; `Inaccessible field store` +64;
-  `hidden shared-generic` +2; `Undefined local` net −26.
-
-### Regressions (all named, all exposure or reclassification)
-
-- `verified → incomplete` ×6 — `Voodoo.Sauce.Internal.Analytics.
-  AmplitudeProvider::GetDebugInfo`, `TinyJson.JSONParser::
-  ParseAnonymousValue`, `EventRuleset.ConditionParser::ReadValue`,
-  `AttributionAdsDebugScreen::CreateWidgets`, `Nakama.TinyJson.
-  JsonParser::ParseAnonymousValue`, `MoreMountains.Tools.
-  MMPersistent::GetCurrentComponents`. The covered-span note and the
-  `Undefined local` note now name copies whose own width is narrower
-  than the source's declared type (1-byte of `Int32`, 4-byte of
-  `Double`/`Int64`, 8-byte `LDP` half of a 16-byte `ComponentData`)
-  where control emitted a compilable whole-value conversion the move
-  cannot satisfy — previously-silent wrong-width emission, now
-  diagnosed.
-- `compiles_unverified → incomplete` ×1 —
-  `Google.Protobuf.Collections.ProtobufEqualityComparers+
-  BitwiseSingleEqualityComparerImpl::GetHashCode(System.Single)`: a
-  4-byte move of an 8-byte `Double` — same honest covered-span note.
-- `incomplete → fails_compile` ×1 —
-  `CW.Common.CwFollow::UpdatePosition`: the `Unrecoverable operation:
-  Multiply` vector diagnostics cleared (the method now emits code);
-  the remaining `CS0117 'Math' does not contain 'E'/'PI'` is a
-  preexisting regenerated-mscorlib member gap present identically in
-  control — lateral reclassification, not new breakage.
-- `fails_compile` +1 total; compile-error deltas `Voodoo.Nakama` +2,
-  `VoodooTuneSDK` +1 — all `CS0246 <>c__DisplayClassNN_0` missing
-  generated-closure types (the tree does not emit them), on
-  already-failing assemblies; `RootMotion` −2, `DOTweenModules` −1.
-- Cluster growth on already-`incomplete` methods: `Receiver instance`
-  +420 (`d__` async state-machine locals now settle their real struct
-  type, so receiver-recovery failure names it, replacing
-  `Int32→slot` conversion notes), `Inaccessible field store` +64
-  (aggregate types settling on locals resolve stores to unwritable
-  fields), `hidden shared-generic` +2, `DebugException` backing +1 —
-  same mechanism, diagnosed either way.
-- 1 new `ilverify:StackUnexpected` finding on
-  `NakamaServer+<Authenticate>d__62::MoveNext` — on an already-
-  `incomplete` method; `invalid_il` membership unchanged.
+diagnostics **2029 → 2055** (+26 — the honest notes above, including
+the 57-method regressed set's CastleClashers.Game share).
 
 ## Tests
 
@@ -198,6 +203,16 @@ Assembly-wide (`codeverify`, control vs branch):
   src` emits `stfld inner.x` (**fails on control**).
 - `UnspellableCoveredFieldKeepsDiagnostic` — private members keep the
   operand's diagnostic and emit no synthetic default.
+- `ThreeLaneAggregateStoreStaysWholeStructStore` — an `x`/`y`/`z`
+  lane-store run into an aggregate collapses back to one whole-struct
+  store through `InlinedMemberRecovery` (**fails on `f0baeda0`**: the
+  leaf projection won over composite packing).
+- `PartiallyMaterializedAggregateKeepsConversionDiagnostic` — a
+  `Color` local whose only materialized bytes come from a 4-byte
+  literal store keeps the conversion diagnostic (**fails on
+  `f0baeda0`**: emitted `default`+partial stores cleanly).
+- `LocalLifetimeSplitTests.ScalarCopyIntoAggregateLocalKeepsDiagnostic`
+  — the same materialization rule on the lifetime-split path.
 
 Guard tests kept passing: `PackedRegisterFieldTests.
 FieldReadOnRestampedPrimitiveSlotStaysDiagnosed` (a Subtract-defined
