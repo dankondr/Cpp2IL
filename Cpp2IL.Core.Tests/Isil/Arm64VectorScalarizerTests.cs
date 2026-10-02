@@ -230,10 +230,10 @@ public class Arm64VectorScalarizerTests
     [Test]
     public void StoreOfReloadedRegisterReadsReloadedValue()
     {
-        // Two 8-byte copies through d0: each store is a memory-to-memory copy
-        // of the address its own load read — any carry-over of the first
-        // sequence (a cached high-half temporary, a stale lane) would show the
-        // second store reading the first load's source.
+        // Two 8-byte copies through d0: each store reads the register local —
+        // any carry-over of the first sequence (a cached high-half temporary,
+        // a stale lane) would show the second store reading the first load's
+        // source.
         var il = Lift(
             0xfd402520, // ldr d0, [x9, #0x48]
             0xfc024260, // stur d0, [x19, #0x24]
@@ -244,12 +244,14 @@ public class Arm64VectorScalarizerTests
             && i.Operands[0] is MemoryOperand { Base: Register { Name: "X19" } }).ToList();
         Assert.Multiple(() =>
         {
+            // each 8-byte store writes the whole d-register: a scratch-base
+            // load keeps no memory provenance, so the store reads the local
+            // the load defined — SSA dominance makes the second store read
+            // the second load's value, never a stale temp.
             Assert.That(stores, Has.Count.EqualTo(2), () => string.Join("\n", il));
-            Assert.That(stores[0].Operands[1], Is.EqualTo(
-                new MemoryOperand(new Register(null, "X9"), addend: 0x48, accessSize: 8)));
-            Assert.That(stores[1].Operands[1], Is.EqualTo(
-                new MemoryOperand(new Register(null, "X8"), addend: 0x48, accessSize: 8)),
-                "the second store must read the second load's source, not the first's");
+            Assert.That(stores[0].Operands[1], Is.EqualTo(new Register(null, "V0")));
+            Assert.That(stores[1].Operands[1], Is.EqualTo(new Register(null, "V0")));
+            Assert.That(((MemoryOperand)stores[0].Operands[0]).AccessSize, Is.EqualTo(8));
             Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False);
         });
     }
@@ -1064,12 +1066,13 @@ public class Arm64VectorScalarizerTests
     }
 
     [Test]
-    public void ScalarDoubleStoreIsAMemoryCopy()
+    public void ScalarDoubleStoreIsOneWideStore()
     {
         // A `str d` of a register an `ldr d` just filled is one eight-byte
-        // memory-to-memory copy: the resolver spells the whole aggregate on
-        // both sides — a target made of two adjacent float members resolves
-        // both fields, a double member resolves the double.
+        // store of the register local: a scratch-base load keeps no memory
+        // provenance, but the local's definition does — the resolver spells
+        // the whole aggregate, a double member resolves the double, and
+        // adjacent float members resolve their two halves.
         var il = Lift(
             0xfd400e60, // ldr d0, [x19, #0x18]
             0xfd402100, // ldr d0, [x8, #0x40]
@@ -1082,8 +1085,7 @@ public class Arm64VectorScalarizerTests
             Assert.That(stores, Has.Count.EqualTo(1), () => string.Join("\n", il));
             Assert.That((MemoryOperand)stores[0].Operands[0],
                 Is.EqualTo(new MemoryOperand(new Register(null, "X20"), addend: 0x20, accessSize: 8)));
-            Assert.That(stores[0].Operands[1], Is.EqualTo(
-                new MemoryOperand(new Register(null, "X8"), addend: 0x40, accessSize: 8)));
+            Assert.That(stores[0].Operands[1], Is.EqualTo(new Register(null, "V0")));
             Assert.That(il.Any(i => i.OpCode == OpCode.NotImplemented), Is.False,
                 () => string.Join("\n", il));
         });

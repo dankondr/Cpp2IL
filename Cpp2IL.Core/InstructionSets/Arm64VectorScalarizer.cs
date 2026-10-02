@@ -610,7 +610,8 @@ internal sealed class Arm64VectorScalarizer
             ClearCopyOrigin(Normalize(insn.Op0Reg));
             if (insn.Mnemonic is Arm64Mnemonic.LDR or Arm64Mnemonic.LDUR or Arm64Mnemonic.LDP
                 && insn.MemBase is not (Arm64Register.INVALID or Arm64Register.X31)
-                && insn.MemIndexMode == Arm64MemoryIndexMode.Offset)
+                && insn.MemIndexMode == Arm64MemoryIndexMode.Offset
+                && IsArgumentBase(insn.MemBase))
                 state.LoadMemory = new MemoryOperand(Reg(insn.MemBase), addend: insn.MemOffset,
                     accessSize: writtenBits / 8);
 
@@ -628,7 +629,8 @@ internal sealed class Arm64VectorScalarizer
                         second.SetSlot(i,  32 * i < secondBits ? new LaneSlice(Reg(insn.Op1Reg), 32 * i) : new LaneSlice(Zero, 0));
                     second.Whole = false;
                     if (insn.MemBase is not (Arm64Register.INVALID or Arm64Register.X31)
-                        && insn.MemIndexMode == Arm64MemoryIndexMode.Offset)
+                        && insn.MemIndexMode == Arm64MemoryIndexMode.Offset
+                        && IsArgumentBase(insn.MemBase))
                         second.LoadMemory = new MemoryOperand(Reg(insn.MemBase),
                             addend: insn.MemOffset + secondBits / 8, accessSize: secondBits / 8);
                 }
@@ -742,7 +744,8 @@ internal sealed class Arm64VectorScalarizer
             for (var i = 0; i < 4; i++)
                 state.SetSlot(i,  null); // lanes opaque, but the local itself is current
             state.Whole = true;
-            if (insn.MemBase != Arm64Register.X31 && RegisterBytes(reg) is > 0 and var loadBytes)
+            if (insn.MemBase != Arm64Register.X31 && RegisterBytes(reg) is > 0 and var loadBytes
+                && IsArgumentBase(insn.MemBase))
                 state.LoadMemory = new MemoryOperand(Reg(insn.MemBase), addend: offset, accessSize: loadBytes);
             return;
         }
@@ -759,9 +762,19 @@ internal sealed class Arm64VectorScalarizer
             state.SetSlot(i,  new LaneSlice(laneReg, 0));
         }
         state.Whole = true; // the caller's normal-path Move materialized Vn too
-        if (insn.MemBase != Arm64Register.X31 && RegisterBytes(reg) is > 0 and var wholeBytes)
+        if (insn.MemBase != Arm64Register.X31 && RegisterBytes(reg) is > 0 and var wholeBytes
+            && IsArgumentBase(insn.MemBase))
             state.LoadMemory = new MemoryOperand(Reg(insn.MemBase), addend: offset, accessSize: wholeBytes);
     }
+
+    /// <summary>
+    /// Load provenance is kept only for argument-register bases: X0–X7 carry
+    /// `this` and parameters, so a load through one is a managed field or
+    /// element access the resolver can re-spell. A scratch-register base is
+    /// usually a raw pointer whose memory-to-memory copy would only diagnose.
+    /// </summary>
+    private static bool IsArgumentBase(Arm64Register reg)
+        => reg is >= Arm64Register.X0 and <= Arm64Register.X7;
 
     private void Diagnostic(string message)
     {
