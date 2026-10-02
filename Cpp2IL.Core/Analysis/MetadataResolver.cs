@@ -1971,16 +1971,28 @@ public static class MetadataResolver
     }
 
     // The address `root + displacement` a local holds on every path: a root plus a
-    // constant, or a phi whose inputs all hold that same address. A pre-indexed store
-    // on each of two paths (`str x0, [x19, #0x18]!`) steps the base to the same field
-    // address twice, and the access after the join is relative to the merge.
+    // constant (the bump may sit on a copy of the root or on an earlier bump), or a
+    // phi whose inputs all hold that same address. A pre-indexed store on each of two
+    // paths (`str x0, [x19, #0x18]!`) steps the base to the same field address twice,
+    // and the access after the join is relative to the merge.
     private static (LocalVariable Root, long Displacement)? AddressAlias(LocalVariable local,
         IReadOnlyDictionary<LocalVariable, Instruction> definitions, HashSet<LocalVariable> visiting)
     {
-        if (!visiting.Add(local) || !definitions.TryGetValue(local, out var definition))
+        if (!visiting.Add(local))
             return null;
+        if (!definitions.TryGetValue(local, out var definition))
+            return (local, 0);
         if (definition is { OpCode: OpCode.Add or OpCode.Subtract, Operands: [_, LocalVariable root, Immediate displacement] })
-            return (root, definition.OpCode == OpCode.Subtract ? -displacement.Value : displacement.Value);
+        {
+            var signed = definition.OpCode == OpCode.Subtract ? -displacement.Value : displacement.Value;
+            if (AddressAlias(root, definitions, visiting) is not { } inner)
+                return (root, signed);
+            try { return (inner.Root, checked(inner.Displacement + signed)); }
+            catch (System.OverflowException) { return null; }
+        }
+        // A plain copy keeps its source's address.
+        if (definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
+            return AddressAlias(source, definitions, visiting);
         if (definition.OpCode != OpCode.Phi)
             return null;
         (LocalVariable Root, long Displacement)? common = null;

@@ -32,7 +32,7 @@ public class SsaForm
     public static void Build(ISILControlFlowGraph graph, DominatorInfo dominatorInfo)
     {
         var ssa = new SsaForm();
-        SinkHoistedAddressTakes(graph);
+        SinkHoistedAddressTakes(graph, dominatorInfo);
         ssa.FindClobberingAddressTakes(graph);
 
         graph.BuildUseDefLists(ssa._clobbering);
@@ -44,7 +44,7 @@ public class SsaForm
 
     // Compilers may calculate &slot before storing the value passed to a native byref call.
     // SSA must bind that address to the stored version, not the stale value that preceded it.
-    private static void SinkHoistedAddressTakes(ISILControlFlowGraph graph)
+    private static void SinkHoistedAddressTakes(ISILControlFlowGraph graph, DominatorInfo dominance)
     {
         foreach (var block in graph.Blocks)
         {
@@ -55,25 +55,104 @@ public class SsaForm
                     continue;
 
                 var lastSlotDefinition = -1;
+                var pointerLiveAtEnd = true;
                 for (var j = i + 1; j < block.Instructions.Count; j++)
                 {
                     var candidate = block.Instructions[j];
                     if (Reads(candidate, pointer)
                         || candidate.Destination is Register pointerDefinition && pointerDefinition.Number == pointer.Number)
+                    {
+                        pointerLiveAtEnd = false;
                         break;
+                    }
 
                     if (candidate.Destination is Register slotDefinition && slotDefinition.Number == slot.Number)
                         lastSlotDefinition = j;
                 }
 
-                if (lastSlotDefinition < 0)
+                if (lastSlotDefinition >= 0)
+                {
+                    block.Instructions.RemoveAt(i);
+                    block.Instructions.Insert(lastSlotDefinition, addressTake);
+                    i = lastSlotDefinition;
+                    continue;
+                }
+
+                // The block ends with the pointer still live: the slot may be written in a
+                // successor before the pointer is read - a diamond joining between the hoist
+                // and the store puts the two in different blocks. When every read of the
+                // pointer sits in one dominated successor, the take can be sunk to just
+                // before its first read there: the address it publishes is path-invariant,
+                // and the new position binds it to the version the dereference sees.
+                if (!pointerLiveAtEnd)
+                    continue;
+                var read = FirstReadInSingleDominatedBlock(block, pointer, dominance);
+                if (read is not var (readBlock, readIndex))
                     continue;
 
                 block.Instructions.RemoveAt(i);
-                block.Instructions.Insert(lastSlotDefinition, addressTake);
-                i = lastSlotDefinition;
+                readBlock.Instructions.Insert(readIndex, addressTake);
+                i--;
             }
         }
+    }
+
+    // The position to sink a hoisted address-take to: the first read of the pointer among
+    // the reads the take actually feeds. Only reads in blocks dominated by the take's block
+    // can bind its version - a read reachable on a path around the take binds an earlier
+    // definition (or a live-in value), so it neither covers the sunk take nor blocks the
+    // move; such blocks can never lead to a dominated one, so the search prunes them. The
+    // pointer being redefined ends its liveness on that path.
+    private static (Block Block, int Index)? FirstReadInSingleDominatedBlock(Block origin, Register pointer, DominatorInfo dominance)
+    {
+        var reads = new Dictionary<Block, int>();
+        var visited = new HashSet<Block>();
+        var queue = new Queue<Block>(origin.Successors);
+
+        while (queue.Count > 0)
+        {
+            var next = queue.Dequeue();
+            if (!visited.Add(next) || !dominance.Dominates(origin, next))
+                continue;
+
+            var pointerDead = false;
+            for (var i = 0; i < next.Instructions.Count; i++)
+            {
+                var candidate = next.Instructions[i];
+
+                // A phi reads on the incoming edge, before any position inside the block.
+                if (candidate.OpCode == OpCode.Phi && Reads(candidate, pointer))
+                    return null;
+
+                if (Reads(candidate, pointer) && !reads.ContainsKey(next))
+                    reads[next] = i;
+
+                if (candidate.Destination is Register defined && defined.Number == pointer.Number)
+                {
+                    pointerDead = true;
+                    break;
+                }
+            }
+
+            if (pointerDead)
+                continue;
+
+            foreach (var successor in next.Successors)
+                queue.Enqueue(successor);
+        }
+
+        if (reads.Count == 0)
+            return null;
+
+        // The earliest read covers the rest only when its block dominates them all; reads in
+        // sibling blocks have no position that covers both.
+        foreach (var (candidate, index) in reads)
+        {
+            if (reads.Keys.All(other => ReferenceEquals(other, candidate) || dominance.Dominates(candidate, other)))
+                return (candidate, index);
+        }
+
+        return null;
     }
 
     // The address-takes whose slot is read again afterwards, and so have to be treated as definitions.
