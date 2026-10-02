@@ -863,6 +863,13 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // final and no later pass can restamp them.
         PackedRegisterFields.Run(this, finalPass: true);
 
+        // A packed read projected only here, on a local whose emitted type could
+        // not be proven inside the fixpoint, can still carry a leaf the caller
+        // cannot spell: the accessor rewrite above has already run, so one more
+        // pass maps such reads onto their returned-field accessors.
+        if (!_suppressMemberRecovery)
+            InlinedMemberRecovery.Run(this);
+
         // A bounds-checked indexed read of a constant table is LLVM's
         // switch-to-lookup-table lowering; recover it to a real switch once
         // local types and operand forms are final.

@@ -294,7 +294,7 @@ internal static class InlinedMemberRecovery
 
     // The unique accessible member of the holder whose body is `return <field>` -
     // a getter over a private instance field, or `get_zero`-style over a static.
-    private static MethodAnalysisContext? FindReturnedFieldAccessor(TypeAnalysisContext holderType,
+    internal static MethodAnalysisContext? FindReturnedFieldAccessor(TypeAnalysisContext holderType,
         FieldAnalysisContext readOf, MethodAnalysisContext context, bool staticAccess)
     {
         MethodAnalysisContext? found = null;
@@ -368,7 +368,7 @@ internal static class InlinedMemberRecovery
     // pointers (MemoryOperand stores, `T*` types). Writing a struct value to
     // one binds the emitted local's type to the struct and breaks every
     // pointer-shaped use of it (conv/cpblk), so the access stays diagnosed.
-    private static bool IsAddressSlot(IOperand operand, MethodAnalysisContext context)
+    internal static bool IsAddressSlot(IOperand operand, MethodAnalysisContext context)
     {
         var local = operand switch
         {
