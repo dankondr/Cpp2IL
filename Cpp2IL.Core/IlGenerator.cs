@@ -7425,6 +7425,10 @@ public static class IlGenerator
         {
             MemoryOperand { Index: null, Addend: 0, Scale: 0, Base: LocalVariable { Type: not ByRefTypeAnalysisContext } baseLocal }
                 => EmittableLocalType(EmittedLocalType(baseLocal, context), context),
+            // A store through `&t` is `t`'s store: the value must satisfy the
+            // pointee's contract (ldobj for a managed address, the field's own
+            // stfld arm after the unwrap), not the pointer's.
+            AddressOf { Target: { } addressTarget } => StoreContract(addressTarget, context),
             _ => null
         };
         return fallback;

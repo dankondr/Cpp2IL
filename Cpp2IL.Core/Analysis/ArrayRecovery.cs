@@ -949,6 +949,13 @@ public static class ArrayRecovery
                 continue;
             var defSet = defs.ToHashSet();
 
+            // A register keeps its last written value: when the local is also defined
+            // by a copy, a literal or arithmetic that is not &f, it is a value join —
+            // &f is provable only when no other definition reaches it at all.
+            if (cfg.Instructions.Any(other => ReferenceEquals(other.Destination, alias)
+                    && !defSet.Contains(other)))
+                continue;
+
             var changed = false;
             foreach (var use in cfg.Instructions)
             for (var i = 0; i < use.Operands.Count; i++)
