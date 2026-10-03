@@ -53,6 +53,23 @@ control-flow windows; the shapes below are what survived it.
    emission): `Move [p], v` resolved to `Move &f, v` operand-wise needed
    the store arms to see `f`, not `&f`.
 
+6. **A local may only alias `&f` when *every* definition of it is `&f`**
+   (`RecoverFieldAddressAliases`): the pass grouped only `Move alias,&f`
+   defs, so a register that also received a plain `Move`/`Add`/literal
+   (a value join) was still claimed — its store operands became bogus
+   `Move &f,v` writes, its `[alias]` loads became `f`, and its remaining
+   uses were rewritten to `&f` (25 ILVerify `ilverify-valid →
+   ilverify-invalid` flips across the game, all in pointer-join locals).
+   The pass now requires no non-`&f` definition to reach the local.
+
+7. **Stores through `&t` carry the pointee's contract** (`StoreContract`
+   in `IlGenerator`): an `AddressOf` destination had no declared type and
+   no fallback, so `Move &t, v` loaded `v` unchecked and the unwrapped
+   `stfld` arm stored it raw (`ref BattleController` into a
+   `MatchEndController` field, `MethodInfo` into an `Int32` field). The
+   `AddressOf` arm now recurses to the target's own `StoreContract`, so
+   `ldobj`/`castclass`/`conv` run exactly as for a direct store to `t`.
+
 ## Scope result (castle building, CastleClashers.Game)
 
 `CastleMaker::InitRefs` 53 → 45 diagnostics, `CastleMaker::SpawnShields`
@@ -65,9 +82,10 @@ member stores in `SpawnShields` now resolve to compiler-internal fields and
 read as `access: inaccessible member` — the store is understood, the member
 is not emittable from the caller's context).
 
-Whole game: 205100 → 204674 diagnostics; 44 methods diagnosed→clean,
-0 clean→diagnosed. `memory: unmanaged store dropped` family on
-CastleClashers.Game: 326 methods/1952 occurrences → 269/1590.
+Whole game: 42 methods diagnosed→clean, 0 clean→diagnosed, and 0
+ILVerify `ilverify-valid → ilverify-invalid` transitions on the fixed
+head. `memory: unmanaged store dropped` family on CastleClashers.Game:
+326 methods/1952 occurrences → 269/1590.
 
 ## The tests
 
