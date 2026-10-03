@@ -751,32 +751,41 @@ internal static class InlinedMemberRecovery
                     continue;
                 // Cheap rejects before the body lift a member with no part in
                 // the leaf call would pay for: a void member cannot stand in
-                // for a result that is read, and a non-void member can never
-                // tail-call a void leaf.
-                if (member.ReturnType is not { } memberReturn
-                    || memberReturn.FullName == "System.Void")
-                {
-                    if (destUsed)
-                        continue;
-                }
-                else if (callee.ReturnType is not { } calleeReturn
-                    || calleeReturn.FullName == "System.Void")
-                {
+                // for a result that is read. Lifting a member only to rule it
+                // out suppresses that member's own deferred member recovery,
+                // so every check here stays metadata-only.
+                if (destUsed
+                    && member.ReturnType is null or { FullName: "System.Void" })
                     continue;
-                }
-                // A member returning a type that shares no shape with the
-                // leaf's cannot have produced the edge either. Lifting its
-                // body just to rule it out would suppress that body's own
-                // member recovery, so this check stays metadata-only.
-                else if (!SameDef(memberReturn, calleeReturn)
+                // Each member parameter is spelled with a caller operand taken
+                // from the leaf's own argument list; a parameter no argument
+                // could spell rules the member out without lifting its body.
+                if (member.Parameters.Any(parameter =>
+                        !decomposed.Any(arg =>
+                            ImmediateCompatible(parameter.ParameterType, arg.Raw)
+                            || arg.Root != null
+                                && ImmediateCompatible(parameter.ParameterType, arg.Root))))
+                    continue;
+                // A member returning a shape unrelated to the leaf's can still
+                // have produced the edge by absorbing the leaf's result behind
+                // a pure post-op (`return ReadVarint(ref this) != 0`); that is
+                // only worth a body lift when the member takes fewer
+                // parameters than the leaf has arguments, deriving the rest
+                // from its receiver and fields.
+                if (destUsed
+                    && member.Parameters.Count >= args.Count
+                    && member.ReturnType is { } memberReturn
+                    && memberReturn.FullName != "System.Void"
+                    && callee.ReturnType is { } calleeReturn
+                    && calleeReturn.FullName != "System.Void"
+                    && !SameDef(memberReturn, calleeReturn)
                     && !memberReturn.IsAssignableTo(calleeReturn)
                     && !calleeReturn.IsAssignableTo(memberReturn))
-                {
                     continue;
-                }
                 var shape = ForwarderOf(member, context);
                 if (shape is not { } forward
                     || forward.Callee.FullName != callee.FullName
+                    || !SameGenericInstantiation(forward.Callee, callee)
                     || forward.Args.Count != args.Count)
                     continue;
                 var match = BindForwarder(member, forward, decomposed, post, destUsed);
@@ -1210,6 +1219,41 @@ internal static class InlinedMemberRecovery
             return cached.Shape;
         var shape = EnsureBody(candidate, context)?.MemberBodyFacts?.Forward;
         return Forwarders.GetOrAdd(candidate, new ForwarderResult { Shape = shape }).Shape;
+    }
+
+    // `Type::Name` carries no generic arguments, so `Load<object>` and `Load<T>`
+    // share a FullName. When the leaf is a generic instantiation the
+    // forwarder's leaf must be the same one: concrete arguments compare by
+    // name, and a generic parameter only matches another generic parameter in
+    // the same slot - the emitted member's own `T` binds the caller's.
+    private static bool SameGenericInstantiation(MethodAnalysisContext a,
+        MethodAnalysisContext b)
+    {
+        if (a is not ConcreteGenericMethodAnalysisContext ga
+            || b is not ConcreteGenericMethodAnalysisContext gb)
+            return !(a is ConcreteGenericMethodAnalysisContext)
+                && !(b is ConcreteGenericMethodAnalysisContext);
+        return SameTypeArguments(ga.TypeGenericParameters, gb.TypeGenericParameters)
+            && SameTypeArguments(ga.MethodGenericParameters, gb.MethodGenericParameters);
+    }
+
+    private static bool SameTypeArguments(IReadOnlyList<TypeAnalysisContext> a,
+        IReadOnlyList<TypeAnalysisContext> b)
+    {
+        if (a.Count != b.Count)
+            return false;
+        for (var i = 0; i < a.Count; i++)
+        {
+            if (a[i] is GenericParameterTypeAnalysisContext)
+            {
+                if (b[i] is not GenericParameterTypeAnalysisContext)
+                    return false;
+            }
+            else if (b[i] is GenericParameterTypeAnalysisContext
+                || a[i].FullName != b[i].FullName)
+                return false;
+        }
+        return true;
     }
 
     // Emission cannot push a `T&`-typed slot as a `&T` receiver or write a
