@@ -288,6 +288,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             addresses.Add(address);
             var newInstruction = new Instruction(instructions.Count, opCode, operands) { NativeAddress = address };
             instructions.Add(newInstruction);
+            if (opCode is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall)
+                scalarizer.NoteCall(newInstruction);
             return newInstruction;
         }
 
@@ -297,6 +299,23 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             if (instruction.Op0Kind == Arm64OperandKind.Register && IsWordRegister(instruction.Op0Reg))
                 generated.NativeIntegerWidthBits = 32;
             return generated;
+        }
+
+        // destination = ~source or -source. When the source is already a
+        // literal the result is spelled as a literal Move — `csinv x0, x8,
+        // xzr`'s all-ones arm must reach the packed-slot analysis as a Move,
+        // and `movn w20, #0`'s 0xFFFFFFFF must carry its four proven bytes so
+        // it reads as a zero-extended word, not an unproven all-ones.
+        void AddInverted(ulong addr, OpCode opCode, IOperand destination, IOperand source)
+        {
+            if (source is Immediate { Value: var value })
+            {
+                var move = AddInteger(addr, OpCode.Move, destination,
+                    new Immediate(opCode == OpCode.Not ? ~value : -value, 8));
+                ImmediateWriteWidth.ApplyToMove(move);
+                return;
+            }
+            AddInteger(addr, opCode, destination, source);
         }
 
         void AddCallAt(ulong target)
@@ -1007,7 +1026,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     break;
                 }
 
-                var move = Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                var move = AddInteger(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
                 move.NativeReadWidthBits = instruction.Mnemonic switch
                 {
                     Arm64Mnemonic.SXTB or Arm64Mnemonic.UXTB => 8,
@@ -1094,18 +1113,13 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 }
             case Arm64Mnemonic.MOVK:
                 // inserts a 16-bit chunk, which after the movz that always precedes it is just an or
-                Add(address, OpCode.Or, ConvertOperand(instruction, 0), ConvertOperand(instruction, 0), Imm(instruction.Op1Imm));
+                AddInteger(address, OpCode.Or, ConvertOperand(instruction, 0), ConvertOperand(instruction, 0), Imm(instruction.Op1Imm));
                 break;
             case Arm64Mnemonic.MOVN:
-                {
-                    var temp = new Register(null, "TEMP");
-                    Add(address, OpCode.Move, temp, ConvertOperand(instruction, 1));
-                    Add(address, OpCode.Not, temp, temp);
-                    Add(address, OpCode.Move, ConvertOperand(instruction, 0), temp);
-                    break;
-                }
+                AddInverted(address, OpCode.Not, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                break;
             case Arm64Mnemonic.MVN:
-                Add(address, OpCode.Not, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                AddInverted(address, OpCode.Not, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
                 break;
             case Arm64Mnemonic.ADR:
                 Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1))
@@ -1405,7 +1419,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         break;
                     }
 
-                    Add(address, OpCode.Not, temp, shiftedOperand);
+                    AddInteger(address, OpCode.Not, temp, shiftedOperand);
                     var opCode = instruction.Mnemonic switch
                     {
                         Arm64Mnemonic.ORN => OpCode.Or,
@@ -1522,7 +1536,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
                     if (lsb == 0)
                     {
-                        Add(address, OpCode.Move, dest, ConvertOperand(instruction, 2));
+                        AddInteger(address, OpCode.Move, dest, ConvertOperand(instruction, 2));
                         break;
                     }
 
@@ -1630,41 +1644,41 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.CSEL:
             case Arm64Mnemonic.FCSEL:
                 EmitConditionalAssign(instruction.FinalOpConditionCode,
-                    () => Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1)),
-                    falseAddress => Add(falseAddress, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 2)));
+                    () => AddInteger(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1)),
+                    falseAddress => AddInteger(falseAddress, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 2)));
                 break;
             case Arm64Mnemonic.CSINC:
                 EmitConditionalAssign(instruction.FinalOpConditionCode,
-                    () => Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1)),
-                    falseAddress => Add(falseAddress, OpCode.Add, ConvertOperand(instruction, 0), ConvertOperand(instruction, 2), Imm(1)));
+                    () => AddInteger(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1)),
+                    falseAddress => AddInteger(falseAddress, OpCode.Add, ConvertOperand(instruction, 0), ConvertOperand(instruction, 2), Imm(1)));
                 break;
             case Arm64Mnemonic.CSINV:
                 EmitConditionalAssign(instruction.FinalOpConditionCode,
-                    () => Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1)),
-                    falseAddress => Add(falseAddress, OpCode.Not, ConvertOperand(instruction, 0), ConvertOperand(instruction, 2)));
+                    () => AddInteger(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1)),
+                    falseAddress => AddInverted(falseAddress, OpCode.Not, ConvertOperand(instruction, 0), ConvertOperand(instruction, 2)));
                 break;
             case Arm64Mnemonic.CSNEG:
                 EmitConditionalAssign(instruction.FinalOpConditionCode,
-                    () => Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1)),
-                    falseAddress => Add(falseAddress, OpCode.Negate, ConvertOperand(instruction, 0), ConvertOperand(instruction, 2)));
+                    () => AddInteger(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1)),
+                    falseAddress => AddInverted(falseAddress, OpCode.Negate, ConvertOperand(instruction, 0), ConvertOperand(instruction, 2)));
                 break;
             case Arm64Mnemonic.CSET:
                 Add(address, OpCode.Move, ConvertOperand(instruction, 0), EmitCondition(instruction.FinalOpConditionCode));
                 break;
             case Arm64Mnemonic.CSETM:
                 EmitConditionalAssign(instruction.FinalOpConditionCode,
-                    () => Add(address, OpCode.Move, ConvertOperand(instruction, 0), Imm(-1L)),
-                    falseAddress => Add(falseAddress, OpCode.Move, ConvertOperand(instruction, 0), Imm(0)));
+                    () => AddInteger(address, OpCode.Move, ConvertOperand(instruction, 0), Imm(-1L)),
+                    falseAddress => AddInteger(falseAddress, OpCode.Move, ConvertOperand(instruction, 0), Imm(0)));
                 break;
             case Arm64Mnemonic.CINC:
                 EmitConditionalAssign(instruction.FinalOpConditionCode,
-                    () => Add(address, OpCode.Add, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), Imm(1)),
-                    falseAddress => Add(falseAddress, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1)));
+                    () => AddInteger(address, OpCode.Add, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), Imm(1)),
+                    falseAddress => AddInteger(falseAddress, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1)));
                 break;
             case Arm64Mnemonic.CNEG:
                 EmitConditionalAssign(instruction.FinalOpConditionCode,
-                    () => Add(address, OpCode.Negate, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1)),
-                    falseAddress => Add(falseAddress, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1)));
+                    () => AddInteger(address, OpCode.Negate, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1)),
+                    falseAddress => AddInteger(falseAddress, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1)));
                 break;
             case Arm64Mnemonic.NOP:
             // pointer auth and branch target hints are meaningless for analysis but might be jump targets
