@@ -188,6 +188,7 @@ public static class MetadataResolver
             .GroupBy(i => (LocalVariable)i.Destination!)
             .Where(g => g.Count() == 1)
             .ToDictionary(g => g.Key, g => g.Single());
+        changed |= NormalizeStaticFieldStorage(method, definitions);
 
         // Locals that are the base register of a raw memory load emit `&T`
         // (or native int) because that use demands it. Replacing the def-source
@@ -780,39 +781,13 @@ public static class MetadataResolver
                     ? (local, typed.OwnerType) : null;
             if (operand is not MemoryOperand { Base: LocalVariable klass, Index: null, Scale: 0 } memory
                 || memory.Addend != (method.AppContext.Binary.is32Bit ? 0x5C : 0xB8)
-                || ClassConstant(klass) is not { } owner)
+                || ClassConstant(klass, definitions) is not { } owner)
                 return null;
             if (!storageLocals.TryGetValue(owner, out var stand))
                 storageLocals[owner] = stand = new LocalVariable($"statics{method.Locals.Count + storageLocals.Count}",
                     new Register(null, $"STATICS{method.Locals.Count + storageLocals.Count}"),
                     new StaticFieldStorageTypeAnalysisContext(owner, owner.DeclaringAssembly));
             return (stand, owner);
-        }
-
-        // The class a local provably holds: a type-metadata load, through copies and merges of
-        // the same class (a class-init guard reloads it on one arm). A merge of different
-        // class pointers is no single class, whatever its joined type says.
-        TypeAnalysisContext? ClassConstant(LocalVariable local, HashSet<LocalVariable>? visiting = null)
-        {
-            if (!(visiting ??= []).Add(local) || !definitions.TryGetValue(local, out var definition))
-                return null;
-            switch (definition)
-            {
-                case { OpCode: OpCode.Move, Operands: [_, RuntimeClassTypeAnalysisContext { RepresentedType: var represented }] }:
-                    return represented;
-                case { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext type and not (RuntimeMethodInfoAnalysisContext
-                        or RuntimeFieldInfoAnalysisContext or StaticFieldStorageTypeAnalysisContext)] }:
-                    return type;
-                case { OpCode: OpCode.Move, Operands: [_, LocalVariable source] }:
-                    return ClassConstant(source, visiting);
-                case { OpCode: OpCode.Phi }:
-                    var classes = definition.Operands.Skip(1)
-                        .Select(input => input is LocalVariable source ? ClassConstant(source, visiting) : null).ToList();
-                    return classes.All(c => c != null) && classes.Select(c => c!.FullName).Distinct().Count() == 1
-                        ? classes[0] : null;
-                default:
-                    return null;
-            }
         }
 
         static bool Mentions(IOperand operand, LocalVariable local) => operand switch
@@ -1059,26 +1034,69 @@ public static class MetadataResolver
                 slots[offset] = null!; // several locals share the offset - ambiguous
         }
 
+        // The unambiguous frame cells with their extents, nearest start first on a lookup:
+        // [&stack + k] = v reaches inside the cell holding that byte — the temp the compiler
+        // laid down there — or the enclosing aggregate's member path.
+        var extents = slots.Where(pair => pair.Value != null)
+            .Select(pair => (Local: pair.Value, Offset: pair.Key,
+                Size: pair.Value.Type is { IsValueType: true } stored
+                    ? (int)TypeSizes.MinimumUnboxedSize(stored, pointerSize) : pointerSize))
+            .Where(cell => cell.Size > 0)
+            .OrderByDescending(cell => cell.Offset)
+            .ToList();
+
+        // An address kept alive across paths (a `v = &f` re-taken each iterator call) still
+        // names the same storage when every definition reaching the local is that same
+        // address-of. The single-definition chase misses those.
+        var sameAddress = new Dictionary<LocalVariable, IOperand>();
+        foreach (var group in method.ControlFlowGraph!.Instructions
+                     .Where(i => i.Destination is LocalVariable)
+                     .GroupBy(i => (LocalVariable)i.Destination!))
+        {
+            var defs = group.ToList();
+            if (defs.Count <= 1 || defs.Any(d => d is not
+                    { OpCode: OpCode.Move, Operands: [_, AddressOf { Target: { } }] }))
+                continue;
+            var target = ((AddressOf)defs[0].Operands[1]).Target;
+            if (defs.All(d => SameTarget(((AddressOf)d.Operands[1]).Target, target)))
+                sameAddress[group.Key] = target;
+        }
+
         var changed = false;
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         for (var i = 0; i < instruction.Operands.Count; i++)
         {
             if (instruction.Operands[i] is not MemoryOperand
-                    { Base: LocalVariable baseLocal, Index: null, Scale: 0 } memory
-                || ResolveAddressedStorage(baseLocal, definitions, []) is not { } resolved)
+                    { Base: LocalVariable baseLocal, Index: null, Scale: 0 } memory)
+                continue;
+
+            var resolved = ResolveAddressedStorage(baseLocal, definitions, [])
+                           ?? (sameAddress.TryGetValue(baseLocal, out var shared)
+                               ? (shared, 0)
+                               : ((IOperand Storage, long Displacement)?)null);
+            if (resolved == null)
                 continue;
 
             long effective;
             try
             {
-                effective = checked(memory.Addend + resolved.Displacement);
+                effective = checked(memory.Addend + resolved.Value.Displacement);
             }
             catch (System.OverflowException)
             {
                 continue;
             }
 
-            switch (resolved.Storage)
+            // [&t + k] = v / [&f + k] = v: the store side of the same addressing model.
+            if (instruction.OpCode == OpCode.Move && instruction.Operands.Count == 2
+                && i == 0)
+            {
+                if (StoreThroughAddressed(instruction, i, memory, resolved.Value.Storage, effective))
+                    changed = true;
+                continue;
+            }
+
+            switch (resolved.Value.Storage)
             {
                 case LocalVariable slot:
                     if (effective == 0)
@@ -1146,6 +1164,174 @@ public static class MetadataResolver
             }
         }
         return changed;
+
+        // [&t + k] = v / [&f + k] = v through a proven address operand. A store through an
+        // address names the managed slot holding the written bytes: the local itself, the
+        // member path inside a value-typed slot at k, the sibling frame cell at the target
+        // offset, or the field on the addressed host. Unproven shapes stay a MemoryOperand.
+        bool StoreThroughAddressed(Instruction store, int operandIndex, MemoryOperand memory,
+            IOperand storage, long effective)
+        {
+            var value = store.Operands[1];
+            switch (storage)
+            {
+                case LocalVariable slot:
+                    if (effective == 0)
+                    {
+                        // [&t] = v writes the slot itself: the value names a whole struct
+                        // cell, or fills a reference cell outright.
+                        var extent = slot.Type is { IsValueType: true } filled
+                            ? (int)TypeSizes.MinimumUnboxedSize(filled, pointerSize)
+                            : pointerSize;
+                        if ((memory.AccessSize <= 0 || memory.AccessSize >= extent)
+                            && (slot.Type is not { IsValueType: true }
+                                || value is LocalVariable { Type: { } vt }
+                                   && vt.FullName == slot.Type.FullName))
+                        {
+                            store.SetOperand(operandIndex, slot);
+                            return true;
+                        }
+                        break;
+                    }
+
+                    if (LocalVariables.TryStackOffset(slot.Register.Name) is { } slotOffset
+                        && slotOffset + effective is >= int.MinValue and <= int.MaxValue)
+                    {
+                        var target = (int)(slotOffset + effective);
+                        foreach (var (cell, offset, size) in extents)
+                        {
+                            if (offset > target || target >= offset + size)
+                                continue;
+                            var residual = target - offset;
+
+                            // A zero run past this store's own width still names the cell:
+                            // `STP XZR, XZR` emits as two stores on the way to `t = null`.
+                            var covered = memory.AccessSize;
+                            List<Instruction>? absorbed = null;
+                            if (residual == 0 && covered < size
+                                && value is Immediate { Value: 0 }
+                                && cell.Type is not { IsValueType: true }
+                                && AdjacentZeroStores(method, store, memory, (LocalVariable)memory.Base!)
+                                    is { Count: > 0 } run
+                                && covered + run.Sum(r => ((MemoryOperand)r.Operands[0]).AccessSize) >= size)
+                            {
+                                covered += run.Sum(r => ((MemoryOperand)r.Operands[0]).AccessSize);
+                                absorbed = run;
+                            }
+
+                            // `cell = v`: the assignment the source made of the whole temp —
+                            // the value's type names the cell — or a whole pointer cell.
+                            if (residual == 0
+                                && (value is LocalVariable { Type: { } vt } && cell.Type != null
+                                        && vt.FullName == cell.Type.FullName
+                                    || cell.Type is not { IsValueType: true }
+                                        && covered >= size))
+                            {
+                                if (absorbed != null)
+                                    foreach (var followed in absorbed)
+                                    {
+                                        followed.OpCode = OpCode.Nop;
+                                        followed.SetOperands();
+                                    }
+                                store.SetOperand(operandIndex, cell);
+                                return true;
+                            }
+
+                            // Inside a value-typed cell, the member path at residual.
+                            if (cell.Type is { IsValueType: true } cellType
+                                && ResolveField(cellType, null, residual, memory.AccessSize) is { } member
+                                && !MemberPathUnspellable((member.Field, member.Containers), method,
+                                    store: true, addressed: false))
+                            {
+                                store.SetOperand(operandIndex,
+                                    new FieldReference(member.Field, cell, (int)residual,
+                                        member.Containers, memory.AccessSize));
+                                return true;
+                            }
+                        }
+
+                        // A value-typed frame temp with no named local: the compiler spilled
+                        // it past the locals that survive - materialise the slot it wrote.
+                        if (!slots.ContainsKey(target))
+                        {
+                            var type = value is LocalVariable { Type: { IsValueType: true } vt }
+                                ? vt : null;
+                            if (type != null && memory.AccessSize >= TypeSizes.MinimumUnboxedSize(type, pointerSize))
+                            {
+                                var name = $"stack_{(target < 0 ? "-" : "")}{System.Math.Abs(target):X}";
+                                var temp = new LocalVariable(name, new Register(null, name), type);
+                                method.Locals.Add(temp);
+                                slots[target] = temp;
+                                extents.Insert(0, (temp, target,
+                                    (int)TypeSizes.MinimumUnboxedSize(type, pointerSize)));
+                                store.SetOperand(operandIndex, temp);
+                                return true;
+                            }
+                        }
+                        break;
+                    }
+
+                    // [&t + k] = v on a named value-typed local is a member store of t.
+                    if (slot.Type is { IsValueType: true } slotType
+                        && ResolveField(slotType, null, effective, memory.AccessSize) is { } nested
+                        && !MemberPathUnspellable((nested.Field, nested.Containers), method,
+                            store: true, addressed: false))
+                    {
+                        store.SetOperand(operandIndex, new FieldReference(nested.Field, slot,
+                            (int)effective, nested.Containers, memory.AccessSize));
+                        return true;
+                    }
+                    break;
+
+                case FieldReference addressed when !addressed.Field.IsStatic:
+                    if (effective == 0)
+                    {
+                        // *(&f) = v is the store of f itself.
+                        var declaredOwner = (addressed.Containers.Count > 0
+                                ? addressed.Containers[0].DeclaringType
+                                : addressed.Field.DeclaringType);
+                        if (declaredOwner != null
+                            && LocalSuppliesFieldBase(addressed.Local, declaredOwner,
+                                method.DeclaringType, method)
+                            && !MemberPathUnspellable((addressed.Field, addressed.Containers),
+                                method, store: true, addressed: false))
+                        {
+                            store.SetOperand(operandIndex, addressed);
+                            return true;
+                        }
+                        break;
+                    }
+
+                    var host = EffectiveObjectType(addressed.Local, definitions, method.DeclaringType)
+                               ?? addressed.Field.DeclaringType;
+                    if (host != null
+                        && LocalSuppliesFieldBase(addressed.Local, host, method.DeclaringType, method)
+                        && ResolveField(host, null, addressed.Offset + effective,
+                            memory.AccessSize) is { } sibling
+                        && !MemberPathUnspellable((sibling.Field, sibling.Containers), method,
+                            store: true, addressed: false))
+                    {
+                        store.SetOperand(operandIndex, new FieldReference(sibling.Field,
+                            addressed.Local, (int)(addressed.Offset + effective), sibling.Containers,
+                            memory.AccessSize));
+                        return true;
+                    }
+                    break;
+            }
+            return false;
+        }
+
+        // Two address-ofs name the same storage: the field at the same absolute offset on
+        // the same local, or the same local itself.
+        static bool SameTarget(IOperand a, IOperand b)
+            => a switch
+            {
+                FieldReference fa => b is FieldReference fb && fa.Field == fb.Field
+                    && ReferenceEquals(fa.Local, fb.Local) && fa.Offset == fb.Offset
+                    && fa.Containers.SequenceEqual(fb.Containers),
+                LocalVariable la => ReferenceEquals(b, la),
+                _ => false,
+            };
     }
 
     // Chases a base register's single-definition Move/Add/Subtract chain to the
@@ -1336,7 +1522,7 @@ public static class MetadataResolver
     // a value-type host (ldloca on a T-declared local, or a &T local), or a
     // reference assignable to the host. An object/untyped local supplies neither,
     // so such sites keep their MemoryOperand and their diagnostic.
-    private static bool LocalSuppliesFieldBase(LocalVariable local, TypeAnalysisContext host,
+    internal static bool LocalSuppliesFieldBase(LocalVariable local, TypeAnalysisContext host,
         TypeAnalysisContext? thisType, MethodAnalysisContext method)
     {
         // Mirrors EmittedLocalTypeCore's `this` arm: ldarg.0 pushes the declaring
@@ -1398,6 +1584,149 @@ public static class MetadataResolver
            && referent.IsValueType
            && PrimitiveStorageSize(referent, referent.AppContext.Binary.PointerSizeBytes) is { } size
            && (memory.AccessSize <= 0 || memory.AccessSize == size);
+
+    // The class a local provably holds: a type-metadata load, through copies and merges of
+    // the same class (a class-init guard reloads it on one arm). A merge of different
+    // class pointers is no single class, whatever its joined type says.
+    private static TypeAnalysisContext? ClassConstant(LocalVariable local,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions, HashSet<LocalVariable>? visiting = null)
+    {
+        if (!(visiting ??= []).Add(local) || !definitions.TryGetValue(local, out var definition))
+            return null;
+        switch (definition)
+        {
+            case { OpCode: OpCode.Move, Operands: [_, RuntimeClassTypeAnalysisContext { RepresentedType: var represented }] }:
+                return represented;
+            case { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext type and not (RuntimeMethodInfoAnalysisContext
+                    or RuntimeFieldInfoAnalysisContext or StaticFieldStorageTypeAnalysisContext)] }:
+                return type;
+            case { OpCode: OpCode.Move, Operands: [_, LocalVariable source] }:
+                return ClassConstant(source, definitions, visiting);
+            case { OpCode: OpCode.Phi }:
+                var classes = definition.Operands.Skip(1)
+                    .Select(input => input is LocalVariable source ? ClassConstant(source, definitions, visiting) : null).ToList();
+                return classes.All(c => c != null) && classes.Select(c => c!.FullName).Distinct().Count() == 1
+                    ? classes[0] : null;
+            default:
+                return null;
+        }
+    }
+
+    /// <summary>
+    /// Rewrites dereferences off a class constant: `[klass + 0]` reads the class itself
+    /// (the runtime class object IS the type constant), and `[klass + static_fields]` is
+    /// the owning type's statics block — stood in for by a typed local so field-offset
+    /// resolution and &amp;T.s recovery can both see it as managed storage.
+    /// </summary>
+    private static bool NormalizeStaticFieldStorage(MethodAnalysisContext method,
+        IReadOnlyDictionary<LocalVariable, Instruction> definitions)
+    {
+        var staticsOffset = method.AppContext.Binary.is32Bit ? 0x5C : 0xB8;
+        var storageLocals = new Dictionary<TypeAnalysisContext, LocalVariable>();
+        HashSet<LocalVariable>? callOperands = null;
+
+        // `PropagateStaticFieldStorage` types `Move x, [base + static_fields]` only when
+        // `base` is RuntimeClass-typed. A base whose class-constant def was created after
+        // `SeedRuntimeClassTypes` ran (a `[klass]` rewritten to `Move x, typeof(T)` here,
+        // or an edge copy of a class constant) holds the same pointer but keeps a plain
+        // Type type - the classic rule can never reach it, so the stand-in is its only
+        // typing path. Follow copies to the defining def; copies of a seeded constant
+        // (RuntimeClass-typed leaf) still take the classic dereference.
+        bool UnseededConstant(LocalVariable klass) => UnseededConstantChase(klass, []);
+
+        bool UnseededConstantChase(LocalVariable klass, HashSet<LocalVariable> visiting)
+        {
+            var current = klass;
+            while (visiting.Add(current))
+            {
+                if (!definitions.TryGetValue(current, out var def))
+                    return false;
+                if (def is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
+                {
+                    current = source;
+                    continue;
+                }
+                if (def is { OpCode: OpCode.Phi })
+                    // A phi already claimed by a non-RuntimeClass type can never reach the
+                    // classic dereference (SetTypeIfUnknown is monotonic); still untyped it
+                    // may yet take a RuntimeClass input - leave the classic path alone.
+                    return current.Type != null && current.Type is not RuntimeClassTypeAnalysisContext;
+                return def is { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext] }
+                       && current.Type is not RuntimeClassTypeAnalysisContext;
+            }
+            return false;
+        }
+
+        var changed = false;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        for (var i = 0; i < instruction.Operands.Count; i++)
+        {
+            if (instruction.Operands[i] is not MemoryOperand
+                    { Base: LocalVariable klass, Index: null, Scale: 0 } memory)
+                continue;
+
+            // The stand-in names two statics-block dereferences: pointer arithmetic
+            // (`Add x, [klass + static_fields], off` is `&T.s`), and any operand on a
+            // class-object base — those never reach `PropagateStaticFieldStorage`'s
+            // `RuntimeClass` requirement, so the fold is their only typing path. A
+            // `[klass + o]` on a class-constant base keeps the classic dereference:
+            // a `Move` source types its destination on the classic schedule (the
+            // stand-in would type it a sweep earlier and can narrow a phi at a join),
+            // and a call operand's dereference IS `&T.s`, which the classic
+            // resolution emits; the bare stand-in would arrive as an unmanaged pointer.
+            if (memory.Addend == staticsOffset
+                && (instruction.OpCode is OpCode.Add or OpCode.Subtract
+                    || (instruction.OpCode is not (OpCode.Call or OpCode.CallVoid or OpCode.Newobj)
+                        && UnseededConstant(klass)))
+                && ClassConstant(klass, definitions) is { } owner)
+            {
+                if (!storageLocals.TryGetValue(owner, out var stand))
+                {
+                    storageLocals[owner] = stand = new LocalVariable(
+                        $"statics{method.Locals.Count + storageLocals.Count}",
+                        new Register(null, $"STATICS{method.Locals.Count + storageLocals.Count}"),
+                        new StaticFieldStorageTypeAnalysisContext(owner, owner.DeclaringAssembly));
+                    method.Locals.Add(stand);
+                }
+                instruction.SetOperand(i, stand);
+                changed = true;
+            }
+            else if (instruction.OpCode == OpCode.Move && i == 1 && memory.Addend == 0
+                     && instruction.Operands[0] is LocalVariable typeDest
+                     && !(callOperands ??= CallOperands(method)).Contains(typeDest)
+                     && ClassConstant(klass, definitions) is { } held)
+            {
+                // `Move x, [klass]` is the runtime class object itself: `Move x, typeof(T)`.
+                // A destination a call or Newobj passes on is left as the dereference —
+                // InstantiatedType and EffectiveObjectType read the klass argument there as
+                // the allocated type, which must not outrun the type the local emits.
+                instruction.SetOperand(i, held);
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    // Locals read directly by a call-family instruction's operands (or as the base/index
+    // of an address one takes): the arguments whose own meaning a `[klass]` rewrite
+    // would change.
+    static HashSet<LocalVariable> CallOperands(MethodAnalysisContext method)
+    {
+        var operands = new HashSet<LocalVariable>();
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (!instruction.IsCall && instruction.OpCode != OpCode.Newobj)
+                continue;
+            foreach (var operand in instruction.Operands)
+            {
+                if (operand is LocalVariable local)
+                    operands.Add(local);
+                else if (operand is MemoryOperand { Base: LocalVariable memoryBase })
+                    operands.Add(memoryBase);
+            }
+        }
+        return operands;
+    }
 
     // A static-storage type reaches a local by inference too: a merge takes it from one input
     // and hands it back to its untyped inputs. The local holds T's static block only when
@@ -1814,7 +2143,7 @@ public static class MetadataResolver
     private static long LeafStorageSize(TypeAnalysisContext type, int pointerSize)
         => PrimitiveStorageSize(type, pointerSize) ?? TypeSizes.MinimumUnboxedSize(type, pointerSize);
 
-    private static (FieldAnalysisContext Container, FieldAnalysisContext Field)? FindNestedStaticFieldAtOffset(
+    internal static (FieldAnalysisContext Container, FieldAnalysisContext Field)? FindNestedStaticFieldAtOffset(
         TypeAnalysisContext owner, long offset, int accessSize)
     {
         if (accessSize <= 0 || owner is GenericInstanceTypeAnalysisContext || owner.GenericParameters.Count > 0)

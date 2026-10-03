@@ -12536,6 +12536,11 @@ public static class IlGenerator
     {
         var instructions = method.CilMethodBody!.Instructions;
 
+        // `Move &t` stores through the address: unwrap it and emit the store the
+        // target's own arm would produce.
+        if (operand is AddressOf { Target: { } storeTarget })
+            operand = storeTarget;
+
         switch (operand)
         {
             // A parameter's reads are ldarg, so its stores must be starg: a stloc would write a

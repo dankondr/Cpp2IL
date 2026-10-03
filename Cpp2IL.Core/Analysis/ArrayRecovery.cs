@@ -72,6 +72,7 @@ public static class ArrayRecovery
         var getLength = method.AppContext.SystemTypes.SystemArrayType?.Methods
             .FirstOrDefault(m => m.Name == "GetLength" && m.Parameters.Count == 1);
         var created = 0;
+        var wholeSets = new List<(LocalVariable Pointer, long Addend, long Size, IOperand Stored)>();
 
         // Elements first: their proofs read the length operands before those become calls.
         foreach (var instruction in cfg.Instructions.ToList())
@@ -90,7 +91,10 @@ public static class ArrayRecovery
                 : definitions.TryGetValue(root, out var address)
                   && address is { OpCode: OpCode.Add, Operands: [_, var left, var right] }
                     ? Element(left, right, addend, memory, instruction, i) ?? Element(right, left, addend, memory, instruction, i)
-                    : null;
+                    : MergedElementAddress(root) is { } merged
+                      ? Element(merged.A, merged.B, addend, memory, instruction, i)
+                        ?? Element(merged.B, merged.A, addend, memory, instruction, i)
+                      : null;
             if ((matched ?? Walk(pointer, memory, instruction, i)) is not { } element)
                 continue;
 
@@ -99,8 +103,11 @@ public static class ArrayRecovery
             var block = cfg.Blocks.First(b => b.Instructions.Contains(instruction));
             if (field == null && store)
             {
+                var stored = instruction.Operands[1];
+                if (memory.AccessSize > 0 && memory.AccessSize < SizeOf(arrayType.ElementType))
+                    wholeSets.Add((pointer, memory.Addend, SizeOf(arrayType.ElementType), stored));
                 instruction.OpCode = OpCode.CallVoid;
-                instruction.SetOperands([Accessor(arrayType, "Set"), array, .. indices, instruction.Operands[1]]);
+                instruction.SetOperands([Accessor(arrayType, "Set"), array, .. indices, stored]);
                 break;
             }
             if (field == null && instruction is { OpCode: OpCode.Move, Operands: [LocalVariable, _] } && i == 1)
@@ -120,6 +127,29 @@ public static class ArrayRecovery
             if (field == null && instruction.IsCall && SizeOf(arrayType.ElementType) == 2L * pointerSize)
                 DropUpperLane(block, instruction, pointer, memory.Addend + pointerSize);
         }
+
+        // A whole-element Set whose operand came split across register lanes leaves its
+        // upper stores behind: `[p + k] = lane` writes bytes the Set's operand already
+        // carried. Drop one only when the stored value is the element operand's own
+        // upper lane - every definition of it copies an implicit-definition register
+        // of a call producing that operand.
+        if (wholeSets.Count > 0)
+            foreach (var instruction in cfg.Instructions)
+            {
+                if (instruction is not { OpCode: OpCode.Move,
+                        Operands: [MemoryOperand { Base: LocalVariable pointer, Index: null, Scale: 0 } memory,
+                                   IOperand storedLane] })
+                    continue;
+                foreach (var (basePointer, baseAddend, elementSize, stored) in wholeSets)
+                {
+                    if (!ReferenceEquals(pointer, basePointer) || memory.Addend <= baseAddend
+                        || memory.Addend + memory.AccessSize > baseAddend + elementSize
+                        || !UpperLaneOf(storedLane, stored))
+                        continue;
+                    MakeNop(instruction);
+                    break;
+                }
+            }
 
         // The address arithmetic the elements no longer read is dead; drop it before the
         // lengths it multiplied become calls.
@@ -237,7 +267,11 @@ public static class ArrayRecovery
             if (inner == 0 && (!elementType.IsValueType || ElementSize(elementType, pointerSize) != 0
                                || memory.AccessSize == 0 || memory.AccessSize >= size
                                || ArgumentType(user, operandIndex) is { } parameter
-                                  && parameter.FullName == elementType.FullName))
+                                  && parameter.FullName == elementType.FullName
+                               || user.OpCode == OpCode.Move && operandIndex == 0
+                                  && user.Operands.Count > 1
+                                  && user.Operands[1] is LocalVariable { Type: { } held }
+                                  && held.FullName == elementType.FullName))
                 return (true, null);
             return elementType.IsValueType && ElementSize(elementType, pointerSize) == 0
                 && FindValueTypeField(elementType, inner) is { } field
@@ -452,16 +486,63 @@ public static class ArrayRecovery
         IOperand Unextended(IOperand index)
             => Definition(index) is { OpCode: OpCode.SignExtend32, Operands: [_, var original] } ? original : index;
 
+        // `stored` is lane 1+ of `first`: every definition of `stored` copies a register
+        // that some call definition of `first` lists among its implicit definitions
+        // (the extra lanes of an aggregate return).
+        bool UpperLaneOf(IOperand stored, IOperand first)
+        {
+            if (stored is not LocalVariable laneUse
+                || !allDefinitions.TryGetValue(laneUse, out var defs) || defs.Count == 0
+                || first is not LocalVariable firstLocal
+                || !allDefinitions.TryGetValue(firstLocal, out var firstDefs))
+                return false;
+            var producing = firstDefs.Where(d => d.OpCode == OpCode.Call
+                && ReferenceEquals(d.Destination, firstLocal)).ToList();
+            return producing.Count > 0
+                && defs.All(d => d is { OpCode: OpCode.Move, Operands: [_, LocalVariable lane] }
+                    && producing.Any(call => call.ImplicitDefinitions.Contains(lane.Register)));
+        }
+
+        // Every definition of `local` is `local = a_k + b_k` with the a_k all equal and
+        // the b_k all equal (through copies and recomputed arithmetic): the pointer
+        // names the same element on every path it is defined on.
+        (IOperand A, IOperand B)? MergedElementAddress(LocalVariable local)
+        {
+            if (!allDefinitions.TryGetValue(local, out var defs) || defs.Count < 2
+                || defs[0] is not { OpCode: OpCode.Add, Operands: [_, var a0, var b0] })
+                return null;
+            foreach (var def in defs.Skip(1))
+                if (def is not { OpCode: OpCode.Add, Operands: [_, var ak, var bk] }
+                    || !(SameValue(ak, a0) && SameValue(bk, b0)
+                         || SameValue(ak, b0) && SameValue(bk, a0)))
+                    return null;
+            return (a0, b0);
+        }
+
         // Copies name the same value: `v = this.grid` and a later `this.grid` operand.
-        bool SameValue(IOperand a, IOperand b)
+        // Pure arithmetic computed twice on the same inputs carries the same bits — a
+        // `shift x, 32` emitted once per use, like a bound check's copy of the index.
+        bool SameValue(IOperand a, IOperand b, int depth = 0)
         {
             a = Root(Unextended(a));
             b = Root(Unextended(b));
             return ReferenceEquals(a, b)
                 || a is FieldReference fa && b is FieldReference fb && fa.Field == fb.Field
-                   && fa.Containers.SequenceEqual(fb.Containers) && SameValue(fa.Local, fb.Local)
-                || a is Immediate ia && b is Immediate ib && ia.Value == ib.Value;
+                   && fa.Containers.SequenceEqual(fb.Containers) && SameValue(fa.Local, fb.Local, depth + 1)
+                || a is MemoryOperand { Index: null, Scale: 0, Base: { } abase } memoryA
+                   && b is MemoryOperand { Index: null, Scale: 0, Base: { } bbase } memoryB
+                   && memoryA.Addend == memoryB.Addend && SameValue(abase, bbase, depth + 1)
+                || a is Immediate ia && b is Immediate ib && ia.Value == ib.Value
+                || depth < 8 && a is LocalVariable la && b is LocalVariable lb && SameComputation(la, lb, depth + 1);
         }
+
+        bool SameComputation(LocalVariable a, LocalVariable b, int depth)
+            => definitions.TryGetValue(a, out var da) && definitions.TryGetValue(b, out var db)
+               && da is { OpCode: OpCode.Move or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+                      or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And
+                      or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate or OpCode.Convert }
+               && db != null && db.OpCode == da.OpCode && da.Operands.Count == db.Operands.Count
+               && da.Operands.Skip(1).Zip(db.Operands.Skip(1)).All(pair => SameValue(pair.First, pair.Second, depth));
 
         IOperand Root(IOperand operand)
         {
@@ -785,15 +866,21 @@ public static class ArrayRecovery
         foreach (var instruction in cfg.Instructions.ToList())
         {
             if (instruction is not { OpCode: OpCode.Add or OpCode.Or,
-                    Operands: [LocalVariable destination, LocalVariable owner, Immediate offset] }
-                || owner.Type is not { IsValueType: false } ownerType
-                )
+                    Operands: [LocalVariable destination, LocalVariable owner, Immediate offset] })
                 continue;
+
+            // An address into a statics block (`&T.s`) names the static at the offset on the
+            // owning type; an object address names the instance field at it.
+            var staticsOwner = owner.Type is StaticFieldStorageTypeAnalysisContext { OwnerType: var block }
+                ? block : null;
+            if (staticsOwner == null && owner.Type is not { IsValueType: false })
+                continue;
+            var ownerType = owner.Type!;
 
             var accessSize = destination.Type is { } destinationType
                 ? (int)TypeSizes.MinimumUnboxedSize(destinationType, method.AppContext.Binary.PointerSizeBytes)
                 : 0;
-            if (MetadataResolver.FindInstanceFieldPathAtOffset(ownerType, offset.Value, accessSize) is not { } addressed)
+            if (AddressedAt(ownerType, staticsOwner, offset.Value, accessSize) is not { } addressed)
                 continue;
 
             var changed = false;
@@ -812,8 +899,8 @@ public static class ArrayRecovery
                     else if (use.Operands[i] is MemoryOperand
                         { Base: LocalVariable memoryBase, Index: null, Scale: 0 } memory
                         && ReferenceEquals(memoryBase, destination)
-                        && MetadataResolver.FindInstanceFieldPathAtOffset(ownerType,
-                            offset.Value + memory.Addend, memory.AccessSize) is { } loaded)
+                        && AddressedAt(ownerType, staticsOwner, offset.Value + memory.Addend,
+                            memory.AccessSize) is { } loaded)
                     {
                         use.SetOperand(i, new FieldReference(loaded.Field, owner,
                             (int)(offset.Value + memory.Addend), loaded.Containers, memory.AccessSize));
@@ -824,17 +911,43 @@ public static class ArrayRecovery
             if (changed)
                 MakeNop(instruction);
         }
+
+        // The field the address at `base + offset` names: a flat static on the block's
+        // owner (or a member of a struct-typed static), else the instance path.
+        static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)?
+            AddressedAt(TypeAnalysisContext owner, TypeAnalysisContext? statics, long offset, int accessSize)
+        {
+            if (statics == null)
+                return MetadataResolver.FindInstanceFieldPathAtOffset(owner, offset, accessSize);
+            if (MetadataResolver.FindStaticFieldAtOffset(statics, offset) is { } flat)
+                return (flat, []);
+            return MetadataResolver.FindNestedStaticFieldAtOffset(statics, offset, accessSize) is { } nested
+                ? (nested.Field, [nested.Container])
+                : null;
+        }
     }
 
     private static void RecoverFieldAddressAliases(MethodAnalysisContext method)
     {
         var cfg = method.ControlFlowGraph!;
-        foreach (var definition in cfg.Instructions.ToList())
+        foreach (var group in cfg.Instructions
+                     .Where(instruction => instruction is { OpCode: OpCode.Move,
+                             Operands: [LocalVariable, AddressOf { Target: FieldReference }] }
+                                 && instruction.Destination is LocalVariable)
+                     .GroupBy(instruction => (LocalVariable)instruction.Destination!))
         {
-            if (definition is not { OpCode: OpCode.Move,
-                    Operands: [LocalVariable alias, AddressOf { Target: FieldReference field }] }
-                || cfg.Instructions.Count(instruction => ReferenceEquals(instruction.Destination, alias)) != 1)
+            var defs = group.ToList();
+            var alias = group.Key;
+            var first = (FieldReference)((AddressOf)defs[0].Operands[1]).Target;
+
+            // [alias + k] names f + k only when every definition reaching the slot took
+            // the same field's address — a join of &a.f and &b.g is not provable.
+            if (!defs.All(def => ((AddressOf)def.Operands[1]).Target is FieldReference other
+                    && other.Field == first.Field && ReferenceEquals(other.Local, first.Local)
+                    && other.Offset == first.Offset
+                    && other.Containers.SequenceEqual(first.Containers)))
                 continue;
+            var defSet = defs.ToHashSet();
 
             var changed = false;
             foreach (var use in cfg.Instructions)
@@ -842,20 +955,69 @@ public static class ArrayRecovery
             {
                 if (ReferenceEquals(use.Operands[i], alias))
                 {
-                    use.SetOperand(i, new AddressOf(field));
+                    // The defs' own destination operand is the alias, not a read of it.
+                    if (i == 0 && defSet.Contains(use))
+                        continue;
+                    use.SetOperand(i, new AddressOf(first));
                     changed = true;
                 }
                 else if (use.Operands[i] is MemoryOperand
-                         { Base: LocalVariable memoryBase, Index: null, Scale: 0, Addend: 0 }
+                         { Base: LocalVariable memoryBase, Index: null, Scale: 0 } memory
                          && ReferenceEquals(memoryBase, alias))
                 {
-                    use.SetOperand(i, field);
+                    if (memory.Addend == 0)
+                    {
+                        use.SetOperand(i, first);
+                        changed = true;
+                        continue;
+                    }
+                    if (ResolveAliasTarget(method, first, first.Offset + memory.Addend,
+                            memory.AccessSize) is not { } sibling
+                        || MetadataResolver.MemberPathUnspellable(sibling, method,
+                            store: use.OpCode == OpCode.Move && i == 0, addressed: false))
+                        continue;
+                    use.SetOperand(i, new FieldReference(sibling.Field, first.Local,
+                        (int)(first.Offset + memory.Addend), sibling.Containers,
+                        memory.AccessSize));
                     changed = true;
                 }
             }
 
-            if (changed)
-                MakeNop(definition);
+            if (!changed)
+                continue;
+            // A use that kept its MemoryOperand still reads through the alias; the defs
+            // die only once no operand names it any more. The defs' own destination
+            // operand writes the alias - it is not a read.
+            var stillUsed = cfg.Instructions.Any(u => u.Operands.Where((o, i) =>
+                    !(i == 0 && defSet.Contains(u)))
+                .Any(o => ReferenceEquals(o, alias)
+                    || o is MemoryOperand { Base: LocalVariable b } && ReferenceEquals(b, alias)));
+            if (!stillUsed)
+                foreach (var def in defs)
+                    MakeNop(def);
+        }
+        return;
+
+        // The member [alias + k] names: the sibling of f's host at f's offset + k
+        // (static or instance by f's kind). The host is f's declaring type; its base
+        // local must still be able to stand as the field receiver.
+        static (FieldAnalysisContext Field, IReadOnlyList<FieldAnalysisContext> Containers)?
+            ResolveAliasTarget(MethodAnalysisContext method, FieldReference addressed,
+                long offset, int accessSize)
+        {
+            var owner = addressed.Field.DeclaringType;
+            if (owner == null
+                || !MetadataResolver.LocalSuppliesFieldBase(addressed.Local, owner,
+                    method.DeclaringType, method))
+                return null;
+            if (addressed.Field.IsStatic)
+            {
+                if (MetadataResolver.FindStaticFieldAtOffset(owner, offset) is { } flat)
+                    return (flat, []);
+                return MetadataResolver.FindNestedStaticFieldAtOffset(owner, offset, accessSize)
+                    is { } nested ? (nested.Field, [nested.Container]) : null;
+            }
+            return MetadataResolver.FindInstanceFieldPathAtOffset(owner, offset, accessSize);
         }
     }
 
@@ -2155,9 +2317,15 @@ public static class ArrayRecovery
             return null;
 
         var targetType = access.Field?.FieldType ?? arrayType.ElementType;
+        // A store's source need only cover the element's bytes: a packed value-typed
+        // local of the same width is the element's bit image — the conversion (if any)
+        // belongs to the value, not the store site.
         if (sibling is LocalVariable { Type: { } contract }
             && (contract.IsValueType
                 ? contract.FullName != targetType.FullName
+                  && (operandIndex != 0
+                      || TypeSizes.MinimumUnboxedSize(contract, pointerSize)
+                         != TypeSizes.MinimumUnboxedSize(targetType, pointerSize))
                 : targetType.IsValueType))
             return null;
 
