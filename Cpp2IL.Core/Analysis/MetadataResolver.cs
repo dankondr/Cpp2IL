@@ -1665,6 +1665,21 @@ public static class MetadataResolver
                     { Base: LocalVariable klass, Index: null, Scale: 0 } memory)
                 continue;
 
+            // A proven class constant that stayed untyped — a phi of `Type:`
+            // constants, or an edge copy written after `SeedRuntimeClassTypes`
+            // ran — still IS the class pointer. Claiming `RuntimeClass` puts
+            // every dereference on the classic schedule: `Move x,
+            // [klass + static_fields]` types its destination via
+            // `PropagateStaticFieldStorage` and emission drops the move, while
+            // the stand-in would be read as a value nothing spells.
+            if (klass.Type == null
+                && ClassConstant(klass, definitions) is { } seededOwner)
+            {
+                klass.Type = new RuntimeClassTypeAnalysisContext(seededOwner,
+                    seededOwner.DeclaringAssembly);
+                changed = true;
+            }
+
             // The stand-in names two statics-block dereferences: pointer arithmetic
             // (`Add x, [klass + static_fields], off` is `&T.s`), and any operand on a
             // class-object base — those never reach `PropagateStaticFieldStorage`'s
