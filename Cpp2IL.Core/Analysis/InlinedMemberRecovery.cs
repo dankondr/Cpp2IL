@@ -788,13 +788,19 @@ internal static class InlinedMemberRecovery
     {
         var pending = new Queue<LocalVariable>();
         var pruned = new HashSet<Instruction>();
+        // Locals the rewritten call still reads (an old operand bound straight
+        // onto a parameter) stay alive - the maps list them as used by this
+        // same instruction either way.
+        var live = call.SourcesAndConstants
+            .SelectMany(o => LocalVariables.OperandLocals(o)).ToHashSet();
         foreach (var arg in decomposed)
-            if (arg.Raw is LocalVariable local)
+            if (arg.Raw is LocalVariable local && !live.Contains(local))
                 pending.Enqueue(local);
         while (pending.Count > 0)
         {
             var local = pending.Dequeue();
-            if (!maps.Uses.TryGetValue(local, out var uses)
+            if (live.Contains(local)
+                || !maps.Uses.TryGetValue(local, out var uses)
                 || uses.Any(u => !ReferenceEquals(u, call) && !pruned.Contains(u))
                 || !maps.Defs.TryGetValue(local, out var def)
                 || def.OpCode is not (OpCode.Move or OpCode.Add or OpCode.Subtract
