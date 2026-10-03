@@ -19,7 +19,17 @@ internal static class AccessibilityExtensions
     /// </summary>
     internal static bool EmittedInternalsAreShared;
 
-    public static bool IsAccessibleTo(this TypeAnalysisContext referenceType, TypeAnalysisContext referencingType)
+    public static bool IsAccessibleTo(this TypeAnalysisContext referenceType, TypeAnalysisContext referencingType) =>
+        referenceType.IsAccessibleTo(referencingType, emittedScope: true);
+
+    /// <summary>
+    /// <paramref name="emittedScope"/> selects which internal scope answers: the default
+    /// friend scope the emitted assemblies share (<see cref="EmittedInternalsAreShared"/>),
+    /// or <c>false</c> for the caller's source scope — same or same-named assembly only,
+    /// where no InternalsVisibleTo grant survived.
+    /// </summary>
+    internal static bool IsAccessibleTo(this TypeAnalysisContext referenceType,
+        TypeAnalysisContext referencingType, bool emittedScope)
     {
         if (referenceType == referencingType)
             return true;
@@ -27,7 +37,10 @@ internal static class AccessibilityExtensions
         var declaringTypesHierarchy = referenceType.GetTypeAndDeclaringTypes().ToArray();
         var referencingNesting = referencingType.GetTypeAndDeclaringTypes().ToArray();
         var sameAssembly = referenceType.DeclaringAssembly == referencingType.DeclaringAssembly
-            || SharesEmittedInternals(referenceType.DeclaringAssembly, referencingType.DeclaringAssembly);
+            || (emittedScope
+                ? SharesEmittedInternals(referenceType.DeclaringAssembly, referencingType.DeclaringAssembly)
+                : referenceType.DeclaringAssembly?.Name == referencingType.DeclaringAssembly?.Name
+                    && referenceType.DeclaringAssembly != null);
         if (!sameAssembly
             && !referenceType.DeclaringAssembly.IsDependencyOf(referencingType.DeclaringAssembly))
         {

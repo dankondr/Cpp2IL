@@ -87,6 +87,31 @@ internal static class InlinedMemberRecovery
             MethodAnalysisContext Ctor)> CtorCalls = new();
         public readonly List<IOperand> Returns = new();
         public bool Rejected;
+        // A body proven to be one call to N fed by projections of `this` and
+        // its parameters, plus at most a pure transform on the result - the
+        // accessible forwarder an inlined call edge to N was once written as.
+        public ForwarderShape? Forward;
+    }
+
+    // What one leaf-call argument of a forwarder body traces back to: an offset
+    // projection of the receiver (`&this.f` / `this.f`), of a parameter, a
+    // literal, or an operand rooted elsewhere.
+    internal abstract record ForwarderArg;
+    internal sealed record ForwarderThisArg(long Offset, bool ByValue) : ForwarderArg;
+    internal sealed record ForwarderParamArg(int Index, long Offset, bool ByValue) : ForwarderArg;
+    internal sealed record ForwarderConstArg(object? Value) : ForwarderArg;
+    internal sealed record ForwarderOtherArg : ForwarderArg;
+
+    // The proven single-call shape of a member body.
+    internal sealed class ForwarderShape
+    {
+        public required MethodAnalysisContext Callee;
+        // One entry per argument slot of the leaf call (the receiver slot
+        // included when the leaf is an instance call).
+        public required List<ForwarderArg> Args = [];
+        // The result transform as a normalized pure-op tree over the call's
+        // result ("R"), or null for a void forward / dropped result.
+        public string? PostOp;
     }
 
     // Snapshot the body's summary inputs. AnalyzeCore calls this at a fixed
@@ -142,7 +167,223 @@ internal static class InlinedMemberRecovery
                     break;
             }
         }
+        facts.Forward = CaptureForward(body, facts);
         body.MemberBodyFacts = facts;
+    }
+
+    // Strict shape scan, independent of the summary Rejected flag: every
+    // instruction in the body must be the single leaf call, an argument
+    // projection or result-transform temp (`Add`/`Move`/pure ops), a `Nop`/
+    // `Jump`/`ShiftStack`, or the one `Return`. Anything else - a second call,
+    // a field store, a branch on a computed value, an unresolved target - and
+    // the body is no proven forwarder.
+    private static ForwarderShape? CaptureForward(MethodAnalysisContext body, BodyFacts facts)
+    {
+        var instructions = body.ControlFlowGraph!.Blocks.SelectMany(b => b.Instructions).ToList();
+        Instruction? leaf = null;
+        var returns = 0;
+        var defs = new Dictionary<LocalVariable, Instruction>();
+        var defCounts = new Dictionary<LocalVariable, int>();
+        foreach (var instruction in instructions)
+        {
+            if (instruction.Destination is LocalVariable defined)
+            {
+                defs[defined] = instruction;
+                defCounts[defined] = defCounts.GetValueOrDefault(defined) + 1;
+            }
+            switch (instruction.OpCode)
+            {
+                case OpCode.Nop or OpCode.Jump or OpCode.ShiftStack:
+                    break;
+                case OpCode.Move when instruction.Operands is [LocalVariable, _]:
+                    break;
+                case OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+                    or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight
+                    or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
+                    or OpCode.Convert or OpCode.SignExtend32
+                    or OpCode.CheckEqual or OpCode.CheckNotEqual
+                    or OpCode.CheckLess or OpCode.CheckLessOrEqual
+                    or OpCode.CheckGreater or OpCode.CheckGreaterOrEqual
+                    or OpCode.VectorMin or OpCode.VectorMax:
+                    break;
+                case OpCode.Call or OpCode.CallVoid:
+                    if (leaf != null || instruction.Operands.Count == 0
+                        || instruction.Operands[0] is not MethodAnalysisContext
+                        {
+                            Name: not ".ctor" and not ".cctor"
+                        })
+                        return null;
+                    leaf = instruction;
+                    break;
+                case OpCode.Return:
+                    returns++;
+                    break;
+                default:
+                    return null;
+            }
+        }
+        if (leaf == null || returns > 1)
+            return null;
+
+        var leafArgs = leaf.Operands.Skip(leaf.OpCode == OpCode.CallVoid ? 1 : 2).ToList();
+        var args = new List<ForwarderArg>();
+        foreach (var operand in leafArgs)
+        {
+            var template = ForwardArgOf(operand, facts, defs, defCounts, 0);
+            if (template is ForwarderOtherArg)
+                return null;
+            args.Add(template);
+        }
+
+        var callDest = leaf.OpCode == OpCode.Call && leaf.Destination is LocalVariable dest
+            ? dest
+            : null;
+        string? postOp;
+        if (leaf.OpCode == OpCode.CallVoid || callDest == null)
+            postOp = null;
+        else
+        {
+            var ret = instructions.LastOrDefault(i => i.OpCode == OpCode.Return);
+            if (ret == null || ret.Operands.Count == 0)
+                postOp = null; // `N(...); return` - the result is dropped
+            else
+            {
+                postOp = PostOpTree(ret.Operands[0], callDest, defs, defCounts, 0);
+                if (postOp == null || TreeHasExternal(postOp))
+                    return null; // the return value is not provably the call's
+            }
+        }
+        return new ForwarderShape
+        {
+            Callee = (MethodAnalysisContext)leaf.Operands[0],
+            Args = args,
+            PostOp = postOp,
+        };
+    }
+
+    // An "E" node - a value not derived from the call result - anywhere in
+    // the tree. E always stands alone, so it shows as the whole tree or after
+    // `(` or `,`; op names like CheckEqual never produce that shape.
+    private static bool TreeHasExternal(string tree) =>
+        tree == "E" || tree.Contains("(E") || tree.Contains(",E");
+
+    // The normalized pure-op tree an operand's value computes: "R" for the leaf
+    // call's result, "K(v)" for literals, "Op(...)" nodes, "E" for leaves not
+    // rooted at the result (an external read - never matches, marks the tree
+    // unprovable on the member side).
+    private static string? PostOpTree(IOperand operand, LocalVariable callDest,
+        Dictionary<LocalVariable, Instruction> defs, Dictionary<LocalVariable, int> defCounts,
+        int depth)
+    {
+        if (depth > 8)
+            return "E";
+        switch (operand)
+        {
+            case LocalVariable local:
+                if (ReferenceEquals(local, callDest))
+                    return "R";
+                if (defCounts.GetValueOrDefault(local) == 1
+                    && defs.TryGetValue(local, out var def))
+                {
+                    if (def.OpCode == OpCode.Move && def.Operands.Count == 2)
+                        return PostOpTree(def.Operands[1], callDest, defs, defCounts, depth + 1);
+                    if (IsPureResultOp(def.OpCode))
+                    {
+                        var children = def.Operands.Skip(1)
+                            .Select(o => PostOpTree(o, callDest, defs, defCounts, depth + 1))
+                            .ToList();
+                        return children.Any(c => c == null)
+                            ? null
+                            : $"{def.OpCode}({string.Join(",", children)})";
+                    }
+                }
+                return "E";
+            case Immediate immediate:
+                return $"K({immediate.Value})";
+            case FloatLiteral f:
+                return $"Kf({f.Value})";
+            case DoubleLiteral d:
+                return $"Kd({d.Value})";
+            default:
+                return "E";
+        }
+    }
+
+    private static bool IsPureResultOp(OpCode op) => op is
+        OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide
+        or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight
+        or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
+        or OpCode.Convert or OpCode.SignExtend32
+        or OpCode.CheckEqual or OpCode.CheckNotEqual
+        or OpCode.CheckLess or OpCode.CheckLessOrEqual
+        or OpCode.CheckGreater or OpCode.CheckGreaterOrEqual
+        or OpCode.VectorMin or OpCode.VectorMax;
+
+    // What one leaf-call operand of the forwarder body is formed from. `this`
+    // and parameter projections carry a byte offset - `Add(x, 16)` and
+    // `x.f@16` are the same projection in the lifted form.
+    private static ForwarderArg ForwardArgOf(IOperand operand, BodyFacts facts,
+        Dictionary<LocalVariable, Instruction> defs, Dictionary<LocalVariable, int> defCounts,
+        int depth)
+    {
+        if (depth > 8)
+            return new ForwarderOtherArg();
+        switch (operand)
+        {
+            case LocalVariable local:
+            {
+                if (facts.ThisLocal != null && ReferenceEquals(local, facts.ThisLocal))
+                    return new ForwarderThisArg(0, ByValue: true);
+                if (facts.ParamIndex.TryGetValue(local, out var index))
+                    return new ForwarderParamArg(index, 0, ByValue: true);
+                if (defCounts.GetValueOrDefault(local) == 1
+                    && defs.TryGetValue(local, out var def))
+                {
+                    if (def.OpCode == OpCode.Move && def.Operands.Count == 2)
+                        return ForwardArgOf(def.Operands[1], facts, defs, defCounts, depth + 1);
+                    if ((def.OpCode is OpCode.Add or OpCode.Subtract) && def.Operands.Count == 3
+                        && def.Operands[2] is Immediate { Value: var addend })
+                    {
+                        var inner = ForwardArgOf(def.Operands[1], facts, defs, defCounts, depth + 1);
+                        var addOffset = def.OpCode == OpCode.Add ? addend : -addend;
+                        return inner switch
+                        {
+                            ForwarderThisArg t => new ForwarderThisArg(t.Offset + addOffset,
+                                ByValue: false),
+                            ForwarderParamArg param => new ForwarderParamArg(param.Index,
+                                param.Offset + addOffset, ByValue: false),
+                            _ => new ForwarderOtherArg(),
+                        };
+                    }
+                }
+                return new ForwarderOtherArg();
+            }
+            case FieldReference field:
+            {
+                if (facts.ThisLocal != null && ReferenceEquals(field.Local, facts.ThisLocal))
+                    return new ForwarderThisArg(field.Offset, ByValue: true);
+                if (facts.ParamIndex.TryGetValue(field.Local, out var index))
+                    return new ForwarderParamArg(index, field.Offset, ByValue: true);
+                return new ForwarderOtherArg();
+            }
+            case AddressOf { Target: { } target }:
+            {
+                return ForwardArgOf(target, facts, defs, defCounts, depth + 1) switch
+                {
+                    ForwarderThisArg t => t with { ByValue = false },
+                    ForwarderParamArg p => p with { ByValue = false },
+                    var other => other,
+                };
+            }
+            case Immediate immediate:
+                return new ForwarderConstArg(immediate.Value);
+            case FloatLiteral f:
+                return new ForwarderConstArg(f.Value);
+            case DoubleLiteral d:
+                return new ForwarderConstArg(d.Value);
+            default:
+                return new ForwarderOtherArg();
+        }
     }
 
     public static int Run(MethodAnalysisContext method)
@@ -162,6 +403,7 @@ internal static class InlinedMemberRecovery
                 {
                     progress |= RewriteReads(block, method);
                     progress |= RewriteStores(block, method);
+                    progress |= RewriteCalls(block, method);
                 }
                 catch (Exception e) when (e is not OutOfMemoryException)
                 {
@@ -359,6 +601,562 @@ internal static class InlinedMemberRecovery
             i++;
         }
         return changed;
+    }
+
+    // ---------------------------------------------------- inaccessible callees
+    //
+    // A call edge can target a member N the caller's source could not name:
+    // clang inlined the accessible forwarder M the source actually wrote and
+    // left the leaf N behind. When the type of an argument's projection root
+    // has a source-visible member M whose own body is exactly `N` fed by
+    // projections of `this` and its parameters - plus at most a pure
+    // transform on the result - the call is `x.M(...)`. The result transform
+    // the caller applies is checked against M's own: an identical one is
+    // absorbed (`ParseRawVarint64(...) != 0` becomes `x.ReadBool()`); a
+    // caller transform M does not share just means M is not the forwarder the
+    // source wrote, and an unmatchable caller shape takes only the identity
+    // forwarder. A callee with no proven forwarder keeps N's name - which is
+    // what the call sites the fix cannot prove keep producing.
+
+    // One call argument decomposed: `&Root + Offset` for an address projection
+    // (IsAddress), the operand itself for a whole-object or field value, or a
+    // computed value with no root.
+    private sealed record CallerArg(IOperand Raw, IOperand? Root, long Offset, bool IsAddress);
+
+    // Def/use maps for one method, built lazily the first time a block holds
+    // a callee the caller's source cannot name - most methods have none.
+    private sealed class CallMaps
+    {
+        public required HashSet<Instruction> InBlock;
+        public required Dictionary<Instruction, int> Position;
+        public required Dictionary<LocalVariable, Instruction> Defs;
+        public required Dictionary<LocalVariable, int> DefCounts;
+        public required Dictionary<LocalVariable, List<Instruction>> Uses;
+
+        public static CallMaps Build(MethodAnalysisContext context, Block block)
+        {
+            var defs = new Dictionary<LocalVariable, Instruction>();
+            var defCounts = new Dictionary<LocalVariable, int>();
+            var uses = new Dictionary<LocalVariable, List<Instruction>>();
+            foreach (var instruction in context.ControlFlowGraph!.Blocks
+                         .SelectMany(b => b.Instructions))
+            {
+                if (instruction.Destination is LocalVariable defined)
+                {
+                    defs[defined] = instruction;
+                    defCounts[defined] = defCounts.GetValueOrDefault(defined) + 1;
+                }
+                foreach (var source in instruction.Sources)
+                    foreach (var local in LocalVariables.OperandLocals(source))
+                        (uses.TryGetValue(local, out var list) ? list : uses[local] = [])
+                            .Add(instruction);
+            }
+            return new CallMaps
+            {
+                InBlock = block.Instructions.ToHashSet(),
+                Position = block.Instructions.Select((i, p) => (i, p))
+                    .ToDictionary(pair => pair.i, pair => pair.p),
+                Defs = defs,
+                DefCounts = defCounts,
+                Uses = uses,
+            };
+        }
+    }
+
+    // What the caller does with the leaf call's result, for absorb matching.
+    private sealed class CallerPostOp
+    {
+        // The normalized tree the boundary value computes over the call result;
+        // "R" for an identity passthrough (also when the shape is unmatchable,
+        // which then restricts the rewrite to identity forwarders).
+        public string Tree = "R";
+        public readonly List<Instruction> PureOps = [];
+        // `Move` aliases the result flowed through; on absorb only the ones
+        // on the boundary's own def-chain still carry a live value.
+        public readonly List<Instruction> Aliases = [];
+        public readonly HashSet<Instruction> ChainAliases = [];
+        // The outermost pure op feeding the boundary - where `Move b, t`
+        // lands on absorb.
+        public Instruction? RootPure;
+    }
+
+    private sealed class ForwarderMatch
+    {
+        public required MethodAnalysisContext Member;
+        public IOperand? Receiver;
+        public required List<IOperand> Args;
+        public bool Absorb;
+    }
+
+    private static readonly ConcurrentDictionary<MethodAnalysisContext, ForwarderResult> Forwarders = new();
+
+    private sealed class ForwarderResult
+    {
+        public ForwarderShape? Shape;
+    }
+
+    private static bool RewriteCalls(Block block, MethodAnalysisContext context)
+    {
+        var changed = false;
+        CallMaps? maps = null;
+        for (var index = 0; index < block.Instructions.Count; index++)
+        {
+            var instruction = block.Instructions[index];
+            if (!instruction.IsCall || instruction.Operands.Count == 0
+                || instruction.Operands[0] is not MethodAnalysisContext callee
+                || callee.Name is ".ctor" or ".cctor")
+                continue;
+            // A call edge landing on a leaf reached through a proven
+            // accessible forwarder means the C++ compiler inlined `M(...) {
+            // N(...) }` and the edge names the inlined `N`; the source spelled
+            // `M`. Whether the caller could have named `N` only decides why the
+            // rewrite is needed (an inaccessible `N` cannot compile), never
+            // what the honest spelling is - so it is no gate here.
+            maps ??= CallMaps.Build(context, block);
+            if (TryForwarderCall(block, index, instruction, callee, context, maps))
+            {
+                changed = true;
+                maps = CallMaps.Build(context, block); // operands just moved
+            }
+        }
+        return changed;
+    }
+
+    private static bool TryForwarderCall(Block block, int index, Instruction call,
+        MethodAnalysisContext callee, MethodAnalysisContext context, CallMaps maps)
+    {
+        var args = call.Operands.Skip(call.OpCode == OpCode.CallVoid ? 1 : 2).ToList();
+        // Positional matching needs the full lifted argument list.
+        if (args.Count != callee.Parameters.Count + (callee.IsStatic ? 0 : 1))
+            return false;
+        var decomposed = args.Select(a => DecomposeArg(a, maps, 0)).ToList();
+
+        var post = LazyCallerPostOp(block, index, call, maps);
+        var destUsed = call.OpCode == OpCode.Call
+            && call.Destination is LocalVariable dest
+            && maps.Uses.TryGetValue(dest, out var destUses) && destUses.Count > 0;
+        var bound = new List<ForwarderMatch>();
+        var searched = new HashSet<string>();
+        foreach (var arg in decomposed)
+        {
+            if (arg.Root == null || ObjectTypeOf(arg.Root) is not { } candidateType
+                || !searched.Add(candidateType.FullName))
+                continue;
+            foreach (var member in MembersOn(candidateType))
+            {
+                if (member.Name is ".ctor" or ".cctor"
+                    || member.Parameters.Count > args.Count
+                    || DefinitionOf(member) == DefinitionOf(context)
+                    || !InaccessibleCalleeRecovery.IsVisibleFromSource(member, context))
+                    continue;
+                // Cheap rejects before the body lift a member with no part in
+                // the leaf call would pay for: a void member cannot stand in
+                // for a result that is read.
+                if (destUsed
+                    && member.ReturnType is null or { FullName: "System.Void" })
+                    continue;
+                var shape = ForwarderOf(member, context);
+                if (shape is not { } forward
+                    || forward.Callee.FullName != callee.FullName
+                    || forward.Args.Count != args.Count)
+                    continue;
+                var match = BindForwarder(member, forward, decomposed, post, destUsed);
+                if (match != null)
+                    bound.Add(match);
+            }
+        }
+        if (bound.Count == 0)
+            return false;
+        var best = bound.GroupBy(m => m.Absorb ? 2
+                : m.Member.ReturnType?.FullName == callee.ReturnType?.FullName ? 1 : 0)
+            .MaxBy(g => g.Key)!;
+        if (best.Count() != 1)
+            return false; // two forwarders the same shape cannot be told apart
+        var chosen = best.First();
+        ApplyForwarder(block, index, call, chosen, post);
+        PruneDeadArgTemporaries(decomposed, maps, call);
+        return true;
+    }
+
+    // The leaf's argument temporaries (`ref state = ref input.state`,
+    // `v44 = input + 16`) exist only to feed it; once the call no longer names
+    // them their projections read as stray inaccessible accesses, so a temp
+    // whose uses were all the rewritten call dies with it, recursively. Only
+    // pure projection instructions are pruned - a call or store survives.
+    private static void PruneDeadArgTemporaries(List<CallerArg> decomposed,
+        CallMaps maps, Instruction call)
+    {
+        var pending = new Queue<LocalVariable>();
+        var pruned = new HashSet<Instruction>();
+        foreach (var arg in decomposed)
+            if (arg.Raw is LocalVariable local)
+                pending.Enqueue(local);
+        while (pending.Count > 0)
+        {
+            var local = pending.Dequeue();
+            if (!maps.Uses.TryGetValue(local, out var uses)
+                || uses.Any(u => !ReferenceEquals(u, call) && !pruned.Contains(u))
+                || !maps.Defs.TryGetValue(local, out var def)
+                || def.OpCode is not (OpCode.Move or OpCode.Add or OpCode.Subtract
+                    or OpCode.Convert or OpCode.SignExtend32))
+                continue;
+            NopOut(def);
+            pruned.Add(def);
+            foreach (var source in def.Sources)
+                foreach (var nested in LocalVariables.OperandLocals(source))
+                    pending.Enqueue(nested);
+        }
+    }
+
+    private static CallerPostOp LazyCallerPostOp(Block block, int index, Instruction call,
+        CallMaps maps)
+    {
+        var post = new CallerPostOp();
+        if (call.OpCode != OpCode.Call || call.Destination is not LocalVariable result)
+            return post;
+        // A result written elsewhere too cannot be collapsed onto the call -
+        // its consumers may not be this call's value. Identity-only.
+        if (maps.DefCounts.GetValueOrDefault(result) != 1)
+            return post;
+
+        // Walk the use graph from the call's result: pure ops join the
+        // transform region, a `Move` to another local forwards through
+        // transparently, and anything else is a boundary sink. A call ends
+        // its basic block, so consumers live in successor blocks - the walk
+        // follows data flow across them, not instruction order. Every local
+        // followed has exactly one def, so all of its uses read this value;
+        // one it cannot prove (a merge, a store) funnels into the boundary.
+        // The region must funnel into exactly one boundary value.
+        var pending = new Queue<LocalVariable>();
+        var seen = new HashSet<LocalVariable>();
+        var boundary = new HashSet<LocalVariable>();
+        pending.Enqueue(result);
+        while (pending.Count > 0)
+        {
+            var value = pending.Dequeue();
+            if (!seen.Add(value) || !maps.Uses.TryGetValue(value, out var users))
+                continue;
+            foreach (var user in users)
+            {
+                if (user == call)
+                    continue;
+                if (user.OpCode == OpCode.Move && user.Operands is [LocalVariable next, _]
+                    && maps.DefCounts.GetValueOrDefault(next) == 1)
+                {
+                    post.Aliases.Add(user);
+                    pending.Enqueue(next);
+                    continue;
+                }
+                if (IsPureResultOp(user.OpCode) && user.Destination is LocalVariable produced
+                    && maps.DefCounts.GetValueOrDefault(produced) == 1)
+                {
+                    post.PureOps.Add(user);
+                    pending.Enqueue(produced);
+                    continue;
+                }
+                boundary.Add(value);
+            }
+        }
+
+        if (boundary.Count != 1)
+            return post; // dead or split result: identity-only
+        var boundaryValue = boundary.Single();
+        var tree = PostOpTree(boundaryValue, result, maps.Defs, maps.DefCounts, 0);
+        if (tree == null || TreeHasExternal(tree))
+            return post;
+        if (tree != "R" && RootPureOf(boundaryValue, result, maps, post) is { } root)
+        {
+            post.Tree = tree;
+            post.RootPure = root;
+            return post;
+        }
+        return post;
+    }
+
+    // The outermost pure op producing the boundary value, chasing transparent
+    // `Move` aliases back to their definition and recording the chain that
+    // still propagates the result on absorb.
+    private static Instruction? RootPureOf(LocalVariable value, LocalVariable callDest,
+        CallMaps maps, CallerPostOp post)
+    {
+        var current = value;
+        for (var guard = 0; guard < 8; guard++)
+        {
+            if (ReferenceEquals(current, callDest))
+                return null;
+            if (maps.DefCounts.GetValueOrDefault(current) != 1
+                || !maps.Defs.TryGetValue(current, out var def))
+                return null;
+            if (def.OpCode == OpCode.Move && def.Operands is [_, LocalVariable next])
+            {
+                post.ChainAliases.Add(def);
+                current = next;
+                continue;
+            }
+            return IsPureResultOp(def.OpCode) ? def : null;
+        }
+        return null;
+    }
+
+    // What one call argument is made of: `&root + offset` when it is an
+    // address into a root's storage (a `T&` operand, an `Add`/`Subtract` of
+    // one, or an `AddressOf`), else the operand itself or its field root.
+    private static CallerArg DecomposeArg(IOperand operand, CallMaps maps, int depth)
+    {
+        if (depth > 8)
+            return new CallerArg(operand, null, 0, false);
+        switch (operand)
+        {
+            case LocalVariable local:
+            {
+                if (maps.DefCounts.GetValueOrDefault(local) == 1
+                    && maps.Defs.TryGetValue(local, out var def))
+                {
+                    if (def.OpCode == OpCode.Move && def.Operands.Count == 2)
+                    {
+                        var moved = DecomposeArg(def.Operands[1], maps, depth + 1);
+                        return moved with { Raw = operand };
+                    }
+                    if ((def.OpCode is OpCode.Add or OpCode.Subtract) && def.Operands.Count == 3
+                        && def.Operands[2] is Immediate { Value: var addend })
+                    {
+                        // `x + 16` on a pointer or a field slot is `&x + 16`;
+                        // a plain local's `+` is arithmetic and stays a value.
+                        var inner = DecomposeArg(def.Operands[1], maps, depth + 1);
+                        if (inner.Root != null && (inner.IsAddress || inner.Raw is FieldReference))
+                        {
+                            return inner with
+                            {
+                                Raw = operand,
+                                Offset = inner.Offset
+                                    + (def.OpCode == OpCode.Add ? addend : -addend),
+                                IsAddress = true,
+                            };
+                        }
+                    }
+                    // A computed temp is a value, not a projection root.
+                    return new CallerArg(operand, null, 0, false);
+                }
+                // Undeclared storage: a managed pointer names the object's
+                // storage directly, a plain local its value.
+                return local.Type is ByRefTypeAnalysisContext
+                    ? new CallerArg(operand, local, 0, true)
+                    : new CallerArg(operand, local, 0, false);
+            }
+            case FieldReference field:
+            {
+                // `x.f1..fN` reads the value at the cumulative byte offset.
+                var inner = DecomposeArg(field.Local, maps, depth + 1);
+                return new CallerArg(operand, inner.Root, inner.Offset + field.Offset, false);
+            }
+            case AddressOf { Target: { } target }:
+            {
+                var inner = DecomposeArg(target, maps, depth + 1);
+                return inner.Root == null
+                    ? new CallerArg(operand, null, 0, false)
+                    : inner with { Raw = operand, IsAddress = true };
+            }
+            case ReferenceCast cast:
+                return DecomposeArg(cast.Value, maps, depth + 1);
+            default:
+                return new CallerArg(operand, null, 0, false);
+        }
+    }
+
+    // The object type a projection root names - the type forwarder members
+    // are looked up on.
+    private static TypeAnalysisContext? ObjectTypeOf(IOperand root) => root switch
+    {
+        LocalVariable local => local.Type is WrappedTypeAnalysisContext wrapped
+            ? wrapped.ElementType
+            : local.Type,
+        FieldReference field => field.Field.FieldType is WrappedTypeAnalysisContext wrapped
+            ? wrapped.ElementType
+            : field.Field.FieldType,
+        AddressOf address => ObjectTypeOf(address.Target),
+        _ => null,
+    };
+
+    // Unify a forwarder's arg templates with the caller's operands: the
+    // member's `this` maps to one projection root and each parameter to one
+    // caller operand - never two different ones.
+    private static ForwarderMatch? BindForwarder(MethodAnalysisContext member,
+        ForwarderShape forward, List<CallerArg> decomposed, CallerPostOp post,
+        bool destUsed)
+    {
+        var memberVoid = member.ReturnType == null || member.ReturnType.FullName == "System.Void";
+        // A void forward can only stand in where no result value is read.
+        if (memberVoid && (forward.PostOp != null || destUsed))
+            return null;
+        // A member returning the leaf's raw value (`P_M` is identity) fits
+        // whatever the caller does with the result - the caller's own post-op
+        // is its loop's business, not the member's (`tag = input.ReadTag();
+        // tag != 0`). One applying a transform (`!= 0` -> ReadBool) only fits
+        // when the caller computes exactly that transform, which the rewrite
+        // then absorbs into the call.
+        var memberPost = forward.PostOp ?? "R";
+        if (!memberVoid && memberPost != "R" && memberPost != post.Tree)
+            return null;
+
+        IOperand? receiver = null;
+        var bound = new IOperand?[member.Parameters.Count];
+        for (var j = 0; j < forward.Args.Count; j++)
+        {
+            var arg = decomposed[j];
+            switch (forward.Args[j])
+            {
+                // At offset 0 the `this` operand and its storage coincide -
+                // `this` and `&this` decompose to the same projection, so the
+                // by-value flag only discriminates deeper offsets.
+                case ForwarderThisArg thisArg:
+                    if (arg.Root == null || arg.Offset != thisArg.Offset
+                        || arg.Offset != 0 && arg.IsAddress == thisArg.ByValue)
+                        return null;
+                    if (!Bind(ref receiver, arg.Root))
+                        return null;
+                    break;
+                case ForwarderParamArg param:
+                {
+                    if (param.Index >= bound.Length)
+                        return null;
+                    IOperand? value;
+                    if (param.Offset == 0)
+                    {
+                        // `p` whole (or `&p` - same offset-0 projection): the
+                        // operand goes to the parameter slot verbatim.
+                        value = arg.Raw;
+                    }
+                    else if (param.ByValue
+                             ? !arg.IsAddress && arg.Root != null && arg.Offset == param.Offset
+                             : arg.IsAddress && arg.Root != null && arg.Offset == param.Offset)
+                    {
+                        value = arg.Root;
+                    }
+                    else
+                    {
+                        return null;
+                    }
+                    if (!Bind(ref bound[param.Index], value))
+                        return null;
+                    break;
+                }
+                case ForwarderConstArg constant:
+                    if (!ConstEquals(arg.Raw, constant.Value))
+                        return null;
+                    break;
+                default:
+                    return null;
+            }
+        }
+        if ((!member.IsStatic && receiver == null) || bound.Any(b => b == null))
+            return null;
+
+        // The emitted slot must spell the bound operand: a `ref T` parameter
+        // takes the address form, a value parameter the operand itself.
+        var emit = new List<IOperand>();
+        for (var i = 0; i < bound.Length; i++)
+        {
+            var operand = bound[i]!;
+            var byRef = member.Parameters[i].ParameterType is ByRefTypeAnalysisContext;
+            var spelled = byRef ? AddressOperand(operand) : operand;
+            if (spelled == null
+                || !byRef && !ImmediateCompatible(member.Parameters[i].ParameterType, operand))
+                return null;
+            emit.Add(spelled);
+        }
+
+        var spelledReceiver = member.IsStatic
+            ? null
+            : ReceiverOperand(receiver!, member.DeclaringType);
+        if (!member.IsStatic && spelledReceiver == null)
+            return null;
+        return new ForwarderMatch
+        {
+            Member = member,
+            Receiver = spelledReceiver,
+            Args = emit,
+            Absorb = !memberVoid && memberPost != "R",
+        };
+    }
+
+    private static bool Bind(ref IOperand? slot, IOperand value)
+    {
+        if (slot == null)
+        {
+            slot = value;
+            return true;
+        }
+        return SameOperand(slot, value);
+    }
+
+    private static bool SameOperand(IOperand a, IOperand b) => (a, b) switch
+    {
+        (LocalVariable x, LocalVariable y) => ReferenceEquals(x, y),
+        (FieldReference x, FieldReference y) => ReferenceEquals(x.Local, y.Local)
+            && x.Offset == y.Offset && SameField(x.Field, y.Field)
+            && SamePath(x.Containers, y.Containers),
+        (AddressOf x, AddressOf y) => SameOperand(x.Target, y.Target),
+        _ => false,
+    };
+
+    // The `ref T`/`&T` spelling of a bound projection root.
+    private static IOperand? AddressOperand(IOperand operand) => operand switch
+    {
+        LocalVariable { Type: ByRefTypeAnalysisContext } local => local,
+        LocalVariable local => new AddressOf(local),
+        FieldReference field => new AddressOf(field),
+        AddressOf address => address,
+        _ => null,
+    };
+
+    private static void ApplyForwarder(Block block, int index, Instruction call,
+        ForwarderMatch match, CallerPostOp post)
+    {
+        var member = match.Member;
+        var memberVoid = member.ReturnType == null || member.ReturnType.FullName == "System.Void";
+        List<IOperand> operands = [member];
+        IOperand? destination = null;
+        if (call.OpCode == OpCode.Call && !memberVoid && call.Destination is { } dest)
+        {
+            operands.Add(dest);
+            destination = dest;
+        }
+        else
+        {
+            call.OpCode = OpCode.CallVoid;
+        }
+        if (match.Receiver != null)
+            operands.Add(match.Receiver);
+        operands.AddRange(match.Args);
+        call.SetOperands(operands);
+        call.IsVirtualDispatch = false;
+
+        if (!match.Absorb || post.RootPure == null || destination == null
+            || post.RootPure.Destination is not { } rootDest)
+            return;
+        // The caller's transform is the member's own: collapse it into the
+        // call and let the member produce the transformed value directly.
+        if (destination is LocalVariable result)
+            result.Type = member.ReturnType;
+        post.RootPure.OpCode = OpCode.Move;
+        post.RootPure.SetOperands(rootDest, destination);
+        foreach (var instruction in post.PureOps)
+            if (!ReferenceEquals(instruction, post.RootPure))
+                NopOut(instruction);
+        // Aliases whose destination only region ops consumed die with them;
+        // the boundary's own forwarder chain still propagates the result.
+        foreach (var alias in post.Aliases)
+            if (!post.ChainAliases.Contains(alias))
+                NopOut(alias);
+    }
+
+    private static ForwarderShape? ForwarderOf(MethodAnalysisContext candidate,
+        MethodAnalysisContext context)
+    {
+        if (Forwarders.TryGetValue(candidate, out var cached))
+            return cached.Shape;
+        var shape = EnsureBody(candidate, context)?.MemberBodyFacts?.Forward;
+        return Forwarders.GetOrAdd(candidate, new ForwarderResult { Shape = shape }).Shape;
     }
 
     // Emission cannot push a `T&`-typed slot as a `&T` receiver or write a

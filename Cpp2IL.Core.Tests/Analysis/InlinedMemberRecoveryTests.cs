@@ -738,4 +738,235 @@ public class InlinedMemberRecoveryTests
             Assert.That(SourceOf(b), Is.SameAs(calls[1].Operands[1]));
         });
     }
+
+    // A callee the caller's source could not name - an internal helper behind
+    // an inlined accessible forwarder - maps back to the forwarder whose own
+    // body is exactly that call fed by projections of `this`.
+    [Test]
+    public void InaccessibleLeafCallCallsForwarder()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+
+        var parseContext = InjectedStruct("ParseContext");
+        var state = InjectedStruct("ParserInternalState");
+        var primitives = new InjectedTypeAnalysisContext(Mscorlib, "Tests", "ParsingPrimitives",
+            App.SystemTypes.SystemObjectType, TypeAttributes.Public);
+
+        // `ParsingPrimitives.ParseTag(ref ParseContext, ref ParserInternalState)`
+        // is internal to mscorlib: Tests.Caller in System.Core cannot name it.
+        var parseTag = Member(primitives, "ParseTag", App.SystemTypes.SystemUInt32Type,
+            MethodAttributes.Static | MethodAttributes.Assembly,
+            new ByRefTypeAnalysisContext(parseContext),
+            new ByRefTypeAnalysisContext(state));
+        primitives.Methods.Add(parseTag);
+
+        // `input.ReadTag()` is what the source wrote: a public method whose
+        // body is the leaf call fed by `this` and `&this + 16`.
+        var readTag = Member(parseContext, "ReadTag", App.SystemTypes.SystemUInt32Type,
+            MethodAttributes.Public);
+        parseContext.Methods.Add(readTag);
+        var fwdThis = Local("this", parseContext);
+        var fwdState = Local("v44", new ByRefTypeAnalysisContext(state));
+        var fwdResult = Local("returnVal1", App.SystemTypes.SystemUInt32Type);
+        GiveBody(readTag, fwdThis, [],
+            new Instruction(0, OpCode.Add, fwdState, fwdThis, new Immediate(16)),
+            new Instruction(1, OpCode.Call, parseTag, fwdResult, fwdThis, fwdState),
+            new Instruction(2, OpCode.Return, fwdResult));
+
+        var caller = CallerIn(OtherAssembly);
+        var input = Local("input", new ByRefTypeAnalysisContext(parseContext));
+        var callState = Local("v108", new ByRefTypeAnalysisContext(state));
+        var tag = Local("v111", App.SystemTypes.SystemUInt32Type);
+        var isDone = Local("v59", App.SystemTypes.SystemBooleanType);
+        // `(tag = input.ReadTag()) != 0`: the check is the caller's own loop
+        // condition, not the member's post-op, and must survive the rewrite.
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Add, callState, input, new Immediate(16)),
+            new Instruction(1, OpCode.Call, parseTag, tag, input, callState),
+            new Instruction(2, OpCode.CheckNotEqual, isDone, tag, new Immediate(0)),
+            new Instruction(3, OpCode.Return, isDone),
+        ]);
+
+        InlinedMemberRecovery.Run(caller);
+
+        var instructions = caller.ControlFlowGraph!.Blocks
+            .SelectMany(b => b.Instructions).ToList();
+        var call = instructions.FirstOrDefault(i => i.OpCode == OpCode.Call);
+        var check = instructions.FirstOrDefault(i => i.OpCode == OpCode.CheckNotEqual);
+        Assert.Multiple(() =>
+        {
+            Assert.That(call, Is.Not.Null);
+            Assert.That(call!.Operands[0], Is.SameAs((IOperand)readTag));
+            Assert.That(call.Operands[1], Is.SameAs((IOperand)tag));
+            Assert.That(call.Operands[2], Is.SameAs((IOperand)input));
+            Assert.That(call.Operands.Count, Is.EqualTo(3));
+            Assert.That(check, Is.Not.Null);
+            Assert.That(check!.Operands[1], Is.SameAs((IOperand)tag));
+        });
+    }
+
+    // When the caller applies the same pure transform to the leaf result that
+    // the forwarder's own body does (`!= 0` -> ReadBool), the transform is
+    // absorbed into the call.
+    [Test]
+    public void InaccessibleLeafCallAbsorbsSharedPostOp()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+
+        var parseContext = InjectedStruct("ParseContext");
+        var primitives = new InjectedTypeAnalysisContext(Mscorlib, "Tests", "ParsingPrimitives",
+            App.SystemTypes.SystemObjectType, TypeAttributes.Public);
+
+        var parseRawVarint64 = Member(primitives, "ParseRawVarint64",
+            App.SystemTypes.SystemUInt64Type,
+            MethodAttributes.Static | MethodAttributes.Assembly,
+            new ByRefTypeAnalysisContext(parseContext));
+        primitives.Methods.Add(parseRawVarint64);
+
+        var readBool = Member(parseContext, "ReadBool", App.SystemTypes.SystemBooleanType,
+            MethodAttributes.Public);
+        parseContext.Methods.Add(readBool);
+        var fwdThis = Local("this", parseContext);
+        var raw = Local("v47", App.SystemTypes.SystemUInt64Type);
+        var flag = Local("v59", App.SystemTypes.SystemBooleanType);
+        GiveBody(readBool, fwdThis, [],
+            new Instruction(0, OpCode.Call, parseRawVarint64, raw, fwdThis),
+            new Instruction(1, OpCode.CheckNotEqual, flag, raw, new Immediate(0)),
+            new Instruction(2, OpCode.Return, flag));
+
+        var caller = CallerIn(OtherAssembly);
+        var input = Local("input", new ByRefTypeAnalysisContext(parseContext));
+        var t = Local("t", App.SystemTypes.SystemUInt64Type);
+        var b = Local("b", App.SystemTypes.SystemBooleanType);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Call, parseRawVarint64, t, input),
+            new Instruction(1, OpCode.CheckNotEqual, b, t, new Immediate(0)),
+            new Instruction(2, OpCode.Return, b),
+        ]);
+
+        InlinedMemberRecovery.Run(caller);
+
+        var instructions = caller.ControlFlowGraph!.Blocks
+            .SelectMany(b => b.Instructions).ToList();
+        var call = instructions.FirstOrDefault(i => i.OpCode == OpCode.Call);
+        var move = instructions.FirstOrDefault(i => i.OpCode == OpCode.Move);
+        Assert.Multiple(() =>
+        {
+            Assert.That(call, Is.Not.Null);
+            Assert.That(call!.Operands[0], Is.SameAs((IOperand)readBool));
+            Assert.That(call.Operands[1], Is.SameAs((IOperand)t));
+            Assert.That(call.Operands[2], Is.SameAs((IOperand)input));
+            Assert.That(call.Operands.Count, Is.EqualTo(3));
+            // The check is the forwarder's own: it collapses to a move of the
+            // bool it now returns, and the result slot takes the member's type.
+            Assert.That(move, Is.Not.Null);
+            Assert.That(move!.Operands[0], Is.SameAs((IOperand)b));
+            Assert.That(move.Operands[1], Is.SameAs((IOperand)t));
+            Assert.That(t.Type, Is.SameAs(App.SystemTypes.SystemBooleanType));
+            Assert.That(instructions.Any(i => i.OpCode == OpCode.CheckNotEqual), Is.False);
+        });
+    }
+
+    // A member doing more than forwarding - a second call, a store, anything
+    // past the one leaf call - is no proven forwarder: the call keeps the
+    // inaccessible callee's name, as today.
+    [Test]
+    public void InaccessibleLeafCallStaysWhenMemberDoesMore()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+
+        var parseContext = InjectedStruct("ParseContext");
+        var state = InjectedStruct("ParserInternalState");
+        var primitives = new InjectedTypeAnalysisContext(Mscorlib, "Tests", "ParsingPrimitives",
+            App.SystemTypes.SystemObjectType, TypeAttributes.Public);
+
+        var parseTag = Member(primitives, "ParseTag", App.SystemTypes.SystemUInt32Type,
+            MethodAttributes.Static | MethodAttributes.Assembly,
+            new ByRefTypeAnalysisContext(parseContext),
+            new ByRefTypeAnalysisContext(state));
+        primitives.Methods.Add(parseTag);
+
+        var readTagTwice = Member(parseContext, "ReadTagTwice",
+            App.SystemTypes.SystemUInt32Type, MethodAttributes.Public);
+        parseContext.Methods.Add(readTagTwice);
+        var fwdThis = Local("this", parseContext);
+        var fwdState = Local("v44", new ByRefTypeAnalysisContext(state));
+        var first = Local("first", App.SystemTypes.SystemUInt32Type);
+        var second = Local("second", App.SystemTypes.SystemUInt32Type);
+        GiveBody(readTagTwice, fwdThis, [],
+            new Instruction(0, OpCode.Call, parseTag, first, fwdThis, fwdState),
+            new Instruction(1, OpCode.Call, parseTag, second, fwdThis, fwdState),
+            new Instruction(2, OpCode.Return, second));
+
+        var caller = CallerIn(OtherAssembly);
+        var input = Local("input", new ByRefTypeAnalysisContext(parseContext));
+        var callState = Local("v108", new ByRefTypeAnalysisContext(state));
+        var tag = Local("v111", App.SystemTypes.SystemUInt32Type);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.Add, callState, input, new Immediate(16)),
+            new Instruction(1, OpCode.Call, parseTag, tag, input, callState),
+            new Instruction(2, OpCode.Return, tag),
+        ]);
+
+        InlinedMemberRecovery.Run(caller);
+
+        var call = Body(caller).Instructions.FirstOrDefault(i => i.OpCode == OpCode.Call);
+        Assert.Multiple(() =>
+        {
+            Assert.That(call, Is.Not.Null);
+            Assert.That(call!.Operands[0], Is.SameAs((IOperand)parseTag));
+        });
+    }
+
+    // `N(ref this, message)` inside `M(message)`: the whole `this`, not a field
+    // of it, feeds the leaf - `input.ReadMessage(msg)` shape.
+    [Test]
+    public void InaccessibleLeafCallCallsForwarderThroughRefThis()
+    {
+        Cpp2IlApi.ResetInternalState();
+        TestGameLoader.LoadSimple2022Game();
+
+        var parseContext = InjectedStruct("ParseContext");
+        var primitives = new InjectedTypeAnalysisContext(Mscorlib, "Tests", "ParsingPrimitivesMessages",
+            App.SystemTypes.SystemObjectType, TypeAttributes.Public);
+
+        var readMessage = Member(primitives, "ReadMessage", App.SystemTypes.SystemVoidType,
+            MethodAttributes.Static | MethodAttributes.Assembly,
+            new ByRefTypeAnalysisContext(parseContext), App.SystemTypes.SystemObjectType);
+        primitives.Methods.Add(readMessage);
+
+        var fwd = Member(parseContext, "ReadMessage", App.SystemTypes.SystemVoidType,
+            MethodAttributes.Public, App.SystemTypes.SystemObjectType);
+        parseContext.Methods.Add(fwd);
+        var fwdThis = Local("this", parseContext);
+        var fwdMsg = Local("message", App.SystemTypes.SystemObjectType);
+        GiveBody(fwd, fwdThis, [fwdMsg],
+            new Instruction(0, OpCode.CallVoid, readMessage, fwdThis, fwdMsg),
+            new Instruction(1, OpCode.Return));
+
+        var caller = CallerIn(OtherAssembly);
+        var input = Local("input", new ByRefTypeAnalysisContext(parseContext));
+        var msg = Local("msg", App.SystemTypes.SystemObjectType);
+        caller.ControlFlowGraph = new ISILControlFlowGraph([
+            new Instruction(0, OpCode.CallVoid, readMessage, input, msg),
+            new Instruction(1, OpCode.Return),
+        ]);
+
+        InlinedMemberRecovery.Run(caller);
+
+        var call = caller.ControlFlowGraph!.Blocks.SelectMany(b => b.Instructions)
+            .FirstOrDefault(i => i.OpCode == OpCode.CallVoid);
+        Assert.Multiple(() =>
+        {
+            Assert.That(call, Is.Not.Null);
+            Assert.That(call!.Operands[0], Is.SameAs((IOperand)fwd));
+            Assert.That(call.Operands[1], Is.SameAs((IOperand)input));
+            Assert.That(call.Operands[2], Is.SameAs((IOperand)msg));
+            Assert.That(call.Operands.Count, Is.EqualTo(3));
+        });
+    }
 }
+

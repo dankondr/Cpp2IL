@@ -76,6 +76,58 @@ internal static class InaccessibleCalleeRecovery
     }
 
     /// <summary>
+    /// Whether the caller's own source could have named the callee: the declared
+    /// accessibility rules with no emitted friend scope. A binary can contain calls
+    /// to members the C# caller never wrote when the compiler inlined an accessible
+    /// forwarder down to its leaf — those are the calls this check separates from
+    /// ones the source made directly.
+    /// </summary>
+    /// <remarks>
+    /// Unlike <see cref="IsVisibleFrom"/>, the member-access check applies to every
+    /// declaring assembly: emission relaxes member flags on non-runtime assemblies
+    /// to public, but the source never saw them that way.
+    /// </remarks>
+    internal static bool IsVisibleFromSource(MethodAnalysisContext callee, MethodAnalysisContext caller)
+    {
+        var callerType = caller.DeclaringType;
+        if (callerType is null)
+            return true; // no metadata basis to judge the access
+
+        var concrete = callee as ConcreteGenericMethodAnalysisContext;
+        var declaring = concrete?.BaseMethodContext.DeclaringType ?? callee.DeclaringType;
+        if (declaring is not null)
+        {
+            var sameAssembly = SharesSourceInternals(callerType.DeclaringAssembly,
+                declaring.DeclaringAssembly);
+            var memberVisible = (callee.Attributes & MethodAttributes.MemberAccessMask) switch
+            {
+                MethodAttributes.Public => true,
+                MethodAttributes.Private => IsWithinOrSame(callerType, declaring) || IsWithinOrSame(declaring, callerType),
+                MethodAttributes.Assembly => sameAssembly,
+                MethodAttributes.Family => IsWithinOrSame(callerType, declaring) || callerType.IsAssignableTo(declaring),
+                MethodAttributes.FamANDAssem => sameAssembly && (IsWithinOrSame(callerType, declaring) || callerType.IsAssignableTo(declaring)),
+                MethodAttributes.FamORAssem => sameAssembly || IsWithinOrSame(callerType, declaring) || callerType.IsAssignableTo(declaring),
+                _ => false,
+            };
+            if (!memberVisible)
+                return false;
+        }
+
+        if (concrete != null)
+        {
+            if (!IsVisibleTypeFromSource(concrete.DeclaringType, callerType)
+                || !concrete.MethodGenericParameters.All(parameter =>
+                    IsVisibleTypeFromSource(parameter, callerType)))
+                return false;
+        }
+
+        foreach (var parameter in callee.Parameters)
+            if (!IsVisibleTypeFromSource(parameter.ParameterType, callerType))
+                return false;
+        return IsVisibleTypeFromSource(callee.ReturnType, callerType);
+    }
+
+    /// <summary>
     /// Whether every generic argument the concrete callee carries satisfies the
     /// constraint its open declaration declares. An erased shared-generic
     /// argument (object) can leave an instantiation no honest type fulfils -
@@ -196,6 +248,34 @@ internal static class InaccessibleCalleeRecovery
             _ => type.DeclaringAssembly is null || type.IsAccessibleTo(callerType),
         };
     }
+
+    /// <summary>
+    /// <see cref="IsVisibleType"/> under the caller's source scope: no emitted
+    /// friend internals, so a type only an emitted sibling could name fails here.
+    /// </summary>
+    internal static bool IsVisibleTypeFromSource(TypeAnalysisContext? type, TypeAnalysisContext callerType)
+    {
+        return type switch
+        {
+            null => true,
+            GenericInstanceTypeAnalysisContext instance => IsVisibleTypeFromSource(instance.GenericType, callerType)
+                && instance.GenericArguments.All(argument => IsVisibleTypeFromSource(argument, callerType))
+                && IsVisibleTypeFromSource(instance.DeclaringType, callerType),
+            WrappedTypeAnalysisContext wrapped => IsVisibleTypeFromSource(wrapped.ElementType, callerType),
+            GenericParameterTypeAnalysisContext or SentinelTypeAnalysisContext
+                or RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext
+                or RuntimeFieldInfoAnalysisContext or StaticFieldStorageTypeAnalysisContext
+                or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext => true,
+            _ => type.DeclaringAssembly is null
+                || type.IsAccessibleTo(callerType, emittedScope: false),
+        };
+    }
+
+    // The internal scope the caller's source compiled under: the same assembly,
+    // or one sharing its name. The original InternalsVisibleTo grants did not
+    // survive into il2cpp metadata, so name-sharing is the broadest recoverable scope.
+    private static bool SharesSourceInternals(AssemblyAnalysisContext? a, AssemblyAnalysisContext? b) =>
+        ReferenceEquals(a, b) || (a != null && b != null && a.Name == b.Name);
 
     private static bool IsWithinOrSame(TypeAnalysisContext candidate, TypeAnalysisContext declaring)
     {
