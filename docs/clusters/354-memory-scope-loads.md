@@ -20,7 +20,14 @@ copies.
    `BoundsArray` resolves every definition of a bounds block the same way
    (a `[base + bounds]` seed on any def, or a copy of another block) and
    requires all defs to agree on one array; `Length` gained the same
-   multi-definition arm for merged `[block + dim·2p]` reloads.
+   multi-definition arm for merged `[block + dim·2p]` reloads. Emitted
+   operands keep the *local* spelling of the array (`v`, not the
+   `FieldReference` `Root` canonicalizes to): the check prover values a
+   field read at the position of its load, so a copy local compares equal
+   wherever it is used — writing `this.grid` into `GetLength`/element
+   calls stranded the two length terms of one check on different write
+   epochs and the bounds-check fold never fired (the `TileWrite2d`
+   corpus regression).
 
 2. **Element addresses folded into one register** (`p = arr + i·stride +
    header; …; [p]` / `[p + k]`). `GuardedIndexAccess` needed a

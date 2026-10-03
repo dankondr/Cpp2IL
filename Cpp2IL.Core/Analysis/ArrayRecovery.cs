@@ -326,13 +326,15 @@ public static class ArrayRecovery
             : ElementSize(elementType, pointerSize);
 
         // A local, a field read, or a merged copy of either names its array: `v = this.grid`
-        // and a merge of two `this.grid` loads hold the same grid. The canonical operand -
-        // the field read or the typed local - is what emitted accesses spell.
+        // and a merge of two `this.grid` loads hold the same grid. The emitted operand keeps
+        // the spelling it was reached through (`v`, not `this.grid` directly): the check
+        // prover values a field read at the position of its load, so a copy of it compares
+        // equal wherever it is used.
         (IOperand Array, ArrayTypeAnalysisContext Type)? ArrayOperand(IOperand operand)
             => Root(operand) switch
             {
                 LocalVariable { Type: ArrayTypeAnalysisContext local } l => (l, local),
-                FieldReference { Field.FieldType: ArrayTypeAnalysisContext stored } f => (f, stored),
+                FieldReference { Field.FieldType: ArrayTypeAnalysisContext stored } => (operand, stored),
                 _ => null,
             };
 

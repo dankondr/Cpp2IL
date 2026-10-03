@@ -28,7 +28,8 @@ public class MergedScopeLoadTests
     // The jit may reload `[grid + bounds]` on each edge of a merge, leaving the
     // bounds pointer with several definitions that read the same word through
     // different copies of `this.grid`. The block still names one array, so its
-    // lengths are GetLength calls.
+    // lengths are GetLength calls - spelled by the local that holds the grid,
+    // the same operand the bounds-check prover matches the access against.
     [Test]
     public void MergedBoundsReloadsStillNameTheirLengths()
     {
@@ -72,7 +73,8 @@ public class MergedScopeLoadTests
             Assert.That(getLengths, Has.Count.EqualTo(2));
             Assert.That(getLengths.Select(i => ((Immediate)i.Operands[3]).Value),
                 Is.EqualTo(new long[] { 0, 1 }));
-            Assert.That(getLengths.All(i => i.Operands[2] is FieldReference { Field.Name: "grid" }),
+            Assert.That(getLengths.All(i => i.Operands[2] is LocalVariable
+                && (ReferenceEquals(i.Operands[2], first) || ReferenceEquals(i.Operands[2], second))),
                 Is.True);
             Assert.That(lengthRead.Operands[1], Is.Not.InstanceOf<MemoryOperand>());
             Assert.That(widthRead.Operands[1], Is.Not.InstanceOf<MemoryOperand>());
