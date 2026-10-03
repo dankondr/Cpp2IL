@@ -56,18 +56,55 @@ public static class ArrayRecovery
         var cfg = method.ControlFlowGraph!;
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
         var definitions = SingleDefinitions(cfg);
-        var bounds = new Dictionary<LocalVariable, LocalVariable>();
+        var allDefinitions = cfg.Instructions.Where(d => d.Destination is LocalVariable)
+            .GroupBy(d => (LocalVariable)d.Destination!).ToDictionary(g => g.Key, g => g.ToList());
+        var bounds = new Dictionary<LocalVariable, (IOperand Array, ArrayTypeAnalysisContext Type)>();
+
+        // `block` names the bounds pointer when every definition of it writes that same
+        // pointer: a `Move block, [array + bounds]` seed, or a copy of another block.
+        // The jit may reload `[array + bounds]` on each edge of a merge, leaving `block`
+        // a multi-definition copy of the same pointer from possibly different reloads
+        // of the array itself (a field read on each path names the same array, so the
+        // array operand is canonicalized past copies and merges before it is compared).
+        (IOperand Array, ArrayTypeAnalysisContext Type)? BoundsArray(LocalVariable block,
+            HashSet<LocalVariable>? visiting = null)
+        {
+            if (bounds.TryGetValue(block, out var recorded))
+                return recorded;
+            if (!allDefinitions.TryGetValue(block, out var defs) || defs.Count == 0
+                || !(visiting ??= []).Add(block))
+                return null;
+            IOperand? array = null;
+            ArrayTypeAnalysisContext? arrayType = null;
+            foreach (var def in defs)
+            {
+                var matched = def switch
+                {
+                    { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: LocalVariable baseLocal,
+                        Index: null, Scale: 0 } source] } when source.Addend == 2L * pointerSize
+                        => ArrayOperand(baseLocal),
+                    { OpCode: OpCode.Move, Operands: [_, LocalVariable source] } => BoundsArray(source, visiting),
+                    _ => null,
+                };
+                if (matched is not { } next
+                    || (array != null && !SameValue(array, next.Array)))
+                    return null;
+                (array, arrayType) = next;
+            }
+            if (array != null)
+                bounds[block] = (array, arrayType!);
+            return array == null ? null : (array, arrayType!);
+        }
+
         foreach (var instruction in cfg.Instructions)
             if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable block,
-                    MemoryOperand { Base: LocalVariable { Type: ArrayTypeAnalysisContext } array, Index: null, Scale: 0 } source] }
-                && source.Addend == 2L * pointerSize && definitions.TryGetValue(block, out var single) && single != null)
-                bounds[block] = array;
+                    MemoryOperand { Base: LocalVariable, Index: null, Scale: 0 } source] }
+                && source.Addend == 2L * pointerSize)
+                BoundsArray(block);
         if (bounds.Count == 0)
             return;
 
         var int32 = method.AppContext.SystemTypes.SystemInt32Type;
-        var allDefinitions = cfg.Instructions.Where(d => d.Destination is LocalVariable)
-            .GroupBy(d => (LocalVariable)d.Destination!).ToDictionary(g => g.Key, g => g.ToList());
         var columns = new Dictionary<LocalVariable, LocalVariable>();
         var getLength = method.AppContext.SystemTypes.SystemArrayType?.Methods
             .FirstOrDefault(m => m.Name == "GetLength" && m.Parameters.Count == 1);
@@ -86,15 +123,14 @@ public static class ArrayRecovery
                                 && definitions.TryGetValue(root, out var step)
                                 && step is { OpCode: OpCode.Add, Operands: [_, LocalVariable from, Immediate constant] }; depth++)
                 (root, addend) = (from, addend + constant.Value);
-            var matched = root.Type is ArrayTypeAnalysisContext
-                ? Element(root, null, addend, memory, instruction, i)
-                : definitions.TryGetValue(root, out var address)
+            var matched = Element(root, null, addend, memory, instruction, i)
+                ?? (definitions.TryGetValue(root, out var address)
                   && address is { OpCode: OpCode.Add, Operands: [_, var left, var right] }
                     ? Element(left, right, addend, memory, instruction, i) ?? Element(right, left, addend, memory, instruction, i)
                     : MergedElementAddress(root) is { } merged
                       ? Element(merged.A, merged.B, addend, memory, instruction, i)
                         ?? Element(merged.B, merged.A, addend, memory, instruction, i)
-                      : null;
+                      : null);
             if ((matched ?? Walk(pointer, memory, instruction, i)) is not { } element)
                 continue;
 
@@ -191,19 +227,29 @@ public static class ArrayRecovery
                     MakeNop(definition);
         return;
 
-        (LocalVariable Array, TypeAnalysisContext Dimensioned)? BoundsOf(IOperand operand)
-            => operand is LocalVariable block && bounds.TryGetValue(block, out var array) ? (array, array.Type!) : null;
+        (IOperand Array, ArrayTypeAnalysisContext Dimensioned)? BoundsOf(IOperand operand)
+            => operand is LocalVariable block && bounds.TryGetValue(block, out var owner) ? owner : null;
 
-        (LocalVariable Array, int Dimension)? Length(IOperand operand)
+        (IOperand Array, int Dimension)? Length(IOperand operand)
         {
             if (operand is LocalVariable local && definitions.TryGetValue(local, out var definition)
                 && definition is { OpCode: OpCode.Move, Operands: [_, MemoryOperand copied] })
                 operand = copied;
+            // A merged local whose every definition loads the same length from the same
+            // block (the jit may reload it on each edge) is that length read.
+            else if (operand is LocalVariable merged && allDefinitions.TryGetValue(merged, out var copies)
+                     && copies.Count > 1
+                     && copies.All(copy => copy is { OpCode: OpCode.Move, Operands: [_, MemoryOperand] }))
+            {
+                var first = copies[0].Operands[1];
+                if (copies.Skip(1).All(copy => SameValue(first, copy.Operands[1])))
+                    operand = first;
+            }
             return operand is MemoryOperand { Index: null, Scale: 0 } memory && memory.Base != null
                 && BoundsOf(memory.Base) is { } owner
                 && memory.Addend % (2L * pointerSize) == 0
                 && memory.Addend / (2L * pointerSize) is var dimension
-                && dimension < ((ArrayTypeAnalysisContext)owner.Dimensioned).Rank
+                && dimension < owner.Dimensioned.Rank
                 ? (owner.Array, (int)dimension)
                 : null;
         }
@@ -216,22 +262,17 @@ public static class ArrayRecovery
         (IOperand Array, ArrayTypeAnalysisContext Type, List<IOperand> Indices, FieldAnalysisContext? Field)?
             Element(IOperand array, IOperand? offset, long addend, MemoryOperand memory, Instruction user, int operandIndex)
         {
-            var arrayType = array switch
-            {
-                LocalVariable { Type: ArrayTypeAnalysisContext local } => local,
-                FieldReference { Field.FieldType: ArrayTypeAnalysisContext stored } => stored,
-                _ => null,
-            };
-            if (arrayType == null)
+            if (ArrayOperand(array) is not { } resolved)
                 return null;
+            var (canonical, arrayType) = resolved;
             var elementType = arrayType.ElementType;
             var size = SizeOf(elementType);
             var relative = addend - ElementsOffset(pointerSize);
             if (size <= 0 || relative < 0
                 || (offset == null ? Enumerable.Repeat<IOperand>(new Immediate(0), arrayType.Rank).ToList()
-                    : ScaledIndex(offset, size, definitions, 0) is { } flat ? Indices(flat, arrayType.Rank, array)
-                    : ConstantOuter(offset, size, array, arrayType.Rank)) is not { } indices
-                || indices.Select((index, dimension) => index is Immediate || Compared(index, array, dimension)).Any(ok => !ok))
+                    : ScaledIndex(offset, size, definitions, 0) is { } flat ? Indices(flat, arrayType.Rank, canonical)
+                    : ConstantOuter(offset, size, canonical, arrayType.Rank)) is not { } indices
+                || indices.Select((index, dimension) => index is Immediate || Compared(index, canonical, dimension)).Any(ok => !ok))
                 return null;
             // A constant last index is folded into the displacement: `grid[1, 1]` of 8-byte elements
             // is `[grid + (len1 << 3) + 0x28]`.
@@ -243,7 +284,7 @@ public static class ArrayRecovery
             }
 
             return Part(elementType, size, relative % size, memory, user, operandIndex)
-                is { } part ? (array, arrayType, indices, part.Field) : null;
+                is { } part ? (canonical, arrayType, indices, part.Field) : null;
         }
 
         // A constant outer index scales the last length by index·size in one step: `grid[2, j]`
@@ -284,12 +325,21 @@ public static class ArrayRecovery
             ? MetadataElementSize(elementType, pointerSize)
             : ElementSize(elementType, pointerSize);
 
-        static ArrayTypeAnalysisContext? GridType(IOperand operand) => operand switch
-        {
-            LocalVariable { Type: ArrayTypeAnalysisContext { Rank: 2 } local } => local,
-            FieldReference { Field.FieldType: ArrayTypeAnalysisContext { Rank: 2 } stored } => stored,
-            _ => null,
-        };
+        // A local, a field read, or a merged copy of either names its array: `v = this.grid`
+        // and a merge of two `this.grid` loads hold the same grid. The emitted operand keeps
+        // the spelling it was reached through (`v`, not `this.grid` directly): the check
+        // prover values a field read at the position of its load, so a copy of it compares
+        // equal wherever it is used.
+        (IOperand Array, ArrayTypeAnalysisContext Type)? ArrayOperand(IOperand operand)
+            => Root(operand) switch
+            {
+                LocalVariable { Type: ArrayTypeAnalysisContext local } l => (l, local),
+                FieldReference { Field.FieldType: ArrayTypeAnalysisContext stored } => (operand, stored),
+                _ => null,
+            };
+
+        (IOperand Array, ArrayTypeAnalysisContext Type)? GridOperand(IOperand operand)
+            => ArrayOperand(operand) is { Type.Rank: 2 } grid ? grid : null;
 
         // Walks along the last dimension of a T[,] (only rank 2). A row walk starts a pointer at
         // `data + len1·s` - s the row index scaled by the element size, directly or as a
@@ -309,19 +359,19 @@ public static class ArrayRecovery
             if (defs.Count == 1 && defs[0] is { OpCode: OpCode.Add, Operands: [_, var a, var b] })
                 foreach (var (array, offset) in new[] { (a, b), (b, a) })
                 {
-                    if (GridType(array) is not { } offsetGrid || offset is not LocalVariable off
+                    if (GridOperand(array) is not { } offsetGrid || offset is not LocalVariable off
                         || Induction(off) is not { } offInduction)
                         continue;
-                    var size = SizeOf(offsetGrid.ElementType);
+                    var size = SizeOf(offsetGrid.Type.ElementType);
                     var relative = memory.Addend + offInduction.Start - ElementsOffset(pointerSize);
                     if (size <= 0 || offInduction.Step != size || relative < 0)
                         continue;
                     var counter = allDefinitions.Keys.FirstOrDefault(k => Induction(k) is { Step: 1 } kInduction
                         && kInduction.Start == relative / size && CoInductive(kInduction, offInduction, user));
-                    if (counter == null || !Compared(counter, array, 1)
-                        || Part(offsetGrid.ElementType, size, relative % size, memory, user, operandIndex) is not { } part)
+                    if (counter == null || !Compared(counter, offsetGrid.Array, 1)
+                        || Part(offsetGrid.Type.ElementType, size, relative % size, memory, user, operandIndex) is not { } part)
                         continue;
-                    return (array, offsetGrid, [new Immediate(0), counter], part.Field);
+                    return (offsetGrid.Array, offsetGrid.Type, [new Immediate(0), counter], part.Field);
                 }
 
             if (defs.Count != 2)
@@ -333,10 +383,11 @@ public static class ArrayRecovery
                 return null;
             foreach (var (dataStart, rowOffset) in new[] { (x, y), (y, x) })
             {
-                if (Definition(dataStart) is not { OpCode: OpCode.Add, Operands: [_, var array, Immediate header] }
-                    || header.Value != ElementsOffset(pointerSize) || GridType(array) is not { } grid)
+                if (Definition(dataStart) is not { OpCode: OpCode.Add, Operands: [_, var dataBase, Immediate header] }
+                    || header.Value != ElementsOffset(pointerSize) || GridOperand(dataBase) is not { } grid)
                     continue;
-                var size = SizeOf(grid.ElementType);
+                var array = grid.Array;
+                var size = SizeOf(grid.Type.ElementType);
                 if (size <= 0 || ((Immediate)step.Operands[2]).Value != size || memory.Addend < 0 || memory.Addend >= size)
                     continue;
                 var row = ScaledIndex(rowOffset, size, definitions, 0) is { } flat && Factor(flat, array, 1) is { } scaled
@@ -349,7 +400,7 @@ public static class ArrayRecovery
                         : null;
                 if (row == null || row is not Immediate && !Compared(row, array, 0)
                     || row is LocalVariable rowLocal && ChangesBetween(rowLocal, start, user)
-                    || Part(grid.ElementType, size, memory.Addend, memory, user, operandIndex) is not { } part)
+                    || Part(grid.Type.ElementType, size, memory.Addend, memory, user, operandIndex) is not { } part)
                     continue;
                 if (!columns.TryGetValue(pointer, out var column))
                 {
@@ -357,7 +408,7 @@ public static class ArrayRecovery
                     InsertAfter(start, new Instruction(-1, OpCode.Move, column, new Immediate(0)));
                     InsertAfter(step, new Instruction(-1, OpCode.Add, column, column, new Immediate(1)));
                 }
-                return (array, grid, [row, column], part.Field);
+                return (array, grid.Type, [row, column], part.Field);
             }
             return null;
         }
@@ -524,8 +575,8 @@ public static class ArrayRecovery
         // `shift x, 32` emitted once per use, like a bound check's copy of the index.
         bool SameValue(IOperand a, IOperand b, int depth = 0)
         {
-            a = Root(Unextended(a));
-            b = Root(Unextended(b));
+            a = Root(Unextended(a), depth);
+            b = Root(Unextended(b), depth);
             return ReferenceEquals(a, b)
                 || a is FieldReference fa && b is FieldReference fb && fa.Field == fb.Field
                    && fa.Containers.SequenceEqual(fb.Containers) && SameValue(fa.Local, fb.Local, depth + 1)
@@ -544,12 +595,39 @@ public static class ArrayRecovery
                && db != null && db.OpCode == da.OpCode && da.Operands.Count == db.Operands.Count
                && da.Operands.Skip(1).Zip(db.Operands.Skip(1)).All(pair => SameValue(pair.First, pair.Second, depth));
 
-        IOperand Root(IOperand operand)
+        IOperand Root(IOperand operand, int depth = 0)
         {
-            for (var depth = 0; depth < 8 && Definition(operand) is { OpCode: OpCode.Move, Operands: [_, var source] }
-                                 && source is LocalVariable or FieldReference; depth++)
-                operand = source;
+            for (; depth < 8; depth++)
+            {
+                if (Definition(operand) is { OpCode: OpCode.Move, Operands: [_, var source] }
+                    && source is LocalVariable or FieldReference)
+                    operand = source;
+                else if (operand is LocalVariable merged && MergedCopy(merged, depth) is { } agreed)
+                    operand = agreed;
+                else
+                    break;
+            }
             return operand;
+        }
+
+        // Every definition of `local` copies a value all its sources agree on (through
+        // more copies and reloads of the same field): the merged local names that value.
+        IOperand? MergedCopy(LocalVariable local, int depth)
+        {
+            if (!allDefinitions.TryGetValue(local, out var defs) || defs.Count < 2)
+                return null;
+            IOperand? common = null;
+            foreach (var def in defs)
+            {
+                if (def is not { OpCode: OpCode.Move, Operands: [_, var source] }
+                    || source is not (LocalVariable or FieldReference))
+                    return null;
+                var root = Root(source, depth + 1);
+                if (common != null && !SameValue(common, root, depth + 1))
+                    return null;
+                common = root;
+            }
+            return common;
         }
 
         static bool Mentions(IOperand operand, LocalVariable local) => operand switch
@@ -1376,7 +1454,7 @@ public static class ArrayRecovery
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
-            RecoverAllocation(instruction);
+            RecoverAllocation(instruction, guardContext.AllDefinitions);
 
             for (var i = 0; i < instruction.Operands.Count; i++)
             {
@@ -1396,6 +1474,9 @@ public static class ArrayRecovery
                     else if (GuardedIndexAccess(method, instruction, i, memory, pointerSize, definitions,
                                  () => uses ??= CollectUses(method.ControlFlowGraph!), guardContext) is { } guardedDerived)
                         instruction.SetOperand(i, guardedDerived);
+                    else if (FoldedElementAccess(method, instruction, i, memory, pointerSize, definitions,
+                                 () => uses ??= CollectUses(method.ControlFlowGraph!), guardContext) is { } foldedDerived)
+                        instruction.SetOperand(i, foldedDerived);
                     else if (LengthWordLoad(instruction, i, memory, pointerSize, definitions) is { } lengthArray)
                     {
                         instruction.SetOperand(i, new ArrayLength(lengthArray));
@@ -1667,6 +1748,29 @@ public static class ArrayRecovery
         SzArrayTypeAnalysisContext arrayType,
         Affine baseAffine)
     {
+        var indexAffine = ScaleBy(Evaluate(memory.Index, definitions, 0, true), Math.Max(memory.Scale, 1));
+        if (indexAffine is not { Root: { } } idx)
+        {
+            return null;
+        }
+        return GuardedIndexAccessResolved(method, instruction, operandIndex, memory, pointerSize,
+            definitions, uses, context, array, arrayType, idx, baseAffine.Offset + memory.Addend);
+    }
+
+    private static IOperand? GuardedIndexAccessResolved(
+        MethodAnalysisContext method,
+        Instruction instruction,
+        int operandIndex,
+        MemoryOperand memory,
+        int pointerSize,
+        Dictionary<LocalVariable, Instruction?> definitions,
+        Func<Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>>> uses,
+        GuardedIndexContext context,
+        LocalVariable array,
+        SzArrayTypeAnalysisContext arrayType,
+        Affine idx,
+        long offset)
+    {
         var elementSize = ElementSize(arrayType.ElementType, pointerSize);
         if (elementSize == 0 && arrayType.ElementType.IsValueType)
             elementSize = MetadataElementSize(arrayType.ElementType, pointerSize);
@@ -1687,8 +1791,7 @@ public static class ArrayRecovery
             return null;
         }
 
-        var indexAffine = ScaleBy(Evaluate(memory.Index, definitions, 0, true), Math.Max(memory.Scale, 1));
-        if (indexAffine is not { Root: { } indexRoot } idx)
+        if (idx is not { Root: { } indexRoot })
         {
             return null;
         }
@@ -1698,7 +1801,7 @@ public static class ArrayRecovery
         }
 
         var multiplier = idx.Multiplier / elementSize;
-        var tail = idx.Offset + baseAffine.Offset + memory.Addend - ElementsOffset(pointerSize);
+        var tail = idx.Offset + offset - ElementsOffset(pointerSize);
         var fieldOffset = tail % elementSize;
         if (fieldOffset < 0)
             fieldOffset += elementSize;
@@ -1776,6 +1879,110 @@ public static class ArrayRecovery
         return access.Field is { } elementField
             ? new ArrayElementFieldReference(array, access.Index, elementField)
             : new ArrayAccess(array, access.Index);
+    }
+
+    // Element accesses whose whole address - array, index and element-region
+    // offset - is folded into a register: `[p]` or `[p + k]` whose base `p` is
+    // `array + i·stride + tail`. The jit materializes such an element address
+    // once (`add`/`lsl` chains) when it is dereferenced more than once, so no
+    // `[arr + i·s + off]` operand survives to match. Flatten the base local's
+    // address arithmetic into the array leaf, the index affine and a folded
+    // constant, then prove and emit it like the subscripted form.
+    private static IOperand? FoldedElementAccess(
+        MethodAnalysisContext method,
+        Instruction instruction,
+        int operandIndex,
+        MemoryOperand memory,
+        int pointerSize,
+        Dictionary<LocalVariable, Instruction?> definitions,
+        Func<Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>>> uses,
+        GuardedIndexContext context)
+    {
+        // The same position rule as GuardedIndexAccess: the operand must consume
+        // the element value, not feed address arithmetic.
+        if (memory.Index != null || memory.Base is not LocalVariable pointer
+            || method.DominatorInfo == null
+            || instruction.OpCode is not (OpCode.Move
+                or OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall
+                or OpCode.CheckEqual or OpCode.CheckNotEqual
+                or OpCode.CheckLess or OpCode.CheckGreater
+                or OpCode.CheckLessOrEqual or OpCode.CheckGreaterOrEqual
+                or OpCode.Return or OpCode.Throw))
+        {
+            return null;
+        }
+
+        var terms = new List<(IOperand Leaf, long Multiplier)>();
+        var offset = 0L;
+        FlattenAddress(pointer, 1, 0, definitions, terms, ref offset);
+        if (terms.Count == 0)
+            return null;
+
+        // Exactly one leaf must resolve to the array; every other leaf folds
+        // into the index affine (they must share one root, or `Sum` refuses).
+        LocalVariable? array = null;
+        Affine? index = new Affine(null, 0, 0);
+        foreach (var (leaf, termMultiplier) in terms)
+        {
+            if (termMultiplier == 1 && ResolveArray(leaf, definitions, 0) is { } resolved)
+            {
+                if (array != null)
+                    return null;
+                array = resolved;
+                continue;
+            }
+            index = Sum(index, ScaleBy(Evaluate(leaf, definitions, 0, true), termMultiplier));
+            if (index == null)
+                return null;
+        }
+
+        if (array?.Type is not SzArrayTypeAnalysisContext arrayType)
+            return null;
+        return GuardedIndexAccessResolved(method, instruction, operandIndex, memory, pointerSize,
+            definitions, uses, context, array, arrayType, index.Value, offset + memory.Addend);
+    }
+
+    // The leaf terms of `operand`'s address arithmetic: `Move` copies and
+    // `Add`/`Subtract`/`Multiply`/`ShiftLeft` definitions are unfolded with
+    // their immediate contributions accumulated into `offset`; everything else
+    // stays an opaque leaf scaled by the enclosing multiplier.
+    private static void FlattenAddress(IOperand operand, long multiplier, int depth,
+        Dictionary<LocalVariable, Instruction?> definitions,
+        List<(IOperand Leaf, long Multiplier)> terms, ref long offset)
+    {
+        if (operand is Immediate immediate)
+        {
+            offset += immediate.Value * multiplier;
+            return;
+        }
+        if (operand is LocalVariable local && depth <= 8
+            && definitions.TryGetValue(local, out var definition) && definition != null)
+        {
+            switch (definition)
+            {
+                // Move and sign-extension copies carry the same value.
+                case { OpCode: OpCode.Move or OpCode.SignExtend32, Operands: [_, var source] }:
+                    FlattenAddress(source, multiplier, depth + 1, definitions, terms, ref offset);
+                    return;
+                case { OpCode: OpCode.Add, Operands: [_, var left, var right] }:
+                    FlattenAddress(left, multiplier, depth + 1, definitions, terms, ref offset);
+                    FlattenAddress(right, multiplier, depth + 1, definitions, terms, ref offset);
+                    return;
+                case { OpCode: OpCode.Subtract, Operands: [_, var left, var right] }:
+                    FlattenAddress(left, multiplier, depth + 1, definitions, terms, ref offset);
+                    FlattenAddress(right, -multiplier, depth + 1, definitions, terms, ref offset);
+                    return;
+                case { OpCode: OpCode.Multiply, Operands: [_, var value, Immediate factor] }:
+                    FlattenAddress(value, multiplier * factor.Value, depth + 1, definitions,
+                        terms, ref offset);
+                    return;
+                case { OpCode: OpCode.ShiftLeft, Operands: [_, var value, Immediate { Value: >= 0 and < 64 } shift] }:
+                    FlattenAddress(value, multiplier << (int)shift.Value, depth + 1, definitions,
+                        terms, ref offset);
+                    return;
+            }
+        }
+        terms.Add((operand, multiplier));
     }
 
     // Whether an operand carrying `emittedType` may occupy the slot it would
@@ -1978,14 +2185,16 @@ public static class ArrayRecovery
             if (candidate.OpCode != OpCode.CheckLess
                 || candidate.Operands is not [LocalVariable { Register.Name: "C" } flag, _, _]
                 || Evaluate(candidate.Operands[1], definitions, 0, true) is not { } compared
-                || !ReferenceEquals(compared.Root, elementIndex.Root)
+                || !(compared.Root == null && elementIndex.Root == null
+                     || compared.Root != null && elementIndex.Root != null
+                        && SameOperandValue(compared.Root, elementIndex.Root, context.AllDefinitions))
                 || compared.Multiplier != elementIndex.Multiplier
                 || compared.Offset != elementIndex.Offset)
                 continue;
 
             if (EvaluateSeed(candidate.Operands[2], context.AllDefinitions, method, []) is not
                     { Type: SeedType.Length, Array: { } checkedArray }
-                || !ReferenceEquals(checkedArray, array))
+                || !SameOperandValue(checkedArray, array, context.AllDefinitions))
                 continue;
 
             if (GuardedEdges(flag, uses(), context.HomeMap) is { } inBounds
@@ -2207,11 +2416,22 @@ public static class ArrayRecovery
         return false;
     }
 
-    private static void RecoverAllocation(Instruction instruction)
+    private static void RecoverAllocation(Instruction instruction,
+        Dictionary<LocalVariable, List<Instruction>> allDefinitions)
     {
         // Call "SzArrayNew", result, typeof(T[]), length, ...
-        if (!instruction.IsCall || instruction.Operands is not [StringLiteral { Value: var name }, LocalVariable result, TypeAnalysisContext type, { } length, ..]
+        if (!instruction.IsCall || instruction.Operands is not [StringLiteral { Value: var name }, LocalVariable result, { } typeOperand, { } length, ..]
             || !ArrayNewFunctions.Contains(name))
+            return;
+
+        // The type operand usually lands as a literal `Type:` constant once copy
+        // propagation folds it into the call, but shared-generic allocation sites
+        // keep it in a register (the constant is only `Move`d there, possibly
+        // along more than one definition edge). Chase those copies and require
+        // they all name one type.
+        var type = typeOperand as SzArrayTypeAnalysisContext
+            ?? NewArrayTypeOperand(typeOperand, allDefinitions);
+        if (type == null)
             return;
 
         instruction.OpCode = OpCode.NewArr;
@@ -2219,6 +2439,48 @@ public static class ArrayRecovery
 
         if (result.Type is not SzArrayTypeAnalysisContext)
             result.Type = type;
+    }
+
+    // The array type the operand's `SzArrayNew` type slot names: a literal
+    // `Type: T[]` constant, a local already typed as the `Il2CppClass<T[]>`
+    // runtime-class pointer (shared-generic sites keep the klass in a register
+    // instead of folding the constant into the call), or `Move` copies of
+    // either - every definition must agree on one array type.
+    private static SzArrayTypeAnalysisContext? NewArrayTypeOperand(IOperand operand,
+        Dictionary<LocalVariable, List<Instruction>> definitions, int depth = 0)
+    {
+        switch (operand)
+        {
+            case SzArrayTypeAnalysisContext type:
+                return type;
+            case RuntimeClassTypeAnalysisContext
+            {
+                RepresentedType: SzArrayTypeAnalysisContext represented,
+            }:
+                return represented;
+            case LocalVariable
+            {
+                Type: RuntimeClassTypeAnalysisContext
+                {
+                    RepresentedType: SzArrayTypeAnalysisContext represented,
+                },
+            }:
+                return represented;
+            case LocalVariable local when depth < 8
+                && definitions.TryGetValue(local, out var defs) && defs.Count > 0:
+                SzArrayTypeAnalysisContext? resolved = null;
+                foreach (var def in defs)
+                {
+                    if (def is not { OpCode: OpCode.Move, Operands: [_, var source] }
+                        || NewArrayTypeOperand(source, definitions, depth + 1) is not { } resolvedType
+                        || (resolved != null && resolved.FullName != resolvedType.FullName))
+                        return null;
+                    resolved = resolvedType;
+                }
+                return resolved;
+            default:
+                return null;
+        }
     }
 
     private static IOperand? ElementIndex(MemoryOperand memory, SzArrayTypeAnalysisContext arrayType, int pointerSize)
@@ -2529,6 +2791,58 @@ public static class ArrayRecovery
 
     private static Affine? ScaleBy(Affine? value, long factor)
         => value is { } affine ? new Affine(affine.Root, affine.Multiplier * factor, affine.Offset * factor) : null;
+
+    // A local whose every definition copies the same value (the jit reloading the same
+    // field on each edge, or plain copies) names that value: chase copy-only definition
+    // chains to the operand they all reproduce, single-definition or merged alike.
+    private static IOperand ValueRoot(IOperand operand,
+        Dictionary<LocalVariable, List<Instruction>> definitions, int depth = 0)
+    {
+        while (depth++ < 8 && operand is LocalVariable local
+            && definitions.TryGetValue(local, out var defs) && defs.Count > 0)
+        {
+            IOperand? source = null;
+            var copies = true;
+            foreach (var def in defs)
+            {
+                // A SignExtend32 copy carries the same integer value as its
+                // source, so it unwinds like a Move for value equality.
+                if (def is not { OpCode: OpCode.Move or OpCode.SignExtend32, Operands: [_, var s] }
+                    || s is not (LocalVariable or FieldReference))
+                {
+                    copies = false;
+                    break;
+                }
+                var root = ValueRoot(s, definitions, depth);
+                if (source != null && !SameOperandValue(source, root, definitions, depth))
+                {
+                    copies = false;
+                    break;
+                }
+                source = root;
+            }
+            if (!copies || source == null)
+                break;
+            operand = source;
+        }
+        return operand;
+    }
+
+    // Whether two operands name the same value once copies, merged copies and reloads
+    // of the same field are accounted for.
+    private static bool SameOperandValue(IOperand a, IOperand b,
+        Dictionary<LocalVariable, List<Instruction>> definitions, int depth = 0)
+    {
+        if (depth > 8)
+            return false;
+        a = ValueRoot(a, definitions, depth);
+        b = ValueRoot(b, definitions, depth);
+        return ReferenceEquals(a, b)
+            || a is FieldReference fa && b is FieldReference fb && fa.Field == fb.Field
+               && fa.Containers.SequenceEqual(fb.Containers)
+               && SameOperandValue(fa.Local, fb.Local, definitions, depth + 1)
+            || a is Immediate ia && b is Immediate ib && ia.Value == ib.Value;
+    }
 
     // null means the local has more than one definition
     private static Dictionary<LocalVariable, Instruction?> SingleDefinitions(ISILControlFlowGraph cfg)
@@ -3079,7 +3393,7 @@ public static class ArrayRecovery
             && instruction.Operands.Skip(1).Any(o => ReferenceEquals(o, candidate))
             && instruction.Operands.Skip(1).Any(o =>
                 EvaluateSeed(o, definitions, method, []) is { Type: SeedType.Length, Array: { } lengthArray }
-                && ReferenceEquals(lengthArray, array)));
+                && SameOperandValue(lengthArray, array, definitions)));
 
     private static LoopCounter? FindLoopCounter(List<LoopCounter> counters,
         Dictionary<LocalVariable, List<Instruction>> definitions, Block block)
