@@ -140,6 +140,137 @@ public class ByReferenceArgumentTests
         Assert.That(call.Operands[1], Is.TypeOf<AddressOf>());
     }
 
+    // castle-recovery#327: the frame model splits a wide copy into one cell per
+    // word, each cell filled from the source's next bytes. `&head` still names a
+    // whole copy of the source, so a by-value call passes the source's value -
+    // the head cell alone is not it.
+    [Test]
+    public void FragmentedCopyOfOneSourcePassesTheSource()
+    {
+        var head = Slot("stack_-108");
+        var tail = Slot("stack_-F8");
+        var source = new LocalVariable("result", new Register(null, "X1"), _loadout);
+        var bridge = new LocalVariable("ptr", new Register(null, "X19", 1), null);
+        var lane0 = new LocalVariable("lane0", new Register(null, "V0", 1), null);
+        var lane1 = new LocalVariable("lane1", new Register(null, "V1", 1), null);
+        var call = new Instruction(10, OpCode.CallVoid, Callee(_loadout), new AddressOf(head));
+        var caller = Caller(
+            new Instruction(0, OpCode.Move, bridge, source),
+            new Instruction(1, OpCode.Move, lane0, new MemoryOperand(bridge, addend: 0, accessSize: 16)),
+            new Instruction(2, OpCode.Move, head, lane0),
+            new Instruction(3, OpCode.Move, lane1, new MemoryOperand(bridge, addend: 16, accessSize: 16)),
+            new Instruction(4, OpCode.Move, tail, lane1),
+            call);
+
+        ByReferenceArgumentRecovery.Run(caller);
+
+        Assert.That(call.Operands[1], Is.SameAs(source));
+        Assert.That(head.Type, Is.Null, "the fragment itself is not retyped");
+    }
+
+    // The same fragmented shape where the lanes are phi-merged: both paths
+    // filled the merged local from the same source bytes, so the whole copy
+    // still images that source.
+    [Test]
+    public void FragmentedCopyThroughConvergingPhiPassesTheSource()
+    {
+        var head = Slot("stack_-108");
+        var tail = Slot("stack_-F8");
+        var source = new LocalVariable("result", new Register(null, "X1"), _loadout);
+        var bridge = new LocalVariable("ptr", new Register(null, "X19", 1), null);
+        var edgeA0 = new LocalVariable("eA0", new Register(null, "V0", 2), null);
+        var edgeB0 = new LocalVariable("eB0", new Register(null, "V0", 3), null);
+        var merged0 = new LocalVariable("m0", new Register(null, "V0", 4), null);
+        var lane0 = new LocalVariable("lane0", new Register(null, "V0", 5), null);
+        var edgeA1 = new LocalVariable("eA1", new Register(null, "V1", 2), null);
+        var edgeB1 = new LocalVariable("eB1", new Register(null, "V1", 3), null);
+        var merged1 = new LocalVariable("m1", new Register(null, "V1", 4), null);
+        var lane1 = new LocalVariable("lane1", new Register(null, "V1", 5), null);
+        var call = new Instruction(20, OpCode.CallVoid, Callee(_loadout), new AddressOf(head));
+        var caller = Caller(
+            new Instruction(0, OpCode.Move, bridge, source),
+            new Instruction(1, OpCode.Move, edgeA0, new MemoryOperand(bridge, addend: 0, accessSize: 16)),
+            new Instruction(2, OpCode.Move, edgeB0, new MemoryOperand(bridge, addend: 0, accessSize: 16)),
+            new Instruction(3, OpCode.Phi, merged0, edgeA0, edgeB0),
+            new Instruction(4, OpCode.Move, lane0, merged0),
+            new Instruction(5, OpCode.Move, head, lane0),
+            new Instruction(6, OpCode.Move, edgeA1, new MemoryOperand(bridge, addend: 16, accessSize: 16)),
+            new Instruction(7, OpCode.Move, edgeB1, new MemoryOperand(bridge, addend: 16, accessSize: 16)),
+            new Instruction(8, OpCode.Phi, merged1, edgeA1, edgeB1),
+            new Instruction(9, OpCode.Move, lane1, merged1),
+            new Instruction(10, OpCode.Move, tail, lane1),
+            call);
+
+        ByReferenceArgumentRecovery.Run(caller);
+
+        Assert.That(call.Operands[1], Is.SameAs(source));
+        Assert.That(head.Type, Is.Null);
+    }
+
+    // A phi whose edges read different bytes is not one copy: the address stays
+    // rather than pass a value only some paths stored.
+    [Test]
+    public void FragmentedCopyThroughDivergingPhiKeepsItsAddress()
+    {
+        var head = Slot("stack_-108");
+        var tail = Slot("stack_-F8");
+        var source = new LocalVariable("result", new Register(null, "X1"), _loadout);
+        var bridge = new LocalVariable("ptr", new Register(null, "X19", 1), null);
+        var other = new LocalVariable("optr", new Register(null, "X20", 1), null);
+        var edgeA0 = new LocalVariable("eA0", new Register(null, "V0", 2), null);
+        var edgeB0 = new LocalVariable("eB0", new Register(null, "V0", 3), null);
+        var merged0 = new LocalVariable("m0", new Register(null, "V0", 4), null);
+        var lane0 = new LocalVariable("lane0", new Register(null, "V0", 5), null);
+        var edgeA1 = new LocalVariable("eA1", new Register(null, "V1", 2), null);
+        var edgeB1 = new LocalVariable("eB1", new Register(null, "V1", 3), null);
+        var merged1 = new LocalVariable("m1", new Register(null, "V1", 4), null);
+        var lane1 = new LocalVariable("lane1", new Register(null, "V1", 5), null);
+        var call = new Instruction(20, OpCode.CallVoid, Callee(_loadout), new AddressOf(head));
+        var caller = Caller(
+            new Instruction(0, OpCode.Move, bridge, source),
+            new Instruction(1, OpCode.Move, edgeA0, new MemoryOperand(bridge, addend: 0, accessSize: 16)),
+            new Instruction(2, OpCode.Move, edgeB0, new MemoryOperand(other, addend: 0, accessSize: 16)),
+            new Instruction(3, OpCode.Phi, merged0, edgeA0, edgeB0),
+            new Instruction(4, OpCode.Move, lane0, merged0),
+            new Instruction(5, OpCode.Move, head, lane0),
+            new Instruction(6, OpCode.Move, edgeA1, new MemoryOperand(bridge, addend: 16, accessSize: 16)),
+            new Instruction(7, OpCode.Move, edgeB1, new MemoryOperand(other, addend: 16, accessSize: 16)),
+            new Instruction(8, OpCode.Phi, merged1, edgeA1, edgeB1),
+            new Instruction(9, OpCode.Move, lane1, merged1),
+            new Instruction(10, OpCode.Move, tail, lane1),
+            call);
+
+        ByReferenceArgumentRecovery.Run(caller);
+
+        Assert.That(call.Operands[1], Is.TypeOf<AddressOf>());
+    }
+
+    // The same fragmented shape with a sibling that writes a cell: the copy is
+    // not frozen, so the address stays rather than pass diverging bytes.
+    [Test]
+    public void FragmentedCopyMutatedAfterFillKeepsItsAddress()
+    {
+        var head = Slot("stack_-108");
+        var tail = Slot("stack_-F8");
+        var source = new LocalVariable("result", new Register(null, "X1"), _loadout);
+        var bridge = new LocalVariable("ptr", new Register(null, "X19", 1), null);
+        var lane0 = new LocalVariable("lane0", new Register(null, "V0", 1), null);
+        var lane1 = new LocalVariable("lane1", new Register(null, "V1", 1), null);
+        var call = new Instruction(10, OpCode.CallVoid, Callee(_loadout), new AddressOf(head));
+        var caller = Caller(
+            new Instruction(0, OpCode.Move, bridge, source),
+            new Instruction(1, OpCode.Move, lane0, new MemoryOperand(bridge, addend: 0, accessSize: 16)),
+            new Instruction(2, OpCode.Move, head, lane0),
+            new Instruction(3, OpCode.Move, lane1, new MemoryOperand(bridge, addend: 16, accessSize: 16)),
+            new Instruction(4, OpCode.Move, tail, lane1),
+            new Instruction(5, OpCode.Move, tail, new Immediate(0)),
+            call);
+
+        ByReferenceArgumentRecovery.Run(caller);
+
+        Assert.That(call.Operands[1], Is.TypeOf<AddressOf>());
+    }
+
     // The copy itself is fed from a frame slot nothing writes (a register copy
     // out of a hidden-return slot the lift does not connect to the call's result):
     // the argument keeps its address rather than pass unassigned bytes.

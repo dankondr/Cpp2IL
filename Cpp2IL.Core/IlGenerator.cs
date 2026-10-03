@@ -1567,7 +1567,7 @@ public static class IlGenerator
                 if (!CalleeUsableFrom(targetMethod, context)
                     || !Analysis.InaccessibleCalleeRecovery.SatisfiesDeclaredConstraints(targetMethod))
                 {
-                    if (Analysis.InaccessibleCalleeRecovery.TrySubstitute(targetMethod) is { } accessibleCallee
+                    if (Analysis.InaccessibleCalleeRecovery.TrySubstitute(targetMethod, context) is { } accessibleCallee
                         && CalleeUsableFrom(accessibleCallee, context)
                         && Analysis.InaccessibleCalleeRecovery.SatisfiesDeclaredConstraints(accessibleCallee))
                         targetMethod = accessibleCallee;
@@ -3841,7 +3841,7 @@ public static class IlGenerator
         var target = represented;
         if (!CalleeUsableFrom(target, context))
         {
-            if (Analysis.InaccessibleCalleeRecovery.TrySubstitute(target) is { } substitute
+            if (Analysis.InaccessibleCalleeRecovery.TrySubstitute(target, context) is { } substitute
                 && CalleeUsableFrom(substitute, context))
                 target = substitute;
             else
@@ -3945,7 +3945,7 @@ public static class IlGenerator
 
         // The same invisible corlib helpers show up as function pointers; the honest
         // substitutes are the ones a direct call would use.
-        var substitute = Analysis.InaccessibleCalleeRecovery.TrySubstitute(represented);
+        var substitute = Analysis.InaccessibleCalleeRecovery.TrySubstitute(represented, callingContext);
         if (substitute == null
             || CalleeUsesSharedEnumMarker(substitute)
             || (callingContext != null
