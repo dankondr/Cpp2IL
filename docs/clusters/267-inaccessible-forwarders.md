@@ -46,6 +46,17 @@ and are cached per candidate; `EnsureBody` lifts a candidate body under
 its monitor exactly as the #181 passes do (a body inside `AnalyzeCore`
 never runs this pass, so the wait cannot cycle — re-entry safe).
 
+Because lifting an unanalyzed member to rule it out suppresses that
+member's own deferred member recovery, candidates are screened on
+metadata first: every parameter must be spellable from the leaf's own
+argument list, and a member taking at least as many parameters as the
+leaf has arguments whose return type shares no shape with the leaf's is
+skipped — absorb forwarders like `return ReadVarint(ref this) != 0` take
+fewer parameters than the leaf and stay eligible. The leaf match also
+pins the generic instantiation (`Load<object>` cannot stand in for
+`Load<T>`; `Type::Name` renders no generic arguments). Emitted `ref`/`out`
+slots bind only to addresses of exactly the parameter's element type.
+
 ## Regression test
 
 `Cpp2IL.Core.Tests/Analysis/InlinedMemberRecoveryTests.cs` — synthetic
@@ -109,7 +120,15 @@ input.ReadMessage(cCMatchCompletedPayload);                                  // 
 
 ## Scope check
 
-`diag_families.py --assemblies CastleClashers.Game` control vs branch and
-the ILVerify comparison: see the gate report in the PR's Verification —
-no valid→invalid transition in any game-owned assembly, and the
-castle-building scope does not regress.
+Whole-game sweep + audit comparison (`tools/codeverify/gate.py`, r241
+evidence): game-owned methods `cleared 0, regressed 0` — the
+castle-building scope (`CastleBuildingController`,
+`TimedCastleBuildingController`, `CastleMaker`, `EngineersController` and
+nested) does not regress, and no ILVerify valid→invalid transition
+appears in any game-owned assembly. The silent-wrong-recovery scanner
+reports 0 new hits; the corpus oracle is 376/635 matched on both sides
+(Δ0). Six recovery diagnostics do disappear — all outside game-owned
+assemblies: four `Operand slot … filled with a synthetic default` in
+`Google.Protobuf.ByteString` and two `No legal conversion` in ACTk
+`ObscuredQuaternion`/`ObscuredVector3.HideValue`, all removed because the
+correct forwarder call replaced the shape that produced them.
