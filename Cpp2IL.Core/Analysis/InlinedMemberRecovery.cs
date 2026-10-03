@@ -751,10 +751,29 @@ internal static class InlinedMemberRecovery
                     continue;
                 // Cheap rejects before the body lift a member with no part in
                 // the leaf call would pay for: a void member cannot stand in
-                // for a result that is read.
-                if (destUsed
-                    && member.ReturnType is null or { FullName: "System.Void" })
+                // for a result that is read, and a non-void member can never
+                // tail-call a void leaf.
+                if (member.ReturnType is not { } memberReturn
+                    || memberReturn.FullName == "System.Void")
+                {
+                    if (destUsed)
+                        continue;
+                }
+                else if (callee.ReturnType is not { } calleeReturn
+                    || calleeReturn.FullName == "System.Void")
+                {
                     continue;
+                }
+                // A member returning a type that shares no shape with the
+                // leaf's cannot have produced the edge either. Lifting its
+                // body just to rule it out would suppress that body's own
+                // member recovery, so this check stays metadata-only.
+                else if (!SameDef(memberReturn, calleeReturn)
+                    && !memberReturn.IsAssignableTo(calleeReturn)
+                    && !calleeReturn.IsAssignableTo(memberReturn))
+                {
+                    continue;
+                }
                 var shape = ForwarderOf(member, context);
                 if (shape is not { } forward
                     || forward.Callee.FullName != callee.FullName
@@ -774,37 +793,33 @@ internal static class InlinedMemberRecovery
             return false; // two forwarders the same shape cannot be told apart
         var chosen = best.First();
         ApplyForwarder(block, index, call, chosen, post);
-        PruneDeadArgTemporaries(decomposed, maps, call);
+        PruneDeadArgTemporaries(decomposed, maps, context);
         return true;
     }
 
     // The leaf's argument temporaries (`ref state = ref input.state`,
     // `v44 = input + 16`) exist only to feed it; once the call no longer names
     // them their projections read as stray inaccessible accesses, so a temp
-    // whose uses were all the rewritten call dies with it, recursively. Only
-    // pure projection instructions are pruned - a call or store survives.
+    // dies with it, recursively. Deadness is judged on the live instruction
+    // list, not the pre-rewrite maps: a local bound onto the new operand
+    // list, or read by any surviving instruction anywhere in the method,
+    // keeps its def. Only pure projection instructions are pruned - a call
+    // or store survives.
     private static void PruneDeadArgTemporaries(List<CallerArg> decomposed,
-        CallMaps maps, Instruction call)
+        CallMaps maps, MethodAnalysisContext context)
     {
         var pending = new Queue<LocalVariable>();
         var pruned = new HashSet<Instruction>();
-        // Locals the rewritten call still reads (an old operand bound straight
-        // onto a parameter) stay alive - the maps list them as used by this
-        // same instruction either way.
-        var live = call.SourcesAndConstants
-            .SelectMany(o => LocalVariables.OperandLocals(o)).ToHashSet();
         foreach (var arg in decomposed)
-            if (arg.Raw is LocalVariable local && !live.Contains(local))
+            if (arg.Raw is LocalVariable local)
                 pending.Enqueue(local);
         while (pending.Count > 0)
         {
             var local = pending.Dequeue();
-            if (live.Contains(local)
-                || !maps.Uses.TryGetValue(local, out var uses)
-                || uses.Any(u => !ReferenceEquals(u, call) && !pruned.Contains(u))
-                || !maps.Defs.TryGetValue(local, out var def)
+            if (!maps.Defs.TryGetValue(local, out var def)
                 || def.OpCode is not (OpCode.Move or OpCode.Add or OpCode.Subtract
-                    or OpCode.Convert or OpCode.SignExtend32))
+                    or OpCode.Convert or OpCode.SignExtend32)
+                || StillRead(local, context, def, pruned))
                 continue;
             NopOut(def);
             pruned.Add(def);
@@ -812,6 +827,17 @@ internal static class InlinedMemberRecovery
                 foreach (var nested in LocalVariables.OperandLocals(source))
                     pending.Enqueue(nested);
         }
+    }
+
+    private static bool StillRead(LocalVariable local, MethodAnalysisContext context,
+        Instruction def, HashSet<Instruction> pruned)
+    {
+        foreach (var b in context.ControlFlowGraph!.Blocks)
+            foreach (var i in b.Instructions)
+                if (!ReferenceEquals(i, def) && !pruned.Contains(i)
+                    && i.Operands.Any(o => LocalVariables.OperandLocals(o).Contains(local)))
+                    return true;
+        return false;
     }
 
     private static CallerPostOp LazyCallerPostOp(Block block, int index, Instruction call,
@@ -1057,16 +1083,26 @@ internal static class InlinedMemberRecovery
         if ((!member.IsStatic && receiver == null) || bound.Any(b => b == null))
             return null;
 
-        // The emitted slot must spell the bound operand: a `ref T` parameter
-        // takes the address form, a value parameter the operand itself.
+        // The emitted slot must spell the bound operand: a `ref T`/`out T`
+        // parameter takes the address form of exactly a `T`-typed operand (no
+        // conversion is possible through an address), a value parameter the
+        // operand itself.
         var emit = new List<IOperand>();
         for (var i = 0; i < bound.Length; i++)
         {
             var operand = bound[i]!;
-            var byRef = member.Parameters[i].ParameterType is ByRefTypeAnalysisContext;
-            var spelled = byRef ? AddressOperand(operand) : operand;
-            if (spelled == null
-                || !byRef && !ImmediateCompatible(member.Parameters[i].ParameterType, operand))
+            var spelled = member.Parameters[i].ParameterType
+                is ByRefTypeAnalysisContext byRef
+                ? AddressOperand(operand) is { } address
+                    && AddressedType(operand)?.FullName == byRef.ElementType?.FullName
+                    ? address
+                    : null
+                : (operand is Immediate or FloatLiteral or DoubleLiteral
+                        || OperandObjectType(operand) != null)
+                    && ImmediateCompatible(member.Parameters[i].ParameterType, operand)
+                    ? operand
+                    : null;
+            if (spelled == null)
                 return null;
             emit.Add(spelled);
         }
@@ -1112,6 +1148,17 @@ internal static class InlinedMemberRecovery
         LocalVariable local => new AddressOf(local),
         FieldReference field => new AddressOf(field),
         AddressOf address => address,
+        _ => null,
+    };
+
+    // The `T` an address spelling of the operand yields: `&local` is `T&` for a
+    // `T` local, `&field.x` the last accessed field's type.
+    private static TypeAnalysisContext? AddressedType(IOperand operand) => operand switch
+    {
+        LocalVariable { Type: ByRefTypeAnalysisContext byRef } => byRef.ElementType,
+        LocalVariable local => local.Type,
+        FieldReference field => field.Field.FieldType,
+        AddressOf address => AddressedType(address.Target),
         _ => null,
     };
 
