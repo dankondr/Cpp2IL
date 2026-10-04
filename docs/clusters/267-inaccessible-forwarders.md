@@ -121,14 +121,13 @@ input.ReadMessage(cCMatchCompletedPayload);                                  // 
 ## Scope check
 
 Whole-game sweep + audit comparison (`tools/codeverify/gate.py`, r241
-evidence): game-owned methods `cleared 0, regressed 0` — the
-castle-building scope (`CastleBuildingController`,
-`TimedCastleBuildingController`, `CastleMaker`, `EngineersController` and
-nested) does not regress, and no ILVerify valid→invalid transition
-appears in any game-owned assembly. The silent-wrong-recovery scanner
-reports 0 new hits; the corpus oracle is 376/635 matched on both sides
-(Δ0). Six recovery diagnostics do disappear — all outside game-owned
-assemblies: four `Operand slot … filled with a synthetic default` in
-`Google.Protobuf.ByteString` and two `No legal conversion` in ACTk
-`ObscuredQuaternion`/`ObscuredVector3.HideValue`, all removed because the
-correct forwarder call replaced the shape that produced them.
+evidence, run on the merge of this branch with `development` at #237):
+game-owned methods `cleared 16, regressed 0` — the castle-building scope
+(`CastleBuildingController`, `TimedCastleBuildingController`,
+`CastleMaker`, `EngineersController` and nested) does not regress, and
+the only ILVerify transition is five methods moving invalid→valid (none
+valid→invalid) in any game-owned assembly. The silent-wrong-recovery
+scanner reports 0 new hits; the corpus oracle is 376/635 matched on both
+sides (Δ0). 130 recovery diagnostics disappear, all ref/byref slot
+conversions or synthetic defaults that emitted forwarder and base-declared
+substitute calls (#237, merged into the measured tree) replaced.
