@@ -81,7 +81,7 @@ The two positives and the `ref this` shape fail on `development`
 against the stock nupkg `Google.Protobuf` 3.34.1 (sha256
 `b05f9f01…65b`) + net10 reference pack:
 
-| error code | control (78ce02b6) | branch |
+| error code | control (963761da) | branch |
 |---|---|---|
 | CS0122 `ParsingPrimitives` | 30 | 0 |
 | CS0122 `ParserInternalState` | 30 | 0 |
@@ -90,11 +90,22 @@ against the stock nupkg `Google.Protobuf` 3.34.1 (sha256
 | CS0122 `ParsingPrimitivesMessages` | 4 | 0 |
 | **total** | **124** | **0** |
 
-No other diagnostic code. The isolated decompile covers 7
-`CastleClashers.Protobuf` files; the #247 rebuild project's tree reports
-186 (more generated files, same per-site family) — the members are the
-same set the 260 doc mapped, and every survivor is classified: none
-survive.
+No other diagnostic code on branch — the build succeeds. On the 186
+vs 124: the #247 rebuild project's Unity compile counted 186 on
+2026-09-30 (#222). The same family measures exactly 124 (same five
+members, same per-member multiplicities) on every recoverable vintage:
+`90aa42e` (the Sep-28 baseline pin the rebuild drew from), `6b992535`
+(the 260 doc's canonical baseline), and the merge base `963761da` — each
+sweep has the identical 16 internal-protobuf leaf calls, all in the 7
+`InternalMergeFrom` fast-path bodies. The other 62 are therefore either
+Unity-side diagnostic multiplicity or sites on a project snapshot older
+than `90aa42e`; they cannot exist on this control, and the family is
+0 on branch either way — the next project rebuild will confirm.
+No other scope assembly contributes: `CastleClashers.Rules.Client`,
+`CastleClashers.SDKGlue`, `CastleClashers.VoodooTune` have 0 internal
+`Google.Protobuf` call sites in their control `recovery.json` (the other
+three scope assemblies ship as binary plugins or reference stock
+protobuf). Survivors: none.
 
 ### The three doc sites, emitted call before → after
 
@@ -121,13 +132,17 @@ input.ReadMessage(cCMatchCompletedPayload);                                  // 
 ## Scope check
 
 Whole-game sweep + audit comparison (`tools/codeverify/gate.py`, r241
-evidence, run on the merge of this branch with `development` at #237):
-game-owned methods `cleared 16, regressed 0` — the castle-building scope
-(`CastleBuildingController`, `TimedCastleBuildingController`,
-`CastleMaker`, `EngineersController` and nested) does not regress, and
-the only ILVerify transition is five methods moving invalid→valid (none
-valid→invalid) in any game-owned assembly. The silent-wrong-recovery
-scanner reports 0 new hits; the corpus oracle is 376/635 matched on both
-sides (Δ0). 130 recovery diagnostics disappear, all ref/byref slot
-conversions or synthetic defaults that emitted forwarder and base-declared
-substitute calls (#237, merged into the measured tree) replaced.
+evidence; **control = `development` @ `963761da`, the PR's merge
+base**, branch = head): game-owned methods `cleared 0, regressed 0` —
+the rewrite changes emitted callee names, not method diagnoses
+(`CastleClashers.Rules` `Calls` differ in exactly the 7 protobuf fast-path
+methods, `Diagnostics` identical), so the gate's cleared/regressed
+metric is flat by construction. ILVerify reports no transitions at all;
+the silent-wrong-recovery scanner reports 0 new hits; the corpus oracle
+is 376/635 matched on both sides (Δ0). The castle-building scope does
+not regress. `## Verdict PASS`.
+
+(An earlier gate run on this branch used control `78ce02b6` — the
+merge base *before* #237 landed — and reported `cleared 16`, five
+ILVerify invalid→valid, and 130 diagnostics gone. Re-measurement against
+`963761da` shows all three were #237's own deltas, not this branch's.)
