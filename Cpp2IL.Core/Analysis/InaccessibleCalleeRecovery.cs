@@ -111,7 +111,7 @@ internal static class InaccessibleCalleeRecovery
                 MethodAttributes.FamORAssem => sameAssembly || IsWithinOrSame(callerType, declaring) || callerType.IsAssignableTo(declaring),
                 _ => false,
             };
-            if (!memberVisible)
+            if (!memberVisible || !IsNameableTypeFromSource(declaring, callerType))
                 return false;
         }
 
@@ -320,6 +320,17 @@ internal static class InaccessibleCalleeRecovery
         for (var current = type; current != null; current = current.DeclaringType)
             if (current.Visibility is not (TypeAttributes.Public or TypeAttributes.NestedPublic))
                 return type.IsAccessibleTo(callerType);
+        return true;
+    }
+
+    // The source-scope twin of <see cref="IsNameableType"/>: the declaring
+    // chain's accessibility is judged under the caller's original internals
+    // scope, not the emitted module's relaxed one.
+    private static bool IsNameableTypeFromSource(TypeAnalysisContext type, TypeAnalysisContext callerType)
+    {
+        for (var current = type; current != null; current = current.DeclaringType)
+            if (current.Visibility is not (TypeAttributes.Public or TypeAttributes.NestedPublic))
+                return type.IsAccessibleTo(callerType, emittedScope: false);
         return true;
     }
 
