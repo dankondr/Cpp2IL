@@ -54,7 +54,9 @@ internal static class InaccessibleCalleeRecovery
                 MethodAttributes.FamORAssem => sameAssembly || IsWithinOrSame(callerType, declaring) || callerType.IsAssignableTo(declaring),
                 _ => false,
             };
-            if (!memberVisible)
+            // The declaring type is part of the member-reference token: a public
+            // member on a type the caller cannot name is still uncallable.
+            if (!memberVisible || !IsNameableType(declaring, callerType))
                 return false;
         }
 
@@ -207,7 +209,8 @@ internal static class InaccessibleCalleeRecovery
     /// inlines the capacity check and leaves a direct call to it, so <c>Add</c> is the faithful
     /// substitute on the same instantiation.
     /// </summary>
-    internal static MethodAnalysisContext? TrySubstitute(MethodAnalysisContext callee)
+    internal static MethodAnalysisContext? TrySubstitute(MethodAnalysisContext callee,
+        MethodAnalysisContext? caller = null)
     {
         if (callee is ConcreteGenericMethodAnalysisContext { Name: "AddWithResize", Parameters.Count: 1 } concrete
             && concrete.BaseMethodContext.DeclaringType is { DefaultFullName: "System.Collections.Generic.List`1" } listDefinition
@@ -218,7 +221,38 @@ internal static class InaccessibleCalleeRecovery
             return new ConcreteGenericMethodAnalysisContext(add, concrete.TypeGenericParameters, []);
         }
 
-        return null;
+        // A virtual call narrowed onto a declaring type the caller cannot see
+        // dispatches to the same target through the slot's visible base
+        // declaration: callvirt on the base-declared member names the same
+        // override. A non-virtual callee has no same-slot substitute - a
+        // `call` must run that exact body.
+        if (!callee.IsVirtual)
+            return null;
+        return BaseDeclarations(callee)
+            .FirstOrDefault(candidate => caller == null || IsVisibleFrom(candidate, caller));
+    }
+
+    // The methods whose vtable slot the callee occupies, nearest first: the
+    // override chain where metadata has one, then the same-signature virtual
+    // match each base type declares (injected contexts have no definition to
+    // chain).
+    private static IEnumerable<MethodAnalysisContext> BaseDeclarations(MethodAnalysisContext callee)
+    {
+        var chained = false;
+        for (var method = callee; method.BaseMethod is { } baseMethod; method = baseMethod)
+        {
+            chained = true;
+            yield return baseMethod;
+        }
+        if (!chained)
+            for (var type = callee.DeclaringType?.DefaultBaseType; type != null; type = type.DefaultBaseType)
+                foreach (var candidate in type.Methods)
+                    if (!candidate.IsStatic && candidate.IsVirtual
+                        && candidate.Name == callee.Name
+                        && candidate.ReturnType.FullName == callee.ReturnType.FullName
+                        && candidate.Parameters.Select(p => p.ParameterType.FullName)
+                            .SequenceEqual(callee.Parameters.Select(p => p.ParameterType.FullName)))
+                        yield return candidate;
     }
 
     /// <summary>
@@ -276,6 +310,18 @@ internal static class InaccessibleCalleeRecovery
     // survive into il2cpp metadata, so name-sharing is the broadest recoverable scope.
     private static bool SharesSourceInternals(AssemblyAnalysisContext? a, AssemblyAnalysisContext? b) =>
         ReferenceEquals(a, b) || (a != null && b != null && a.Name == b.Name);
+
+    // Whether a member-reference token may name `type` in the caller's emitted
+    // assembly: a fully-public declaring chain is nameable from anywhere (the
+    // emitted module gains whatever reference it needs); any non-public link
+    // still needs the assembly's own access rules.
+    private static bool IsNameableType(TypeAnalysisContext type, TypeAnalysisContext callerType)
+    {
+        for (var current = type; current != null; current = current.DeclaringType)
+            if (current.Visibility is not (TypeAttributes.Public or TypeAttributes.NestedPublic))
+                return type.IsAccessibleTo(callerType);
+        return true;
+    }
 
     private static bool IsWithinOrSame(TypeAnalysisContext candidate, TypeAnalysisContext declaring)
     {

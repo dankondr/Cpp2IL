@@ -30,6 +30,11 @@ public static class ByReferenceArgumentRecovery
             || method.ControlFlowGraph is not { } cfg)
             return;
 
+        // The pipeline witnesses copies right after locals are created; a driver
+        // that runs this pass alone still has every fill, so witness them here.
+        if (method.CopiedSpans == null)
+            CopiedFrameSpanRecovery.Run(method);
+
         var instructions = cfg.Instructions;
         var candidates = new List<(Instruction Call, int Index, TypeAnalysisContext Type, bool ByValue)>();
         foreach (var call in instructions)
@@ -53,16 +58,31 @@ public static class ByReferenceArgumentRecovery
         foreach (var (call, index, type, byValue) in candidates)
         {
             var operand = call.Operands[index];
-            if (operand is AddressOf { Target: LocalVariable { Type: null } slot }
-                && !TypeFrameSlot(slot, type, method, instructions, argumentPositions, needsFill: byValue))
-                continue;
+            if (operand is AddressOf { Target: LocalVariable { Type: null } slot })
+                TypeFrameSlot(slot, type, method, instructions, argumentPositions, needsFill: byValue);
 
             if (!byValue)
                 continue;
             if (Referent(operand, type) is { } value
                 && !(value is LocalVariable copy && CopiesUnwrittenLocal(copy, method, instructions)))
                 call.SetOperand(index, value);
+            else if (CopiedValue(operand, type, method) is { } copied)
+                call.SetOperand(index, copied);
         }
+    }
+
+    // A frame cell whose span a whole-copy witness names: the cells image the
+    // source's bytes, so `&cell` in a by-value argument is the value the source
+    // spells (`&cell` == `*source` over the span). The cell itself is never the
+    // value - its sibling words live under other names.
+    private static IOperand? CopiedValue(IOperand operand, TypeAnalysisContext type,
+        MethodAnalysisContext method)
+    {
+        if (operand is not AddressOf { Target: LocalVariable cell }
+            || method.CopiedSpans?.TryGetValue(cell, out var span) != true
+            || span.Bytes < TypeSizes.MinimumUnboxedSize(type, method.AppContext.Binary.PointerSizeBytes))
+            return null;
+        return Referent(new AddressOf(span.Source), type);
     }
 
     // What a pointer argument names, when it provably names a T: a local, field or
